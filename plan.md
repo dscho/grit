@@ -105,6 +105,8 @@
     cleanup scoping with upstream.
   - Completed `t5616-partial-clone.sh` (47/47): restore submodule recursion works and
     traced promisor fetches hydrate missing REF_DELTA parent-tree blobs.
+  - Completed `t5552-skipping-fetch-negotiator.sh` (6/6) by using protocol v0 for local
+    fetches configured with the skipping negotiator.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

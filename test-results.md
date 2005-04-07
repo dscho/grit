@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5552-skipping-fetch-negotiator
+
+- Focus harness: `./scripts/run-tests.sh t5552-skipping-fetch-negotiator.sh --verbose` passes 6/6 after local skipping-negotiator fetches use protocol v0 negotiation.
+- Regression harness: `./scripts/run-tests.sh t5552-skipping-fetch-negotiator.sh t5554-noop-fetch-negotiator.sh t5616-partial-clone.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5616-partial-clone
 
 - Focus harness: `./scripts/run-tests.sh t5616-partial-clone.sh --verbose` passes 47/47.

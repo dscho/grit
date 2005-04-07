@@ -1034,7 +1034,12 @@ pub fn fetch_via_upload_pack_skipping(
     Option<String>,
     Option<ObjectId>,
 )> {
-    let client_proto = protocol_wire::effective_client_protocol_version();
+    let mut client_proto = protocol_wire::effective_client_protocol_version();
+    if fetch_negotiation_algorithm(local_git_dir)
+        .is_some_and(|value| value.eq_ignore_ascii_case("skipping"))
+    {
+        client_proto = 0;
+    }
     let mut child = spawn_upload_pack_with_proto(upload_pack_cmd, remote_repo_path, client_proto)?;
     let mut stdin = child.stdin.take().context("upload-pack stdin")?;
     let mut stdout = child.stdout.take().context("upload-pack stdout")?;
@@ -1198,6 +1203,12 @@ pub fn fetch_via_upload_pack_skipping(
     unpack_upload_pack_bytes(local_git_dir, &pack_buf, filter_active)?;
 
     Ok((remote_heads, remote_tags, head_symref, head_advertised_oid))
+}
+
+fn fetch_negotiation_algorithm(local_git_dir: &Path) -> Option<String> {
+    ConfigSet::load(Some(local_git_dir), true)
+        .ok()
+        .and_then(|cfg| cfg.get("fetch.negotiationalgorithm"))
 }
 
 /// Store a received pack from `upload-pack` into the local ODB.
