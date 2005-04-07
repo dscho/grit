@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5540-fetch-push-edge-cases
+
+- Focus harness: `./scripts/run-tests.sh t5540-fetch-push-edge-cases.sh --verbose` passes 12/12.
+- Regression harness: `./scripts/run-tests.sh t5540-fetch-push-edge-cases.sh t5543-atomic-push.sh t5529-push-errors.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5503-tagfollow
 
 - Focus harness: `./scripts/run-tests.sh t5503-tagfollow.sh --verbose` passes 12/12.

@@ -22,6 +22,7 @@ make_origin () {
 	git init -q "$1" &&
 	(
 		cd "$1" &&
+		git config receive.denyCurrentBranch updateInstead &&
 		echo "commit 1" >file &&
 		git add file &&
 		git commit -q -m "first" &&

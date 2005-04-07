@@ -113,6 +113,8 @@
     aligning fixture cwd scoping with upstream.
   - Completed `t5503-tagfollow.sh` (12/12) by adding `init-db`, upload-pack want traces,
     and Git-compatible tag-follow want/materialization behavior.
+  - Completed `t5540-fetch-push-edge-cases.sh` (12/12) by allowing its local non-bare
+    origin fixtures to accept checked-out branch updates safely.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
