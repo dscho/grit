@@ -1,7 +1,8 @@
 
-## 2026-06-04 — t5616-partial-clone progress
+## 2026-06-04 — t5616-partial-clone
 
-- Focus harness: `./scripts/run-tests.sh t5616-partial-clone.sh --verbose` now reports 46/47 after `restore --recurse-submodules` support; final REF_DELTA/promisor trace case remains failing.
+- Focus harness: `./scripts/run-tests.sh t5616-partial-clone.sh --verbose` passes 47/47.
+- Regression harness: `./scripts/run-tests.sh t5616-partial-clone.sh t5620-backfill.sh t5614-clone-submodules-shallow.sh t5551-http-fetch-smart.sh --verbose` passes all covered rows (`t5551` has 6 expected TODO failures).
 
 
 ## 2026-06-04 — t5614-clone-submodules-shallow

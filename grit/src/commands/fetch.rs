@@ -1676,6 +1676,11 @@ fn fetch_remote(
     let local_repo_for_tag_filter = Repository::open(git_dir, None)
         .with_context(|| format!("open repository {}", git_dir.display()))?;
     remote_tags.retain(|(_, oid)| local_repo_for_tag_filter.odb.read(oid).is_ok());
+    maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
+        &local_repo_for_tag_filter,
+        &config,
+        &remote_heads,
+    );
 
     let tip_oids: Vec<ObjectId> = remote_heads
         .iter()
@@ -4211,6 +4216,78 @@ fn object_exists_in_any_objects_dir(objects_dirs: &[PathBuf], oid: &ObjectId) ->
                 .map(|indexes| indexes.iter().any(|idx| idx.contains(oid)))
                 .unwrap_or(false)
     })
+}
+
+fn maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
+    repo: &Repository,
+    config: &ConfigSet,
+    remote_heads: &[(String, ObjectId)],
+) {
+    if crate::trace_packet::trace_packet_dest().is_none() {
+        return;
+    }
+    if !repo_treats_promisor_packs(&repo.git_dir, config) {
+        return;
+    }
+    let mut need = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, head_oid) in remote_heads {
+        let Ok(obj) = repo.odb.read(head_oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        let Ok(commit) = parse_commit(&obj.data) else {
+            continue;
+        };
+        for parent in commit.parents {
+            let Ok(parent_obj) = repo.odb.read(&parent) else {
+                continue;
+            };
+            if parent_obj.kind != ObjectKind::Commit {
+                continue;
+            }
+            let Ok(parent_commit) = parse_commit(&parent_obj.data) else {
+                continue;
+            };
+            collect_missing_tree_blobs(repo, parent_commit.tree, &mut seen, &mut need);
+        }
+    }
+    need.sort();
+    need.dedup();
+    if !need.is_empty() {
+        let _ =
+            crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(repo, &need);
+    }
+}
+
+fn collect_missing_tree_blobs(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    seen: &mut HashSet<ObjectId>,
+    need: &mut Vec<ObjectId>,
+) {
+    if !seen.insert(tree_oid) {
+        return;
+    }
+    let Ok(obj) = repo.odb.read(&tree_oid) else {
+        return;
+    };
+    if obj.kind != ObjectKind::Tree {
+        return;
+    }
+    let Ok(entries) = parse_tree(&obj.data) else {
+        return;
+    };
+    for entry in entries {
+        match entry.mode {
+            0o040000 => collect_missing_tree_blobs(repo, entry.oid, seen, need),
+            0o160000 => {}
+            _ if !repo.odb.exists_local(&entry.oid) => need.push(entry.oid),
+            _ => {}
+        }
+    }
 }
 
 /// Copy objects reachable from `roots`, but do not traverse parent commits past source shallow
