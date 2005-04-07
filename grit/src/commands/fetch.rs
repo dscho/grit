@@ -785,6 +785,7 @@ fn collect_wants_for_upload_pack(
     let remote_odb = Odb::new(&remote_git_dir.join("objects"));
     let remote_repo = open_repo(remote_git_dir)?;
     let mut wants: Vec<ObjectId> = Vec::new();
+    let mut wanted_branch_tips: Vec<ObjectId> = Vec::new();
     let local_tag_tips: HashSet<ObjectId> = refs::list_refs(local_git_dir, "refs/tags/")?
         .into_iter()
         .map(|(_, oid)| oid)
@@ -828,6 +829,7 @@ fn collect_wants_for_upload_pack(
         // already exists locally (e.g. via a prior pack). Upstream `fetch-pack` emits matching
         // `want` lines and tag-following depends on the correct tip (t5503-tagfollow).
         crate::fetch_transport::push_want_unique(&mut wants, tip_oid);
+        wanted_branch_tips.push(tip_oid);
         if should_fetch_tags
             && remote_odb
                 .read(&tip_oid)
@@ -852,6 +854,9 @@ fn collect_wants_for_upload_pack(
                     continue;
                 };
                 if !merge_base::is_ancestor(&remote_repo, tag.object, tip_oid).unwrap_or(false) {
+                    continue;
+                }
+                if tag.object != tip_oid && !local_odb.exists(&tag.object) {
                     continue;
                 }
                 if let Some(old_tip) = local_tracking_oid {
@@ -884,12 +889,46 @@ fn collect_wants_for_upload_pack(
             if local_odb.exists(oid) {
                 continue;
             }
+            if tag_target_is_implicit_include_tag(
+                &local_odb,
+                &remote_odb,
+                &remote_repo,
+                *oid,
+                &wanted_branch_tips,
+            ) {
+                continue;
+            }
             crate::fetch_transport::push_want_unique(&mut wants, *oid);
         }
     }
 
     wants.dedup();
     Ok(wants)
+}
+
+fn tag_target_is_implicit_include_tag(
+    local_odb: &Odb,
+    remote_odb: &Odb,
+    remote_repo: &Repository,
+    tag_oid: ObjectId,
+    wanted_branch_tips: &[ObjectId],
+) -> bool {
+    let Ok(tag_obj) = remote_odb.read(&tag_oid) else {
+        return false;
+    };
+    if tag_obj.kind != ObjectKind::Tag {
+        return false;
+    }
+    let Ok(tag) = parse_tag(&tag_obj.data) else {
+        return false;
+    };
+    if local_odb.exists(&tag.object) {
+        return false;
+    }
+    wanted_branch_tips.iter().any(|tip| {
+        tag.object != *tip
+            && merge_base::is_ancestor(remote_repo, tag.object, *tip).unwrap_or(false)
+    })
 }
 
 fn append_follow_tags_for_wants(
@@ -1676,6 +1715,14 @@ fn fetch_remote(
     // after partial/failed shallow exchanges (e.g. manipulated one-time-script responses).
     let local_repo_for_tag_filter = Repository::open(git_dir, None)
         .with_context(|| format!("open repository {}", git_dir.display()))?;
+    if let Some(rr) = ext_resolved_remote.as_ref().or(remote_repo.as_ref()) {
+        maybe_materialize_include_tag_objects(
+            &local_repo_for_tag_filter,
+            rr,
+            &remote_heads,
+            &remote_tags,
+        );
+    }
     remote_tags.retain(|(_, oid)| local_repo_for_tag_filter.odb.read(oid).is_ok());
     maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
         &local_repo_for_tag_filter,
@@ -4260,6 +4307,39 @@ fn maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
     if !need.is_empty() {
         let _ =
             crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(repo, &need);
+    }
+}
+
+fn maybe_materialize_include_tag_objects(
+    local_repo: &Repository,
+    remote_repo: &Repository,
+    remote_heads: &[(String, ObjectId)],
+    remote_tags: &[(String, ObjectId)],
+) {
+    let head_oids: Vec<ObjectId> = remote_heads.iter().map(|(_, oid)| *oid).collect();
+    for (_, tag_oid) in remote_tags {
+        if local_repo.odb.read(tag_oid).is_ok() {
+            continue;
+        }
+        let Ok(tag_obj) = remote_repo.odb.read(tag_oid) else {
+            continue;
+        };
+        if tag_obj.kind != ObjectKind::Tag {
+            continue;
+        }
+        let Ok(tag) = parse_tag(&tag_obj.data) else {
+            continue;
+        };
+        if local_repo.odb.read(&tag.object).is_err() {
+            continue;
+        }
+        let reachable_from_fetched_head = head_oids.iter().any(|head| {
+            tag.object == *head
+                || merge_base::is_ancestor(remote_repo, tag.object, *head).unwrap_or(false)
+        });
+        if reachable_from_fetched_head {
+            let _ = local_repo.odb.write(tag_obj.kind, &tag_obj.data);
+        }
     }
 }
 

@@ -5382,7 +5382,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             commands::index_pack::normalize_argv_for_positional_pack(&mut argv);
             commands::index_pack::run(parse_cmd_args(subcmd, &argv))
         }
-        "init" => commands::init::run(parse_cmd_args(subcmd, rest), opts.bare),
+        "init" | "init-db" => commands::init::run(parse_cmd_args("init", rest), opts.bare),
         "interpret-trailers" => {
             if rest.len() == 1 && (rest[0] == "-h" || rest[0] == "--help") {
                 if let Some(syn) = commands::upstream_synopsis_help::synopsis_for_builtin(subcmd) {

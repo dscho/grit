@@ -111,6 +111,8 @@
     for inner `.git`, bare repos, and `.git` suffix fallback.
   - Completed `t5618-alternate-refs.sh` (6/6) by honoring alternate ref prefixes and
     aligning fixture cwd scoping with upstream.
+  - Completed `t5503-tagfollow.sh` (12/12) by adding `init-db`, upload-pack want traces,
+    and Git-compatible tag-follow want/materialization behavior.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5503-tagfollow
+
+- Focus harness: `./scripts/run-tests.sh t5503-tagfollow.sh --verbose` passes 12/12.
+- Regression harness: `./scripts/run-tests.sh t5503-tagfollow.sh t5525-fetch-tagopt.sh t5616-partial-clone.sh t5552-skipping-fetch-negotiator.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5618-alternate-refs
 
 - Focus harness: `./scripts/run-tests.sh t5618-alternate-refs.sh --verbose` passes 6/6.
