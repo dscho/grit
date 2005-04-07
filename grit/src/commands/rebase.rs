@@ -7566,6 +7566,7 @@ fn cleanup_rebase_state(git_dir: &Path) {
     let _ = fs::remove_dir_all(rb_merge);
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(git_dir.join("SQUASH_MSG"));
+    let _ = fs::remove_file(git_dir.join("REBASE_HEAD"));
 }
 
 fn commit_message_unicode(commit: &CommitData) -> String {
