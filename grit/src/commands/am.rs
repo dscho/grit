@@ -19,6 +19,7 @@ use grit_lib::config::{parse_bool, ConfigSet};
 use grit_lib::crlf::{self, ConversionConfig};
 use grit_lib::hooks::{run_hook as grit_run_hook, HookResult};
 use grit_lib::index::{entry_from_metadata, Index, IndexEntry, MODE_REGULAR};
+use grit_lib::merge_file::MergeFavor;
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::refs::{delete_ref, write_ref};
 use grit_lib::repo::Repository;
@@ -1291,6 +1292,7 @@ fn apply_am_format_patch_tree_merge(repo: &Repository, patch: &MboxPatch) -> Res
         &picked_oid,
         &parent_oid,
         &head_oid,
+        MergeFavor::None,
     )?;
 
     let mut merged_index = merge_result.index;

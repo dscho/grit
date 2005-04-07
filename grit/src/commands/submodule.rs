@@ -4333,6 +4333,16 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
 
         let src_hex = oid_src.to_hex();
         let dst_hex = oid_dst.to_hex();
+
+        if src_gitlink && dst_gitlink {
+            let _ = submodule_fetch_gitlink_if_missing(
+                &grit_bin, work_tree, sm_path, &sub_path, &src_hex,
+            );
+            let _ = submodule_fetch_gitlink_if_missing(
+                &grit_bin, work_tree, sm_path, &sub_path, &dst_hex,
+            );
+        }
+
         let src_abbrev = short_oid_in_submodule(&grit_bin, &sub_path, &src_hex)
             .unwrap_or_else(|| src_hex.chars().take(7).collect());
         let dst_abbrev = short_oid_in_submodule(&grit_bin, &sub_path, &dst_hex)
@@ -4358,15 +4368,11 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
             continue;
         }
 
-        let total_commits = if !src_abbrev.is_empty() && !dst_abbrev.is_empty() {
+        let total_commits = if !src_hex.is_empty() && !dst_hex.is_empty() {
             if src_gitlink && dst_gitlink {
-                submodule_rev_list_count(
-                    &grit_bin,
-                    &sub_path,
-                    &format!("{src_abbrev}...{dst_abbrev}"),
-                )?
+                submodule_rev_list_count(&grit_bin, &sub_path, &format!("{src_hex}...{dst_hex}"))?
             } else {
-                submodule_rev_list_count(&grit_bin, &sub_path, &dst_abbrev)?
+                submodule_rev_list_count(&grit_bin, &sub_path, &dst_hex)?
             }
         } else {
             -1
@@ -4385,8 +4391,8 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
                 submodule_log_first_parent(
                     &grit_bin,
                     &sub_path,
-                    &src_abbrev,
-                    &dst_abbrev,
+                    &src_hex,
+                    &dst_hex,
                     summary_limit,
                 )?;
             } else if dst_gitlink {
