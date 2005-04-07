@@ -1,4 +1,9 @@
 
+## 2026-06-04 — t5616-partial-clone progress
+
+- Focus harness: `./scripts/run-tests.sh t5616-partial-clone.sh --verbose` now reports 46/47 after `restore --recurse-submodules` support; final REF_DELTA/promisor trace case remains failing.
+
+
 ## 2026-06-04 — t5614-clone-submodules-shallow
 
 - Focus harness: `./scripts/run-tests.sh t5614-clone-submodules-shallow.sh --verbose` passes 9/9 after aligning fixture cleanup scoping with upstream.

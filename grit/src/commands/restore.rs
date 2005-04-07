@@ -35,6 +35,10 @@ pub struct Args {
     #[arg(long = "ignore-unmerged")]
     pub ignore_unmerged: bool,
 
+    /// Recurse into active submodules when restoring gitlinks.
+    #[arg(long = "recurse-submodules")]
+    pub recurse_submodules: bool,
+
     /// Suppress progress messages.
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
@@ -216,10 +220,22 @@ pub fn run(args: Args) -> Result<()> {
             if let Some(tree_oid) = &source_tree_oid {
                 if !restore_staged {
                     // --source without --staged: restore worktree from tree, leave index alone
-                    do_restore_worktree_from_tree(&repo, &work_tree, rel_path, *tree_oid)?;
+                    do_restore_worktree_from_tree(
+                        &repo,
+                        &work_tree,
+                        rel_path,
+                        *tree_oid,
+                        args.recurse_submodules,
+                    )?;
                 } else {
                     // --source with --staged (and --worktree implied or explicit)
-                    do_restore_worktree_from_tree(&repo, &work_tree, rel_path, *tree_oid)?;
+                    do_restore_worktree_from_tree(
+                        &repo,
+                        &work_tree,
+                        rel_path,
+                        *tree_oid,
+                        args.recurse_submodules,
+                    )?;
                 }
             } else {
                 // No --source: restore worktree from index
@@ -308,6 +324,7 @@ fn do_restore_worktree_from_tree(
     work_tree: &Path,
     rel_path: &str,
     tree_oid: ObjectId,
+    recurse_submodules: bool,
 ) -> Result<()> {
     match find_in_tree(repo, tree_oid, rel_path)? {
         None => {
@@ -317,6 +334,12 @@ fn do_restore_worktree_from_tree(
             );
         }
         Some((blob_oid, mode)) => {
+            if mode == 0o160000 {
+                if recurse_submodules {
+                    restore_submodule_to_gitlink(work_tree, rel_path, blob_oid)?;
+                }
+                return Ok(());
+            }
             let obj = repo
                 .odb
                 .read(&blob_oid)
@@ -326,6 +349,26 @@ fn do_restore_worktree_from_tree(
             }
             write_to_worktree(work_tree, rel_path, &obj.data, mode)?;
         }
+    }
+    Ok(())
+}
+
+fn restore_submodule_to_gitlink(work_tree: &Path, rel_path: &str, oid: ObjectId) -> Result<()> {
+    let sub_path = work_tree.join(rel_path);
+    if !sub_path.join(".git").exists() {
+        return Ok(());
+    }
+    let status = std::process::Command::new(crate::grit_exe::grit_executable())
+        .arg("-C")
+        .arg(&sub_path)
+        .arg("checkout")
+        .arg("--force")
+        .arg("--quiet")
+        .arg(oid.to_hex())
+        .status()
+        .with_context(|| format!("restoring submodule '{rel_path}'"))?;
+    if !status.success() {
+        bail!("could not restore submodule '{rel_path}'");
     }
     Ok(())
 }
@@ -598,7 +641,7 @@ fn expand_pathspecs(
     let mut result = Vec::new();
 
     for spec in pathspecs {
-        if spec == "." {
+        if spec == "." || spec == ":/" || spec == ":" {
             // Expand to all tracked paths
             if let Some(tree_oid) = source_tree {
                 // Collect all paths from the source tree

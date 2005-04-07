@@ -1222,18 +1222,61 @@ pub(crate) fn unpack_upload_pack_bytes(
         if filter_active {
             let _ = std::fs::File::create(pack_path.with_extension("promisor"));
         }
+        lazy_fetch_missing_ref_delta_bases(&repo, pack_buf)?;
         return Ok(());
     }
     if should_store_fetched_pack_as_pack(local_git_dir, pack_buf) {
         let repo = Repository::open(local_git_dir, None)
             .with_context(|| format!("open repository {}", local_git_dir.display()))?;
         index_pack::ingest_pack_bytes(&repo, pack_buf, true).context("ingest fetched pack")?;
+        lazy_fetch_missing_ref_delta_bases(&repo, pack_buf)?;
         return Ok(());
     }
     let odb = Odb::new(&local_git_dir.join("objects"));
+    let repo = Repository::open(local_git_dir, None)
+        .with_context(|| format!("open repository {}", local_git_dir.display()))?;
+    lazy_fetch_missing_ref_delta_bases(&repo, pack_buf)?;
     let mut reader = pack_buf;
     unpack_objects(&mut reader, &odb, &UnpackOptions::default())?;
     Ok(())
+}
+
+fn lazy_fetch_missing_ref_delta_bases(repo: &Repository, pack_buf: &[u8]) -> Result<()> {
+    let missing_bases = missing_ref_delta_bases(repo, pack_buf)?;
+    if !missing_bases.is_empty() {
+        let _ = crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(
+            repo,
+            &missing_bases,
+        );
+    }
+    Ok(())
+}
+
+fn missing_ref_delta_bases(repo: &Repository, pack_buf: &[u8]) -> Result<Vec<ObjectId>> {
+    if pack_buf.len() < 12 || &pack_buf[..4] != b"PACK" {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_be_bytes([pack_buf[8], pack_buf[9], pack_buf[10], pack_buf[11]]) as usize;
+    let mut pos = 12usize;
+    let mut missing = Vec::new();
+    for _ in 0..count {
+        let offset = pos as u64;
+        if let Some(grit_lib::pack::PackedDeltaDependency::RefBase { base_oid }) =
+            grit_lib::pack::read_packed_delta_dependency(pack_buf, offset)?
+        {
+            if !repo.odb.exists_local(&base_oid) {
+                missing.push(base_oid);
+            }
+        }
+        let slice = grit_lib::pack::slice_one_pack_object(pack_buf, offset, 20)?;
+        pos += slice.len();
+        if pos > pack_buf.len().saturating_sub(20) {
+            break;
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
 }
 
 fn should_store_fetched_pack_as_pack(local_git_dir: &Path, pack_buf: &[u8]) -> bool {

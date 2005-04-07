@@ -103,6 +103,8 @@
   - Refreshed `t5551-http-fetch-smart.sh` to complete (31/37 with 6 expected TODO failures).
   - Completed `t5614-clone-submodules-shallow.sh` (9/9) by aligning the ported fixture
     cleanup scoping with upstream.
+  - Partial progress on `t5616-partial-clone.sh`: now 46/47 after restore submodule recursion;
+    final REF_DELTA/promisor trace case remains.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
