@@ -1113,6 +1113,7 @@ fn fetch_remote(
                 remote_path.display()
             )
         })?;
+        remote_path = r.git_dir.clone();
         if url_override.is_some() && url.starts_with("file://") {
             r.enforce_safe_directory_git_dir()?;
         }
@@ -5476,15 +5477,30 @@ fn open_repo(path: &Path) -> Result<Repository> {
         let git_dir = grit_lib::repo::resolve_dot_git(path)?;
         return Repository::open(&git_dir, work_tree.as_deref()).map_err(Into::into);
     }
-    if let Ok(repo) = Repository::open(path, None) {
-        return Ok(repo);
-    }
     let dot_git = path.join(".git");
     if dot_git.is_file() {
         let resolved = grit_lib::repo::resolve_dot_git(&dot_git)?;
         return Repository::open(&resolved, Some(path)).map_err(Into::into);
     }
-    Repository::open(&dot_git, Some(path)).map_err(Into::into)
+    if let Ok(repo) = Repository::open(&dot_git, Some(path)) {
+        return Ok(repo);
+    }
+    if let Ok(repo) = Repository::open(path, None) {
+        return Ok(repo);
+    }
+    let with_git = PathBuf::from(format!("{}.git", path.display()));
+    if let Ok(repo) = Repository::open(&with_git, None) {
+        return Ok(repo);
+    }
+    let dot_git = with_git.join(".git");
+    if dot_git.is_file() {
+        let resolved = grit_lib::repo::resolve_dot_git(&dot_git)?;
+        return Repository::open(&resolved, Some(&with_git)).map_err(Into::into);
+    }
+    if let Ok(repo) = Repository::open(&dot_git, Some(&with_git)) {
+        return Ok(repo);
+    }
+    Repository::open(path, None).map_err(Into::into)
 }
 
 /// Pre-`remote.*` layout: `.git/remotes/<name>` with `URL:` and `Pull:` lines.

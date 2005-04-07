@@ -4300,15 +4300,15 @@ fn open_source_repo(path: &Path) -> Result<Repository> {
         let git_dir = grit_lib::repo::resolve_dot_git(path)?;
         return Repository::open(&git_dir, work_tree.as_deref()).map_err(Into::into);
     }
-    if let Ok(repo) = Repository::open(path, None) {
-        return Ok(repo);
-    }
     let dot_git = path.join(".git");
     if dot_git.is_file() {
         let resolved = grit_lib::repo::resolve_dot_git(&dot_git)?;
         return Repository::open(&resolved, Some(path)).map_err(Into::into);
     }
-    Repository::open(&dot_git, Some(path)).map_err(Into::into)
+    if let Ok(repo) = Repository::open(&dot_git, Some(path)) {
+        return Ok(repo);
+    }
+    Repository::open(path, None).map_err(Into::into)
 }
 
 /// Append one absolute `objects` directory line to `objects/info/alternates` (deduped).

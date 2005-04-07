@@ -107,6 +107,8 @@
     traced promisor fetches hydrate missing REF_DELTA parent-tree blobs.
   - Completed `t5552-skipping-fetch-negotiator.sh` (6/6) by using protocol v0 for local
     fetches configured with the skipping negotiator.
+  - Completed `t5900-repo-selection.sh` (8/8) by matching Git local path selection
+    for inner `.git`, bare repos, and `.git` suffix fallback.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

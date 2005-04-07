@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5900-repo-selection
+
+- Focus harness: `./scripts/run-tests.sh t5900-repo-selection.sh --verbose` passes 8/8.
+- Regression harness: `./scripts/run-tests.sh t5900-repo-selection.sh t5810-proto-disable-local.sh t5616-partial-clone.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5552-skipping-fetch-negotiator
 
 - Focus harness: `./scripts/run-tests.sh t5552-skipping-fetch-negotiator.sh --verbose` passes 6/6 after local skipping-negotiator fetches use protocol v0 negotiation.
