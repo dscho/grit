@@ -166,6 +166,13 @@ impl IndexEntry {
     const FLAG_EXT_OVERLAY_TREE_SKIP: u16 = 0x8000;
     /// In-memory and on-disk compatibility bit for fsmonitor validity (`git ls-files -f`).
     const FLAG_EXT_FSMONITOR_VALID: u16 = 0x1000;
+    /// Extended flags Git persists in index v3 (`CE_EXTENDED_FLAGS` in `read-cache-ll.h`).
+    const FLAG_EXT_ON_DISK: u16 = 0x2000 | 0x4000;
+
+    /// Extended flag bits safe to write to a Git-compatible on-disk index (excludes fsmonitor).
+    fn disk_flags_extended(fe: u16) -> u16 {
+        fe & Self::FLAG_EXT_ON_DISK
+    }
 
     #[must_use]
     pub fn overlay_tree_skip_output(&self) -> bool {
@@ -2046,7 +2053,11 @@ fn serialize_entry_v4(entry: &IndexEntry, previous_path: &mut Vec<u8>, out: &mut
     out.extend_from_slice(entry.oid.as_bytes());
 
     let mut flags = entry.flags;
-    if entry.flags_extended.is_some() {
+    let disk_ext = entry
+        .flags_extended
+        .map(IndexEntry::disk_flags_extended)
+        .filter(|fe| *fe != 0);
+    if disk_ext.is_some() {
         flags |= 0x4000;
     } else {
         flags &= !0x4000;
@@ -2055,7 +2066,7 @@ fn serialize_entry_v4(entry: &IndexEntry, previous_path: &mut Vec<u8>, out: &mut
     flags = (flags & 0xF000) | path_len;
     out.extend_from_slice(&flags.to_be_bytes());
 
-    if let Some(fe) = entry.flags_extended {
+    if let Some(fe) = disk_ext {
         out.extend_from_slice(&fe.to_be_bytes());
     }
 
@@ -2092,7 +2103,11 @@ fn serialize_entry(entry: &IndexEntry, version: u32, out: &mut Vec<u8>) {
 
     // Set or clear the extended-flags bit in flags
     let mut flags = entry.flags;
-    if version >= 3 && entry.flags_extended.is_some() {
+    let disk_ext = entry
+        .flags_extended
+        .map(IndexEntry::disk_flags_extended)
+        .filter(|fe| *fe != 0);
+    if version >= 3 && disk_ext.is_some() {
         flags |= 0x4000;
     } else {
         flags &= !0x4000;
@@ -2103,7 +2118,7 @@ fn serialize_entry(entry: &IndexEntry, version: u32, out: &mut Vec<u8>) {
     out.extend_from_slice(&flags.to_be_bytes());
 
     if version >= 3 {
-        if let Some(fe) = entry.flags_extended {
+        if let Some(fe) = disk_ext {
             out.extend_from_slice(&fe.to_be_bytes());
         }
     }

@@ -4927,6 +4927,7 @@ fn replay_remaining(
                         .cloned()
                         .unwrap_or_else(diff::zero_oid);
 
+                    append_interactive_rebase_done_line(rb_dir, todo[i])?;
                     match run_rebase_pick_in_clean_child_process(repo, i, force_rewrite_commits) {
                         Ok(()) => {
                             let head = resolve_head(git_dir)?;
@@ -4947,7 +4948,6 @@ fn replay_remaining(
                             let _ = append_reflog(
                                 git_dir, "HEAD", &old_head, &new_oid, &ident, &msg, false,
                             );
-                            append_interactive_rebase_done_line(rb_dir, todo[i])?;
 
                             let remaining: Vec<&str> = todo[i + 1..].to_vec();
                             write_rebase_todo_slice(rb_dir, &remaining)?;
@@ -5017,6 +5017,7 @@ fn replay_remaining(
                         .cloned()
                         .unwrap_or_else(diff::zero_oid);
 
+                    append_interactive_rebase_done_line(rb_dir, todo[i])?;
                     match run_rebase_pick_in_clean_child_process(repo, i, force_rewrite_commits) {
                         Ok(()) => {
                             let head = resolve_head(git_dir)?;
@@ -5037,7 +5038,6 @@ fn replay_remaining(
                             let _ = append_reflog(
                                 git_dir, "HEAD", &old_head, &new_oid, &ident, &msg, false,
                             );
-                            append_interactive_rebase_done_line(rb_dir, todo[i])?;
 
                             if let Ok(global_exec) = fs::read_to_string(rb_dir.join("exec")) {
                                 let global_exec = global_exec.trim();
@@ -6515,8 +6515,13 @@ fn do_continue() -> Result<()> {
     } else {
         let (message, _, _) = read_rebase_continue_message(git_dir, &original_commit, &config)?;
         let tree_oid = write_tree_from_index(&repo.odb, &index, "")?;
+        let hook_arg1 = if git_dir.join("MERGE_MSG").exists() {
+            "merge"
+        } else {
+            "message"
+        };
         let raw_msg =
-            commit_message_after_prepare_hook(&repo, git_dir, &message, "message", Some(":"))?;
+            commit_message_after_prepare_hook(&repo, git_dir, &message, hook_arg1, Some(":"))?;
         let cleaned = apply_commit_msg_cleanup(&raw_msg, rebase_commit_msg_cleanup(&config));
         let (message, encoding, raw_message) =
             finalize_message_for_commit_encoding(cleaned, &config);
