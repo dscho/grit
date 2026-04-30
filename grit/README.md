@@ -21,7 +21,7 @@ rates.
 ## Install
 
 ```sh
-cargo install grit-rs
+cargo install grit-cli
 ```
 
 This puts a `grit` binary on your `$PATH`.

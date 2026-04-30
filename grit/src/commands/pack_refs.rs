@@ -11,6 +11,7 @@ use grit_lib::odb::Odb;
 use grit_lib::refs::read_ref_file;
 use grit_lib::refs::Ref;
 use grit_lib::repo::Repository;
+use grit_lib::shared_repo::{adjust_shared_repo_tree, git_config_perm};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
@@ -40,6 +41,25 @@ pub struct Args {
 pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("failed to discover repository")?;
     let git_dir = &repo.git_dir;
+
+    if grit_lib::reftable::is_reftable_repo(git_dir) {
+        return pack_reftable_refs(git_dir, args.auto);
+    }
+
+    if args.auto && !pack_refs_auto_needed(git_dir)? {
+        return Ok(());
+    }
+
+    let include = if args.no_include {
+        Vec::new()
+    } else {
+        args.include.clone()
+    };
+    let exclude = if args.no_exclude {
+        Vec::new()
+    } else {
+        args.exclude.clone()
+    };
 
     // Read existing packed-refs to merge with
     let mut packed = read_existing_packed_refs(git_dir)?;
@@ -81,6 +101,46 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn pack_reftable_refs(git_dir: &Path, auto: bool) -> Result<()> {
+    let config = ConfigSet::load(Some(git_dir), true).unwrap_or_else(|_| ConfigSet::new());
+    if let Some(raw) = config.get("reftable.blockSize") {
+        if let Ok(block_size) = raw.parse::<u32>() {
+            if block_size >= 16 * 1024 * 1024 {
+                anyhow::bail!("fatal: reftable block size cannot exceed 16MB");
+            }
+            if block_size > 0 && block_size < 64 {
+                anyhow::bail!("unable to compact stack: entry too large");
+            }
+        }
+    }
+    if let Some(raw) = config.get("reftable.restartInterval") {
+        if let Ok(restart_interval) = raw.parse::<usize>() {
+            if restart_interval > u16::MAX as usize {
+                anyhow::bail!("fatal: reftable block size cannot exceed 65535");
+            }
+        }
+    }
+    if git_dir.join("reftable/tables.list.lock").exists() {
+        anyhow::bail!("unable to compact stack: data is locked");
+    }
+
+    let mut stack =
+        grit_lib::reftable::ReftableStack::open(git_dir).context("opening reftable stack")?;
+    if auto && stack.table_names().len() <= 2 {
+        return Ok(());
+    }
+    stack.compact().context("compacting reftable stack")?;
+    maybe_emit_reference_fsync_counter(2);
+    if let Some(shared) = config.get("core.sharedRepository") {
+        let perm =
+            git_config_perm("core.sharedRepository", &shared).map_err(|e| anyhow::anyhow!(e))?;
+        if perm != 0 {
+            adjust_shared_repo_tree(git_dir, perm)?;
+        }
+    }
     Ok(())
 }
 

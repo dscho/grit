@@ -1915,6 +1915,10 @@ fn rename_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
     if !force && grit_lib::refs::resolve_ref(&repo.git_dir, &new_ref).is_ok() {
         bail!("A branch named '{new_name}' already exists.");
     }
+    if let Some(conflict) = ref_namespace_conflict(repo, &new_ref) {
+        eprintln!("error: '{conflict}' exists; cannot create '{new_ref}'");
+        bail!("fatal: branch rename failed");
+    }
 
     // Check if the new name is checked out in any worktree (including main)
     let new_branch_current = head.branch_name() == Some(new_name)
@@ -2172,10 +2176,9 @@ fn copy_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
         bail!("A branch named '{dst_name}' already exists.");
     }
 
-    // Check for d/f conflict: new ref is prefix of existing refs
-    let heads_dir = repo.git_dir.join("refs/heads");
-    if heads_dir.join(dst_name).is_dir() {
-        bail!("'{dst_name}' exists; cannot create 'refs/heads/{dst_name}'");
+    if let Some(conflict) = ref_namespace_conflict(repo, &dst_ref) {
+        eprintln!("error: '{conflict}' exists; cannot create '{dst_ref}'");
+        bail!("fatal: branch copy failed");
     }
 
     grit_lib::refs::write_ref(&repo.git_dir, &dst_ref, &src_oid)
@@ -2227,6 +2230,25 @@ fn copy_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn ref_namespace_conflict(repo: &Repository, refname: &str) -> Option<String> {
+    let components: Vec<&str> = refname.split('/').collect();
+    for i in 1..components.len() {
+        let prefix = components[..i].join("/");
+        if prefix.starts_with("refs/")
+            && grit_lib::refs::resolve_ref(&repo.git_dir, &prefix).is_ok()
+        {
+            return Some(prefix);
+        }
+    }
+
+    let prefix = format!("{refname}/");
+    grit_lib::refs::list_refs(&repo.git_dir, "refs/")
+        .ok()?
+        .into_iter()
+        .map(|(name, _)| name)
+        .find(|name| name.starts_with(&prefix))
 }
 
 /// Collect branch names from a refs directory.
