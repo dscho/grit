@@ -6,6 +6,7 @@ use std::fs;
 use std::io::{self, Read};
 use time::OffsetDateTime;
 
+use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::error::Error as GritError;
 use grit_lib::objects::ObjectId;
 use grit_lib::refs::{
