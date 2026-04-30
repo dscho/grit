@@ -1,4 +1,4 @@
-# grit-rs
+# grit-cli
 
 A from-scratch reimplementation of the `git` command-line tool in Rust, built
 on top of [`grit-lib`](https://crates.io/crates/grit-lib).

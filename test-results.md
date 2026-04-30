@@ -2,62 +2,62 @@
 
 **2026-04-27 (remote auth / credential protocol model)**
 
-- `cargo check -p grit-rs`: passed
-- `cargo build --release -p grit-rs`: passed
+- `cargo check -p grit-cli`: passed
+- `cargo build --release -p grit-cli`: passed
 - `cargo test -p grit-lib --lib`: 197 passed
 - `./scripts/run-tests.sh t0300-credentials.sh`: skipped by current `data/test-files.csv` scope; no credential harness tests executed
 - Manual credential smoke checks: Basic helper fill, `authtype` capability filtering, encoded-newline URL rejection, `credential.protectProtocol` CR handling, sanitized askpass prompt, `grit credential capability`, URL-scoped `credential.username`, URL-scoped `credential.useHttpPath`, default HTTP path stripping, fatal credential error shape, and `credential-store` ephemeral skip passed
 
 **2026-04-27 (remote auth / credential-store parity)**
 
-- `cargo check -p grit-rs`: passed
-- `cargo build --release -p grit-rs`: passed
+- `cargo check -p grit-cli`: passed
+- `cargo build --release -p grit-cli`: passed
 - `./scripts/run-tests.sh t0302-credential-store.sh`: skipped by current `data/test-files.csv` scope; no credential-store harness tests executed
 - Manual credential-store smoke checks: home/XDG lookup precedence, XDG fallback, overwrite-on-store, erase across files, `--file` and `--file=`, path matching, CRLF path behavior, invalid-line handling, and Unix permissions passed
 
 **2026-04-27 (remote auth / credential-cache daemon)**
 
-- `cargo check -p grit-rs`: passed
-- `cargo build --release -p grit-rs`: passed
+- `cargo check -p grit-cli`: passed
+- `cargo build --release -p grit-cli`: passed
 - Manual credential-cache smoke checks: default socket creation, custom socket creation, store/get output ordering, erase, timeout expiry, and exit cleanup passed
 
 **2026-04-27 (remote auth / SSH command precedence)**
 
-- `cargo build --release -p grit-rs`: passed
+- `cargo build --release -p grit-cli`: passed
 - `./scripts/run-tests.sh t5507-remote-environment.sh`: 5/5 passed
 - `./scripts/run-tests.sh t5813-proto-disable-ssh.sh`: 63/81 passed (known remaining failures; no regression from SSH command precedence work)
 
 **2026-04-28 (remote auth / live SSH ls-remote)**
 
-- `cargo check -p grit-rs`: passed
-- `cargo build --release -p grit-rs`: passed
+- `cargo check -p grit-cli`: passed
+- `cargo build --release -p grit-cli`: passed
 - `cargo test -p grit-lib --lib`: 197 passed
 - `./scripts/run-tests.sh t5512-ls-remote.sh`: 16/40 passed (existing broader failures remain)
 - `./scripts/run-tests.sh t5601-clone.sh`: 64/115 passed (existing broader failures remain)
 
 **2026-04-28 (remote auth / live SSH fetch)**
 
-- `cargo build --release -p grit-rs`: passed
+- `cargo build --release -p grit-cli`: passed
 - `./scripts/run-tests.sh t5510-fetch.sh`: 199/215 passed (existing broader failures remain)
 - `./scripts/run-tests.sh t5700-protocol-v1.sh`: 0/0 warning from harness selection/status
 
 **2026-04-28 (remote auth / live SSH clone)**
 
-- `cargo build --release -p grit-rs`: passed
+- `cargo build --release -p grit-cli`: passed
 - `./scripts/run-tests.sh t5601-clone.sh`: 64/115 passed (existing broader failures remain)
 - `./scripts/run-tests.sh t5603-clone-dirname.sh`: 25/47 passed (existing broader failures remain)
 
 **2026-04-28 (remote auth / SSH push hardening)**
 
-- `cargo build --release -p grit-rs`: passed
+- `cargo build --release -p grit-cli`: passed
 - `./scripts/run-tests.sh t5406-remote-rejects.sh`: 3/3 passed
 - `./scripts/run-tests.sh t5545-push-options.sh`: 2/13 passed (existing broader failures remain)
 
 **2026-04-28 (remote auth / trace redaction audit)**
 
 - `cargo fmt`: passed
-- `cargo check -p grit-rs`: passed
-- `cargo build --release -p grit-rs`: passed
+- `cargo check -p grit-cli`: passed
+- `cargo build --release -p grit-cli`: passed
 - Manual HTTP trace/error smoke check with URL userinfo: passed; curl request line and connection error both scrubbed username/password.
 - HTTP access errors, curl request-start traces (when `GIT_TRACE_REDACT` is not `0`), and trace2 `git-remote-https` child-start URLs now scrub URL username/password fields before display.
 - Existing curl trace redaction already covers `Authorization`, `Proxy-Authorization`, cookie values, and auth-like `http.extraHeader` values by default.
