@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
+use grit_lib::config::ConfigSet;
 use grit_lib::objects::ObjectKind;
 use grit_lib::odb::Odb;
 use grit_lib::refs::read_ref_file;
