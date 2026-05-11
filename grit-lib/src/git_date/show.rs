@@ -4,7 +4,7 @@ use super::tm::{
     empty_tm, get_time_sec, init_tm_unknown, local_time_tzoffset, local_tzoffset, time_to_tm,
     time_to_tm_local, tm_to_time_t, TzHhmm,
 };
-use libc::{time_t, tm};
+use super::compat::{self, time_t, tm};
 use std::ffi::CString;
 use std::io::IsTerminal;
 
@@ -356,8 +356,8 @@ fn strftime_c(fmt: &str, tm: &tm) -> String {
         Err(_) => CString::new("%Y").unwrap(),
     };
     unsafe {
-        let n = libc::strftime(
-            buf.as_mut_ptr() as *mut libc::c_char,
+        let n = compat::strftime(
+            buf.as_mut_ptr() as *mut std::ffi::c_char,
             buf.len(),
             cfmt.as_ptr(),
             tm,
@@ -366,8 +366,8 @@ fn strftime_c(fmt: &str, tm: &tm) -> String {
             let mut munged = fmt.to_string();
             munged.push(' ');
             let c2 = CString::new(munged.as_str()).unwrap();
-            let n2 = libc::strftime(
-                buf.as_mut_ptr() as *mut libc::c_char,
+            let n2 = compat::strftime(
+                buf.as_mut_ptr() as *mut std::ffi::c_char,
                 buf.len(),
                 c2.as_ptr(),
                 tm,

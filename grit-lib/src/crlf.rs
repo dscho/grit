@@ -331,8 +331,15 @@ pub fn load_gitattributes_for_checkout(
 }
 
 fn path_to_index_bytes(path: &Path) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_os_str().as_bytes().to_vec()
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        path.to_string_lossy().as_bytes().to_vec()
+    }
 }
 
 fn parse_gitattributes(content: &str, rules: &mut Vec<AttrRule>) {

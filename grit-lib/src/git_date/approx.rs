@@ -2,7 +2,7 @@
 
 use super::parse::{match_multi_number, MONTH_NAMES, WEEKDAY_NAMES};
 use super::tm::{get_time_sec, match_string, parse_timestamp_prefix};
-use libc::{time_t, tm};
+use super::compat::{self, time_t, tm};
 use std::mem::MaybeUninit;
 
 fn update_tm(tm: &mut tm, now: &tm, sec: i64) -> time_t {
@@ -19,13 +19,13 @@ fn update_tm(tm: &mut tm, now: &tm, sec: i64) -> time_t {
         }
     }
     unsafe {
-        let t = libc::mktime(tm);
+        let t = compat::mktime(tm);
         if t == -1 {
             return -1;
         }
         let n = t - sec;
         let mut out = MaybeUninit::<tm>::uninit();
-        let p = libc::localtime_r(&n, out.as_mut_ptr());
+        let p = compat::localtime_r(&n, out.as_mut_ptr());
         if p.is_null() {
             return -1;
         }
@@ -116,7 +116,7 @@ fn date_never(tm: &mut tm, _now: &tm, num: &mut i32) {
     let n: time_t = 0;
     unsafe {
         let mut out = MaybeUninit::<tm>::uninit();
-        let p = libc::localtime_r(&n, out.as_mut_ptr());
+        let p = compat::localtime_r(&n, out.as_mut_ptr());
         if !p.is_null() {
             *tm = *p;
         }
@@ -290,12 +290,12 @@ fn approxidate_str(date: &str, time_sec: i64, error_ret: &mut i32) -> u64 {
     let mut now_buf = MaybeUninit::<tm>::uninit();
     unsafe {
         let tt = time_sec as time_t;
-        let p = libc::localtime_r(&tt, tm_buf.as_mut_ptr());
+        let p = compat::localtime_r(&tt, tm_buf.as_mut_ptr());
         if p.is_null() {
             *error_ret = 1;
             return 0;
         }
-        let p2 = libc::localtime_r(&tt, now_buf.as_mut_ptr());
+        let p2 = compat::localtime_r(&tt, now_buf.as_mut_ptr());
         if p2.is_null() {
             *error_ret = 1;
             return 0;

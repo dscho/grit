@@ -1,6 +1,7 @@
 //! Git-compatible date parsing and display (ported from Git `date.c`).
 
 pub mod approx;
+pub(crate) mod compat;
 pub mod parse;
 pub mod show;
 pub mod tm;
@@ -42,7 +43,7 @@ pub fn test_tool_date(args: &[String]) -> Result<TestToolDateResult, String> {
             Ok(TestToolDateResult::Exit(code))
         }
         "time_t-is64bit" => {
-            let code = if size_of::<libc::time_t>() == 8 { 0 } else { 1 };
+            let code = if size_of::<compat::time_t>() == 8 { 0 } else { 1 };
             Ok(TestToolDateResult::Exit(code))
         }
         "relative" => {

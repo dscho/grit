@@ -10,6 +10,7 @@ use crate::state::HeadState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -268,6 +269,7 @@ fn traditional_hook_candidate(
         return None;
     }
     let meta = fs::metadata(&path).ok()?;
+    #[cfg(unix)]
     if meta.permissions().mode() & 0o111 == 0 {
         let config = ConfigSet::load(Some(&repo.git_dir), true).ok();
         let show_warning = config

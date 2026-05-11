@@ -4,7 +4,7 @@ use super::tm::{
     get_time_sec, init_tm_unknown, is_date_known, match_string, maybeiso8601, nodate,
     parse_timestamp_prefix, skip_alpha, tm_to_time_t, TIMESTAMP_MAX,
 };
-use libc::{time_t, tm};
+use super::compat::{self, time_t, tm};
 use std::mem::MaybeUninit;
 
 struct TzName {
@@ -319,7 +319,7 @@ pub fn parse_date_basic(date: &str) -> Result<(u64, i32), ()> {
 
     if offset == -1 {
         tm.tm_isdst = -1;
-        let temp_time = unsafe { libc::mktime(&mut tm) };
+        let temp_time = unsafe { compat::mktime(&mut tm) };
         let tt = ts as i128;
         let tloc = temp_time as i128;
         offset = if tt > tloc {
@@ -562,7 +562,7 @@ pub(crate) fn match_multi_number(
             let mut now_tm_uninit = MaybeUninit::<tm>::uninit();
             let refuse_future: Option<&tm> = unsafe {
                 let tt = now as time_t;
-                let p = libc::gmtime_r(&tt, now_tm_uninit.as_mut_ptr());
+                let p = compat::gmtime_r(&tt, now_tm_uninit.as_mut_ptr());
                 if p.is_null() {
                     None
                 } else {
@@ -657,7 +657,7 @@ fn match_digit(date: &[u8], tm: &mut tm, offset: &mut i32, tm_gmt: &mut i32) -> 
 
     if num >= 100_000_000 && nodate(tm) {
         let tt = num as time_t;
-        let p = unsafe { libc::gmtime_r(&tt, tm) };
+        let p = unsafe { compat::gmtime_r(&tt, tm) };
         if !p.is_null() {
             *tm_gmt = 1;
             return end;

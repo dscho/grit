@@ -1,6 +1,6 @@
 //! Git-compatible time conversion helpers (ported from Git's `date.c`).
 
-use libc::{time_t, tm};
+use super::compat::{self, time_t, tm};
 
 /// Unix timestamp as used by Git (`timestamp_t` is typically `uintmax_t`).
 pub type Timestamp = u64;
@@ -72,7 +72,7 @@ pub fn gm_time_t(mut time: u64, tz: TzHhmm) -> Option<u64> {
 pub unsafe fn time_to_tm(time: u64, tz: TzHhmm, out: *mut tm) -> Option<*mut tm> {
     let t = gm_time_t(time, tz)?;
     let tt = t as time_t;
-    let p = libc::gmtime_r(&tt, out);
+    let p = compat::gmtime_r(&tt, out);
     if p.is_null() {
         None
     } else {
@@ -83,7 +83,7 @@ pub unsafe fn time_to_tm(time: u64, tz: TzHhmm, out: *mut tm) -> Option<*mut tm>
 /// `time_to_tm_local` — `localtime_r` for the current `TZ` environment.
 pub unsafe fn time_to_tm_local(time: u64, out: *mut tm) -> Option<*mut tm> {
     let tt = time as time_t;
-    let p = libc::localtime_r(&tt, out);
+    let p = compat::localtime_r(&tt, out);
     if p.is_null() {
         None
     } else {
@@ -93,7 +93,7 @@ pub unsafe fn time_to_tm_local(time: u64, out: *mut tm) -> Option<*mut tm> {
 
 /// Git's `local_time_tzoffset` — offset for `t` in the **local** zone, as HHMM encoding.
 pub unsafe fn local_time_tzoffset(t: time_t, tm_out: *mut tm) -> TzHhmm {
-    let p = libc::localtime_r(&t, tm_out);
+    let p = compat::localtime_r(&t, tm_out);
     if p.is_null() {
         return 0;
     }

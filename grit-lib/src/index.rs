@@ -1874,23 +1874,52 @@ pub fn entry_from_metadata(
     oid: ObjectId,
     mode: u32,
 ) -> IndexEntry {
-    use std::os::unix::fs::MetadataExt;
-    IndexEntry {
-        ctime_sec: meta.ctime() as u32,
-        ctime_nsec: meta.ctime_nsec() as u32,
-        mtime_sec: meta.mtime() as u32,
-        mtime_nsec: meta.mtime_nsec() as u32,
-        dev: meta.dev() as u32,
-        ino: meta.ino() as u32,
-        mode,
-        uid: meta.uid(),
-        gid: meta.gid(),
-        size: meta.size() as u32,
-        oid,
-        flags: rel_path.len().min(0xFFF) as u16,
-        flags_extended: None,
-        path: rel_path.to_vec(),
-        base_index_pos: 0,
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        IndexEntry {
+            ctime_sec: meta.ctime() as u32,
+            ctime_nsec: meta.ctime_nsec() as u32,
+            mtime_sec: meta.mtime() as u32,
+            mtime_nsec: meta.mtime_nsec() as u32,
+            dev: meta.dev() as u32,
+            ino: meta.ino() as u32,
+            mode,
+            uid: meta.uid(),
+            gid: meta.gid(),
+            size: meta.size() as u32,
+            oid,
+            flags: rel_path.len().min(0xFFF) as u16,
+            flags_extended: None,
+            path: rel_path.to_vec(),
+            base_index_pos: 0,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        use std::time::UNIX_EPOCH;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        IndexEntry {
+            ctime_sec: mtime.as_secs() as u32,
+            ctime_nsec: mtime.subsec_nanos(),
+            mtime_sec: mtime.as_secs() as u32,
+            mtime_nsec: mtime.subsec_nanos(),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            size: meta.len() as u32,
+            oid,
+            flags: rel_path.len().min(0xFFF) as u16,
+            flags_extended: None,
+            path: rel_path.to_vec(),
+            base_index_pos: 0,
+        }
     }
 }
 

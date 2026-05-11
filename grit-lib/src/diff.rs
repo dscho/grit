@@ -21,6 +21,7 @@
 //! numstat.
 
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -1245,26 +1246,44 @@ pub fn stat_matches(ie: &IndexEntry, meta: &fs::Metadata) -> bool {
     if meta.len() as u32 != ie.size {
         return false;
     }
-    // Compare mtime (seconds + nanoseconds)
-    if meta.mtime() as u32 != ie.mtime_sec {
-        return false;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // Compare mtime (seconds + nanoseconds)
+        if meta.mtime() as u32 != ie.mtime_sec {
+            return false;
+        }
+        if meta.mtime_nsec() as u32 != ie.mtime_nsec {
+            return false;
+        }
+        // Compare ctime (seconds + nanoseconds)
+        if meta.ctime() as u32 != ie.ctime_sec {
+            return false;
+        }
+        if meta.ctime_nsec() as u32 != ie.ctime_nsec {
+            return false;
+        }
+        // Compare inode and device
+        if meta.ino() as u32 != ie.ino {
+            return false;
+        }
+        if meta.dev() as u32 != ie.dev {
+            return false;
+        }
     }
-    if meta.mtime_nsec() as u32 != ie.mtime_nsec {
-        return false;
-    }
-    // Compare ctime (seconds + nanoseconds)
-    if meta.ctime() as u32 != ie.ctime_sec {
-        return false;
-    }
-    if meta.ctime_nsec() as u32 != ie.ctime_nsec {
-        return false;
-    }
-    // Compare inode and device
-    if meta.ino() as u32 != ie.ino {
-        return false;
-    }
-    if meta.dev() as u32 != ie.dev {
-        return false;
+    #[cfg(not(unix))]
+    {
+        use std::time::UNIX_EPOCH;
+        if let Ok(mtime) = meta.modified() {
+            if let Ok(dur) = mtime.duration_since(UNIX_EPOCH) {
+                if dur.as_secs() as u32 != ie.mtime_sec {
+                    return false;
+                }
+                if dur.subsec_nanos() != ie.mtime_nsec {
+                    return false;
+                }
+            }
+        }
     }
     true
 }
@@ -1324,9 +1343,13 @@ pub fn hash_worktree_file(
 pub fn mode_from_metadata(meta: &fs::Metadata) -> u32 {
     if meta.file_type().is_symlink() {
         0o120000
-    } else if meta.mode() & 0o111 != 0 {
-        0o100755
     } else {
+        #[cfg(unix)]
+        {
+            if meta.mode() & 0o111 != 0 {
+                return 0o100755;
+            }
+        }
         0o100644
     }
 }
