@@ -303,7 +303,7 @@ def generate_homepage_progress_section(rows: list[dict[str, str]]) -> str:
             <ul class="list">
               <li>
                 140+ Git commands are implemented in the
-                <code>grit-rs</code> CLI.
+                <code>grit-cli</code> CLI.
               </li>
               <li>
                 grit-lib covers

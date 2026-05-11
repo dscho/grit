@@ -803,7 +803,7 @@
                 provides Git behavior as typed Rust modules;</span
               ><br />
               <span
-                ><a href="https://crates.io/crates/grit-rs">grit-rs</a> is the
+                ><a href="https://crates.io/crates/grit-cli">grit-cli</a> is the
                 Git-compatible CLI built to pass Git's own test suite.</span
               >
             </p>
@@ -839,7 +839,7 @@
                   aria-controls="panel-grit-cli"
                   data-tab="grit-cli"
                 >
-                  grit-rs<span class="tab-progress" aria-hidden="true"></span>
+                  grit-cli<span class="tab-progress" aria-hidden="true"></span>
                 </button>
                 <button
                   class="tab-button"
@@ -860,8 +860,11 @@
               role="tabpanel"
               aria-labelledby="tab-grit-cli"
             >
-              <pre><span class="comment"># grit-rs installs a Git-compatible CLI</span>
-<span class="prompt">$</span> <span class="cmd">cargo install grit-rs</span>
+              <pre><span class="comment"># install via shell script (macOS / Linux)</span>
+<span class="prompt">$</span> <span class="cmd">curl -fsSL https://grit-lib.com/install | sh</span>
+
+<span class="comment"># or via cargo</span>
+<span class="prompt">$</span> <span class="cmd">cargo install grit-cli</span>
 <span class="prompt">$</span> <span class="cmd">grit status --short</span>
 <span class="output"> M docs/index.html</span>
 
@@ -909,7 +912,7 @@ grit-lib = <span class="string">"0.1"</span>
             <ul class="list">
               <li>
                 140+ Git commands are implemented in the
-                <code>grit-rs</code> CLI.
+                <code>grit-cli</code> CLI.
               </li>
               <li>
                 grit-lib covers
@@ -1310,7 +1313,7 @@ grit-lib = <span class="string">"0.1"</span>
         >.</span
       >
       <span
-        ><a href="https://crates.io/crates/grit-rs">grit-rs</a> &middot;
+        ><a href="https://crates.io/crates/grit-cli">grit-cli</a> &middot;
         <a href="https://crates.io/crates/grit-lib">grit-lib</a> &middot;
         <a href="progress/">progress</a></span
       >

@@ -507,29 +507,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "grit-lib"
-version = "0.1.2"
-dependencies = [
- "encoding_rs",
- "filetime",
- "flate2",
- "hex",
- "icu_normalizer",
- "imara-diff",
- "libc",
- "regex",
- "sha1",
- "sha2",
- "similar",
- "tempfile",
- "thiserror",
- "time",
- "unicode-width",
- "url",
-]
-
-[[package]]
-name = "grit-rs"
+name = "grit-cli"
 version = "0.1.2"
 dependencies = [
  "anyhow",
@@ -553,6 +531,28 @@ dependencies = [
  "time",
  "unicode-width",
  "ureq",
+ "url",
+]
+
+[[package]]
+name = "grit-lib"
+version = "0.1.2"
+dependencies = [
+ "encoding_rs",
+ "filetime",
+ "flate2",
+ "hex",
+ "icu_normalizer",
+ "imara-diff",
+ "libc",
+ "regex",
+ "sha1",
+ "sha2",
+ "similar",
+ "tempfile",
+ "thiserror",
+ "time",
+ "unicode-width",
  "url",
 ]
 

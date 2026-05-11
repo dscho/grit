@@ -11,7 +11,7 @@ The **single source of truth** for per-file harness status is **`data/test-files
 Build the binary first; the runner expects **`target/release/grit`**.
 
 ```bash
-cargo build --release -p grit-rs
+cargo build --release -p grit-cli
 
 # Single file
 ./scripts/run-tests.sh t3200-branch.sh

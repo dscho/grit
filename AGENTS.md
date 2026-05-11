@@ -21,7 +21,7 @@ The goal: pass the entire upstream Git test suite.
 
 ```bash
 # Build
-cargo build --release -p grit-rs
+cargo build --release -p grit-cli
 
 # Run a single test file
 ./scripts/run-tests.sh t3200-branch.sh
@@ -68,7 +68,7 @@ Read **TESTING.md** for the full strategy. The short version:
 1. Pick **one test file** that isn't fully passing
 2. Run it, study the failures
 3. Fix the Rust code in `grit-lib/src/` by default; use `grit/src/` only for CLI parsing, process setup, user-facing output, or thin command wiring.
-4. Rebuild (`cargo build --release -p grit-rs`)
+4. Rebuild (`cargo build --release -p grit-cli`)
 5. Re-run until fully passing
 6. Refresh results: `./scripts/run-tests.sh <file>.sh` (updates `data/test-files.csv` and dashboards)
 7. Commit with a message like `fix: make t1234-foo fully pass`
@@ -219,7 +219,7 @@ The Git-compatible engine should live in a **library crate** (`grit-lib`); the *
 
 - **Rust toolchain**: The pre-installed Rust may be outdated. The update script runs `rustup update stable && rustup default stable` to ensure the latest stable toolchain is available, since newer workspace dependencies (e.g. `time-core`) require edition 2024 support (Rust ≥ 1.85).
 - **No external services**: Grit is a pure CLI tool with no databases, containers, or network services. Build and test entirely via Cargo and the Bash test runner.
-- **Unit tests**: Run `cargo test -p grit-lib --lib`. The `grit-rs` crate has no lib target; use `cargo test --workspace` to run everything.
+- **Unit tests**: Run `cargo test -p grit-lib --lib`. The `grit-cli` crate has no lib target; use `cargo test --workspace` to run everything.
 - **Integration tests**: Use `./scripts/run-tests.sh <test-file>` (see TESTING.md). Many tests are expected to fail — Grit is a work-in-progress.
-- **Lint**: `cargo check -p grit-rs 2>&1 | grep warning` — there are 2 pre-existing unused-variable warnings in `grit/src/commands/add.rs`.
+- **Lint**: `cargo check -p grit-cli 2>&1 | grep warning` — there are 2 pre-existing unused-variable warnings in `grit/src/commands/add.rs`.
 - **Binary location**: After `cargo build --release`, the binary is at `target/release/grit`. The test harness expects this path.

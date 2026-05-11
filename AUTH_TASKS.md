@@ -44,7 +44,7 @@ transport capabilities in or around `grit/src/http_client.rs`.
 
 Validation:
 
-- [ ] `cargo build --release -p grit-rs`
+- [ ] `cargo build --release -p grit-cli`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5564-http-proxy.sh`
 - [ ] Add or identify upstream-derived HTTPS proxy coverage before marking CONNECT/TLS complete.
 
@@ -72,7 +72,7 @@ they still block full HTTP auth-adjacent confidence.
 
 Validation:
 
-- [ ] `cargo build --release -p grit-rs`
+- [ ] `cargo build --release -p grit-cli`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5551-http-fetch-smart.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5539-fetch-http-shallow.sh`
 - [ ] Re-run the green HTTP baseline listed above if touching shared HTTP auth/client code.
@@ -99,7 +99,7 @@ These tasks are broader transport validation and shared negotiation cleanup.
 
 Validation:
 
-- [ ] `cargo build --release -p grit-rs`
+- [ ] `cargo build --release -p grit-cli`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5601-clone.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5603-clone-dirname.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5510-fetch.sh`
@@ -129,7 +129,7 @@ mostly pass; remaining work is broader push behavior and polish.
 
 Validation:
 
-- [ ] `cargo build --release -p grit-rs`
+- [ ] `cargo build --release -p grit-cli`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5545-push-options.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5547-push-quarantine.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5548-push-porcelain.sh`
@@ -153,7 +153,7 @@ pass; ext enabled fetch/push is transport-limited.
 
 Validation:
 
-- [ ] `cargo build --release -p grit-rs`
+- [ ] `cargo build --release -p grit-cli`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5812-proto-disable-http.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5813-proto-disable-ssh.sh`
 - [ ] `./scripts/run-tests.sh --timeout 150 t5814-proto-disable-ext.sh`

@@ -1,5 +1,5 @@
 [package]
-name = "grit-rs"
+name = "grit-cli"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
