@@ -727,6 +727,55 @@
           padding-top: 2rem;
         }
       }
+      .install-block {
+        margin-bottom: 1.2rem;
+      }
+      .install-cmd {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.6rem;
+        padding: 0.72rem 1rem;
+        border: 1px solid #2d231d;
+        border-radius: 0.65rem;
+        background: var(--code-bg);
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.92rem;
+      }
+      .install-cmd code {
+        color: var(--code-fg);
+        background: none;
+        border: none;
+        padding: 0;
+      }
+      .copy-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 2rem;
+        height: 2rem;
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 0.4rem;
+        background: rgba(255, 255, 255, 0.08);
+        color: #a39182;
+        cursor: pointer;
+        transition: all 0.15s ease;
+      }
+      .copy-btn:hover {
+        background: rgba(255, 255, 255, 0.15);
+        color: var(--code-fg);
+      }
+      .copy-btn.copied {
+        color: #5bbf74;
+        border-color: rgba(91, 191, 116, 0.3);
+      }
+      .install-alt {
+        margin-top: 0.55rem;
+        color: var(--muted);
+        font-size: 0.88rem;
+      }
+      .install-alt code {
+        font-size: 0.85rem;
+      }
       @media (max-width: 560px) {
         body {
           font-size: 14px;
@@ -808,8 +857,8 @@
               >
             </p>
             <div class="cta">
-              <a class="button primary" href="https://crates.io/crates/grit-lib"
-                >Try the crate</a
+              <a class="button primary" href="#install"
+                >Try the CLI</a
               >
               <a class="button" href="https://docs.rs/grit-lib">Read docs</a>
               <a class="button" href="progress/">Track progress</a>
@@ -1284,16 +1333,27 @@ grit-lib = <span class="string">"0.1"</span>
         </div>
       </section>
 
-      <section class="wrap section">
-        <h2>Start with the crate.</h2>
+      <section class="wrap section" id="install">
+        <h2>Try it out.</h2>
         <p class="section-intro">
-          Add <code>grit-lib</code>, open a repository, and use the modules you
-          need. Runnable examples cover objects, the index, rev-list,
-          cherry-pick, and more.
+          Install the <code>grit</code> CLI and use it as a drop-in replacement
+          for <code>git</code>. Pre-built binaries for macOS and Linux, or
+          install via Cargo.
         </p>
+        <div class="install-block">
+          <div class="install-cmd" data-install-cmd>
+            <code>curl -fsSL https://grit-lib.com/install | sh</code>
+            <button class="copy-btn" aria-label="Copy to clipboard" data-copy="curl -fsSL https://grit-lib.com/install | sh">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+          <div class="install-alt">
+            or <code>cargo install grit-cli</code>
+          </div>
+        </div>
         <div class="cta">
-          <a class="button primary" href="https://crates.io/crates/grit-lib"
-            >cargo add grit-lib</a
+          <a class="button" href="https://crates.io/crates/grit-lib"
+            >grit-lib crate</a
           >
           <a
             class="button"
@@ -1320,6 +1380,23 @@ grit-lib = <span class="string">"0.1"</span>
     </footer>
 
     <script>
+      (function () {
+        document.querySelectorAll(".copy-btn").forEach(function (btn) {
+          btn.addEventListener("click", function () {
+            var text = btn.getAttribute("data-copy");
+            navigator.clipboard.writeText(text).then(function () {
+              btn.classList.add("copied");
+              btn.innerHTML =
+                '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+              setTimeout(function () {
+                btn.classList.remove("copied");
+                btn.innerHTML =
+                  '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+              }, 2000);
+            });
+          });
+        });
+      })();
       (function () {
         const terminal = document.querySelector("[data-code-tabs]");
         if (!terminal) return;
