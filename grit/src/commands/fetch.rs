@@ -461,30 +461,46 @@ fn branch_has_merge_config_for_remote(
 }
 
 fn default_fetch_remote_name(git_dir: &Path, config: &ConfigSet) -> String {
+    let remotes = collect_remote_names(config);
+    if remotes.len() == 1 {
+        return remotes[0].clone();
+    }
+
     let Ok(head_raw) = fs::read_to_string(git_dir.join("HEAD")) else {
-        return "origin".to_owned();
+        return pick_default_remote_name(&remotes);
     };
     let head = head_raw.trim();
     let Some(rest) = head.strip_prefix("ref: ") else {
-        return "origin".to_owned();
+        return pick_default_remote_name(&remotes);
     };
     let target = rest.trim();
     let Some(branch) = target.strip_prefix("refs/heads/") else {
-        return "origin".to_owned();
+        return pick_default_remote_name(&remotes);
     };
     let remote_key = format!("branch.{branch}.remote");
     let Some(remote) = config.get(&remote_key) else {
-        return "origin".to_owned();
+        return pick_default_remote_name(&remotes);
     };
     let remote = remote.trim();
     if remote.is_empty() {
-        return "origin".to_owned();
+        return pick_default_remote_name(&remotes);
     }
     let url_key = format!("remote.{remote}.url");
     if config.get(&url_key).is_some() {
         remote.to_owned()
     } else {
+        pick_default_remote_name(&remotes)
+    }
+}
+
+fn pick_default_remote_name(remotes: &[String]) -> String {
+    if remotes.iter().any(|r| r == "origin") {
         "origin".to_owned()
+    } else {
+        remotes
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "origin".to_owned())
     }
 }
 

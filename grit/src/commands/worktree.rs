@@ -326,21 +326,78 @@ fn has_any_local_branch(common: &Path) -> bool {
 
 /// Git's `can_use_local_refs`: we may use local refs as a worktree source when HEAD resolves
 /// to a commit or at least one local branch exists.
-fn can_use_local_refs(common: &Path, head_state: &grit_lib::state::HeadState) -> bool {
+fn can_use_local_refs(
+    common: &Path,
+    git_dir: &Path,
+    head_state: &grit_lib::state::HeadState,
+    quiet: bool,
+) -> bool {
     if head_state.oid().is_some() {
         return true;
     }
-    has_any_local_branch(common)
+    if !has_any_local_branch(common) {
+        return false;
+    }
+    if !quiet {
+        let head_path = git_dir.join("HEAD");
+        let head_contents = fs::read_to_string(&head_path).unwrap_or_default();
+        let head_display = head_path.canonicalize().unwrap_or(head_path);
+        eprintln!(
+            "warning: HEAD points to an invalid (or orphaned) reference.\n\
+HEAD path: '{}'\n\
+HEAD contents: '{}'",
+            head_display.display(),
+            head_contents.trim()
+        );
+    }
+    true
+}
+
+fn remotes_configured(common: &Path) -> bool {
+    let config = ConfigSet::load(Some(common), false).unwrap_or_default();
+    config
+        .entries()
+        .iter()
+        .any(|e| {
+            let parts: Vec<&str> = e.key.splitn(3, '.').collect();
+            parts.len() == 3 && parts[0] == "remote" && parts[2] == "url"
+        })
 }
 
 /// Git's `can_use_remote_refs`: when `guess_remote` is on, remote-tracking refs count as a source.
-fn can_use_remote_refs(common: &Path, guess_remote: bool, no_guess_remote: bool) -> Result<bool> {
+fn can_use_remote_refs(
+    common: &Path,
+    guess_remote: bool,
+    no_guess_remote: bool,
+    force: bool,
+) -> Result<bool> {
     if !guess_remote || no_guess_remote {
         return Ok(false);
     }
-    Ok(!refs::list_refs(common, "refs/remotes/")
+    if !refs::list_refs(common, "refs/remotes/")
         .unwrap_or_default()
-        .is_empty())
+        .is_empty()
+    {
+        return Ok(true);
+    }
+    if remotes_configured(common) && !force {
+        bail!(
+            "fatal: No local or remote refs exist despite at least one remote\n\
+present, stopping; use 'add -f' to override or fetch a remote first"
+        );
+    }
+    Ok(false)
+}
+
+fn print_orphan_worktree_hint(path: &Path, branch: Option<&str>) {
+    eprintln!("hint: If you meant to create a worktree containing a new unborn branch");
+    if let Some(branch) = branch {
+        eprintln!("hint: named '{branch}', use the option '--orphan' as follows:");
+        eprintln!("hint:");
+        eprintln!("hint:     git worktree add --orphan -b {branch} {}", path.display());
+    } else {
+        eprintln!("hint:     git worktree add --orphan {}", path.display());
+    }
 }
 
 /// Git's `dwim_orphan` for `worktree add`: infer `--orphan` when the repo has no usable refs.
@@ -349,16 +406,19 @@ fn can_use_remote_refs(common: &Path, guess_remote: bool, no_guess_remote: bool)
 /// is enabled and [`can_use_remote_refs`] applies — the caller should DWIM from a remote branch.
 fn dwim_infer_orphan(
     common: &Path,
+    git_dir: &Path,
     head_state: &grit_lib::state::HeadState,
     args: &AddArgs,
     guess_remote: bool,
     check_remote: bool,
 ) -> Result<bool> {
-    if can_use_local_refs(common, head_state) {
+    if can_use_local_refs(common, git_dir, head_state, args.quiet) {
         return Ok(false);
     }
 
-    if check_remote && can_use_remote_refs(common, guess_remote, args.no_guess_remote)? {
+    if check_remote
+        && can_use_remote_refs(common, guess_remote, args.no_guess_remote, args.force)?
+    {
         return Ok(false);
     }
 
@@ -448,6 +508,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     }
 
     let repo = Repository::discover(None)?;
+    let git_dir = repo.git_dir.clone();
     let common = common_dir(&repo.git_dir)?;
     let config = ConfigSet::load(Some(&common), true).unwrap_or_default();
     let default_remote = config.get("checkout.defaultRemote");
@@ -502,9 +563,23 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     let used_new_branch_options = args.new_branch.is_some() || args.force_new_branch.is_some();
     if !orphan {
         if args.branch.is_none() && used_new_branch_options {
-            orphan = dwim_infer_orphan(&common, &head_state, &args, guess_remote, false)?;
+            orphan = dwim_infer_orphan(
+                &common,
+                &git_dir,
+                &head_state,
+                &args,
+                guess_remote,
+                false,
+            )?;
         } else if args.branch.is_none() && !used_new_branch_options {
-            orphan = dwim_infer_orphan(&common, &head_state, &args, guess_remote, true)?;
+            orphan = dwim_infer_orphan(
+                &common,
+                &git_dir,
+                &head_state,
+                &args,
+                guess_remote,
+                true,
+            )?;
         }
     }
 
@@ -554,7 +629,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                         new_b,
                         args.path.display()
                     );
-                    bail!("invalid reference: HEAD");
+                    bail!("fatal: invalid reference: HEAD");
                 }
             }
         };
@@ -580,7 +655,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                         new_b,
                         args.path.display()
                     );
-                    bail!("invalid reference: HEAD");
+                    bail!("fatal: invalid reference: HEAD");
                 }
             }
         };
@@ -671,7 +746,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                     "hint:     git worktree add --orphan {}",
                     args.path.display()
                 );
-                bail!("invalid reference: HEAD");
+                bail!("fatal: invalid reference: HEAD");
             }
         } else if let Some(oid) = head_oid {
             (Some(wt_name.clone()), Some(oid), false)
@@ -687,7 +762,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                 "hint:     git worktree add --orphan {}",
                 args.path.display()
             );
-            bail!("invalid reference: HEAD");
+            bail!("fatal: invalid reference: HEAD");
         }
     };
 
