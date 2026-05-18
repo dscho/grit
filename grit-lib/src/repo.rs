@@ -2248,6 +2248,27 @@ fn pathdiff_relative_gitfile(from: &Path, to: &Path) -> String {
 /// # Errors
 ///
 /// Returns [`Error::Io`] on filesystem failures.
+/// Ensure `core.bare = true` in the repository `config` (used after `git clone --bare`).
+pub fn ensure_core_bare(git_dir: &Path) -> Result<()> {
+    let path = git_dir.join("config");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    if text.lines().any(|l| {
+        let t = l.trim();
+        t == "bare = true" || t == "bare=true"
+    }) {
+        return Ok(());
+    }
+    let mut out = text;
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    if !out.contains("[core]") {
+        out.push_str("[core]\n");
+    }
+    out.push_str("\tbare = true\n");
+    fs::write(path, out).map_err(Error::Io)
+}
+
 pub fn init_bare_clone_minimal(
     git_dir: &Path,
     initial_branch: &str,

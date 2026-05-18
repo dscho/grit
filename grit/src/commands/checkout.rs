@@ -1724,6 +1724,10 @@ fn switch_branch(
     branch_merge: bool,
     merge_cli: &CheckoutMergeCli,
 ) -> Result<()> {
+    if repo.work_tree.is_none() {
+        bail!("this operation must be run in a work tree");
+    }
+
     let head = resolve_head(&repo.git_dir)?;
 
     // Fail gracefully when HEAD is corrupt (empty or garbage)
@@ -1778,48 +1782,47 @@ fn switch_branch(
         }
     }
 
-    // Check if branch is already checked out in another worktree
     if !force && !ignore_other_worktrees {
-        let common = refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
-        let worktrees_dir = common.join("worktrees");
-        if worktrees_dir.is_dir() {
-            if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
-                for entry in entries.flatten() {
-                    let admin = entry.path();
-                    if !admin.is_dir() {
-                        continue;
-                    }
-                    // Skip the current worktree (admin = current git_dir)
-                    if admin.canonicalize().unwrap_or(admin.clone())
-                        == repo.git_dir.canonicalize().unwrap_or(repo.git_dir.clone())
-                    {
-                        continue;
-                    }
-                    let wt_head = admin.join("HEAD");
-                    // Read HEAD content, following symlinks properly
-                    let head_content = if wt_head.is_symlink() {
-                        // Symlink HEAD: the link target IS the branch ref string
-                        std::fs::read_link(&wt_head)
-                            .ok()
-                            .map(|t| format!("ref: {}", t.to_string_lossy()))
-                            .or_else(|| std::fs::read_to_string(&wt_head).ok())
-                    } else {
-                        std::fs::read_to_string(&wt_head).ok()
-                    };
-                    if let Some(content) = head_content {
-                        let content = content.trim();
-                        if let Some(refname) = content.strip_prefix("ref: ") {
-                            if refname.trim() == branch_ref {
-                                // Also get the worktree path
-                                let gitdir_file = admin.join("gitdir");
-                                let wt_path = if let Ok(raw) = std::fs::read_to_string(&gitdir_file)
-                                {
-                                    let p = std::path::Path::new(raw.trim());
-                                    p.parent().unwrap_or(p).to_string_lossy().to_string()
-                                } else {
-                                    entry.file_name().to_string_lossy().to_string()
-                                };
-                                bail!("fatal: '{branch_name}' is already used by worktree at '{wt_path}'");
+        if let Some(wt_path) =
+            crate::commands::worktree_refs::branch_occupied_any_worktree(repo, branch_name)
+        {
+            let current = crate::commands::worktree_refs::current_worktree_path_for_repo(repo);
+            if !crate::commands::worktree_refs::worktree_paths_equal_pub(&wt_path, &current) {
+                bail!("fatal: '{branch_name}' is already used by worktree at '{wt_path}'");
+            }
+        } else {
+            let common = refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
+            let worktrees_dir = common.join("worktrees");
+            if worktrees_dir.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&worktrees_dir) {
+                    for entry in entries.flatten() {
+                        let admin = entry.path();
+                        if !admin.is_dir() {
+                            continue;
+                        }
+                        if admin.canonicalize().unwrap_or(admin.clone())
+                            == repo.git_dir.canonicalize().unwrap_or(repo.git_dir.clone())
+                        {
+                            continue;
+                        }
+                        let head_content =
+                            crate::commands::worktree_refs::read_head_content(&admin);
+                        if let Some(content) = head_content {
+                            if let Some(refname) = content.trim().strip_prefix("ref: ") {
+                                if refname.trim() == branch_ref {
+                                    let gitdir_file = admin.join("gitdir");
+                                    let wt_path = if let Ok(raw) =
+                                        std::fs::read_to_string(&gitdir_file)
+                                    {
+                                        let p = std::path::Path::new(raw.trim());
+                                        p.parent().unwrap_or(p).to_string_lossy().to_string()
+                                    } else {
+                                        entry.file_name().to_string_lossy().to_string()
+                                    };
+                                    bail!(
+                                        "fatal: '{branch_name}' is already used by worktree at '{wt_path}'"
+                                    );
+                                }
                             }
                         }
                     }
@@ -2090,28 +2093,18 @@ fn force_create_and_switch_branch(
     validate_new_branch_name(name)?;
     let branch_ref = format!("refs/heads/{name}");
 
-    // Check if branch is checked out in another worktree (including main)
+    if let Some(wt_path) =
+        crate::commands::worktree_refs::branch_occupied_any_worktree(repo, name)
     {
+        let current = crate::commands::worktree_refs::current_worktree_path_for_repo(repo);
+        if !crate::commands::worktree_refs::worktree_paths_equal_pub(&wt_path, &current) {
+            bail!(
+                "fatal: '{name}' is already used by worktree at '{wt_path}'"
+            );
+        }
+    } else {
         let common = refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
         let worktrees_dir = common.join("worktrees");
-        // Main repository git dir (shared across worktrees). Linked worktrees use a different
-        // `repo.git_dir` but the same `common` directory.
-        let we_are_main = repo.git_dir == common;
-        let main_wt_path = common.parent().unwrap_or(&common).to_path_buf();
-        if !we_are_main {
-            if let Ok(main_head) = grit_lib::state::resolve_head(&common) {
-                if let grit_lib::state::HeadState::Branch { ref refname, .. } = main_head {
-                    if *refname == branch_ref {
-                        bail!(
-                            "fatal: '{}' is already used by worktree at '{}'",
-                            name,
-                            main_wt_path.display()
-                        );
-                    }
-                }
-            }
-        }
-        // Check linked worktrees
         if worktrees_dir.is_dir() {
             for entry in std::fs::read_dir(&worktrees_dir)
                 .into_iter()
@@ -2122,27 +2115,26 @@ fn force_create_and_switch_branch(
                 if !admin.is_dir() {
                     continue;
                 }
-                // Skip current worktree
                 if admin.canonicalize().unwrap_or(admin.clone())
                     == repo.git_dir.canonicalize().unwrap_or(repo.git_dir.clone())
                 {
                     continue;
                 }
-                let wt_head = admin.join("HEAD");
-                if let Ok(content) = std::fs::read_to_string(&wt_head) {
+                if let Some(content) =
+                    crate::commands::worktree_refs::read_head_content(&admin)
+                {
                     if let Some(refname) = content.trim().strip_prefix("ref: ") {
                         if refname.trim() == branch_ref {
                             let gitdir_file = admin.join("gitdir");
-                            let wt_path = if let Ok(raw) = std::fs::read_to_string(&gitdir_file) {
+                            let wt_path = if let Ok(raw) = std::fs::read_to_string(&gitdir_file)
+                            {
                                 let p = std::path::Path::new(raw.trim());
                                 p.parent().unwrap_or(p).to_string_lossy().to_string()
                             } else {
                                 entry.file_name().to_string_lossy().to_string()
                             };
                             bail!(
-                                "fatal: '{}' is already used by worktree at '{}'",
-                                name,
-                                wt_path
+                                "fatal: '{name}' is already used by worktree at '{wt_path}'"
                             );
                         }
                     }
@@ -4799,7 +4791,7 @@ fn print_detached_head_message_inner(
 ///
 /// With `--track`, sets `branch.<name>.remote` and `branch.<name>.merge`.
 /// Also respects `branch.autoSetupMerge` config.
-fn maybe_setup_tracking(
+pub(crate) fn maybe_setup_tracking(
     repo: &Repository,
     branch_name: &str,
     start_point: Option<&str>,

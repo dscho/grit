@@ -219,23 +219,9 @@ pub fn run(args: Args) -> Result<()> {
     }
 }
 
-/// Helper: find the "common dir" (the main `.git` directory).
-/// For the main worktree this is just git_dir; for a linked worktree
-/// we follow the `commondir` file.
+/// Shared git directory (main `.git` for linked worktrees).
 fn common_dir(git_dir: &Path) -> Result<PathBuf> {
-    let commondir_file = git_dir.join("commondir");
-    if commondir_file.exists() {
-        let raw = fs::read_to_string(&commondir_file).context("reading commondir")?;
-        let rel = raw.trim();
-        let p = if Path::new(rel).is_absolute() {
-            PathBuf::from(rel)
-        } else {
-            git_dir.join(rel)
-        };
-        Ok(p.canonicalize().context("canonicalizing common dir")?)
-    } else {
-        Ok(git_dir.to_path_buf())
-    }
+    Ok(worktree::common_git_dir(git_dir))
 }
 
 /// Resolve a commit-ish string to an ObjectId within the given repo.
@@ -398,7 +384,6 @@ fn cmd_add(args: AddArgs) -> Result<()> {
 
     let repo = Repository::discover(None)?;
     let common = common_dir(&repo.git_dir)?;
-    let worktrees_dir = common.join("worktrees");
 
     // Determine the absolute path for the new worktree
     let wt_path = if args.path.is_absolute() {
@@ -430,20 +415,8 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         }
     };
 
-    // Worktree name is derived from the basename of the path
-    let wt_name = wt_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("worktree")
-        .to_owned();
-
-    let wt_admin = worktrees_dir.join(&wt_name);
-    if wt_admin.exists() {
-        bail!(
-            "worktree '{}' already exists; use a different path or remove it first",
-            wt_name
-        );
-    }
+    let wt_name = worktree::worktree_path_basename(&wt_path);
+    let wt_admin = worktree::allocate_worktree_admin_dir(&common, &wt_path);
 
     let head_state = resolve_head(&common)?;
 
@@ -593,17 +566,18 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                             .next()
                             .unwrap_or("origin")
                             .to_owned();
-                        // Write tracking config
-                        let cfg_path = common.join("config");
-                        if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
-                            let section = format!(
-                                "\n[branch \"{}\"]\
+                        if !args.no_track {
+                            let cfg_path = common.join("config");
+                            if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
+                                let section = format!(
+                                    "\n[branch \"{}\"]\
 \n\tremote = {}\
 \n\tmerge = refs/heads/{}\n",
-                                spec, remote_name, spec
-                            );
-                            cfg_content.push_str(&section);
-                            let _ = std::fs::write(&cfg_path, cfg_content);
+                                    spec, remote_name, spec
+                                );
+                                cfg_content.push_str(&section);
+                                let _ = std::fs::write(&cfg_path, cfg_content);
+                            }
                         }
                         (Some(spec.clone()), Some(oid), false)
                     } else {
@@ -640,16 +614,18 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                     .next()
                     .unwrap_or("origin")
                     .to_owned();
-                let cfg_path = common.join("config");
-                if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
-                    let section = format!(
-                        "\n[branch \"{}\"]\
+                if !args.no_track {
+                    let cfg_path = common.join("config");
+                    if let Ok(mut cfg_content) = std::fs::read_to_string(&cfg_path) {
+                        let section = format!(
+                            "\n[branch \"{}\"]\
 \n\tremote = {}\
 \n\tmerge = refs/heads/{}\n",
-                        wt_name, remote_name, wt_name
-                    );
-                    cfg_content.push_str(&section);
-                    let _ = std::fs::write(&cfg_path, cfg_content);
+                            wt_name, remote_name, wt_name
+                        );
+                        cfg_content.push_str(&section);
+                        let _ = std::fs::write(&cfg_path, cfg_content);
+                    }
                 }
                 (Some(wt_name.clone()), Some(oid), false)
             } else {
@@ -682,32 +658,29 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         }
     };
 
-    // Check if the branch is already checked out in another worktree
-    // Only applies when NOT in detach mode
+    // Check if the branch is already checked out in another worktree (including rebase/bisect).
     let detach_head_mode = args.detach || implicit_detach;
     if !detach_head_mode {
         if let Some(ref name) = branch_name {
-            if !args.force {
+            if !args.force && repo.work_tree.is_some() {
                 let branch_ref = format!("refs/heads/{name}");
-                // Check all worktrees (main + linked)
                 let main_head = resolve_head(&common).unwrap_or(HeadState::Invalid);
                 if let HeadState::Branch { ref refname, .. } = main_head {
                     if *refname == branch_ref {
                         bail!(
-                            "fatal: '{}' is already checked out at '{}'",
-                            name,
+                            "fatal: '{name}' is already checked out at '{}'",
                             common.parent().unwrap_or(&common).display()
                         );
                     }
                 }
-                // Check linked worktrees
                 let wt_dir = common.join("worktrees");
                 if wt_dir.is_dir() {
                     for entry in std::fs::read_dir(&wt_dir).into_iter().flatten().flatten() {
-                        let head_file = entry.path().join("HEAD");
-                        if let Ok(content) = std::fs::read_to_string(&head_file) {
+                        let head_content =
+                            crate::commands::worktree_refs::read_head_content(&entry.path());
+                        if let Some(content) = head_content {
                             if let Some(refname) = content.trim().strip_prefix("ref: ") {
-                                if refname == branch_ref {
+                                if refname.trim() == branch_ref {
                                     let gitdir_file = entry.path().join("gitdir");
                                     let wt_path_str =
                                         if let Ok(raw) = std::fs::read_to_string(&gitdir_file) {
@@ -717,14 +690,21 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                                             entry.file_name().to_string_lossy().to_string()
                                         };
                                     bail!(
-                                        "fatal: '{}' is already checked out at '{}'",
-                                        name,
-                                        wt_path_str
+                                        "fatal: '{name}' is already checked out at '{wt_path_str}'"
                                     );
                                 }
                             }
                         }
                     }
+                }
+                if let Some(wt_path) =
+                    crate::commands::worktree_refs::branch_held_by_rebase_or_bisect_elsewhere(
+                        &repo, name,
+                    )
+                {
+                    bail!(
+                        "fatal: '{name}' is already checked out at '{wt_path}'"
+                    );
                 }
             }
         }
@@ -753,17 +733,11 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         format!("{}\n", commondir_rel.display()),
     )?;
 
-    // Linked worktrees need `core.worktree` in their admin `config` so discovery
-    // does not treat them as bare when the shared config has `core.bare = true`.
-    let wt_path_abs = wt_path
-        .canonicalize()
-        .unwrap_or_else(|_| wt_path.to_path_buf());
+    // Linked worktree admin `config` is minimal; the work tree path comes from the
+    // gitdir file (Git does not store `core.worktree` in linked admin config).
     fs::write(
         wt_admin.join("config"),
-        format!(
-            "[core]\n\trepositoryformatversion = 0\n\tworktree = {}\n",
-            wt_path_abs.display()
-        ),
+        "[core]\n\trepositoryformatversion = 0\n",
     )?;
     if grit_lib::reftable::is_reftable_repo(&common) {
         initialize_worktree_reftable_stack(&wt_admin, commit_oid, branch_name.as_deref())?;
@@ -853,7 +827,28 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     }
 
     crate::commands::sparse_checkout::copy_sparse_checkout_to_admin(&repo.git_dir, &wt_admin)?;
-    crate::commands::sparse_checkout::copy_worktree_config_to_admin(&repo.git_dir, &wt_admin)?;
+    let common_for_config = worktree::common_git_dir(&repo.git_dir);
+    if grit_lib::repo::worktree_config_enabled(&common_for_config) {
+        worktree::copy_filtered_worktree_config(&common_for_config, &wt_admin)?;
+    } else {
+        crate::commands::sparse_checkout::copy_worktree_config_to_admin(
+            &repo.git_dir,
+            &wt_admin,
+        )?;
+    }
+
+    if args.track && !args.no_track && !detach_head {
+        if let Some(ref new_branch) = branch_name {
+            if let Some(start) = args.branch.as_deref() {
+                crate::commands::checkout::maybe_setup_tracking(
+                    &repo,
+                    new_branch,
+                    Some(start),
+                    Some("direct"),
+                )?;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -900,15 +895,9 @@ fn setup_unborn_worktree(
         wt_admin.join("commondir"),
         format!("{}\n", commondir_rel.display()),
     )?;
-    let wt_path_abs = wt_path
-        .canonicalize()
-        .unwrap_or_else(|_| wt_path.to_path_buf());
     fs::write(
         wt_admin.join("config"),
-        format!(
-            "[core]\n\trepositoryformatversion = 0\n\tworktree = {}\n",
-            wt_path_abs.display()
-        ),
+        "[core]\n\trepositoryformatversion = 0\n",
     )?;
     fs::write(
         wt_admin.join("HEAD"),
@@ -1096,128 +1085,8 @@ fn add_worktree_tree_to_index(
 // worktree list
 // ---------------------------------------------------------------------------
 
-/// Information about a single worktree entry.
-struct WorktreeInfo {
-    path: PathBuf,
-    head: HeadState,
-    is_bare: bool,
-    is_locked: bool,
-    lock_reason: Option<String>,
-}
-
-/// Resolve HEAD for a linked worktree admin dir.
-/// The HEAD file is in the admin dir, but branch refs live in the common dir.
-fn resolve_linked_head(admin: &Path, common: &Path) -> HeadState {
-    let head_path = admin.join("HEAD");
-    let content = match fs::read_to_string(&head_path) {
-        Ok(c) => c,
-        Err(_) => return HeadState::Invalid,
-    };
-    let trimmed = content.trim();
-    if let Some(refname) = trimmed.strip_prefix("ref: ") {
-        let refname = refname.to_owned();
-        let short_name = refname
-            .strip_prefix("refs/heads/")
-            .unwrap_or(&refname)
-            .to_owned();
-        // Resolve the ref against the common dir where refs actually live
-        let oid = refs::resolve_ref(common, &refname).ok();
-        HeadState::Branch {
-            refname,
-            short_name,
-            oid,
-        }
-    } else {
-        match ObjectId::from_hex(trimmed) {
-            Ok(oid) => HeadState::Detached { oid },
-            Err(_) => HeadState::Invalid,
-        }
-    }
-}
-
-fn collect_worktrees(repo: &Repository) -> Result<Vec<WorktreeInfo>> {
-    let common = common_dir(&repo.git_dir)?;
-    let mut entries = Vec::new();
-
-    // Main worktree (or bare repo)
-    let main_head = resolve_head(&common).unwrap_or(HeadState::Invalid);
-    // Determine if the repo is bare based on the common dir
-    let common_is_bare = !common.ends_with(".git") && common.join("config").exists() && {
-        // Check core.bare in config
-        if let Ok(content) = std::fs::read_to_string(common.join("config")) {
-            content.contains("bare = true")
-        } else {
-            false
-        }
-    };
-    // The main worktree path: for non-bare repos, it's common.parent() (i.e. /repo for /repo/.git)
-    // For bare repos, it's the common dir itself
-    let main_path = if common_is_bare {
-        common.clone()
-    } else {
-        common.parent().unwrap_or(&common).to_path_buf()
-    };
-    let is_bare = common_is_bare;
-    entries.push(WorktreeInfo {
-        path: main_path,
-        head: main_head,
-        is_bare,
-        is_locked: false,
-        lock_reason: None,
-    });
-
-    // Linked worktrees
-    let worktrees_dir = common.join("worktrees");
-    if worktrees_dir.is_dir() {
-        let mut names: Vec<_> = fs::read_dir(&worktrees_dir)?
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
-        names.sort();
-
-        for name in names {
-            let admin = worktrees_dir.join(&name);
-            let wt_head = resolve_linked_head(&admin, &common);
-
-            // Read the gitdir file to find the worktree path
-            let gitdir_path = admin.join("gitdir");
-            let wt_path = if gitdir_path.exists() {
-                let raw = fs::read_to_string(&gitdir_path).unwrap_or_default();
-                let p = PathBuf::from(raw.trim());
-                // gitdir points to <worktree>/.git, so parent is the worktree
-                let parent = p.parent().unwrap_or(&p).to_path_buf();
-                // Canonicalize to resolve relative paths like '../there'
-                parent.canonicalize().unwrap_or(parent)
-            } else {
-                admin.clone()
-            };
-
-            let locked_file = admin.join("locked");
-            let is_locked = locked_file.exists();
-            let lock_reason = if is_locked {
-                let content = fs::read_to_string(&locked_file).unwrap_or_default();
-                let reason = content.trim().to_string();
-                if reason.is_empty() {
-                    None
-                } else {
-                    Some(reason)
-                }
-            } else {
-                None
-            };
-
-            entries.push(WorktreeInfo {
-                path: wt_path,
-                head: wt_head,
-                is_bare: false,
-                is_locked,
-                lock_reason,
-            });
-        }
-    }
-
-    Ok(entries)
+fn collect_worktrees(repo: &Repository) -> Result<Vec<WorktreeEntry>> {
+    worktree::list_worktrees(repo).map_err(Into::into)
 }
 
 /// C-quote a path string when it contains non-ASCII characters (core.quotepath behavior).

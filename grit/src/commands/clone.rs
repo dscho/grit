@@ -142,19 +142,11 @@ pub struct Args {
     #[arg(long = "no-shallow-submodules")]
     pub no_shallow_submodules: bool,
 
-    /// Parallel jobs when cloning multiple submodules (`--recurse-submodules`).
-    #[arg(long = "jobs", value_name = "N")]
-    pub submodule_jobs: Option<usize>,
-
     /// Use a custom upload-pack command on the remote side.
     #[arg(short = 'u', long = "upload-pack", value_name = "UPLOAD_PACK")]
     pub upload_pack: Option<String>,
     /// Transmit the given string to the server when speaking protocol v2.
-    #[arg(
-        short = 'o',
-        long = "server-option",
-        action = clap::ArgAction::Append
-    )]
+    #[arg(long = "server-option", action = clap::ArgAction::Append)]
     pub server_options: Vec<String>,
 
     /// Force local clone (default for local paths, accepted for compatibility).
@@ -1358,6 +1350,10 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
         }
+    }
+
+    if args.bare {
+        grit_lib::repo::ensure_core_bare(&dest.git_dir)?;
     }
 
     if !args.quiet && !args.no_checkout {
@@ -3563,7 +3559,7 @@ fn clone_submodules(work_tree: &Path, repo: &Repository, clone_args: &Args) -> R
     }
 
     let n_workers = clone_args
-        .submodule_jobs
+        .jobs
         .unwrap_or(1)
         .max(1)
         .min(jobs.len());

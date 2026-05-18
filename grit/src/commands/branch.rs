@@ -1915,6 +1915,12 @@ fn rename_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
     let old_ref = format!("refs/heads/{old_name}");
     let new_ref = format!("refs/heads/{new_name}");
 
+    if let Some(wt_path) = branch_used_by_other_worktree(repo, old_name)? {
+        bail!(
+            "fatal: cannot rename the branch '{old_name}' used by worktree at '{wt_path}'"
+        );
+    }
+
     // Resolve old branch - check both loose and packed refs
     let old_oid = if let Ok(oid) = grit_lib::refs::resolve_ref(&repo.git_dir, &old_ref) {
         oid
@@ -2075,12 +2081,9 @@ fn update_worktree_heads(repo: &Repository, old_name: &str, new_name: &str) -> R
 }
 
 fn branch_used_by_other_worktree(repo: &Repository, branch: &str) -> Result<Option<String>> {
-    let occupied = crate::commands::worktree_refs::occupied_branch_refs(repo);
-    let target = format!("refs/heads/{branch}");
-    if let Some(wt_path) = occupied.get(&target) {
-        return Ok(Some(wt_path.clone()));
-    }
-    Ok(None)
+    Ok(crate::commands::worktree_refs::branch_occupied_any_worktree(
+        repo, branch,
+    ))
 }
 
 fn branch_checked_out_in_other_worktree(repo: &Repository, branch: &str) -> Option<String> {
