@@ -11,6 +11,7 @@ use grit_lib::objects::ObjectId;
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::state::{resolve_head, HeadState};
+use grit_lib::worktree::{self, WorktreeEntry};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};

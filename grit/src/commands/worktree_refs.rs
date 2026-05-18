@@ -38,6 +38,22 @@ pub fn worktree_path_from_admin(admin_dir: &Path) -> String {
     admin_dir.display().to_string()
 }
 
+fn main_worktree_path(repo: &Repository, common: &Path) -> String {
+    let bare = common.join("HEAD").exists() && repo.work_tree.is_none();
+    if bare {
+        return common.display().to_string();
+    }
+    if let Some(wt) = &repo.work_tree {
+        if repo.git_dir == common || !repo.git_dir.join("commondir").exists() {
+            return wt.display().to_string();
+        }
+    }
+    common
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| common.display().to_string())
+}
+
 /// Build a map `refs/heads/<name>` -> worktree-path for all refs currently
 /// occupied by the main worktree and linked worktrees.
 ///
