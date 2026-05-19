@@ -2199,7 +2199,11 @@ fn resolve_base(
         }
     }
 
-    if let Ok(oid) = refs::resolve_ref(&repo.git_dir, spec) {
+    let (dwim_count, dwim_oid) = refs::resolve_ref_dwim(&repo.git_dir, spec);
+    if dwim_count > 1 {
+        eprintln!("warning: refname '{spec}' is ambiguous.");
+    }
+    if let Some(oid) = dwim_oid {
         return Ok(oid);
     }
     // `remotes/<remote>/<ref>` is a common shorthand for `refs/remotes/<remote>/<ref>` (t2024).
