@@ -50,8 +50,9 @@ use grit_lib::quote_path::{format_diff_path_with_prefix, quote_c_style};
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::{is_symmetric_diff, rev_list, RevListOptions};
 use grit_lib::rev_parse::{
-    abbreviate_object_id, resolve_revision, resolve_revision_as_commit,
-    resolve_treeish_blob_at_path, show_prefix, split_treeish_colon, TreeishBlobAtPath,
+    abbreviate_object_id, expand_rev_token_circ_bang, resolve_revision,
+    resolve_revision_as_commit, resolve_treeish_blob_at_path, show_prefix, split_treeish_colon,
+    TreeishBlobAtPath,
 };
 use grit_lib::userdiff::{matcher_for_path_parsed, word_regex_pattern_for_path_parsed};
 use grit_lib::ws::{self, WhitespaceGitAttr, WS_BLANK_AT_EOF, WS_INCOMPLETE_LINE};
@@ -583,10 +584,11 @@ fn write_submodule_log_lines(
     };
     let mut opts = RevListOptions::default();
     opts.first_parent = true;
+    let exclude_parent = format!("^{}", entry.old_oid.to_hex());
     let Ok(res) = rev_list(
         &sub_repo,
         &[new_oid.to_hex()],
-        &[entry.old_oid.to_hex()],
+        &[exclude_parent],
         &opts,
     ) else {
         return Ok(());
@@ -2243,7 +2245,19 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let mut _symmetric = false;
     if revs.len() == 1 {
-        if let Some((left_spec, right_spec)) = try_treeish_blob_range(&revs[0]) {
+        if revs[0].ends_with("^!") {
+            let expanded = expand_rev_token_circ_bang(&repo, &revs[0])?;
+            if expanded.len() >= 2 {
+                let parent_spec = expanded[1]
+                    .strip_prefix('^')
+                    .unwrap_or(expanded[1].as_str());
+                let parent_oid = resolve_revision(&repo, parent_spec)
+                    .with_context(|| format!("unknown revision: '{parent_spec}'"))?;
+                let commit_oid = resolve_revision(&repo, &expanded[0])
+                    .with_context(|| format!("unknown revision: '{}'", expanded[0]))?;
+                revs = vec![parent_oid.to_hex(), commit_oid.to_hex()];
+            }
+        } else if let Some((left_spec, right_spec)) = try_treeish_blob_range(&revs[0]) {
             revs = vec![left_spec, right_spec];
         } else if let Some((left, right)) = revs[0].split_once("...") {
             let left = if left.is_empty() { "HEAD" } else { left };
