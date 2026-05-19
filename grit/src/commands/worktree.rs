@@ -7,6 +7,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use grit_lib::config::ConfigSet;
+use grit_lib::hooks::{run_hook_opts, HookResult, RunHookOptions};
 use grit_lib::index::{Index, IndexEntry};
 use grit_lib::objects::ObjectId;
 use grit_lib::refs;
@@ -62,8 +63,9 @@ pub struct AddArgs {
     pub detach: bool,
 
     /// Force creation even if the branch is already checked out elsewhere.
-    #[arg(short, long)]
-    pub force: bool,
+    /// Twice: also override a missing locked worktree registration.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    pub force: u8,
 
     /// Create a new unborn/orphan branch in the worktree.
     #[arg(long)]
@@ -369,7 +371,7 @@ fn can_use_remote_refs(
     common: &Path,
     guess_remote: bool,
     no_guess_remote: bool,
-    force: bool,
+    force: u8,
 ) -> Result<bool> {
     if !guess_remote || no_guess_remote {
         return Ok(false);
@@ -380,13 +382,89 @@ fn can_use_remote_refs(
     {
         return Ok(true);
     }
-    if remotes_configured(common) && !force {
+    if remotes_configured(common) && force == 0 {
         bail!(
             "fatal: No local or remote refs exist despite at least one remote\n\
 present, stopping; use 'add -f' to override or fetch a remote first"
         );
     }
     Ok(false)
+}
+
+/// Run `post-checkout` for a newly populated linked worktree (null old OID, flag `1`).
+/// Git `check_candidate_path`: reject or reclaim a registered worktree path.
+fn check_worktree_add_destination(repo: &Repository, wt_path: &Path, force: u8) -> Result<()> {
+    let wt_canon = wt_path.canonicalize().unwrap_or_else(|_| wt_path.to_path_buf());
+    for entry in worktree::list_worktrees(repo)? {
+        let entry_canon = entry
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| entry.path.clone());
+        if entry_canon != wt_canon {
+            continue;
+        }
+        if entry.path.exists() {
+            bail!("'{path}' already exists", path = wt_path.display());
+        }
+        if (!entry.is_locked && force >= 1) || (entry.is_locked && force >= 2) {
+            fs::remove_dir_all(&entry.admin_dir).with_context(|| {
+                format!(
+                    "cannot remove registered worktree '{}'",
+                    entry.admin_dir.display()
+                )
+            })?;
+            return Ok(());
+        }
+        if entry.is_locked {
+            bail!(
+                "fatal: '{}' is a missing but locked worktree;\n\
+use 'git worktree add -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear",
+                wt_path.display()
+            );
+        }
+        bail!(
+            "fatal: '{}' is a missing but already registered worktree;\n\
+use 'git worktree add -f' to override, or 'prune' or 'remove' to clear",
+            wt_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_worktree_add_post_checkout_hook(
+    repo: &Repository,
+    wt_path: &Path,
+    wt_admin: &Path,
+    new_oid: &ObjectId,
+) -> Result<()> {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let zero = ObjectId::from_bytes(&[0u8; 20]).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let git_dir_s = wt_admin.display().to_string();
+    let wt_s = wt_path.display().to_string();
+    let env = [("GIT_DIR", git_dir_s.as_str()), ("GIT_WORK_TREE", wt_s.as_str())];
+    let old_hex = zero.to_hex();
+    let new_hex = new_oid.to_hex();
+    let args = [old_hex.as_str(), new_hex.as_str(), "1"];
+    if let HookResult::Failed(code) = run_hook_opts(
+        Some(repo),
+        "post-checkout",
+        &args,
+        &config,
+        RunHookOptions {
+            stdout_to_stderr: true,
+            path_to_stdin: None,
+            stdin_data: None,
+            env_vars: &env,
+            cwd: Some(wt_path),
+            commit_env: None,
+        },
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        bail!("post-checkout hook exited with status {code}");
+    }
+    Ok(())
 }
 
 fn print_orphan_worktree_hint(path: &Path, branch: Option<&str>) {
@@ -426,10 +504,10 @@ fn dwim_infer_orphan(
         eprintln!("No possible source branch, inferring '--orphan'");
     }
     if args.track {
-        bail!("options '--orphan' and '--track' cannot be used together");
+        bail!("fatal: options '--orphan' and '--track' cannot be used together");
     }
     if args.no_checkout {
-        bail!("options '--orphan' and '--no-checkout' cannot be used together");
+        bail!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
     }
     Ok(true)
 }
@@ -553,9 +631,11 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     };
 
     let wt_name = worktree::worktree_path_basename(&wt_path);
+    check_worktree_add_destination(&repo, &wt_path, args.force)?;
     let wt_admin = worktree::allocate_worktree_admin_dir(&common, &wt_path);
 
-    let head_state = resolve_head(&common)?;
+    // HEAD for DWIM/orphan and invalid-HEAD warnings is per-worktree (`git_dir`), not `commondir`.
+    let head_state = resolve_head(&git_dir)?;
 
     // Git infers `--orphan` when the repo has no commit on HEAD and no local branches (dwim_orphan),
     // before resolving the start ref for `-b` / path-only add.
@@ -616,19 +696,9 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             match head_oid {
                 Some(oid) => oid,
                 None => {
-                    eprintln!(
-                        "hint: If you meant to create a worktree containing a new unborn branch"
-                    );
-                    eprintln!(
-                        "hint: named '{}', use the option '--orphan' as follows:",
-                        new_b
-                    );
-                    eprintln!("hint:");
-                    eprintln!(
-                        "hint:     git worktree add --orphan -b {} {}",
-                        new_b,
-                        args.path.display()
-                    );
+                    if !args.quiet {
+                        print_orphan_worktree_hint(&args.path, Some(new_b));
+                    }
                     bail!("fatal: invalid reference: HEAD");
                 }
             }
@@ -642,19 +712,9 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             match head_oid {
                 Some(oid) => oid,
                 None => {
-                    eprintln!(
-                        "hint: If you meant to create a worktree containing a new unborn branch"
-                    );
-                    eprintln!(
-                        "hint: named '{}', use the option '--orphan' as follows:",
-                        new_b
-                    );
-                    eprintln!("hint:");
-                    eprintln!(
-                        "hint:     git worktree add --orphan -b {} {}",
-                        new_b,
-                        args.path.display()
-                    );
+                    if !args.quiet {
+                        print_orphan_worktree_hint(&args.path, Some(new_b));
+                    }
                     bail!("fatal: invalid reference: HEAD");
                 }
             }
@@ -735,33 +795,17 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             } else if let Some(oid) = head_oid {
                 (Some(wt_name.clone()), Some(oid), false)
             } else {
-                let branch_n = wt_name.as_str();
-                eprintln!("hint: If you meant to create a worktree containing a new unborn branch");
-                eprintln!(
-                    "hint: named '{}', use the option '--orphan' as follows:",
-                    branch_n
-                );
-                eprintln!("hint:");
-                eprintln!(
-                    "hint:     git worktree add --orphan {}",
-                    args.path.display()
-                );
+                if !args.quiet {
+                    print_orphan_worktree_hint(&args.path, None);
+                }
                 bail!("fatal: invalid reference: HEAD");
             }
         } else if let Some(oid) = head_oid {
             (Some(wt_name.clone()), Some(oid), false)
         } else {
-            let branch_n = wt_name.as_str();
-            eprintln!("hint: If you meant to create a worktree containing a new unborn branch");
-            eprintln!(
-                "hint: named '{}', use the option '--orphan' as follows:",
-                branch_n
-            );
-            eprintln!("hint:");
-            eprintln!(
-                "hint:     git worktree add --orphan {}",
-                args.path.display()
-            );
+            if !args.quiet {
+                print_orphan_worktree_hint(&args.path, None);
+            }
             bail!("fatal: invalid reference: HEAD");
         }
     };
@@ -770,7 +814,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     let detach_head_mode = args.detach || implicit_detach;
     if !detach_head_mode {
         if let Some(ref name) = branch_name {
-            if !args.force && repo.work_tree.is_some() {
+            if args.force == 0 && repo.work_tree.is_some() {
                 let branch_ref = format!("refs/heads/{name}");
                 let main_head = resolve_head(&common).unwrap_or(HeadState::Invalid);
                 if let HeadState::Branch { ref refname, .. } = main_head {
@@ -870,7 +914,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         let ref_path = common.join(&branch_ref);
         if !ref_path.exists() {
             refs::write_ref(&common, &branch_ref, &commit_oid)?;
-        } else if !args.force {
+        } else if args.force == 0 {
             // Branch already exists — check if it's checked out in another worktree
             // (For simplicity, allow it; git also warns but --force overrides)
         }
@@ -955,6 +999,12 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                     Some("direct"),
                 )?;
             }
+        }
+    }
+
+    if !args.no_checkout && !orphan {
+        if let Some(commit_oid) = commit_oid {
+            run_worktree_add_post_checkout_hook(&repo, &wt_path, &wt_admin, &commit_oid)?;
         }
     }
 
