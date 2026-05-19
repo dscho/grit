@@ -1376,6 +1376,7 @@ fn validate_repository_format(git_dir: &Path) -> Result<()> {
                 | "objectformat"
                 | "compatobjectformat"
                 | "refstorage"
+                | "relativeworktrees"
                 | "submodulepathconfig"
         ) {
             continue;

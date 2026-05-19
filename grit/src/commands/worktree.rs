@@ -310,9 +310,7 @@ fn resolve_remote_branch_dwim(
             matching.retain(|(remote, _)| remote == def);
         }
         if matching.len() != 1 {
-            bail!(
-                "fatal: '{branch}' matched multiple (remote) tracking branches"
-            );
+            bail!("fatal: '{branch}' matched multiple (remote) tracking branches");
         }
     }
     let (remote, oid) = matching.swap_remove(0);
@@ -357,13 +355,10 @@ HEAD contents: '{}'",
 
 fn remotes_configured(common: &Path) -> bool {
     let config = ConfigSet::load(Some(common), false).unwrap_or_default();
-    config
-        .entries()
-        .iter()
-        .any(|e| {
-            let parts: Vec<&str> = e.key.splitn(3, '.').collect();
-            parts.len() == 3 && parts[0] == "remote" && parts[2] == "url"
-        })
+    config.entries().iter().any(|e| {
+        let parts: Vec<&str> = e.key.splitn(3, '.').collect();
+        parts.len() == 3 && parts[0] == "remote" && parts[2] == "url"
+    })
 }
 
 /// Git's `can_use_remote_refs`: when `guess_remote` is on, remote-tracking refs count as a source.
@@ -394,7 +389,9 @@ present, stopping; use 'add -f' to override or fetch a remote first"
 /// Run `post-checkout` for a newly populated linked worktree (null old OID, flag `1`).
 /// Git `check_candidate_path`: reject or reclaim a registered worktree path.
 fn check_worktree_add_destination(repo: &Repository, wt_path: &Path, force: u8) -> Result<()> {
-    let wt_canon = wt_path.canonicalize().unwrap_or_else(|_| wt_path.to_path_buf());
+    let wt_canon = wt_path
+        .canonicalize()
+        .unwrap_or_else(|_| wt_path.to_path_buf());
     for entry in worktree::list_worktrees(repo)? {
         let entry_canon = entry
             .path
@@ -441,7 +438,10 @@ fn run_worktree_add_post_checkout_hook(
     let zero = ObjectId::from_bytes(&[0u8; 20]).map_err(|e| anyhow::anyhow!("{e}"))?;
     let git_dir_s = wt_admin.display().to_string();
     let wt_s = wt_path.display().to_string();
-    let env = [("GIT_DIR", git_dir_s.as_str()), ("GIT_WORK_TREE", wt_s.as_str())];
+    let env = [
+        ("GIT_DIR", git_dir_s.as_str()),
+        ("GIT_WORK_TREE", wt_s.as_str()),
+    ];
     let old_hex = zero.to_hex();
     let new_hex = new_oid.to_hex();
     let args = [old_hex.as_str(), new_hex.as_str(), "1"];
@@ -472,7 +472,10 @@ fn print_orphan_worktree_hint(path: &Path, branch: Option<&str>) {
     if let Some(branch) = branch {
         eprintln!("hint: named '{branch}', use the option '--orphan' as follows:");
         eprintln!("hint:");
-        eprintln!("hint:     git worktree add --orphan -b {branch} {}", path.display());
+        eprintln!(
+            "hint:     git worktree add --orphan -b {branch} {}",
+            path.display()
+        );
     } else {
         eprintln!("hint:     git worktree add --orphan {}", path.display());
     }
@@ -494,8 +497,7 @@ fn dwim_infer_orphan(
         return Ok(false);
     }
 
-    if check_remote
-        && can_use_remote_refs(common, guess_remote, args.no_guess_remote, args.force)?
+    if check_remote && can_use_remote_refs(common, guess_remote, args.no_guess_remote, args.force)?
     {
         return Ok(false);
     }
@@ -643,23 +645,9 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     let used_new_branch_options = args.new_branch.is_some() || args.force_new_branch.is_some();
     if !orphan {
         if args.branch.is_none() && used_new_branch_options {
-            orphan = dwim_infer_orphan(
-                &common,
-                &git_dir,
-                &head_state,
-                &args,
-                guess_remote,
-                false,
-            )?;
+            orphan = dwim_infer_orphan(&common, &git_dir, &head_state, &args, guess_remote, false)?;
         } else if args.branch.is_none() && !used_new_branch_options {
-            orphan = dwim_infer_orphan(
-                &common,
-                &git_dir,
-                &head_state,
-                &args,
-                guess_remote,
-                true,
-            )?;
+            orphan = dwim_infer_orphan(&common, &git_dir, &head_state, &args, guess_remote, true)?;
         }
     }
 
@@ -749,22 +737,12 @@ fn cmd_add(args: AddArgs) -> Result<()> {
             (Some(spec.clone()), Some(oid), false)
         } else if let Some((remote, branch_on_remote)) = parse_explicit_remote_branch(spec) {
             let tracking = format!("refs/remotes/{remote}/{branch_on_remote}");
-            let oid = refs::resolve_ref(&common, &tracking).map_err(|_| {
-                anyhow::anyhow!("fatal: invalid reference: '{spec}'")
-            })?;
+            let oid = refs::resolve_ref(&common, &tracking)
+                .map_err(|_| anyhow::anyhow!("fatal: invalid reference: '{spec}'"))?;
             if !args.no_track {
-                write_branch_tracking_config(
-                    &common,
-                    branch_on_remote,
-                    remote,
-                    branch_on_remote,
-                );
+                write_branch_tracking_config(&common, branch_on_remote, remote, branch_on_remote);
             }
-            (
-                Some(branch_on_remote.to_string()),
-                Some(oid),
-                false,
-            )
+            (Some(branch_on_remote.to_string()), Some(oid), false)
         } else if let Some((oid, remote_name)) =
             resolve_remote_branch_dwim(&common, spec, default_remote.as_deref())?
         {
@@ -854,9 +832,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
                         &repo, name,
                     )
                 {
-                    bail!(
-                        "fatal: '{name}' is already checked out at '{wt_path}'"
-                    );
+                    bail!("fatal: '{name}' is already checked out at '{wt_path}'");
                 }
             }
         }
@@ -873,9 +849,12 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     fs::create_dir_all(wt_admin.join("refs"))
         .with_context(|| format!("cannot create '{}'", wt_admin.join("refs").display()))?;
 
-    // Write gitdir file — points the admin dir back to the worktree's .git file
-    let gitdir_content = format!("{}\n", wt_path.join(".git").display());
-    fs::write(wt_admin.join("gitdir"), &gitdir_content)?;
+    let use_relative_paths =
+        use_relative_worktree_paths(args.relative_paths, args.no_relative_paths, &config);
+    if use_relative_paths {
+        enable_relative_worktrees_extension(&common)?;
+    }
+    write_worktree_linking_files(&wt_path, &wt_admin, use_relative_paths)?;
 
     // Write commondir file — relative path from worktree admin to the common dir
     // Standard git uses relative paths like "../../"
@@ -940,10 +919,6 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         }
     }
 
-    // Write the .git file in the worktree (gitfile pointing to admin dir)
-    let dotgit_content = format!("gitdir: {}\n", wt_admin.display());
-    fs::write(wt_path.join(".git"), &dotgit_content)?;
-
     // Lock the worktree if --lock was used
     if args.lock {
         let reason = args.reason.as_deref().unwrap_or("");
@@ -983,10 +958,7 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     if grit_lib::repo::worktree_config_enabled(&common_for_config) {
         worktree::copy_filtered_worktree_config(&common_for_config, &wt_admin)?;
     } else {
-        crate::commands::sparse_checkout::copy_worktree_config_to_admin(
-            &repo.git_dir,
-            &wt_admin,
-        )?;
+        crate::commands::sparse_checkout::copy_worktree_config_to_admin(&repo.git_dir, &wt_admin)?;
     }
 
     if args.track && !args.no_track && !detach_head {
@@ -2045,6 +2017,64 @@ fn cmd_move(args: MoveArgs) -> Result<()> {
     };
     fs::write(dst_path.join(".git"), &dotgit_content)?;
 
+    Ok(())
+}
+
+fn use_relative_worktree_paths(
+    args_relative: bool,
+    args_no_relative: bool,
+    config: &ConfigSet,
+) -> bool {
+    if args_relative {
+        return true;
+    }
+    if args_no_relative {
+        return false;
+    }
+    config
+        .get_bool("worktree.useRelativePaths")
+        .and_then(|r| r.ok())
+        .unwrap_or(false)
+}
+
+fn enable_relative_worktrees_extension(common: &Path) -> Result<()> {
+    let cfg_path = common.join("config");
+    let mut content = fs::read_to_string(&cfg_path).unwrap_or_default();
+    if content.contains("relativeWorktrees") || content.contains("relativeworktrees") {
+        return Ok(());
+    }
+    if content.contains("repositoryformatversion = 0") {
+        content = content.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+    }
+    content.push_str("\n[extensions]\n\trelativeWorktrees = true\n");
+    fs::write(&cfg_path, content)?;
+    Ok(())
+}
+
+fn write_worktree_linking_files(wt_path: &Path, wt_admin: &Path, use_relative: bool) -> Result<()> {
+    let dot_git = wt_path.join(".git");
+    if use_relative {
+        let gitdir_rel = make_relative_path(wt_admin, &dot_git);
+        fs::write(
+            wt_admin.join("gitdir"),
+            format!("{}\n", gitdir_rel.display()),
+        )?;
+        let dotgit_rel = make_relative_path(wt_path, wt_admin);
+        fs::write(dot_git, format!("gitdir: {}\n", dotgit_rel.display()))?;
+    } else {
+        let wt_abs = wt_path
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_path(wt_path));
+        let dot_git_abs = wt_abs.join(".git");
+        let admin_abs = wt_admin
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_path(wt_admin));
+        fs::write(
+            wt_admin.join("gitdir"),
+            format!("{}\n", dot_git_abs.display()),
+        )?;
+        fs::write(dot_git, format!("gitdir: {}\n", admin_abs.display()))?;
+    }
     Ok(())
 }
 
