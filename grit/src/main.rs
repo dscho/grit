@@ -801,13 +801,16 @@ fn run_test_tool_partial_clone(rest: &[String]) -> Result<()> {
 }
 
 fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
-    if rest.len() < 4 {
+    if rest.len() < 3 {
         bail!("usage: test-tool ref-store <backend> <subcommand> ...");
     }
     let backend = rest[1].as_str();
     let sub = rest[2].as_str();
+    if backend.starts_with("worktree:") {
+        return commands::test_tool_ref_store::run(&rest[1..]);
+    }
     if backend != "main" {
-        bail!("test-tool ref-store: unsupported backend (only 'main' is implemented)");
+        bail!("test-tool ref-store: unsupported backend (only 'main' and 'worktree:*' are implemented)");
     }
 
     let repo = grit_lib::repo::Repository::discover(None)?;
@@ -992,9 +995,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
         }
         "create-symref" => {
             if rest.len() < 5 {
-                bail!(
-                    "usage: test-tool ref-store main create-symref <refname> <target> [logmsg]"
-                );
+                bail!("usage: test-tool ref-store main create-symref <refname> <target> [logmsg]");
             }
             let refname = &rest[3];
             let target = &rest[4];
@@ -2729,8 +2730,8 @@ fn apply_globals(opts: &GlobalOpts) -> Result<()> {
         }
     }
     if let Some(git_dir) = &opts.git_dir {
-        let resolved = grit_lib::repo::resolve_git_directory_arg(git_dir)
-            .unwrap_or_else(|_| git_dir.clone());
+        let resolved =
+            grit_lib::repo::resolve_git_directory_arg(git_dir).unwrap_or_else(|_| git_dir.clone());
         std::env::set_var("GIT_DIR", resolved);
     }
     if let Some(wt) = &opts.work_tree {
