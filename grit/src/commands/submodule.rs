@@ -316,7 +316,7 @@ fn super_index_has_unmerged_stage(repo: &Repository, rel_path: &str) -> bool {
 }
 
 fn parse_local_config(git_dir: &Path) -> Result<ConfigFile> {
-    let config_path = git_dir.join("config");
+    let config_path = grit_lib::repo::common_git_dir_for_config(git_dir).join("config");
     if config_path.exists() {
         let content = fs::read_to_string(&config_path)?;
         Ok(ConfigFile::parse(
