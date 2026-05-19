@@ -19,6 +19,10 @@ Task lines in `PLAN.md`: 381 completed (`[x]`), 6 in progress (`[~]`), 385 remai
 
 ## Recently completed
 
+- `t2403-worktree-move` — 33/33 (submodule guard on move/remove; `parse_local_config` uses commondir).
+- `t2404-worktree-config` — 12/12 (`config --worktree` path selection, common-dir local config, `core.bare` via config cascade).
+- `t2406-worktree-repair` — 24/24 (macOS `/private` path storage, repair gitfile broken vs incorrect, normalized common dir).
+- `t2407-worktree-heads` — 12/12 (occupied branch refs across worktrees; fetch/branch guards; rebase `--update-refs` file + interactive todo).
 - `t0300-credentials` — 56/56 tests pass (credential helper protocol: helper argv/stdin/stdout framing, capability filtering, URL parsing/matching, prompt behavior, expiry/metadata handling).
 - `t0301-credential-cache` — 52/52 tests pass (cache daemon semantics: overwrite/erase matching, empty credentials, authtype capability filtering, socket selection/cleanup).
 - `t0302-credential-store` — 65/65 tests pass (store helper lookup/write order, empty credentials, overwrite and password-sensitive erase behavior, XDG/home file handling).

@@ -12,3 +12,14 @@
 - Run worktree occupation checks before descendant `list_refs` in `branch -f` (ENOTDIR on `refs/heads/wt-N/`).
 - `fetch`: use `worktree_refs::branch_occupied_any_worktree` (bisect/rebase/update-refs).
 - `rebase --update-refs`: write `rebase-merge/update-refs`; inject `update-ref` lines in `rebase -i` todo.
+
+## t2404-worktree-config (12/12)
+
+- `git config --worktree`: use `config.worktree` when extension enabled; else common `config` (single worktree) or error (multiple).
+- Local config writes/reads use `commondir/config`.
+- `Repository::is_bare()` uses full config cascade.
+
+## t2403-worktree-move (33/33)
+
+- Submodule move/remove guard: `.git` file in submodule + `modules/` in worktree gitdir.
+- `parse_local_config` reads commondir so `submodule update` works from linked worktrees.
