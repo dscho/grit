@@ -5404,39 +5404,12 @@ fn repository_is_bare(git_dir: &Path) -> bool {
 
 /// Check if a branch ref is checked out in any worktree, return the worktree path.
 fn is_branch_in_worktree(git_dir: &std::path::Path, branch_ref: &str) -> Option<String> {
-    let common = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.to_path_buf());
-    // Check main worktree
-    if let Ok(head) = grit_lib::state::resolve_head(&common) {
-        if let grit_lib::state::HeadState::Branch { ref refname, .. } = head {
-            if refname == branch_ref {
-                return Some(common.parent().unwrap_or(&common).display().to_string());
-            }
-        }
-    }
-    // Check linked worktrees
-    let wt_dir = common.join("worktrees");
-    if wt_dir.is_dir() {
-        for entry in std::fs::read_dir(&wt_dir).into_iter().flatten().flatten() {
-            let admin = entry.path();
-            if !admin.is_dir() {
-                continue;
-            }
-            let head_file = admin.join("HEAD");
-            if let Ok(content) = std::fs::read_to_string(&head_file) {
-                if let Some(refname) = content.trim().strip_prefix("ref: ") {
-                    if refname.trim() == branch_ref {
-                        let gitdir_file = admin.join("gitdir");
-                        let path = if let Ok(raw) = std::fs::read_to_string(&gitdir_file) {
-                            let p = std::path::Path::new(raw.trim());
-                            p.parent().unwrap_or(p).display().to_string()
-                        } else {
-                            entry.file_name().to_string_lossy().to_string()
-                        };
-                        return Some(path);
-                    }
-                }
-            }
-        }
-    }
-    None
+    let short = branch_ref.strip_prefix("refs/heads/")?;
+    let work_tree = if repository_is_bare(git_dir) {
+        None
+    } else {
+        git_dir.parent()
+    };
+    let repo = Repository::open(git_dir, work_tree).ok()?;
+    crate::commands::worktree_refs::branch_occupied_any_worktree(&repo, short)
 }

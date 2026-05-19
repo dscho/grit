@@ -85,6 +85,7 @@ fn collect_from_admin(admin_dir: &Path, wt_path: &str, out: &mut HashMap<String,
     // HEAD symref (including symlink HEAD used in t2400 #17).
     if let Some(head_trimmed) = read_head_content(admin_dir) {
         if let Some(refname) = head_trimmed.strip_prefix("ref: ") {
+            let refname = refname.trim();
             if refname.starts_with("refs/heads/") {
                 out.insert(refname.to_string(), wt_path.to_string());
             }
