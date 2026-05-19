@@ -983,6 +983,21 @@ fn cmd_add(args: AddArgs) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the path stored in a worktree admin `gitdir` file.
+///
+/// Relative paths are interpreted relative to the admin directory that contains the
+/// `gitdir` file (matches Git's `resolve_gitdir_file`).
+fn resolve_gitdir_file_target(gitdir_file: &Path, target_str: &str) -> PathBuf {
+    let target_raw = PathBuf::from(target_str);
+    let base = gitdir_file.parent().unwrap_or_else(|| Path::new("."));
+    let joined = if target_raw.is_absolute() {
+        target_raw
+    } else {
+        base.join(target_raw)
+    };
+    normalize_path(&joined)
+}
+
 /// Normalize a path by resolving `.` and `..` without requiring filesystem existence.
 fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
     use std::path::Component;
@@ -1760,9 +1775,7 @@ fn cmd_prune(args: PruneArgs) -> Result<()> {
                     if target_str.is_empty() {
                         (true, "invalid gitdir file")
                     } else {
-                        let target_raw = PathBuf::from(target_str);
-                        // Normalize the path (resolve .. without requiring existence)
-                        let target = normalize_path(&target_raw);
+                        let target = resolve_gitdir_file_target(&gitdir_file, target_str);
                         if !target.exists() {
                             // Check if the worktree path is the same as the main worktree path
                             // (e.g. after main repo was moved to where the linked wt was).
@@ -1841,9 +1854,8 @@ fn cmd_prune(args: PruneArgs) -> Result<()> {
             let admin = worktrees_dir.join(name);
             let gitdir_file = admin.join("gitdir");
             if let Ok(raw) = fs::read_to_string(&gitdir_file) {
-                let target_raw = PathBuf::from(raw.trim());
-                // Normalize first (resolve ..) then canonicalize for duplicate detection
-                let target_normalized = normalize_path(&target_raw);
+                let target_normalized =
+                    resolve_gitdir_file_target(&gitdir_file, raw.trim());
                 let target_canonical = target_normalized
                     .canonicalize()
                     .unwrap_or(target_normalized.clone());
