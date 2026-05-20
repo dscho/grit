@@ -110,6 +110,7 @@ tests. Most logic belongs in a new **`grit-lib/src/worktree.rs`** (and friends).
 - [x] `t3908-stash-in-worktree`, `t2205-add-worktree-config` (non-interactive paths)
 - [x] `t1415-worktree-refs`
 - [x] `t1407-worktree-ref-store` (plumbing)
+- [x] `t2405-worktree-submodule`
 
 ---
 

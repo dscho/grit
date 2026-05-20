@@ -1,17 +1,17 @@
 # Progress — Grit Test Coverage
 
-**Updated:** 2026-05-19
+**Updated:** 2026-05-20
 
 ## Counts (derived from plan.md)
 
 | Status      | Count |
 |-------------|-------|
-| Completed   |   381 |
-| In progress |     6 |
-| Remaining   |   385 |
-| **Total**   |   772 |
+| Completed   |     8 |
+| In progress |     3 |
+| Remaining   |    74 |
+| **Total**   |    85 |
 
-Task lines in `PLAN.md`: 381 completed (`[x]`), 6 in progress (`[~]`), 385 remaining (`[ ]`).
+Task lines in `PLAN.md`: 8 completed (`[x]`), 3 in progress (`[~]`), 74 remaining (`[ ]`).
 
 ## In progress
 
@@ -19,6 +19,7 @@ Task lines in `PLAN.md`: 381 completed (`[x]`), 6 in progress (`[~]`), 385 remai
 
 ## Recently completed
 
+- `t2405-worktree-submodule` — 11/11 harness (10 pass + 1 `test_expect_failure`; submodule worktree checkout, `--recurse-submodules`, `core.worktree` in linked module config).
 - `t2400-worktree-add` — 232/232 (bare main worktree branch occupation; detach on `remote/branch` when no local refs).
 - `t1407-worktree-ref-store` — 4/4 (`test-tool ref-store worktree:*` dispatch + `resolve_ref_storage`).
 - `t1415-worktree-refs` — 10/10 (per-worktree ref storage, `main-worktree/` / `worktrees/` prefixes, DWIM + ambiguous warnings, linked `for-each-ref`).
