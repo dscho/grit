@@ -105,7 +105,7 @@ On each iteration:
 4. Read the tests in `git/t/` and determine which are related.
 5. Read the documentation for the command in `git/Documentation`.
 6. Implement the functionality you are focusing on for that subcommand.
-7. Update `plan.md` to reflect reality. Whenever you change any task checkbox there, update **`progress.md`**: total tasks, completed count, and a short list of what remains (derive counts from `plan.md` lines matching `- [x]` / `- [ ]` / `- [~]` under task headings).
+7. Update `plan.md` to reflect reality. Treat `plan.md` as the planning source of truth and keep checkbox state there current.
 8. After meaningful test runs, refresh **`test-results.md`** with a concise summary of `cargo test --workspace` and `./tests/harness/run.sh` (or note what was skipped).
 9. Update this file only if you discover durable run/build/test knowledge.
 10. Update the log for this task as you go.

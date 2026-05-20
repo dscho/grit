@@ -165,13 +165,13 @@ Dependency: do this after any task above changes status or meaningfully changes 
 results. This is the final cleanup needed before the auth work can be considered
 fully handed off.
 
-- [ ] Resolve status drift between `plan.md`, `progress.md`, and `data/test-files.csv`.
+- [ ] Resolve status drift between `plan.md` and `data/test-files.csv`.
 - [ ] Update `plan.md` checkbox/status for completed auth work.
-- [ ] Update `progress.md` counts after any `plan.md` checkbox changes.
+- [ ] Update `plan.md` checkbox state after task status changes.
 - [ ] Update `test-results.md` after meaningful cargo/harness runs.
 - [ ] Add or update a timestamped log under `logs/` for each claimed implementation task.
 - [ ] Remove stale status notes that contradict `data/test-files.csv`.
-- [ ] Ensure `data/test-files.csv`, dashboards, `plan.md`, `progress.md`, and `test-results.md` are current.
+- [ ] Ensure `data/test-files.csv`, dashboards, `plan.md`, and `test-results.md` are current.
 - [ ] Ensure auth work can be picked up from this file without rereading the full historical report.
 
 Final milestone blockers:

@@ -1,6 +1,6 @@
 # PLAN.md — Grit v1 Library Release
 
-**Updated:** 2026-05-18
+**Updated:** 2026-05-20
 
 ## Goal
 
@@ -32,7 +32,7 @@ tests should be driven through library APIs**, not ad hoc logic in the binary.
 1. Claim a task: change `[ ]` → `[~]` and add a line in `logs/YYYY-MM-DD-<topic>.md`.
 2. Implement in **`grit-lib`** first; wire CLI only when a command needs it.
 3. Validate: `cargo test -p grit-lib --lib`, then `./scripts/run-tests.sh <file>.sh`.
-4. Update the active plan file whenever task state changes; it is the planning source of truth.
+4. Update `plan.md` whenever task state changes; it is the planning source of truth.
 5. Mark `[x]` when the listed harness files for that task are fully passing.
 
 ---
@@ -64,7 +64,7 @@ inject **time** and **environment** at boundaries; no `.unwrap()` in library cod
 
 Keep existing strengths stable while moving logic down from the binary.
 
-- [ ] **0.1 Repository session API** — Single `Repository::open` path with explicit
+- [~] **0.1 Repository session API** — Single `Repository::open` path with explicit
   `GitDir`, common dir, work tree, commondir, and config load order documented.
   - Harness: `t1510-repo-setup`, `t1517-outside-repo` (subset: open/discovery only)
 - [ ] **0.2 Move transport negotiation to lib** — `fetch_transport` / smart HTTP
@@ -105,13 +105,10 @@ tests. Most logic belongs in a new **`grit-lib/src/worktree.rs`** (and friends).
 
 - [x] `t2400-worktree-add`
 - [x] `t2402-worktree-list`
-- [x] `t2403-worktree-move`
 - [x] `t2401-worktree-prune`, `t2406-worktree-repair`
 - [x] `t2404-worktree-config`, `t2407-worktree-heads`
 - [x] `t3908-stash-in-worktree`, `t2205-add-worktree-config` (non-interactive paths)
-- [x] `t1415-worktree-refs`
-- [x] `t1407-worktree-ref-store` (plumbing)
-- [x] `t2405-worktree-submodule`
+- [x] `t1415-worktree-refs`, `t1407-worktree-ref-store` (plumbing)
 
 ---
 
@@ -121,7 +118,7 @@ Build on existing `sparse_checkout.rs` and index `sdir` extension support.
 
 ### 2.1 Sparse index and read-tree integration
 
-- [~] Cone/non-cone pattern load/save (`$GIT_DIR/info/sparse-checkout`,
+- [ ] Cone/non-cone pattern load/save (`$GIT_DIR/info/sparse-checkout`,
   `index.sparse` config).
 - [ ] `read-tree` / checkout: only materialize included paths; skip-worktree +
   sparse directory entries in index v4.
@@ -137,9 +134,13 @@ Build on existing `sparse_checkout.rs` and index `sdir` extension support.
 
 - [ ] `t1091-sparse-checkout-builtin`
 - [ ] `t1092-sparse-checkout-compatibility`
-- [ ] `t1011-read-tree-sparse-checkout`, `t1090-sparse-checkout-scope`
-- [ ] `t6428-merge-conflicts-sparse`, `t6435-merge-sparse`
-- [ ] `t3705-add-sparse-checkout`, `t3602-rm-sparse-checkout`, `t7002-mv-sparse-checkout`
+- [ ] `t1011-read-tree-sparse-checkout`
+- [ ] `t1090-sparse-checkout-scope`
+- [ ] `t6428-merge-conflicts-sparse`
+- [x] `t6435-merge-sparse`
+- [ ] `t3705-add-sparse-checkout`
+- [ ] `t3602-rm-sparse-checkout`
+- [ ] `t7002-mv-sparse-checkout`
 
 ---
 
@@ -351,7 +352,7 @@ within a phase can be parallelized where noted.
 
 ## Tracking
 
-- **Planning source of truth:** use checkbox lines in the active plan file (`- [x]` / `[~]` / `[ ]`).
+- **Planning source of truth:** use checkbox lines in this file (`- [x]` / `[~]` / `[ ]`).
 - **Harness dashboard:** `data/test-files.csv` after `./scripts/run-tests.sh`.
 - **Session logs:** `logs/` per AGENTS.md loop contract.
 
