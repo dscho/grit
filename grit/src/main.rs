@@ -4103,6 +4103,10 @@ fn preprocess_diff_args(rest: &[String]) -> Vec<String> {
             // `-U<N>` without a space
             result.push(format!("--unified={n}"));
             i += 1;
+        } else if arg == "--submodule" {
+            // Bare `--submodule` must not consume the next argv token (e.g. `main^!` in t2405).
+            result.push("--submodule=log".to_owned());
+            i += 1;
         } else {
             result.push(arg.clone());
             i += 1;

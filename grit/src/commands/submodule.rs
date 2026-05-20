@@ -2099,6 +2099,26 @@ pub(crate) fn unset_submodule_core_worktree_config(modules_dir: &Path) -> Result
     let mut cfg = ConfigFile::parse(&config_path, &content, ConfigScope::Local)?;
     if cfg.unset("core.worktree")? > 0 {
         cfg.write()?;
+        return Ok(());
+    }
+    // Linked worktree module configs may keep `worktree` only in raw `[core]` lines that
+    // `ConfigFile` does not round-trip into entries (t2405).
+    let mut out_lines = Vec::new();
+    let mut removed = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("worktree =") || trimmed.starts_with("worktree=") {
+            removed = true;
+            continue;
+        }
+        out_lines.push(line);
+    }
+    if removed {
+        let mut rebuilt = out_lines.join("\n");
+        if !rebuilt.ends_with('\n') {
+            rebuilt.push('\n');
+        }
+        fs::write(&config_path, rebuilt)?;
     }
     Ok(())
 }

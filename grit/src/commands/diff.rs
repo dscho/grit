@@ -584,11 +584,12 @@ fn write_submodule_log_lines(
     };
     let mut opts = RevListOptions::default();
     opts.first_parent = true;
-    let exclude_parent = format!("^{}", entry.old_oid.to_hex());
+    let (_, negative_specs) =
+        grit_lib::rev_list::split_revision_token(&format!("^{}", entry.old_oid.to_hex()));
     let Ok(res) = rev_list(
         &sub_repo,
         &[new_oid.to_hex()],
-        &[exclude_parent],
+        &negative_specs,
         &opts,
     ) else {
         return Ok(());
@@ -1770,6 +1771,20 @@ pub fn run(mut args: Args) -> Result<()> {
     };
     let diff_algo_cli = parse_cli_diff_algorithm_from_argv();
 
+    if args.submodule.as_deref().is_none_or(str::is_empty)
+        && raw_args
+            .iter()
+            .any(|a| a == "--submodule" || a.starts_with("--submodule="))
+    {
+        args.submodule = Some(
+            raw_args
+                .iter()
+                .find_map(|a| a.strip_prefix("--submodule="))
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "log".to_string()),
+        );
+    }
     let emit_unified_patch = diff_emit_unified_patch_from_argv(&raw_args);
     let indent_heuristic = resolve_indent_heuristic(
         &diff_config_early,
@@ -3139,8 +3154,13 @@ pub fn run(mut args: Args) -> Result<()> {
             }
             // `git diff --stat -p` prints stat then patch only when `-p`/`-u`/etc. appear on argv;
             // plain `--stat` must not append hunks (matches Git).
-            let show_unified_after_stat =
-                diff_cli_requests_unified_patch_alongside_stat(&raw_args) && !args.no_patch;
+            let submodule_fmt_requested = args
+                .submodule
+                .as_deref()
+                .is_some_and(|s| !s.is_empty());
+            let show_unified_after_stat = !args.no_patch
+                && (diff_cli_requests_unified_patch_alongside_stat(&raw_args)
+                    || submodule_fmt_requested);
             if show_unified_after_stat {
                 for patch in &conflict_combined_patches {
                     write!(out, "{patch}")?;

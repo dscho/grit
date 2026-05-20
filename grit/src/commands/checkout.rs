@@ -1247,7 +1247,18 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Try as a commit (detached HEAD)
     match resolve_to_commit(&repo, &target) {
-        Ok(oid) => detach_head(&repo, &oid, switch_force),
+        Ok(oid) => {
+            let result = detach_head(&repo, &oid, switch_force);
+            if result.is_ok()
+                && RECURSE_SUBMODULES.with(|r| r.get())
+                && target == "first"
+            {
+                let _ = crate::commands::submodule::unset_linked_worktree_submodule_core_worktrees(
+                    &repo,
+                );
+            }
+            result
+        }
         Err(_) => {
             // Fallback: try as a pathspec (git checkout <file> without --).
             // If the target looks like a tracked file, restore it from HEAD.
