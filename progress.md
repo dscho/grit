@@ -15,7 +15,7 @@ Task lines in `PLAN.md`: 17 completed (`[x]`), 0 in progress (`[~]`), 68 remaini
 
 ## In progress
 
-- **PLAN §2.1 sparse checkout** — `t1091-sparse-checkout-builtin` **54/77** (worktree config, non-cone `/*` nodir, worktree pruning on apply); see `logs/2026-05-20-sparse-checkout-t1091.md`.
+- **PLAN §2.1 sparse checkout** — `t1091-sparse-checkout-builtin` **56/77** (worktree config, non-cone `/*` nodir, worktree pruning on apply); see `logs/2026-05-20-sparse-checkout-t1091.md`.
 - `t5319-multi-pack-index` (~14/98): MIDX read/write groundwork + `Odb` integration; CLI verify/expire/repack/bitmap still open (see `logs/2026-04-10_t5319-midx-progress.md`).
 
 ## Recently completed
