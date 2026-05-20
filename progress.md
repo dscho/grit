@@ -6,12 +6,12 @@
 
 | Status      | Count |
 |-------------|-------|
-| Completed   |     8 |
+| Completed   |     9 |
 | In progress |     3 |
-| Remaining   |    74 |
+| Remaining   |    73 |
 | **Total**   |    85 |
 
-Task lines in `PLAN.md`: 8 completed (`[x]`), 3 in progress (`[~]`), 74 remaining (`[ ]`).
+Task lines in `PLAN.md`: 9 completed (`[x]`), 3 in progress (`[~]`), 73 remaining (`[ ]`).
 
 ## In progress
 
