@@ -6,12 +6,12 @@
 
 | Status      | Count |
 |-------------|-------|
-| Completed   |     9 |
-| In progress |     3 |
-| Remaining   |    73 |
+| Completed   |    15 |
+| In progress |     2 |
+| Remaining   |    68 |
 | **Total**   |    85 |
 
-Task lines in `PLAN.md`: 9 completed (`[x]`), 3 in progress (`[~]`), 73 remaining (`[ ]`).
+Task lines in `PLAN.md`: 15 completed (`[x]`), 2 in progress (`[~]`), 68 remaining (`[ ]`).
 
 ## In progress
 
@@ -19,6 +19,8 @@ Task lines in `PLAN.md`: 9 completed (`[x]`), 3 in progress (`[~]`), 73 remainin
 
 ## Recently completed
 
+- **PLAN §1.1–1.2 worktrees** — Registry, commondir/refs, `config.worktree` / `worktreeConfig`, lifecycle commands, occupation guards (harness t2400–t2407, t2205, t1415, t1407, t2405).
+- `t2404-worktree-config` — 12/12; `t2205-add-worktree-config` — 13/13.
 - `t2405-worktree-submodule` — 11/11 harness (10 pass + 1 `test_expect_failure`; submodule worktree checkout, `--recurse-submodules`, `core.worktree` in linked module config).
 - `t2400-worktree-add` — 232/232 (bare main worktree branch occupation; detach on `remote/branch` when no local refs).
 - `t1407-worktree-ref-store` — 4/4 (`test-tool ref-store worktree:*` dispatch + `resolve_ref_storage`).

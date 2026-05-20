@@ -83,23 +83,23 @@ tests. Most logic belongs in a new **`grit-lib/src/worktree.rs`** (and friends).
 
 ### 1.1 Core worktree filesystem model
 
-- [~] Create `worktrees/` registry under common git dir (`worktrees/<id>/gitdir`,
+- [x] Create `worktrees/` registry under common git dir (`worktrees/<id>/gitdir`,
   `commondir`, `locked`, `prunable`, `HEAD`, private refs).
-- [~] Resolve `git_dir` vs `common_dir` vs per-worktree refs (`refs/worktree/*`).
-- [ ] `config.worktree` overlay and `extensions.worktreeConfig` behavior.
+- [x] Resolve `git_dir` vs `common_dir` vs per-worktree refs (`refs/worktree/*`).
+- [x] `config.worktree` overlay and `extensions.worktreeConfig` behavior.
 
 ### 1.2 Worktree lifecycle API
 
-- [~] `Worktree::add(branch, path, opts)` — checkout new or existing branch, write
+- [x] `Worktree::add(branch, path, opts)` — checkout new or existing branch, write
   `.git` / gitfile, seed `HEAD`, index, optionally fetch.
-- [ ] `Worktree::list` / `remove` / `lock` / `unlock` / `move` / `repair` / `prune`.
-- [ ] Prevent unsafe operations (checkout branch checked out elsewhere, orphan paths).
+- [x] `Worktree::list` / `remove` / `lock` / `unlock` / `move` / `repair` / `prune`.
+- [x] Prevent unsafe operations (checkout branch checked out elsewhere, orphan paths).
 
 ### 1.3 Commands using worktree index and refs
 
-- [ ] Index path: per-worktree `index` and shared vs private ref reads on
+- [~] Index path: per-worktree `index` and shared vs private ref reads on
   `status`, `diff`, `commit`, `reset`, `merge`, `checkout` (non-interactive).
-- [ ] Hook env: correct `GIT_WORK_TREE`, `GIT_DIR`, `GIT_COMMON_DIR` per worktree.
+- [~] Hook env: correct `GIT_WORK_TREE`, `GIT_DIR`, `GIT_COMMON_DIR` per worktree.
 
 ### 1.4 Harness targets (worktrees)
 
