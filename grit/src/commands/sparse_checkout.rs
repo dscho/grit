@@ -15,7 +15,8 @@ use grit_lib::repo::Repository;
 use grit_lib::sparse_checkout::{
     build_expanded_cone_sparse_checkout_lines, cone_directory_inputs_for_add,
     effective_cone_mode_for_sparse_file, load_sparse_checkout_with_warnings,
-    parse_expanded_cone_recursive_dirs, path_in_sparse_checkout,
+    parse_expanded_cone_recursive_dirs, parse_expanded_cone_user_directories,
+    path_in_sparse_checkout,
     sparse_checkout_lines_look_like_expanded_cone, ConePatterns, ConeWorkspace, NonConePatterns,
 };
 use grit_lib::state::resolve_head;
@@ -663,7 +664,13 @@ fn cmd_list(repo: &Repository) -> Result<()> {
     let mut out = stdout.lock();
 
     if cone_cfg && sparse_checkout_lines_look_like_expanded_cone(&lines) {
-        for d in parse_expanded_cone_recursive_dirs(&lines) {
+        let mut dirs = parse_expanded_cone_user_directories(&lines);
+        if dirs.is_empty() {
+            dirs = parse_expanded_cone_recursive_dirs(&lines);
+        }
+        dirs.sort();
+        dirs.dedup();
+        for d in dirs {
             writeln!(out, "{d}")?;
         }
         return Ok(());
