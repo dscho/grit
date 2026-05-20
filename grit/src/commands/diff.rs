@@ -47,7 +47,7 @@ use grit_lib::merge_diff::{
 use grit_lib::objects::{parse_commit, parse_tag, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::quote_path::{format_diff_path_with_prefix, quote_c_style};
-use grit_lib::repo::Repository;
+use grit_lib::repo::{resolve_dot_git, Repository};
 use grit_lib::rev_list::{is_symmetric_diff, rev_list, RevListOptions};
 use grit_lib::rev_parse::{
     abbreviate_object_id, expand_rev_token_circ_bang, resolve_revision,
@@ -553,6 +553,31 @@ fn submodule_gitlink_patch_plus_suffix(
     }
 }
 
+/// Open the submodule repository for `--submodule=log` only when it is checked out.
+fn open_submodule_repo_for_log(
+    super_git_dir: &Path,
+    work_tree: Option<&Path>,
+    path: &str,
+) -> Option<Repository> {
+    if let Some(wt) = work_tree {
+        let sub_wt = wt.join(path);
+        let dot_git = sub_wt.join(".git");
+        if dot_git.exists() {
+            if let Ok(gd) = resolve_dot_git(&dot_git) {
+                if let Ok(repo) = Repository::open(&gd, Some(&sub_wt)) {
+                    return Some(repo);
+                }
+            }
+        }
+    }
+    let modules_dir = super_git_dir.join("modules").join(path);
+    if modules_dir.is_dir() {
+        Repository::open(&modules_dir, None).ok()
+    } else {
+        None
+    }
+}
+
 fn write_submodule_log_lines(
     out: &mut impl Write,
     repo: &Repository,
@@ -574,14 +599,23 @@ fn write_submodule_log_lines(
     }
     let old_a = abbreviate_object_id(repo, entry.old_oid, 7)?;
     let new_a = abbreviate_object_id(repo, new_oid, 7)?;
+    let Some(wt) = work_tree.or(repo.work_tree.as_deref()) else {
+        writeln!(out, "Submodule {} {}..{}:", entry.path(), old_a, new_a)?;
+        return Ok(());
+    };
+    let sub_repo = open_submodule_repo_for_log(&repo.git_dir, Some(wt), entry.path());
+    if sub_repo.is_none() {
+        writeln!(
+            out,
+            "Submodule {} {}...{} (commits not present)",
+            entry.path(),
+            old_a,
+            new_a
+        )?;
+        return Ok(());
+    }
+    let sub_repo = sub_repo.expect("checked above");
     writeln!(out, "Submodule {} {}..{}:", entry.path(), old_a, new_a)?;
-    let Some(wt) = repo.work_tree.as_deref() else {
-        return Ok(());
-    };
-    let sub_path = wt.join(entry.path());
-    let Ok(sub_repo) = Repository::discover(Some(&sub_path)) else {
-        return Ok(());
-    };
     let mut opts = RevListOptions::default();
     opts.first_parent = true;
     let (_, negative_specs) =
