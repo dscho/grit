@@ -17,7 +17,9 @@ use grit_lib::pack::{
     PackedDeltaDependency,
 };
 use grit_lib::pack_rev::{build_pack_rev_bytes_from_index_order_offsets, rev_path_for_index};
-use grit_lib::rev_list::{rev_list, shallow_boundary_oids, MissingAction, RevListOptions};
+use grit_lib::rev_list::{
+    rev_list, shallow_boundary_oids, MissingAction, ObjectFilter, RevListOptions,
+};
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha256Digest, Sha256};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -1504,9 +1506,12 @@ fn apply_list_objects_filter(entries: &mut Vec<PackEntry>, filter: Option<&str>)
     let Some(spec) = filter.map(str::trim).filter(|s| !s.is_empty()) else {
         return;
     };
-    if spec == "blob:none" {
-        entries.retain(|e| e.kind != ObjectKind::Blob);
-    }
+    let Ok(filter) = ObjectFilter::parse(spec) else {
+        return;
+    };
+    entries.retain(|e| {
+        e.kind != ObjectKind::Blob || !object_filter_omits_blob(&filter, e.data.len() as u64)
+    });
 }
 
 fn omit_prefiltered_blobs(
@@ -1514,19 +1519,34 @@ fn omit_prefiltered_blobs(
     oids: &mut Vec<ObjectId>,
     filter: Option<&str>,
 ) -> Result<()> {
-    if filter.map(str::trim) != Some("blob:none") {
+    let Some(spec) = filter.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(());
-    }
+    };
+    let Ok(filter) = ObjectFilter::parse(spec) else {
+        return Ok(());
+    };
 
     let mut keep = Vec::with_capacity(oids.len());
     for oid in oids.iter().copied() {
         let obj = read_object_from_repo_unverified(repo, &oid)?;
-        if obj.kind != ObjectKind::Blob {
+        if obj.kind != ObjectKind::Blob || !object_filter_omits_blob(&filter, obj.data.len() as u64)
+        {
             keep.push(oid);
         }
     }
     *oids = keep;
     Ok(())
+}
+
+fn object_filter_omits_blob(filter: &ObjectFilter, size: u64) -> bool {
+    match filter {
+        ObjectFilter::BlobNone => true,
+        ObjectFilter::BlobLimit(limit) => size > *limit,
+        ObjectFilter::Combine(filters) => filters
+            .iter()
+            .any(|filter| object_filter_omits_blob(filter, size)),
+        _ => false,
+    }
 }
 
 fn read_object_from_repo_unverified(

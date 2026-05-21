@@ -1469,26 +1469,31 @@ pub(crate) fn fetch_upload_pack_negotiate_pack_bytes_with_streams(
     stdin.write_all(&req).context("write wants")?;
     stdin.flush()?;
 
+    let suppress_haves = negotiation_tip_oids.is_some_and(|tips| tips.is_empty());
     let mut negotiator = SkippingNegotiator::new(local_repo);
 
-    if let Ok(entries) = refs::list_refs(local_git_dir, "refs/bundles/") {
-        for (name, oid) in entries {
-            let t = if let Ok(resolved) = resolve_revision(negotiator.repo(), &name) {
-                resolved
-            } else {
-                oid
-            };
-            if negotiator.repo().odb.read(&t).is_ok() {
-                let c = peel_commit_oid_for_negotiation(negotiator.repo(), t)?;
-                negotiator.add_tip(c)?;
+    if !suppress_haves {
+        if let Ok(entries) = refs::list_refs(local_git_dir, "refs/bundles/") {
+            for (name, oid) in entries {
+                let t = if let Ok(resolved) = resolve_revision(negotiator.repo(), &name) {
+                    resolved
+                } else {
+                    oid
+                };
+                if negotiator.repo().odb.read(&t).is_ok() {
+                    let c = peel_commit_oid_for_negotiation(negotiator.repo(), t)?;
+                    negotiator.add_tip(c)?;
+                }
             }
         }
     }
 
-    for w in wants {
-        if negotiator.repo().odb.read(w).is_ok() {
-            let c = peel_commit_oid_for_negotiation(negotiator.repo(), *w)?;
-            negotiator.add_tip(c)?;
+    if !suppress_haves {
+        for w in wants {
+            if negotiator.repo().odb.read(w).is_ok() {
+                let c = peel_commit_oid_for_negotiation(negotiator.repo(), *w)?;
+                negotiator.add_tip(c)?;
+            }
         }
     }
 
@@ -1503,74 +1508,78 @@ pub(crate) fn fetch_upload_pack_negotiate_pack_bytes_with_streams(
         tip_filter = Some(set);
     }
 
-    for prefix in ["refs/heads/", "refs/tags/"] {
-        if let Ok(entries) = refs::list_refs(local_git_dir, prefix) {
-            for (name, oid) in entries {
-                let tip = if let Ok(resolved) = resolve_revision(negotiator.repo(), &name) {
-                    resolved
-                } else {
-                    oid
-                };
-                if negotiator.repo().odb.read(&tip).is_err() {
-                    continue;
+    if !suppress_haves {
+        for prefix in ["refs/heads/", "refs/tags/"] {
+            if let Ok(entries) = refs::list_refs(local_git_dir, prefix) {
+                for (name, oid) in entries {
+                    let tip = if let Ok(resolved) = resolve_revision(negotiator.repo(), &name) {
+                        resolved
+                    } else {
+                        oid
+                    };
+                    if negotiator.repo().odb.read(&tip).is_err() {
+                        continue;
+                    }
+                    let peeled = peel_commit_oid_for_negotiation(negotiator.repo(), tip)?;
+                    if tip_filter
+                        .as_ref()
+                        .is_some_and(|filter| !filter.contains(&peeled))
+                    {
+                        continue;
+                    }
+                    tips.push(peeled);
                 }
-                let peeled = peel_commit_oid_for_negotiation(negotiator.repo(), tip)?;
-                if tip_filter
+            }
+        }
+        if let Ok(h) = refs::resolve_ref(local_git_dir, "HEAD") {
+            if negotiator.repo().odb.read(&h).is_ok() {
+                let peeled = peel_commit_oid_for_negotiation(negotiator.repo(), h)?;
+                if !tip_filter
                     .as_ref()
                     .is_some_and(|filter| !filter.contains(&peeled))
                 {
-                    continue;
+                    tips.push(peeled);
                 }
-                tips.push(peeled);
             }
         }
-    }
-    if let Ok(h) = refs::resolve_ref(local_git_dir, "HEAD") {
-        if negotiator.repo().odb.read(&h).is_ok() {
-            let peeled = peel_commit_oid_for_negotiation(negotiator.repo(), h)?;
-            if !tip_filter
-                .as_ref()
-                .is_some_and(|filter| !filter.contains(&peeled))
-            {
-                tips.push(peeled);
-            }
-        }
-    }
-    for sym in ["HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
-        if let Ok(oid) = resolve_revision(negotiator.repo(), sym) {
-            if negotiator.repo().odb.read(&oid).is_ok() {
-                let peeled = peel_commit_oid_for_negotiation(negotiator.repo(), oid)?;
-                if tip_filter
-                    .as_ref()
-                    .is_some_and(|filter| !filter.contains(&peeled))
-                {
-                    continue;
+        for sym in ["HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"] {
+            if let Ok(oid) = resolve_revision(negotiator.repo(), sym) {
+                if negotiator.repo().odb.read(&oid).is_ok() {
+                    let peeled = peel_commit_oid_for_negotiation(negotiator.repo(), oid)?;
+                    if tip_filter
+                        .as_ref()
+                        .is_some_and(|filter| !filter.contains(&peeled))
+                    {
+                        continue;
+                    }
+                    tips.push(peeled);
                 }
-                tips.push(peeled);
             }
         }
-    }
-    tips.sort_by_key(|o| o.to_hex());
-    tips.dedup();
-    for t in tips {
-        if want_set.contains(&t) {
-            continue;
+        tips.sort_by_key(|o| o.to_hex());
+        tips.dedup();
+        for t in tips {
+            if want_set.contains(&t) {
+                continue;
+            }
+            if negotiator.repo().odb.read(&t).is_err() {
+                continue;
+            }
+            negotiator.add_tip(t)?;
         }
-        if negotiator.repo().odb.read(&t).is_err() {
-            continue;
-        }
-        negotiator.add_tip(t)?;
     }
 
     // With no `have` lines, Git's upload-pack does not send `NAK` until it sees `done`
     // (`upload-pack.c` `get_common_commits`). Reading ACKs here deadlocks the child on a pipe.
-    for (_, oid) in advertised {
-        if want_set.contains(oid) {
-            continue;
-        }
-        if negotiator.repo().odb.read(oid).is_ok() {
-            let c = peel_commit_oid_for_negotiation(negotiator.repo(), *oid)?;
-            negotiator.known_common(c)?;
+    if !suppress_haves {
+        for (_, oid) in advertised {
+            if want_set.contains(oid) {
+                continue;
+            }
+            if negotiator.repo().odb.read(oid).is_ok() {
+                let c = peel_commit_oid_for_negotiation(negotiator.repo(), *oid)?;
+                negotiator.known_common(c)?;
+            }
         }
     }
 

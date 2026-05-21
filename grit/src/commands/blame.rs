@@ -8,9 +8,10 @@ use grit_lib::crlf::{
     convert_to_git, convert_to_worktree_eager, get_file_attrs, load_gitattributes,
     load_gitattributes_from_index, ConversionConfig, GitAttributes,
 };
+use grit_lib::error::Error as LibError;
 use grit_lib::git_date::approx::approxidate_careful;
 use grit_lib::mailmap::load_mailmap_table;
-use grit_lib::objects::{parse_commit, parse_tree, CommitData, ObjectId, ObjectKind};
+use grit_lib::objects::{parse_commit, parse_tree, CommitData, Object, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse::{resolve_revision, resolve_revision_without_index_dwim};
@@ -26,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
+
+use crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object;
 
 /// Arguments for `grit blame`.
 #[derive(Debug, ClapArgs)]
@@ -484,7 +487,7 @@ fn resolve_path_in_tree_entry(
     let mut current = *tree_oid;
 
     for (i, part) in parts.iter().enumerate() {
-        let obj = odb.read(&current)?;
+        let obj = read_object_for_blame(odb, &current)?;
         let entries = parse_tree(&obj.data)?;
         match entries
             .iter()
@@ -635,6 +638,22 @@ fn load_diff_attr_rules(repo: &Repository) -> Vec<DiffAttrRule> {
     rules
 }
 
+fn read_object_for_blame(odb: &Odb, oid: &ObjectId) -> Result<Object> {
+    match odb.read(oid) {
+        Ok(obj) => Ok(obj),
+        Err(LibError::ObjectNotFound(_)) => {
+            if let Ok(repo) = Repository::discover(None) {
+                let _ = try_lazy_fetch_promisor_object(&repo, *oid);
+                return odb
+                    .read(oid)
+                    .with_context(|| format!("reading object {}", oid.to_hex()));
+            }
+            Err(LibError::ObjectNotFound(oid.to_hex()).into())
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn parse_diff_attr_file(path: &Path, rules: &mut Vec<DiffAttrRule>) {
     if let Ok(content) = std::fs::read_to_string(path) {
         parse_diff_attr_content(&content, rules);
@@ -754,7 +773,7 @@ fn read_blob_content_for_blame(
     textconv_ctx: Option<&BlameTextconvContext>,
     use_textconv: bool,
 ) -> Result<String> {
-    let obj = odb.read(oid)?;
+    let obj = read_object_for_blame(odb, oid)?;
     if obj.kind != ObjectKind::Blob {
         bail!("expected blob object");
     }
@@ -800,7 +819,7 @@ fn compute_blame(
     grafts: &HashMap<ObjectId, Vec<ObjectId>>,
 ) -> Result<Vec<BlameLine>> {
     let start_commit = {
-        let obj = odb.read(&start_oid)?;
+        let obj = read_object_for_blame(odb, &start_oid)?;
         parse_commit(&obj.data)?
     };
 
@@ -1635,7 +1654,7 @@ fn collect_tree_file_entries(
     prefix: &str,
     out: &mut Vec<(String, ObjectId, u32)>,
 ) -> Result<()> {
-    let obj = odb.read(tree_oid)?;
+    let obj = read_object_for_blame(odb, tree_oid)?;
     if obj.kind != ObjectKind::Tree {
         bail!("expected tree");
     }
@@ -1664,7 +1683,7 @@ fn get_commit(
     if let Some(c) = cache.get(&oid) {
         return Ok(c.clone());
     }
-    let obj = odb.read(&oid)?;
+    let obj = read_object_for_blame(odb, &oid)?;
     let c = parse_commit(&obj.data)?;
     cache.insert(oid, c.clone());
     Ok(c)
@@ -1712,7 +1731,7 @@ fn apply_annotate_huge_graft_fixup(
     let mut oid_01 = None;
     let mut oid_10 = None;
     for p in parents {
-        let obj = odb.read(p)?;
+        let obj = read_object_for_blame(odb, p)?;
         let c = parse_commit(&obj.data)?;
         let msg = c.message.trim();
         if msg == "01" {
@@ -1870,7 +1889,7 @@ struct BlameColorStyle {
 
 fn peel_to_commit_oid(odb: &Odb, mut oid: ObjectId) -> Result<Option<ObjectId>> {
     loop {
-        let obj = odb.read(&oid)?;
+        let obj = read_object_for_blame(odb, &oid)?;
         match obj.kind {
             ObjectKind::Commit => return Ok(Some(oid)),
             ObjectKind::Tag => {
@@ -2500,7 +2519,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     raw_message: None,
                 });
             } else {
-                let obj = odb.read(&bl.oid)?;
+                let obj = read_object_for_blame(&odb, &bl.oid)?;
                 e.insert(parse_commit(&obj.data)?);
             }
         }
@@ -2563,7 +2582,7 @@ fn read_from_index_conflict(repo: &Repository, odb: &Odb, file_path: &str) -> Re
         }
     }
     let entry = best.ok_or_else(|| anyhow::anyhow!("file not in index"))?;
-    let obj = odb.read(&entry.oid)?;
+    let obj = read_object_for_blame(odb, &entry.oid)?;
     String::from_utf8(obj.data).context("blob is not valid UTF-8")
 }
 
@@ -2589,7 +2608,7 @@ fn build_uncommitted_blame(
         HashMap<String, usize>,
     )> = None;
     if copy_depth >= 2 {
-        let head_obj = odb.read(&start_oid)?;
+        let head_obj = read_object_for_blame(odb, &start_oid)?;
         let head_commit = parse_commit(&head_obj.data)?;
         if let Some((source_path, source_blame)) = find_copy_source_blame(
             odb,
@@ -2885,7 +2904,7 @@ fn apply_final_content_overlay(
     textconv_ctx: Option<&BlameTextconvContext>,
     use_textconv: bool,
 ) -> Result<Option<Vec<BlameLine>>> {
-    let head_commit_obj = odb.read(&start_oid)?;
+    let head_commit_obj = read_object_for_blame(odb, &start_oid)?;
     let head_commit = parse_commit(&head_commit_obj.data)?;
     let Some((head_blob_oid, head_mode)) =
         resolve_path_in_tree_entry(odb, &head_commit.tree, file_path)?
@@ -2970,7 +2989,7 @@ fn apply_worktree_overlay(
     let raw_worktree = std::fs::read(&abs_path)?;
     let raw_worktree_text = String::from_utf8_lossy(&raw_worktree).into_owned();
 
-    let head_commit_obj = odb.read(&start_oid)?;
+    let head_commit_obj = read_object_for_blame(odb, &start_oid)?;
     let head_commit = parse_commit(&head_commit_obj.data)?;
     let Some((head_blob_oid, head_mode)) =
         resolve_path_in_tree_entry(odb, &head_commit.tree, file_path)?

@@ -16,6 +16,7 @@ use grit_lib::odb::Odb;
 use grit_lib::promisor::{read_promisor_missing_oids, write_promisor_marker};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
+use grit_lib::rev_list::ObjectFilter;
 use grit_lib::rev_parse::resolve_revision;
 use grit_lib::state::resolve_head;
 use grit_lib::state::HeadState;
@@ -714,6 +715,7 @@ fn collect_wants_for_upload_pack(
     refspecs: &[FetchRefspec],
     should_fetch_tags: bool,
     remote_name: &str,
+    refetch: bool,
 ) -> Result<Vec<ObjectId>> {
     let local_odb = Odb::new(&local_git_dir.join("objects"));
     let remote_odb = Odb::new(&remote_git_dir.join("objects"));
@@ -755,7 +757,7 @@ fn collect_wants_for_upload_pack(
         let local_tracking_oid = refs::resolve_ref(local_git_dir, &local_ref)
             .ok()
             .or_else(|| read_loose_ref_chain(local_git_dir, &local_ref));
-        if local_tracking_oid.as_ref() == Some(&tip_oid) {
+        if !refetch && local_tracking_oid.as_ref() == Some(&tip_oid) {
             continue;
         }
         // Always request the branch tip OID when the remote-tracking ref lags, even if the object
@@ -1367,6 +1369,7 @@ fn fetch_remote(
                                 &refspec_owned_ext,
                                 should_tags_ext,
                                 &remote_nm_ext,
+                                false,
                             )
                         } else {
                             crate::fetch_transport::collect_wants(adv, &[])
@@ -1461,6 +1464,7 @@ fn fetch_remote(
         let remote_gd = remote_repo_upload.git_dir.clone();
         let remote_nm = remote_name.to_owned();
         let has_cli_refspecs = !cli_owned.is_empty();
+        let refetch = args.refetch;
         let compute_wants = move |adv: &[(String, ObjectId)]| -> Result<Vec<ObjectId>> {
             if !cli_owned.is_empty() {
                 let mut wants =
@@ -1477,6 +1481,7 @@ fn fetch_remote(
                     &refspec_owned,
                     should_fetch_tags,
                     &remote_nm,
+                    refetch,
                 )
             }
         };
@@ -1490,7 +1495,9 @@ fn fetch_remote(
                 include_head_ref_prefix,
                 filter_active,
                 should_fetch_tags,
-                if regular_negotiation_tips.is_empty() {
+                if args.refetch {
+                    Some(&[][..])
+                } else if regular_negotiation_tips.is_empty() {
                     None
                 } else {
                     Some(regular_negotiation_tips.as_slice())
@@ -1554,7 +1561,15 @@ fn fetch_remote(
         remote_head_advertised_oid = refs::resolve_ref(&remote_repo.git_dir, "HEAD").ok();
         remote_head_symbolic_branch_from_transport =
             remote_symbolic_head_branch(&remote_repo.git_dir);
-        if args.refetch {
+        if let Some(spec) = pack_filter_spec {
+            copy_reachable_objects_filtered(
+                &remote_repo.git_dir,
+                git_dir,
+                &object_copy_roots,
+                spec,
+            )
+            .context("copying filtered reachable objects from remote")?;
+        } else if args.refetch {
             copy_objects(&remote_repo.git_dir, git_dir, true)
                 .context("copying objects from remote")?;
         } else {
@@ -2746,7 +2761,7 @@ fn fetch_remote(
         bail!("some local refs could not be updated");
     }
 
-    if effective_filter.as_deref() == Some("blob:none") {
+    if effective_filter.as_deref() == Some("blob:none") && remote_repo.is_none() {
         apply_blob_none_filter(git_dir, remote_repo.as_ref(), &remote_heads)
             .context("applying blob:none filter")?;
     }
@@ -3778,6 +3793,78 @@ pub(crate) fn copy_reachable_objects(
     roots: &[ObjectId],
 ) -> Result<()> {
     copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, false)
+}
+
+fn copy_reachable_objects_filtered(
+    src_git_dir: &Path,
+    dst_git_dir: &Path,
+    roots: &[ObjectId],
+    filter_spec: &str,
+) -> Result<()> {
+    let filter = ObjectFilter::parse(filter_spec)
+        .map_err(|err| anyhow::anyhow!("invalid object filter: {err}"))?;
+    let src_odb = Odb::new(&src_git_dir.join("objects"));
+    let dst_odb = Odb::new(&dst_git_dir.join("objects"));
+    let mut stack: Vec<ObjectId> = roots.to_vec();
+    let mut seen = HashSet::new();
+    let mut omitted = HashSet::new();
+
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let obj = src_odb.read(&oid).with_context(|| {
+            format!("missing object {} while copying from remote", oid.to_hex())
+        })?;
+        if obj.kind == ObjectKind::Blob && filter_omits_blob(&filter, obj.data.len() as u64) {
+            if !dst_odb.exists_local(&oid) {
+                omitted.insert(oid);
+            }
+            continue;
+        }
+        if !dst_odb.exists_local(&oid) {
+            dst_odb
+                .write(obj.kind, &obj.data)
+                .with_context(|| format!("write object {}", oid.to_hex()))?;
+        }
+        match obj.kind {
+            ObjectKind::Commit => {
+                let c = parse_commit(&obj.data)?;
+                stack.push(c.tree);
+                stack.extend_from_slice(&c.parents);
+            }
+            ObjectKind::Tree => {
+                for e in parse_tree(&obj.data)? {
+                    stack.push(e.oid);
+                }
+            }
+            ObjectKind::Tag => {
+                stack.push(parse_tag(&obj.data)?.object);
+            }
+            ObjectKind::Blob => {}
+        }
+    }
+
+    if !omitted.is_empty() {
+        let mut marker_set: HashSet<ObjectId> = read_promisor_missing_oids(dst_git_dir)
+            .into_iter()
+            .collect();
+        marker_set.extend(omitted);
+        write_promisor_marker(dst_git_dir, &marker_set)?;
+    }
+
+    Ok(())
+}
+
+fn filter_omits_blob(filter: &ObjectFilter, size: u64) -> bool {
+    match filter {
+        ObjectFilter::BlobNone => true,
+        ObjectFilter::BlobLimit(limit) => size > *limit,
+        ObjectFilter::Combine(filters) => {
+            filters.iter().any(|filter| filter_omits_blob(filter, size))
+        }
+        _ => false,
+    }
 }
 
 /// Copy objects reachable from `roots`, optionally stopping parent traversal at remote shallow

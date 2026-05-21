@@ -18,3 +18,9 @@ Updated: 2026-05-21
 - Focused partial clone: `t5616-partial-clone.sh --run=1-8`, `--run=34`, and `--run=35` pass.
 - Harness partial clone: `./scripts/run-tests.sh t5616-partial-clone.sh` is 21/47 after clone/fetch filter work.
 - Regression partial clone: `./scripts/run-tests.sh t0410-partial-clone.sh` remains 37/38.
+- Phase 2 promisor continuation: `cargo build --release -p grit-cli` passes with existing warnings.
+- Focused partial clone: `t5616-partial-clone.sh --run=1-10` passes after blame lazy-fetch hydration.
+- Focused partial clone: `t5616-partial-clone.sh --run=1-18` now passes through test 16; remaining failures begin at shallow partial clone/refetch and trace2 maintenance checks.
+- Harness partial clone: `./scripts/run-tests.sh t5616-partial-clone.sh` is 24/47 after `fetch-pack --stdin`, `blob:limit` filtering, and refetch negotiation work.
+- Pre-commit: `cargo check` passes with existing warnings; `cargo test -p grit-lib --lib` passes 204/204.
+- Pre-commit: `cargo clippy --fix --allow-dirty` completed only with the existing warning backlog; clippy reported failed auto-fixes in unrelated files and no scoped clippy changes were kept.

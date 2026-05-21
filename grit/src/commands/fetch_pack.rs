@@ -6,15 +6,21 @@
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::objects::ObjectId;
+use grit_lib::odb::Odb;
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
 /// Arguments for `grit fetch-pack`.
 #[derive(Debug, ClapArgs)]
 #[command(about = "Download objects from a remote repository (plumbing)")]
 pub struct Args {
+    /// Read object IDs to fetch from standard input.
+    #[arg(long = "stdin")]
+    pub stdin: bool,
+
     /// Path to the remote repository (bare or non-bare).
     #[arg(value_name = "REMOTE")]
     pub remote: String,
@@ -35,7 +41,7 @@ pub struct Args {
 pub fn run(args: Args) -> Result<()> {
     let git_dir = resolve_git_dir()?;
 
-    let remote_path = PathBuf::from(&args.remote);
+    let remote_path = remote_path_from_arg(&args.remote);
     let remote_repo = open_repo(&remote_path).with_context(|| {
         format!(
             "could not open remote repository at '{}'",
@@ -63,6 +69,24 @@ pub fn run(args: Args) -> Result<()> {
             .collect()
     };
 
+    if args.stdin {
+        let stdin = std::io::stdin();
+        let mut wants = Vec::new();
+        for line in stdin.lock().lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            wants.push(ObjectId::from_hex(trimmed)?);
+        }
+        if !args.dry_run {
+            copy_requested_objects(&remote_repo.git_dir, &git_dir, &wants)
+                .context("copying requested objects from remote")?;
+        }
+        return Ok(());
+    }
+
     if !args.dry_run {
         // Copy objects from remote → local
         copy_objects(&remote_repo.git_dir, &git_dir).context("copying objects from remote")?;
@@ -73,6 +97,27 @@ pub fn run(args: Args) -> Result<()> {
         println!("{}\t{}", oid.to_hex(), refname);
     }
 
+    Ok(())
+}
+
+fn copy_requested_objects(
+    src_git_dir: &Path,
+    dst_git_dir: &Path,
+    wants: &[ObjectId],
+) -> Result<()> {
+    let src_odb = Odb::new(&src_git_dir.join("objects"));
+    let dst_odb = Odb::new(&dst_git_dir.join("objects"));
+    for oid in wants {
+        if dst_odb.exists_local(oid) {
+            continue;
+        }
+        let obj = src_odb
+            .read(oid)
+            .with_context(|| format!("missing object {} in remote", oid.to_hex()))?;
+        dst_odb
+            .write(obj.kind, &obj.data)
+            .with_context(|| format!("write object {}", oid.to_hex()))?;
+    }
     Ok(())
 }
 
@@ -135,6 +180,13 @@ fn open_repo(path: &Path) -> Result<Repository> {
     }
     let git_dir = path.join(".git");
     Repository::open(&git_dir, Some(path)).map_err(Into::into)
+}
+
+fn remote_path_from_arg(remote: &str) -> PathBuf {
+    remote
+        .strip_prefix("file://")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(remote))
 }
 
 /// Resolve the git directory from CWD.

@@ -126,7 +126,7 @@ Extend `promisor.rs`, `shallow.rs`, and ODB miss handling.
 ### 2.2 Clone/fetch filters
 
 - [~] `filter=blob:none|tree:0|...` on clone/fetch; record filter in config.
-- [ ] Lazy fetch in merge, checkout, `cat-file`, `apply` (blob touch paths).
+- [~] Lazy fetch in merge, checkout, `cat-file`, `apply` (blob touch paths).
 - [ ] `backfill` / `promisor hydrate` as library API.
 
 ### 2.3 Shallow + partial interaction
@@ -135,7 +135,7 @@ Extend `promisor.rs`, `shallow.rs`, and ODB miss handling.
 
 ### 2.4 Harness targets (partial / promisor)
 
-- [ ] `t0410-partial-clone`, `t5616-partial-clone`
+- [~] `t0410-partial-clone`, `t5616-partial-clone`
 - [ ] `t6421-merge-partial-clone`, `t1022-read-tree-partial-clone`
 - [ ] `t5620-backfill`, `t6110-rev-list-sparse` (promisor-related cases)
 - [ ] `t4067-diff-partial-clone`, `t5537-fetch-shallow` (non-interactive)
