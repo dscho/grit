@@ -16,8 +16,8 @@ use grit_lib::sparse_checkout::{
     build_expanded_cone_sparse_checkout_lines, cone_directory_inputs_for_add,
     effective_cone_mode_for_sparse_file, load_sparse_checkout_with_warnings,
     parse_expanded_cone_recursive_dirs, parse_expanded_cone_user_directories,
-    path_in_sparse_checkout,
-    sparse_checkout_lines_look_like_expanded_cone, ConePatterns, ConeWorkspace, NonConePatterns,
+    path_in_sparse_checkout, sparse_checkout_lines_look_like_expanded_cone, ConePatterns,
+    ConeWorkspace, NonConePatterns,
 };
 use grit_lib::state::resolve_head;
 use std::collections::{BTreeSet, HashSet};
@@ -1136,7 +1136,9 @@ fn warn_sparse_apply_side_effects(
     if !repo.index_path().exists() {
         return Ok(());
     }
-    let index = repo.load_index().context("reading index for sparse warnings")?;
+    let index = repo
+        .load_index()
+        .context("reading index for sparse warnings")?;
     let file_content = read_sparse_file_content(repo);
     let cone_struct = if effective_cone_mode_for_sparse_file(cone_mode, patterns) {
         ConePatterns::try_parse(&file_content)

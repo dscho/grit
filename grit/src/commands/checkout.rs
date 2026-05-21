@@ -132,7 +132,8 @@ fn submodule_modules_git_dir_for_checkout(
     work_tree: &Path,
     rel: &str,
 ) -> Result<PathBuf> {
-    if let Ok(modules) = crate::commands::submodule::parse_gitmodules_with_repo(work_tree, Some(repo))
+    if let Ok(modules) =
+        crate::commands::submodule::parse_gitmodules_with_repo(work_tree, Some(repo))
     {
         if let Some(m) = modules.iter().find(|m| m.path == rel) {
             return crate::commands::submodule::submodule_separate_git_dir(
@@ -1266,10 +1267,7 @@ pub fn run(mut args: Args) -> Result<()> {
     match resolve_to_commit(&repo, &target) {
         Ok(oid) => {
             let result = detach_head(&repo, &oid, switch_force);
-            if result.is_ok()
-                && RECURSE_SUBMODULES.with(|r| r.get())
-                && target == "first"
-            {
+            if result.is_ok() && RECURSE_SUBMODULES.with(|r| r.get()) && target == "first" {
                 let _ = crate::commands::submodule::unset_linked_worktree_submodule_core_worktrees(
                     &repo,
                 );

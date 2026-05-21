@@ -81,10 +81,7 @@ pub fn resolve_ref_storage(git_dir: &Path, refname: &str) -> (PathBuf, String) {
         RefWorktreeType::Main => (common, bare.into_owned()),
         RefWorktreeType::Other => {
             let id = wt_id.map(|c| c.into_owned()).unwrap_or_default();
-            (
-                common.join("worktrees").join(id),
-                bare.into_owned(),
-            )
+            (common.join("worktrees").join(id), bare.into_owned())
         }
         RefWorktreeType::Current => (git_dir.to_path_buf(), refname.to_owned()),
         RefWorktreeType::Shared => (common, refname.to_owned()),

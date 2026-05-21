@@ -12,8 +12,8 @@ use grit_lib::config::{
 use grit_lib::error::Error as LibError;
 use grit_lib::objects::ObjectKind;
 use grit_lib::repo::{common_git_dir_for_config, worktree_config_enabled, Repository};
-use grit_lib::worktree::registered_worktree_count;
 use grit_lib::rev_parse::resolve_revision;
+use grit_lib::worktree::registered_worktree_count;
 use std::path::{Path, PathBuf};
 
 /// True when `--bool`, `--bool-or-int`, or `--type=bool|bool-or-int` requests explicit boolean output.

@@ -41,8 +41,7 @@ use grit_lib::rev_list::{
 };
 use grit_lib::rev_parse::{
     load_graft_parents, peel_to_commit_for_merge_base, resolve_reflog_walk_log_ref,
-    resolve_revision_as_commit, resolve_revision_for_range_end,
-    try_parse_double_dot_log_range,
+    resolve_revision_as_commit, resolve_revision_for_range_end, try_parse_double_dot_log_range,
 };
 use grit_lib::state::{resolve_head, HeadState};
 use regex::{Regex, RegexBuilder};

@@ -169,7 +169,8 @@ fn read_loose_ref_for_store(
     store: &RefStore,
     refname: &str,
 ) -> Result<std::result::Result<Ref, grit_lib::error::Error>> {
-    let (stor_dir, stor_name) = grit_lib::worktree_ref::resolve_ref_storage(&store.git_dir, refname);
+    let (stor_dir, stor_name) =
+        grit_lib::worktree_ref::resolve_ref_storage(&store.git_dir, refname);
     match read_ref_file(&stor_dir.join(&stor_name)) {
         Ok(reference) => return Ok(Ok(reference)),
         Err(grit_lib::error::Error::Io(err)) if err.kind() == io::ErrorKind::NotFound => {}

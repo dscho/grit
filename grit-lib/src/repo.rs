@@ -1176,12 +1176,10 @@ pub fn init_worktree_config(git_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut common_cfg =
-        open_or_create_config_file(&common_config_path, ConfigScope::Local)?;
+    let mut common_cfg = open_or_create_config_file(&common_config_path, ConfigScope::Local)?;
     common_cfg.set("extensions.worktreeConfig", "true")?;
 
-    let mut wt_cfg =
-        open_or_create_config_file(&worktree_config_path, ConfigScope::Worktree)?;
+    let mut wt_cfg = open_or_create_config_file(&worktree_config_path, ConfigScope::Worktree)?;
 
     if config_file_bool_true(&common_cfg, "core.bare") {
         wt_cfg.set("core.bare", "true")?;

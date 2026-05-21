@@ -50,9 +50,8 @@ use grit_lib::quote_path::{format_diff_path_with_prefix, quote_c_style};
 use grit_lib::repo::{resolve_dot_git, Repository};
 use grit_lib::rev_list::{is_symmetric_diff, rev_list, RevListOptions};
 use grit_lib::rev_parse::{
-    abbreviate_object_id, expand_rev_token_circ_bang, resolve_revision,
-    resolve_revision_as_commit, resolve_treeish_blob_at_path, show_prefix, split_treeish_colon,
-    TreeishBlobAtPath,
+    abbreviate_object_id, expand_rev_token_circ_bang, resolve_revision, resolve_revision_as_commit,
+    resolve_treeish_blob_at_path, show_prefix, split_treeish_colon, TreeishBlobAtPath,
 };
 use grit_lib::userdiff::{matcher_for_path_parsed, word_regex_pattern_for_path_parsed};
 use grit_lib::ws::{self, WhitespaceGitAttr, WS_BLANK_AT_EOF, WS_INCOMPLETE_LINE};
@@ -620,12 +619,7 @@ fn write_submodule_log_lines(
     opts.first_parent = true;
     let (_, negative_specs) =
         grit_lib::rev_list::split_revision_token(&format!("^{}", entry.old_oid.to_hex()));
-    let Ok(res) = rev_list(
-        &sub_repo,
-        &[new_oid.to_hex()],
-        &negative_specs,
-        &opts,
-    ) else {
+    let Ok(res) = rev_list(&sub_repo, &[new_oid.to_hex()], &negative_specs, &opts) else {
         return Ok(());
     };
     for oid in res.commits.iter().rev() {
@@ -3188,10 +3182,7 @@ pub fn run(mut args: Args) -> Result<()> {
             }
             // `git diff --stat -p` prints stat then patch only when `-p`/`-u`/etc. appear on argv;
             // plain `--stat` must not append hunks (matches Git).
-            let submodule_fmt_requested = args
-                .submodule
-                .as_deref()
-                .is_some_and(|s| !s.is_empty());
+            let submodule_fmt_requested = args.submodule.as_deref().is_some_and(|s| !s.is_empty());
             let show_unified_after_stat = !args.no_patch
                 && (diff_cli_requests_unified_patch_alongside_stat(&raw_args)
                     || submodule_fmt_requested);

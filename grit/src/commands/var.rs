@@ -164,13 +164,13 @@ fn resolve_email_for_var_strict(config: &ConfigSet, role: IdentRole) -> Option<S
     {
         return crate::ident::resolve_email(config, role).ok();
     }
-    if config
-        .get(config_key)
-        .is_some_and(|v| !v.trim().is_empty())
-    {
+    if config.get(config_key).is_some_and(|v| !v.trim().is_empty()) {
         return crate::ident::resolve_email(config, role).ok();
     }
-    if config.get("user.email").is_some_and(|v| !v.trim().is_empty()) {
+    if config
+        .get("user.email")
+        .is_some_and(|v| !v.trim().is_empty())
+    {
         return crate::ident::resolve_email(config, role).ok();
     }
     if std::env::var("EMAIL")

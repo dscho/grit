@@ -1461,8 +1461,8 @@ fn walk_worktree(
             }
         } else if ft.is_dir() {
             let dot_git = path.join(".git");
-            let is_own_git_dir =
-                dot_git_marks_git_repository(&dot_git) && dot_git_is_own_repository(&dot_git, own_git_dir);
+            let is_own_git_dir = dot_git_marks_git_repository(&dot_git)
+                && dot_git_is_own_repository(&dot_git, own_git_dir);
             if dot_git_marks_git_repository(&dot_git) && !is_own_git_dir {
                 // Untracked git repository: emit as a directory entry
                 // (git treats these as opaque and doesn't recurse into them)
@@ -1816,13 +1816,14 @@ fn resolve_pathspec(
     let rel: PathBuf = if pathspec.is_absolute() {
         let normalized_str = normalized.to_string_lossy();
         PathBuf::from(
-            grit_lib::git_path::abspath_part_inside_repo(&normalized_str, work_tree)
-                .with_context(|| {
+            grit_lib::git_path::abspath_part_inside_repo(&normalized_str, work_tree).with_context(
+                || {
                     format!(
                         "pathspec '{}' is outside repository work tree",
                         pathspec.display()
                     )
-                })?,
+                },
+            )?,
         )
     } else {
         normalized

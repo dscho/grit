@@ -637,7 +637,12 @@ pub fn rev_list(
     let mut graph = CommitGraph::new(repo, options.first_parent);
 
     let (mut include, object_roots, tip_annotated_tag_by_commit) = if options.objects {
-        resolve_specs_for_objects_with_options(repo, positive_specs, options.ignore_missing)?
+        resolve_specs_for_objects_with_options(
+            repo,
+            positive_specs,
+            options.ignore_missing,
+            options.missing_action,
+        )?
     } else {
         (
             resolve_specs_with_options(repo, positive_specs, options.ignore_missing)?,
@@ -2386,13 +2391,14 @@ fn resolve_specs_for_objects(
     repo: &Repository,
     specs: &[String],
 ) -> Result<(Vec<ObjectId>, Vec<RootObject>, HashMap<ObjectId, ObjectId>)> {
-    resolve_specs_for_objects_with_options(repo, specs, false)
+    resolve_specs_for_objects_with_options(repo, specs, false, MissingAction::Error)
 }
 
 fn resolve_specs_for_objects_with_options(
     repo: &Repository,
     specs: &[String],
     ignore_missing: bool,
+    missing_action: MissingAction,
 ) -> Result<(Vec<ObjectId>, Vec<RootObject>, HashMap<ObjectId, ObjectId>)> {
     let mut commits = Vec::new();
     let mut roots = Vec::new();
@@ -2403,6 +2409,16 @@ fn resolve_specs_for_objects_with_options(
             let raw_object = match repo.odb.read(&raw_oid) {
                 Ok(obj) => obj,
                 Err(Error::ObjectNotFound(_)) if ignore_missing => continue,
+                Err(Error::ObjectNotFound(_)) if missing_action != MissingAction::Error => {
+                    roots.push(RootObject {
+                        oid: raw_oid,
+                        input: spec.clone(),
+                        expected_kind: None,
+                        root_path: None,
+                        wrap_with_tag: None,
+                    });
+                    continue;
+                }
                 Err(err) => return Err(err),
             };
             match raw_object.kind {

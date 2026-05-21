@@ -3558,11 +3558,7 @@ fn clone_submodules(work_tree: &Path, repo: &Repository, clone_args: &Args) -> R
         return Ok(());
     }
 
-    let n_workers = clone_args
-        .jobs
-        .unwrap_or(1)
-        .max(1)
-        .min(jobs.len());
+    let n_workers = clone_args.jobs.unwrap_or(1).max(1).min(jobs.len());
     if n_workers <= 1 {
         for j in jobs {
             let status = clone_with_optional_superproject_refs(
