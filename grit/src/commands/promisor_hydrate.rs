@@ -472,7 +472,7 @@ pub(crate) fn trim_promisor_marker_to_missing_local(dest: &Repository) -> Result
     let mut oids: HashSet<ObjectId> = read_promisor_missing_oids(&dest.git_dir)
         .into_iter()
         .collect();
-    oids.retain(|oid| !dest.odb.exists_local(oid));
+    oids.retain(|oid| !dest.odb.exists(oid));
     write_promisor_marker(&dest.git_dir, &oids).map_err(|e| anyhow::anyhow!(e))
 }
 

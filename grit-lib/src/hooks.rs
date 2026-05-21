@@ -5,7 +5,7 @@
 
 use crate::config::{parse_path, ConfigSet};
 use crate::objects::ObjectId;
-use crate::repo::{common_git_dir_for_config, Repository};
+use crate::repo::Repository;
 use crate::state::HeadState;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;

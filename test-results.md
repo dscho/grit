@@ -24,3 +24,8 @@ Updated: 2026-05-21
 - Harness partial clone: `./scripts/run-tests.sh t5616-partial-clone.sh` is 24/47 after `fetch-pack --stdin`, `blob:limit` filtering, and refetch negotiation work.
 - Pre-commit: `cargo check` passes with existing warnings; `cargo test -p grit-lib --lib` passes 204/204.
 - Pre-commit: `cargo clippy --fix --allow-dirty` completed only with the existing warning backlog; clippy reported failed auto-fixes in unrelated files and no scoped clippy changes were kept.
+- Phase 2 shallow partial clone: `cargo build --release -p grit-cli` passes with existing warnings.
+- Focused partial clone: `t5616-partial-clone.sh --run=1-17` passes, including shallow `clone --depth=1 --filter=blob:none` plus `fetch --refetch --filter=blob:limit=999`.
+- Harness partial clone: `./scripts/run-tests.sh t5616-partial-clone.sh` is 26/47 after shallow promisor marker and filtered-refetch marker trimming fixes.
+- Pre-commit: `cargo fmt` ran; `cargo check` passes with existing warnings; `cargo test -p grit-lib --lib` passes 204/204.
+- Pre-commit: `cargo clippy --fix --allow-dirty` completed after sandbox escalation; it applied one unused-import cleanup and still reports the existing clippy warning backlog plus failed auto-fixes in unrelated files.

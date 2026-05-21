@@ -1,6 +1,6 @@
 # PLAN.md — Grit v1 Library Release
 
-**Updated:** 2026-05-20
+**Updated:** 2026-05-21
 
 ## Goal
 
@@ -131,7 +131,7 @@ Extend `promisor.rs`, `shallow.rs`, and ODB miss handling.
 
 ### 2.3 Shallow + partial interaction
 
-- [ ] Shallow boundary + promisor: fetch deepen, push shallow (non-interactive).
+- [~] Shallow boundary + promisor: fetch deepen, push shallow (non-interactive).
 
 ### 2.4 Harness targets (partial / promisor)
 

@@ -1226,6 +1226,14 @@ pub fn run(mut args: Args) -> Result<()> {
         config.write().context("writing config")?;
     }
 
+    if args.revision.is_none() {
+        if let Some(depth) = args.depth {
+            if depth > 0 {
+                write_shallow_boundary(&dest, depth)?;
+            }
+        }
+    }
+
     if partial_blob_none {
         let filter_spec = filter_spec.as_deref().unwrap_or("blob:none");
         materialize_blob_none_partial_layout(&dest)
@@ -2313,6 +2321,7 @@ fn initialize_partial_clone_state_http(
     filter_spec: &str,
 ) -> Result<()> {
     let mut missing: Vec<String> = Vec::new();
+    let shallow_boundaries = grit_lib::shallow::load_shallow_boundaries(&dest.git_dir);
     if let Ok(head) = grit_lib::refs::resolve_ref(&dest.git_dir, "HEAD") {
         let mut queue = VecDeque::new();
         let mut seen_commits = HashSet::new();
@@ -2329,8 +2338,10 @@ fn initialize_partial_clone_state_http(
                         continue;
                     }
                     let commit = parse_commit(&obj.data)?;
-                    for p in &commit.parents {
-                        queue.push_back(*p);
+                    if !shallow_boundaries.contains(&oid) {
+                        for p in &commit.parents {
+                            queue.push_back(*p);
+                        }
                     }
                     queue.push_back(commit.tree);
                 }
@@ -2907,6 +2918,14 @@ fn run_ssh_clone(args: Args) -> Result<()> {
         };
         config.set(&format!("remote.{remote_name}.tagOpt"), "--no-tags")?;
         config.write().context("writing config")?;
+    }
+
+    if args.revision.is_none() {
+        if let Some(depth) = args.depth {
+            if depth > 0 {
+                write_shallow_boundary(&dest, depth)?;
+            }
+        }
     }
 
     if partial_blob_none {
@@ -5129,6 +5148,7 @@ fn collect_reachable_blob_oids_from_dest_refs(
     let mut seen_trees = HashSet::new();
     let mut seen_tags = HashSet::new();
     let mut queue = VecDeque::new();
+    let shallow_boundaries = grit_lib::shallow::load_shallow_boundaries(&dest.git_dir);
 
     // Seed only from `HEAD` (same default revision as `git rev-list` for this clone).
     if let Ok(head) = grit_lib::refs::resolve_ref(&dest.git_dir, "HEAD") {
@@ -5146,8 +5166,10 @@ fn collect_reachable_blob_oids_from_dest_refs(
                     continue;
                 }
                 let commit = parse_commit(&obj.data)?;
-                for p in &commit.parents {
-                    queue.push_back(*p);
+                if !shallow_boundaries.contains(&oid) {
+                    for p in &commit.parents {
+                        queue.push_back(*p);
+                    }
                 }
                 queue.push_back(commit.tree);
             }

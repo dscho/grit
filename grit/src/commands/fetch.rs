@@ -2797,6 +2797,11 @@ fn fetch_remote(
     if args.filter.is_some() && !args.no_filter {
         apply_partial_clone_fetch_config(git_dir, remote_name, args.filter.as_deref())?;
     }
+    if effective_filter.is_some() {
+        let repo = Repository::open(git_dir, None)?;
+        crate::commands::promisor_hydrate::trim_promisor_marker_to_missing_local(&repo)
+            .context("trimming promisor marker after filtered fetch")?;
+    }
 
     Ok(())
 }
@@ -3808,6 +3813,7 @@ fn copy_reachable_objects_filtered(
     let mut stack: Vec<ObjectId> = roots.to_vec();
     let mut seen = HashSet::new();
     let mut omitted = HashSet::new();
+    let shallow_boundaries = grit_lib::shallow::load_shallow_boundaries(dst_git_dir);
 
     while let Some(oid) = stack.pop() {
         if !seen.insert(oid) {
@@ -3831,7 +3837,9 @@ fn copy_reachable_objects_filtered(
             ObjectKind::Commit => {
                 let c = parse_commit(&obj.data)?;
                 stack.push(c.tree);
-                stack.extend_from_slice(&c.parents);
+                if !shallow_boundaries.contains(&oid) {
+                    stack.extend_from_slice(&c.parents);
+                }
             }
             ObjectKind::Tree => {
                 for e in parse_tree(&obj.data)? {
@@ -3845,13 +3853,12 @@ fn copy_reachable_objects_filtered(
         }
     }
 
-    if !omitted.is_empty() {
-        let mut marker_set: HashSet<ObjectId> = read_promisor_missing_oids(dst_git_dir)
-            .into_iter()
-            .collect();
-        marker_set.extend(omitted);
-        write_promisor_marker(dst_git_dir, &marker_set)?;
-    }
+    let mut marker_set: HashSet<ObjectId> = read_promisor_missing_oids(dst_git_dir)
+        .into_iter()
+        .collect();
+    marker_set.extend(omitted);
+    marker_set.retain(|oid| !dst_odb.exists_local(oid));
+    write_promisor_marker(dst_git_dir, &marker_set)?;
 
     Ok(())
 }
