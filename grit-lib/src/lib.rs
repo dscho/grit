@@ -108,6 +108,7 @@ pub mod sparse_checkout;
 pub mod split_index;
 pub mod unicode_normalization;
 pub mod untracked_cache;
+pub mod upload_filter;
 #[cfg(not(unix))]
 pub mod simple_ipc {
     /// Whether simple IPC is supported on this platform.

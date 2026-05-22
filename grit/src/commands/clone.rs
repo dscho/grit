@@ -618,6 +618,13 @@ pub fn run(mut args: Args) -> Result<()> {
             filter_spec.as_deref().unwrap_or("")
         );
     }
+    if is_file_url && uploadpack_filter_allowed(&source.git_dir) {
+        if let Some(spec) = filter_spec.as_deref().filter(|s| !s.trim().is_empty()) {
+            let config = ConfigSet::load(Some(&source.git_dir), false).unwrap_or_default();
+            grit_lib::upload_filter::validate_upload_filter_config(&config)?;
+            grit_lib::upload_filter::validate_upload_filter_request(&config, spec)?;
+        }
+    }
 
     let partial_blob_limit_zero = matches!(
         filter_spec.as_deref(),

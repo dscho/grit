@@ -62,6 +62,8 @@ pub fn run(args: Args) -> Result<()> {
         )
     })?;
     repo.enforce_safe_directory_git_dir()?;
+    let config = ConfigSet::load(Some(&repo.git_dir), false).unwrap_or_default();
+    grit_lib::upload_filter::validate_upload_filter_config(&config)?;
 
     trace2_transfer::emit_negotiated_version_from_git_protocol_env();
 
@@ -107,6 +109,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut wants: Vec<ObjectId> = Vec::new();
     let mut client_shallow_boundaries: HashSet<ObjectId> = HashSet::new();
     let mut requested_depth: Option<usize> = None;
+    let mut filter_spec: Option<String> = None;
     let mut multi_ack_detailed = false;
     loop {
         match pkt_line::read_packet(&mut stdin)? {
@@ -141,6 +144,12 @@ pub fn run(args: Args) -> Result<()> {
                             Some(current) => current.min(depth),
                             None => depth,
                         });
+                    }
+                } else if let Some(rest) = line.strip_prefix("filter ") {
+                    let spec = rest.trim();
+                    if !spec.is_empty() {
+                        grit_lib::upload_filter::validate_upload_filter_request(&config, spec)?;
+                        filter_spec = Some(spec.to_owned());
                     }
                 }
             }
@@ -266,8 +275,11 @@ pub fn run(args: Args) -> Result<()> {
         let thin = client_shallow_boundaries.is_empty()
             && !exclusion_commits.is_empty()
             && wants_include_only_commits(&repo, &want_unique);
-        let mut child =
-            crate::pack_objects_upload::spawn_pack_objects_upload(&repo.git_dir, thin, None)?;
+        let mut child = crate::pack_objects_upload::spawn_pack_objects_upload(
+            &repo.git_dir,
+            thin,
+            filter_spec.as_deref(),
+        )?;
         {
             let mut pin = child.stdin.take().context("pack-objects stdin")?;
             crate::pack_objects_upload::write_pack_objects_revs_stdin(

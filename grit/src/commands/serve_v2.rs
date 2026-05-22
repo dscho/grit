@@ -6,7 +6,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
-use grit_lib::config::{ConfigFile, ConfigScope};
+use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::git_date::parse::parse_date_basic;
 use grit_lib::merge_base;
 use grit_lib::objects::{self, parse_commit, ObjectId, ObjectKind};
@@ -365,6 +365,8 @@ fn cmd_fetch(
 ) -> Result<()> {
     let repo = Repository::open(git_dir, None)
         .with_context(|| format!("could not open repository at '{}'", git_dir.display()))?;
+    let config = ConfigSet::load(Some(git_dir), false).unwrap_or_default();
+    grit_lib::upload_filter::validate_upload_filter_config(&config)?;
 
     let mut wants: Vec<ObjectId> = Vec::new();
     let mut have_oids: Vec<ObjectId> = Vec::new();
@@ -439,6 +441,7 @@ fn cmd_fetch(
                 if spec.is_empty() {
                     bail!("unexpected line: '{s}'");
                 }
+                grit_lib::upload_filter::validate_upload_filter_request(&config, spec)?;
                 filter_spec = Some(spec.to_owned());
             }
             s if s.starts_with("packfile-uris ") => {
