@@ -7,13 +7,15 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
-use grit_lib::config::{parse_bool, ConfigFile, ConfigScope, ConfigSet};
+use grit_lib::config::{canonical_key, parse_bool, ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::error::Error as GritError;
 use grit_lib::hooks::{run_hook, HookResult};
 use grit_lib::merge_base;
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
-use grit_lib::promisor::{read_promisor_missing_oids, write_promisor_marker};
+use grit_lib::promisor::{
+    read_promisor_missing_oids, repo_treats_promisor_packs, write_promisor_marker,
+};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::ObjectFilter;
@@ -31,7 +33,7 @@ use crate::ref_transaction_hooks::{
     run_ref_transaction_aborted, run_ref_transaction_committed, run_ref_transaction_prepare,
     HookUpdate,
 };
-use crate::trace_run_command_git_invocation;
+use crate::{trace2_emit_git_subcommand_argv, trace_run_command_git_invocation};
 
 /// Error carrying a Git-compatible exit code (e.g. 128 for transport failures).
 #[derive(Debug)]
@@ -2872,17 +2874,35 @@ fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result
         return Ok(());
     }
     let repo = Repository::open(git_dir, None)?;
-    trace_run_command_git_invocation(&["maintenance", "run", "--auto", "--no-quiet", "--detach"]);
+    let quiet_arg = if args.quiet { "--quiet" } else { "--no-quiet" };
+    let cfg = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
+    let foreground_maintenance = args.refetch || repo_treats_promisor_packs(git_dir, &cfg);
+    let detach_arg = if foreground_maintenance {
+        "--no-detach"
+    } else {
+        "--detach"
+    };
+    let trace_args = ["maintenance", "run", "--auto", quiet_arg, detach_arg];
+    trace_run_command_git_invocation(&trace_args);
+    let trace2_args = ["git", "maintenance", "run", "--auto", quiet_arg, detach_arg]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<Vec<_>>();
+    trace2_emit_git_subcommand_argv(&trace2_args);
     let work_dir = repo.work_tree.as_deref().unwrap_or(git_dir);
     let mut cmd = Command::new(crate::grit_exe::grit_executable());
     cmd.current_dir(work_dir)
-        .args(["maintenance", "run", "--auto"]);
-    if args.quiet {
-        cmd.arg("--quiet");
-    } else {
-        cmd.arg("--no-quiet");
+        .args(["maintenance", "run", "--auto"])
+        .arg(quiet_arg)
+        .arg(detach_arg);
+    if args.refetch {
+        let overrides = refetch_maintenance_config_overrides(&cfg);
+        emit_refetch_maintenance_trace_config(&overrides);
+        cmd.env(
+            "GIT_CONFIG_PARAMETERS",
+            append_git_config_parameters(std::env::var("GIT_CONFIG_PARAMETERS").ok(), &overrides),
+        );
     }
-    cmd.arg("--detach");
     let status = cmd
         .status()
         .context("failed to run auto maintenance after fetch")?;
@@ -2890,6 +2910,89 @@ fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result
         eprintln!("warning: auto maintenance returned non-zero status");
     }
     Ok(())
+}
+
+fn refetch_maintenance_config_overrides(config: &ConfigSet) -> [(&'static str, String); 2] {
+    let gc_auto_pack_limit = match config
+        .get("gc.autopacklimit")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    {
+        Some(0) => "0",
+        _ => "1",
+    };
+    let incremental_repack_auto = match config
+        .get("maintenance.incremental-repack.auto")
+        .as_deref()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+    {
+        Some(0) => "0",
+        _ => "-1",
+    };
+    [
+        ("gc.autopacklimit", gc_auto_pack_limit.to_string()),
+        (
+            "maintenance.incremental-repack.auto",
+            incremental_repack_auto.to_string(),
+        ),
+    ]
+}
+
+fn append_git_config_parameters(
+    existing: Option<String>,
+    overrides: &[(&'static str, String); 2],
+) -> String {
+    let mut parts = existing
+        .filter(|value| !value.trim().is_empty())
+        .into_iter()
+        .collect::<Vec<_>>();
+    parts.extend(
+        overrides
+            .iter()
+            .map(|(key, value)| format!("'{key}={value}'")),
+    );
+    parts.join(" ")
+}
+
+fn emit_refetch_maintenance_trace_config(overrides: &[(&'static str, String); 2]) {
+    let Ok(path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let requested = requested_trace2_config_params();
+    if requested.is_empty() {
+        return;
+    }
+    for (key, value) in overrides {
+        if requested
+            .iter()
+            .any(|requested_key| requested_key.as_str() == *key)
+        {
+            let _ = write_trace2_config_param(&path, key, value);
+        }
+    }
+}
+
+fn requested_trace2_config_params() -> Vec<String> {
+    std::env::var("GIT_TRACE2_CONFIG_PARAMS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|key| canonical_key(key.trim()).ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn write_trace2_config_param(path: &str, key: &str, value: &str) -> std::io::Result<()> {
+    writeln!(
+        OpenOptions::new().create(true).append(true).open(path)?,
+        r#"{{"event":"def_param","sid":"grit-0","param":"{}","value":"{}"}}"#,
+        key,
+        value
+    )
 }
 
 /// Known `extensions.*` keys Git accepts in v0 repos (`setup.c` `handle_extension_v0`).

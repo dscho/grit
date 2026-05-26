@@ -137,6 +137,9 @@ Extend `promisor.rs`, `shallow.rs`, and ODB miss handling.
 
 - [x] `t0410-partial-clone`
 - [~] `t5616-partial-clone`
+  - [x] `fetch --refetch` runs partial-clone maintenance in the foreground and emits expected trace2 config params (`t5616` test 18).
+  - [x] Filtered `file://` clones with `transfer.fsckobjects=1` emit the expected `index-pack --fsck-objects` trace (`t5616` test 21).
+  - [~] Remaining failures cover `tree:0` backfill/fsck, combine-filter tracing, sparse filter files, lazy delta fetch, partial-clone repack/gc, submodule lazy fetch, and HTTP incomplete-pack edge cases.
 - [ ] `t6421-merge-partial-clone`, `t1022-read-tree-partial-clone`
 - [ ] `t5620-backfill`, `t6110-rev-list-sparse` (promisor-related cases)
 - [ ] `t4067-diff-partial-clone`, `t5537-fetch-shallow` (non-interactive)

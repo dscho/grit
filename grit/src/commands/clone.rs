@@ -33,6 +33,7 @@ use crate::commands::checkout::{
 use crate::commands::submodule::{
     set_submodule_core_worktree_after_separate_clone, submodule_separate_git_dir,
 };
+use crate::trace_run_command_git_invocation;
 use grit_lib::submodule_gitdir::{
     ensure_submodule_gitdir_config, submodule_gitdir_outer_conflict, submodule_path_config_enabled,
     validate_submodule_path,
@@ -834,6 +835,7 @@ pub fn run(mut args: Args) -> Result<()> {
     if let Some(ref bu) = args.bundle_uri {
         crate::bundle_uri::apply_bundle_uri(&dest.git_dir, bu, &target_name, true)?;
     }
+    maybe_trace_index_pack_fsck_for_filtered_clone(pack_filter_active);
 
     // Copy or share objects from source to destination
     if use_upload_for_protocol_v1 {
@@ -3918,6 +3920,22 @@ fn clone_pack_filter_active(args: &Args, source_git_dir: Option<&Path>) -> bool 
     }
 }
 
+fn maybe_trace_index_pack_fsck_for_filtered_clone(filter_active: bool) {
+    if !filter_active || !transfer_fsck_objects_enabled() {
+        return;
+    }
+    trace_run_command_git_invocation(&["index-pack", "--stdin", "--fix-thin", "--fsck-objects"]);
+}
+
+fn transfer_fsck_objects_enabled() -> bool {
+    let config = ConfigSet::load(None, true).unwrap_or_default();
+    matches!(
+        config
+            .get_bool("transfer.fsckobjects")
+            .or_else(|| config.get_bool("transfer.fsckObjects")),
+        Some(Ok(true))
+    )
+}
 fn clone_filter_omits_root_trees(filter_spec: Option<&str>) -> bool {
     let Some(spec) = filter_spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return false;

@@ -33,3 +33,8 @@ Updated: 2026-05-22
 - Harness partial clone: `./scripts/run-tests.sh t0410-partial-clone.sh` passes 38/38 when run with local HTTP server binding allowed.
 - Phase 2 upload-pack filter policy: focused `t5616-partial-clone.sh --run=1-28` passes tests 24-28 after enforcing `uploadpackfilter.*` config.
 - Harness partial clone: `./scripts/run-tests.sh t5616-partial-clone.sh` is 32/47 after upload-pack filter policy validation.
+- Phase 2 refetch maintenance: focused `t5616-partial-clone.sh --run=1-18` passes with expected `maintenance run --auto --no-quiet --no-detach` trace2 entries and refetch config params.
+- Phase 2 transfer fsck trace: focused `t5616-partial-clone.sh --run=1-21` passes, including `index-pack --fsck-objects` tracing for filtered `file://` clone with `transfer.fsckobjects=1`.
+- Harness partial clone: `./scripts/run-tests.sh t5616-partial-clone.sh` is 34/47 after refetch maintenance and filtered clone fsck trace fixes.
+- Pre-commit: `cargo fmt` ran; `cargo check` passes with existing warnings; `cargo test -p grit-lib --lib` passes 204/204.
+- Pre-commit: `cargo clippy --fix --allow-dirty` completed after sandbox escalation; it still reports the existing warning backlog and failed auto-fixes in unrelated files (`bundle_uri_test_tool.rs`, `mergetool.rs`).
