@@ -5163,11 +5163,19 @@ fn collect_reachable_skeleton_and_blobs(
     let mut seen_tags = HashSet::new();
     let mut queue = VecDeque::new();
 
+    // Blobs that a ref (or a tag chain) points at directly must stay present, like upstream
+    // upload-pack, which always sends ref-tip objects (even blobs) in a filtered pack. Track
+    // those OIDs so the `Blob` arm classifies them as skeleton (kept) rather than deletable
+    // content blobs (t5616 "fetches blobs pointed to by refs even if normally filtered out").
+    let mut ref_target_blobs: HashSet<ObjectId> = HashSet::new();
+
     if let Ok(head) = grit_lib::refs::resolve_ref(&repo.git_dir, "HEAD") {
+        ref_target_blobs.insert(head);
         queue.push_back(head);
     }
     if let Ok(refs) = grit_lib::refs::list_refs(&repo.git_dir, "refs/") {
         for (_, oid) in refs {
+            ref_target_blobs.insert(oid);
             queue.push_back(oid);
         }
     }
@@ -5211,14 +5219,23 @@ fn collect_reachable_skeleton_and_blobs(
                 }
                 skeleton.insert(oid);
                 if let Ok(tag) = parse_tag(&obj.data) {
+                    // A tag pointing directly at a blob keeps that blob present too.
+                    ref_target_blobs.insert(tag.object);
                     queue.push_back(tag.object);
                 }
             }
             ObjectKind::Blob => {
-                blobs.insert(oid);
+                if ref_target_blobs.contains(&oid) {
+                    skeleton.insert(oid);
+                } else {
+                    blobs.insert(oid);
+                }
             }
         }
     }
+
+    // A ref-tip blob must never also be queued for deletion via a tree entry.
+    blobs.retain(|oid| !skeleton.contains(oid));
 
     Ok((skeleton, blobs))
 }
