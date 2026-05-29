@@ -2282,6 +2282,15 @@ fn run_http_clone(args: Args) -> Result<()> {
         initialize_partial_clone_state_http(&dest, &remote_name, "blob:none")?;
     }
 
+    // A filtered HTTP clone must still receive every object a ref points at directly (upstream
+    // upload-pack always sends ref-tip objects). Verify each ref tip is present or promised; if a
+    // crafted/buggy server omits one without promising it, fail like Git rather than leaving a ref
+    // dangling (t5616 "upon cloning, check that all refs point to objects").
+    if partial_blob_none_http {
+        check_clone_ref_tip_connectivity(&dest)
+            .context("checking ref-tip connectivity after partial clone")?;
+    }
+
     if partial_blob_none_http && !args.bare && !args.no_checkout {
         if grit_lib::refs::resolve_ref(&dest.git_dir, "HEAD").is_err() {
             crate::commands::promisor_hydrate::trim_promisor_marker_to_missing_local(&dest)
@@ -5150,6 +5159,34 @@ fn promisor_ref_list(repo: &Repository) -> Result<String> {
     } else {
         format!("{}\n", lines.join("\n"))
     })
+}
+
+/// Verify that every ref points directly at an object that is present or promised.
+///
+/// This does NOT descend into trees or follow tag peel chains: content blobs/trees omitted by the
+/// filter — and the target of an annotated tag — are legitimately absent (promised by the promisor
+/// remote), which upstream tolerates ("tolerate server not sending target of tag"). It only fails
+/// when a ref itself points directly at an object the server neither sent nor promised — Git's
+/// "did not send all necessary objects" ("upon cloning, check that all refs point to objects").
+fn check_clone_ref_tip_connectivity(dest: &Repository) -> Result<()> {
+    let promised = grit_lib::promisor::promisor_pack_object_ids(&dest.git_dir.join("objects"));
+
+    let mut tips: Vec<ObjectId> = Vec::new();
+    if let Ok(head) = grit_lib::refs::resolve_ref(&dest.git_dir, "HEAD") {
+        tips.push(head);
+    }
+    if let Ok(refs) = grit_lib::refs::list_refs(&dest.git_dir, "refs/") {
+        for (_, oid) in refs {
+            tips.push(oid);
+        }
+    }
+
+    for oid in tips {
+        if dest.odb.read(&oid).is_err() && !promised.contains(&oid) {
+            bail!("did not send all necessary objects");
+        }
+    }
+    Ok(())
 }
 
 /// Walk all refs and partition reachable objects into commits+trees vs blobs.
