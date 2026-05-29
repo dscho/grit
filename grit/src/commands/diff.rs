@@ -3197,11 +3197,16 @@ pub fn run(mut args: Args) -> Result<()> {
                 writeln!(out)?;
             }
             // `git diff --stat -p` prints stat then patch only when `-p`/`-u`/etc. appear on argv;
-            // plain `--stat` must not append hunks (matches Git).
+            // plain `--stat` must not append hunks (matches Git). But a plain `git diff` with no
+            // competing format (no --stat/--raw/--name-only/... and no -s/--no-patch, the latter
+            // already cleared show_unified_patch) must emit the unified patch body — that is the
+            // default Git behavior. Gate the extra hunks on either an explicit -p alongside a
+            // stat/format, or the absence of any other format entirely.
             let submodule_fmt_requested = args.submodule.as_deref().is_some_and(|s| !s.is_empty());
             let show_unified_after_stat = !args.no_patch
                 && (diff_cli_requests_unified_patch_alongside_stat(&raw_args)
-                    || submodule_fmt_requested);
+                    || submodule_fmt_requested
+                    || !format_besides_unified_patch);
             if show_unified_after_stat {
                 for patch in &conflict_combined_patches {
                     write!(out, "{patch}")?;
