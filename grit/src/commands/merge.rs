@@ -8330,16 +8330,20 @@ fn tree_to_map_for_merge(
 
 /// Maps a canonical (ASCII-lowercased) merge key back to the original on-disk spelling.
 ///
-/// Built once per merge from the un-lowercased side trees with priority ours > theirs > base, so
-/// after `merge_trees` returns we can rewrite the lowercased result paths back to the spelling the
-/// real index/worktree uses. Without this, `core.ignorecase` merges would emit lowercased paths
-/// (e.g. `a.t` instead of the tracked `A.t`), breaking case-sensitive byte comparisons against the
-/// real index in `bail_if_merge_would_overwrite_local_changes` / `remove_deleted_files` (t6110).
+/// Built once per merge from the un-lowercased side trees (see
+/// [`build_original_spelling_table`] for the priority rules), so after `merge_trees` returns we can
+/// rewrite the lowercased result paths back to the spelling the real index/worktree uses. Without
+/// this, `core.ignorecase` merges would emit lowercased paths (e.g. `a.t` instead of the tracked
+/// `A.t`), breaking case-sensitive byte comparisons against the real index in
+/// `bail_if_merge_would_overwrite_local_changes` / `remove_deleted_files` (t6110).
 type OriginalSpellingTable = HashMap<Vec<u8>, Vec<u8>>;
 
-/// Build the canonical-lowercase → original-spelling table from the raw (un-lowercased) side
-/// entries. Priority ours > theirs > base matches `git merge-ort`, which keeps the current side's
-/// spelling when only the case differs.
+/// Build the canonical-lowercase → original-spelling table from the raw (un-lowercased) side trees.
+///
+/// For a case-only rename (e.g. base `TestCase`, theirs renamed to `testcase`, ours kept
+/// `TestCase`), `git merge-ort` keeps the *renamed* spelling. So the priority is: a side whose
+/// spelling differs from base (the side that performed the case change) wins over a side that kept
+/// the base spelling; among equally-eligible sides prefer ours, then theirs, then base.
 fn build_original_spelling_table(
     repo: &Repository,
     base_tree: &ObjectId,
@@ -8349,13 +8353,41 @@ fn build_original_spelling_table(
     if !core_ignorecase(repo) {
         return Ok(None);
     }
-    let mut table: OriginalSpellingTable = HashMap::new();
-    // Insert in reverse priority order (base, then theirs, then ours) so higher-priority spellings
-    // overwrite lower-priority ones for the same canonical key.
-    for tree in [base_tree, theirs_tree, ours_tree] {
+    let collect = |tree: &ObjectId| -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+        let mut m = HashMap::new();
         for e in tree_to_index_entries(repo, tree, "")? {
             let key = path_ascii_lowercase_components(&e.path);
-            table.insert(key, e.path);
+            m.entry(key).or_insert(e.path);
+        }
+        Ok(m)
+    };
+    let base = collect(base_tree)?;
+    let ours = collect(ours_tree)?;
+    let theirs = collect(theirs_tree)?;
+
+    let mut keys: BTreeSet<&Vec<u8>> = BTreeSet::new();
+    keys.extend(base.keys());
+    keys.extend(ours.keys());
+    keys.extend(theirs.keys());
+
+    let mut table: OriginalSpellingTable = HashMap::new();
+    for key in keys {
+        let base_spelling = base.get(key);
+        // A side "renamed" (case-changed) the path when its spelling differs from base's.
+        let changed = |side: Option<&Vec<u8>>| match (side, base_spelling) {
+            (Some(s), Some(b)) => s != b,
+            (Some(_), None) => false, // pure add: spelling is its own, not a case-rename
+            (None, _) => false,
+        };
+        let pick = if changed(ours.get(key)) {
+            ours.get(key)
+        } else if changed(theirs.get(key)) {
+            theirs.get(key)
+        } else {
+            ours.get(key).or_else(|| theirs.get(key)).or(base_spelling)
+        };
+        if let Some(spelling) = pick {
+            table.insert(key.clone(), spelling.clone());
         }
     }
     Ok(Some(table))
