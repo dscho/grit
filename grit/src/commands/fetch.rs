@@ -2852,12 +2852,28 @@ fn maybe_write_commit_graph_after_fetch(git_dir: &Path, args: &Args) -> Result<(
     Ok(())
 }
 
+/// Whether `s` is a full 40-hex (SHA-1) object ID, i.e. an explicit `want <oid>`
+/// rather than a refspec or ref name.
+fn is_raw_object_id(s: &str) -> bool {
+    let s = s.trim();
+    s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 fn effective_fetch_filter(config: &ConfigSet, remote_name: &str, args: &Args) -> Option<String> {
     if args.no_filter {
         return None;
     }
     if let Some(spec) = args.filter.as_deref().filter(|s| !s.trim().is_empty()) {
         return Some(spec.to_owned());
+    }
+
+    // When the user names specific object IDs to fetch (`git fetch origin <oid>`),
+    // do not apply the inherited partial-clone filter: the server would otherwise
+    // filter out the very object that was explicitly requested. Matches upstream,
+    // which omits the filter for an explicit `want <oid>` (t5616 "fetch what is
+    // specified on CLI even if already promised").
+    if args.refspecs.iter().any(|s| is_raw_object_id(s)) {
+        return None;
     }
 
     let promisor_key = format!("remote.{remote_name}.promisor");
