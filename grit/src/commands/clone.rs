@@ -613,6 +613,20 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let filter_spec = clone_filter_spec(&args);
 
+    // A `file://` partial clone whose filter cannot be reproduced by the client-side
+    // `copy_objects` + materialize layout (e.g. `tree:<n>`, `sparse:oid=…`, or a combine spec
+    // containing them) must negotiate via upload-pack so `pack-objects --filter` applies the
+    // reachability-aware filter server-side. Match upstream Git, which disables the local-clone
+    // optimization for partial clones.
+    if is_file_url
+        && !args.no_local
+        && uploadpack_filter_allowed(&source.git_dir)
+        && filter_spec.is_some()
+        && !clone_filter_materializable_locally(filter_spec.as_deref())
+    {
+        args.no_local = true;
+    }
+
     if is_file_url && filter_spec.is_some() && !uploadpack_filter_allowed(&source.git_dir) {
         eprintln!(
             "warning: filtering not recognized by server, ignoring --filter={}",
@@ -3986,6 +4000,31 @@ fn clone_filter_omits_root_trees(filter_spec: Option<&str>) -> bool {
             .iter()
             .any(|filter| matches!(filter, ObjectFilter::TreeDepth(0))),
         _ => false,
+    }
+}
+
+/// Whether the client-side `copy_objects` + materialize layout can faithfully apply this filter.
+///
+/// Only `blob:none` (and combine specs whose only effect is omitting blobs / omitting root trees,
+/// i.e. `tree:0`) can be materialized client-side. A `tree:<depth>` with depth>0, `sparse:oid=…`,
+/// or `blob:limit=<nonzero>` requires the actual reachability-aware filter that
+/// `pack-objects --filter` applies on the upload-pack side; those must negotiate via upload-pack.
+fn clone_filter_materializable_locally(filter_spec: Option<&str>) -> bool {
+    let Some(spec) = filter_spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    fn one_ok(f: &ObjectFilter) -> bool {
+        match f {
+            ObjectFilter::BlobNone => true,
+            ObjectFilter::TreeDepth(d) => *d == 0,
+            ObjectFilter::Combine(parts) => parts.iter().all(one_ok),
+            _ => false,
+        }
+    }
+    match ObjectFilter::parse(spec) {
+        Ok(f) => one_ok(&f),
+        // An unparseable spec is left to the server to reject.
+        Err(_) => false,
     }
 }
 

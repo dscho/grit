@@ -1553,6 +1553,62 @@ fn object_filter_omits_blob(filter: &ObjectFilter, size: u64) -> bool {
     }
 }
 
+/// Whether `--filter=<spec>` needs the reachability-aware `rev-list` object walk rather than the
+/// flat blob-size post-filter (`object_filter_omits_blob`).
+///
+/// `blob:none` / `blob:limit=<n>` only depend on a blob's size, so the cheaper flat pass suffices.
+/// `tree:<depth>`, `sparse:oid=…`, and `object:type=…` (and any combine spec containing them) depend
+/// on the object's position in the reachability graph (tree depth, path), so the full walk is
+/// required to know which trees/blobs to omit.
+fn filter_needs_rev_list_walk(spec: &str) -> bool {
+    fn needs(f: &ObjectFilter) -> bool {
+        match f {
+            ObjectFilter::BlobNone | ObjectFilter::BlobLimit(_) => false,
+            ObjectFilter::TreeDepth(_)
+            | ObjectFilter::SparseOid(_)
+            | ObjectFilter::ObjectType(_) => true,
+            ObjectFilter::Combine(parts) => parts.iter().any(needs),
+        }
+    }
+    ObjectFilter::parse(spec)
+        .map(|f| needs(&f))
+        .unwrap_or(false)
+}
+
+/// Collect the filtered object set for `pack-objects --revs --filter=<spec>` using the
+/// reachability-aware `rev-list` walk (which honors `tree:<depth>`, `sparse:oid=…`, `combine:…`).
+///
+/// Commits are included as objects so the resulting pack carries the commit history; trees/blobs
+/// follow the filter's per-object decisions.
+fn collect_filtered_objects_via_rev_list(
+    repo: &Repository,
+    positive: &[String],
+    negative: &[String],
+    filter_spec: &str,
+) -> Result<Vec<ObjectId>> {
+    let filter = ObjectFilter::parse(filter_spec)
+        .map_err(|e| anyhow::anyhow!("invalid filter spec '{filter_spec}': {e}"))?;
+    let mut opts = RevListOptions::default();
+    opts.objects = true;
+    opts.missing_action = MissingAction::Allow;
+    opts.filter = Some(filter);
+    let r = rev_list(repo, positive, negative, &opts)
+        .map_err(|e| anyhow::anyhow!("rev-list for pack-objects --filter: {e}"))?;
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut out: Vec<ObjectId> = Vec::new();
+    for c in &r.commits {
+        if seen.insert(*c) {
+            out.push(*c);
+        }
+    }
+    for (o, _) in &r.objects {
+        if seen.insert(*o) {
+            out.push(*o);
+        }
+    }
+    Ok(out)
+}
+
 fn read_object_from_repo_unverified(
     repo: &Repository,
     oid: &ObjectId,
@@ -1964,6 +2020,24 @@ fn collect_pack_objects_from_rev_stdin_lines(
         } else {
             positive.push(trimmed.to_string());
         }
+    }
+
+    // A reachability-aware filter (`tree:<depth>`, `sparse:oid=…`, `object:type=…`, or a combine
+    // spec containing them) cannot be applied by the flat blob-size post-pass. Enumerate the
+    // filtered object set with the `rev-list` walk, which honors per-object tree depth / path.
+    if let Some(spec) = args
+        .filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| filter_needs_rev_list_walk(s))
+    {
+        let ordered = collect_filtered_objects_via_rev_list(repo, &positive, &negative, spec)?;
+        return Ok(PackObjectList {
+            oids: ordered,
+            thin_blob_deltas: Vec::new(),
+            rev_list_stdin: true,
+        });
     }
 
     let use_sparse = pack_objects_sparse_mode(repo, args)?;
