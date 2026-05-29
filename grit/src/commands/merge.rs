@@ -1958,7 +1958,8 @@ fn do_real_merge(
     // Flatten trees to path→entry maps
     let mut base_entries =
         tree_to_map_for_merge(repo, tree_to_index_entries(repo, &base_tree, "")?);
-    let ours_entries = tree_to_map_for_merge(repo, tree_to_index_entries(repo, &ours_tree, "")?);
+    let mut ours_entries =
+        tree_to_map_for_merge(repo, tree_to_index_entries(repo, &ours_tree, "")?);
     let mut theirs_entries =
         tree_to_map_for_merge(repo, tree_to_index_entries(repo, &theirs_tree, "")?);
     apply_subtree_shift(
@@ -1967,6 +1968,12 @@ fn do_real_merge(
         &mut base_entries,
         &mut theirs_entries,
     );
+
+    // On case-insensitive repos (`core.ignorecase`), merge keys are ASCII-lowercased so cross-side
+    // case-only renames collapse to one path (t6419). Capture the original spelling now so we can
+    // rewrite the lowercased merge result back to the spelling the real index/worktree uses,
+    // otherwise downstream byte-exact comparisons against the real index misfire (t6110).
+    let spelling_table = build_original_spelling_table(repo, &base_tree, &ours_tree, &theirs_tree)?;
 
     let autostash_entries = if args.autostash {
         capture_dirty_tracked_entries(repo)?
@@ -2035,6 +2042,17 @@ Aborting"
         criss_cross_outer,
         None,
     )?;
+
+    // Rewrite lowercased merge-key paths back to original spelling (case-insensitive repos only) so
+    // the result index/worktree and the ours/base/theirs maps used below all agree with the real
+    // index spelling.
+    if let Some(ref table) = spelling_table {
+        restore_merge_result_spelling(&mut merge_result, table);
+        restore_map_spelling(&mut ours_entries, table);
+        restore_map_spelling(&mut base_entries, table);
+        restore_map_spelling(&mut theirs_entries, table);
+    }
+
     apply_sparse_checkout_skip_worktree(
         &repo.git_dir,
         repo.work_tree.as_deref(),
@@ -8308,6 +8326,99 @@ fn tree_to_map_for_merge(
         out.entry(key).or_insert(e);
     }
     out
+}
+
+/// Maps a canonical (ASCII-lowercased) merge key back to the original on-disk spelling.
+///
+/// Built once per merge from the un-lowercased side trees with priority ours > theirs > base, so
+/// after `merge_trees` returns we can rewrite the lowercased result paths back to the spelling the
+/// real index/worktree uses. Without this, `core.ignorecase` merges would emit lowercased paths
+/// (e.g. `a.t` instead of the tracked `A.t`), breaking case-sensitive byte comparisons against the
+/// real index in `bail_if_merge_would_overwrite_local_changes` / `remove_deleted_files` (t6110).
+type OriginalSpellingTable = HashMap<Vec<u8>, Vec<u8>>;
+
+/// Build the canonical-lowercase → original-spelling table from the raw (un-lowercased) side
+/// entries. Priority ours > theirs > base matches `git merge-ort`, which keeps the current side's
+/// spelling when only the case differs.
+fn build_original_spelling_table(
+    repo: &Repository,
+    base_tree: &ObjectId,
+    ours_tree: &ObjectId,
+    theirs_tree: &ObjectId,
+) -> Result<Option<OriginalSpellingTable>> {
+    if !core_ignorecase(repo) {
+        return Ok(None);
+    }
+    let mut table: OriginalSpellingTable = HashMap::new();
+    // Insert in reverse priority order (base, then theirs, then ours) so higher-priority spellings
+    // overwrite lower-priority ones for the same canonical key.
+    for tree in [base_tree, theirs_tree, ours_tree] {
+        for e in tree_to_index_entries(repo, tree, "")? {
+            let key = path_ascii_lowercase_components(&e.path);
+            table.insert(key, e.path);
+        }
+    }
+    Ok(Some(table))
+}
+
+/// Rewrite a single path from its canonical-lowercase form to the original spelling, recomputing
+/// the 0xFFF path-length flag bits exactly as `tree_to_map_for_merge` does.
+fn restore_entry_spelling(entry: &mut IndexEntry, table: &OriginalSpellingTable) {
+    if let Some(original) = table.get(&entry.path) {
+        if *original != entry.path {
+            let plen = original.len().min(0xFFF) as u16;
+            entry.path = original.clone();
+            entry.flags = (entry.flags & !0xFFF) | plen;
+        }
+    }
+}
+
+/// Restore original spelling on every entry of an index (all stages).
+fn restore_index_spelling(index: &mut Index, table: &OriginalSpellingTable) {
+    for e in &mut index.entries {
+        restore_entry_spelling(e, table);
+    }
+}
+
+/// Restore original spelling on a path→entry map (rebuilt because keys change with the spelling).
+fn restore_map_spelling(map: &mut HashMap<Vec<u8>, IndexEntry>, table: &OriginalSpellingTable) {
+    let old = std::mem::take(map);
+    for (_key, mut e) in old {
+        restore_entry_spelling(&mut e, table);
+        map.insert(e.path.clone(), e);
+    }
+}
+
+/// Restore original spelling on a `String` path used in conflict output.
+fn restore_string_path_spelling(path: &str, table: &OriginalSpellingTable) -> String {
+    match table.get(path.as_bytes()) {
+        Some(original) => String::from_utf8_lossy(original).into_owned(),
+        None => path.to_string(),
+    }
+}
+
+/// Rewrite all lowercased result paths in a `MergeResult` (index, conflict files, conflict
+/// descriptions) back to original spelling so they line up with the real index/worktree.
+fn restore_merge_result_spelling(result: &mut MergeResult, table: &OriginalSpellingTable) {
+    restore_index_spelling(&mut result.index, table);
+    for (path, _content) in &mut result.conflict_files {
+        *path = restore_string_path_spelling(path, table);
+    }
+    for desc in &mut result.conflict_descriptions {
+        desc.subject_path = restore_string_path_spelling(&desc.subject_path, table);
+        if let Some(p) = desc.remerge_anchor_path.take() {
+            desc.remerge_anchor_path = Some(restore_string_path_spelling(&p, table));
+        }
+        if let Some(p) = desc.rename_rr_ours_dest.take() {
+            desc.rename_rr_ours_dest = Some(restore_string_path_spelling(&p, table));
+        }
+        if let Some(p) = desc.rename_rr_theirs_dest.take() {
+            desc.rename_rr_theirs_dest = Some(restore_string_path_spelling(&p, table));
+        }
+        if let Some(p) = desc.auto_merge_hint_path.take() {
+            desc.auto_merge_hint_path = Some(restore_string_path_spelling(&p, table));
+        }
+    }
 }
 
 /// Resolve a merge target (branch name or commit-ish).
