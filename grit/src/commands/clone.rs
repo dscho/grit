@@ -4885,7 +4885,11 @@ fn materialize_blob_none_partial_layout(dest: &Repository) -> Result<()> {
             Ok(o) => o,
             Err(_) => continue,
         };
-        let _ = dest.odb.write(obj.kind, &obj.data)?;
+        // Force a loose copy even though the object is still present in the
+        // just-fetched pack: `write` (and `write_local`) would short-circuit
+        // because the object exists in that pack, leaving nothing loose once
+        // the packs are deleted below.
+        let _ = dest.odb.write_loose_materialize(obj.kind, &obj.data)?;
     }
 
     let pack_dir = dest.git_dir.join("objects/pack");
@@ -4938,7 +4942,9 @@ fn materialize_tree_zero_partial_layout(dest: &Repository) -> Result<Vec<ObjectI
             Ok(o) => o,
             Err(_) => continue,
         };
-        let _ = dest.odb.write(obj.kind, &obj.data)?;
+        // Force a loose copy even though the object is still present in the
+        // just-fetched pack (see `materialize_blob_none_partial_layout`).
+        let _ = dest.odb.write_loose_materialize(obj.kind, &obj.data)?;
     }
 
     let pack_dir = dest.git_dir.join("objects/pack");

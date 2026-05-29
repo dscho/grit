@@ -2881,6 +2881,11 @@ fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result
     let repo = Repository::open(git_dir, None)?;
     let quiet_arg = if args.quiet { "--quiet" } else { "--no-quiet" };
     let cfg = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
+    // Mirror upstream `prepare_auto_maintenance`: when `maintenance.auto` is
+    // explicitly false, do not run (or even spawn) maintenance after fetch.
+    if cfg.get_bool("maintenance.auto").and_then(|r| r.ok()) == Some(false) {
+        return Ok(());
+    }
     let foreground_maintenance = args.refetch || repo_treats_promisor_packs(git_dir, &cfg);
     let detach_arg = if foreground_maintenance {
         "--no-detach"

@@ -639,6 +639,12 @@ pub fn run(mut args: Args) -> Result<()> {
         if !args.stdout && !args.quiet {
             eprintln!("Total 0 (delta 0), reused 0 (delta 0)");
         }
+        // `--unpack-unreachable` (repack -A) must still run the loosen pass and
+        // emit its trace even when no pack is written (Git runs
+        // `loosen_unused_packed_objects` during object enumeration).
+        if args.unpack_unreachable.is_some() {
+            loosen_unused_packed_objects(&repo, &HashSet::new(), &[], args.honor_pack_keep)?;
+        }
         return Ok(());
     }
 
@@ -694,6 +700,12 @@ pub fn run(mut args: Args) -> Result<()> {
         }
         if !args.stdout && !args.quiet {
             eprintln!("Total 0 (delta 0), reused 0 (delta 0)");
+        }
+        // See comment above: emit the `--unpack-unreachable` loosen trace even
+        // when the filtered object set turns out empty.
+        if args.unpack_unreachable.is_some() {
+            let packed: HashSet<ObjectId> = pack_list.oids.iter().copied().collect();
+            loosen_unused_packed_objects(&repo, &packed, &[], args.honor_pack_keep)?;
         }
         return Ok(());
     }
@@ -2492,6 +2504,7 @@ fn loosen_unused_packed_objects(
     };
     let indexes = grit_lib::pack::read_local_pack_indexes(&objects_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut loosened_objects_nr: i64 = 0;
     for idx in indexes {
         let name = idx
             .pack_path
@@ -2499,6 +2512,12 @@ fn loosen_unused_packed_objects(
             .and_then(|s| s.to_str())
             .unwrap_or("");
         if !name.ends_with(".pack") {
+            continue;
+        }
+        // Never loosen objects that live in a promisor pack: those are
+        // lazily-fetchable from the promisor remote and must stay packed
+        // (Git skips non-local/promisor packs in `loosen_unused_packed_objects`).
+        if idx.pack_path.with_extension("promisor").is_file() {
             continue;
         }
         let stem = name.strip_suffix(".pack").unwrap_or(name);
@@ -2526,8 +2545,14 @@ fn loosen_unused_packed_objects(
             }
             let obj = read_object_from_repo(repo, &oid)?;
             repo.odb.write(obj.kind, &obj.data)?;
+            loosened_objects_nr += 1;
         }
     }
+    crate::trace2_emit_data_intmax(
+        "pack-objects",
+        "loosen_unused_packed_objects/loosened",
+        loosened_objects_nr,
+    );
     Ok(())
 }
 
