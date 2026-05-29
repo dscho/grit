@@ -624,18 +624,11 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     if pack_list.oids.is_empty() {
-        // Git’s cruft `pack-objects` pass may enumerate zero objects; `repack` still passes
-        // `--non-empty` but expects a successful no-op with no stdout hash.
-        //
-        // An empty repository’s full `repack`/`gc` also runs `pack-objects --all --non-empty` with
-        // zero reachable objects; Git skips writing a pack (t6500 `gc --quiet` on fresh repo).
-        let allow_empty = (args.cruft && !args.incremental)
-            || (args.all && !args.incremental && !args.unpacked)
-            // `repack -d` incremental pass: nothing loose to pack (t5332 after full repack).
-            || (args.all && args.incremental && args.unpacked);
-        if args.non_empty && !allow_empty {
-            bail!("pack-objects refuses to create an empty pack");
-        }
+        // `--non-empty` means "do not write an empty pack": Git's pack-objects
+        // simply succeeds writing nothing (`if (non_empty && !nr_result) goto
+        // cleanup;`), it never errors. A `repack --geometric --exclude-promisor-objects`
+        // on a partial clone can legitimately enumerate zero non-promisor objects
+        // (t5616 "after fetching descendants of non-promisor commits, gc works").
         if !args.stdout && !args.quiet {
             eprintln!("Total 0 (delta 0), reused 0 (delta 0)");
         }
@@ -695,9 +688,8 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     if entries.is_empty() {
-        if args.non_empty && !(args.all && args.incremental && args.unpacked) {
-            bail!("pack-objects refuses to create an empty pack");
-        }
+        // `--non-empty` with an empty result is success (no pack written), never
+        // an error — matches Git's pack-objects `goto cleanup`.
         if !args.stdout && !args.quiet {
             eprintln!("Total 0 (delta 0), reused 0 (delta 0)");
         }
@@ -2184,6 +2176,15 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
         .lines()
         .collect::<std::io::Result<Vec<_>>>()?;
 
+    // `--stdin-packs` interprets stdin as pack names (`pack-…` / `^pack-…`), not
+    // as rev-list arguments. This must be handled before the rev-list heuristic
+    // below, otherwise the leading `^` of an excluded pack makes the line look
+    // like a rev exclusion and the pack name is fed to rev-parse (`repack
+    // --geometric` on a partial clone: t5616 "after fetching descendants ...").
+    if args.stdin_packs {
+        return collect_stdin_packs_oids(repo, args, &stdin_lines);
+    }
+
     let rev_mode = args.revs || stdin_looks_like_rev_list(&stdin_lines);
     let has_rev_input = stdin_lines.iter().any(|l| !l.trim().is_empty());
     if rev_mode && has_rev_input {
@@ -2231,58 +2232,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
         oids.retain(|o| !skip.contains(o));
     }
 
-    if args.stdin_packs {
-        // Read pack filenames from stdin: `^pack-…` builds an exclusion set; other lines add
-        // objects from those packs minus exclusions (order-independent; `git repack --filter`).
-        let pack_dir = repo.odb.objects_dir().join("pack");
-        let mut exclude: HashSet<ObjectId> = HashSet::new();
-        for trimmed in stdin_lines
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            if !trimmed.starts_with('^') {
-                continue;
-            }
-            let spec = trimmed[1..].trim();
-            let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, spec)?;
-            let idx = grit_lib::pack::read_pack_index(&idx_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
-            for entry in idx.entries {
-                if entry.oid.len() == 20 {
-                    if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
-                        exclude.insert(oid);
-                    }
-                }
-            }
-        }
-        for trimmed in stdin_lines
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-        {
-            if trimmed.starts_with('^') {
-                continue;
-            }
-            let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, trimmed)?;
-            let idx = grit_lib::pack::read_pack_index(&idx_path)
-                .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
-            for entry in idx.entries {
-                if entry.oid.len() == 20 {
-                    if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
-                        if !exclude.contains(&oid) {
-                            oids.insert(oid);
-                        }
-                    }
-                }
-            }
-        }
-        return Ok(PackObjectList {
-            oids: oids.into_iter().collect(),
-            thin_blob_deltas: Vec::new(),
-            rev_list_stdin: false,
-        });
-    } else if !args.all {
+    if !args.all {
         // Git `pack-objects` stdin format (see git/builtin/pack-objects.c `read_object_list_from_stdin`):
         //   -<oid>  — set preferred base (tree OID for thin-pack blob deltas), not an exclusion
         //   <oid> [<path>] — object to pack; with a preferred base, path selects the base blob
@@ -2342,6 +2292,83 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
         }
     }
 
+    Ok(PackObjectList {
+        oids: oids.into_iter().collect(),
+        thin_blob_deltas: Vec::new(),
+        rev_list_stdin: false,
+    })
+}
+
+/// Collect the object set for `pack-objects --stdin-packs`: each non-`^` line
+/// names a pack whose objects are included; each `^pack-…` line names a pack
+/// whose objects are excluded. With `--exclude-promisor-objects`, members of
+/// promisor packs are also dropped so `repack --geometric` on a partial clone
+/// does not try to repack lazily-fetchable objects.
+fn collect_stdin_packs_oids(
+    repo: &Repository,
+    args: &Args,
+    stdin_lines: &[String],
+) -> Result<PackObjectList> {
+    let pack_dir = repo.odb.objects_dir().join("pack");
+    let mut oids: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut exclude: HashSet<ObjectId> = HashSet::new();
+    for trimmed in stdin_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if !trimmed.starts_with('^') {
+            continue;
+        }
+        let spec = trimmed[1..].trim();
+        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, spec)?;
+        let idx = grit_lib::pack::read_pack_index(&idx_path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
+        for entry in idx.entries {
+            if entry.oid.len() == 20 {
+                if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
+                    exclude.insert(oid);
+                }
+            }
+        }
+    }
+    if args.exclude_promisor_objects {
+        let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        if repo_treats_promisor_packs(&repo.git_dir, &config) {
+            exclude.extend(promisor_pack_object_ids(&repo.git_dir.join("objects")));
+        }
+    }
+    for trimmed in stdin_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        if trimmed.starts_with('^') {
+            continue;
+        }
+        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, trimmed)?;
+        let idx = grit_lib::pack::read_pack_index(&idx_path)
+            .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
+        for entry in idx.entries {
+            if entry.oid.len() == 20 {
+                if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
+                    if !exclude.contains(&oid) {
+                        oids.insert(oid);
+                    }
+                }
+            }
+        }
+    }
+    // `--unpacked` additionally packs loose objects not present in any pack.
+    if args.unpacked {
+        let mut loose = BTreeSet::new();
+        collect_all_loose(&repo.odb, &mut loose)?;
+        for oid in loose {
+            if !exclude.contains(&oid) {
+                oids.insert(oid);
+            }
+        }
+    }
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
         thin_blob_deltas: Vec::new(),
