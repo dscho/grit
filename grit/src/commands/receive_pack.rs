@@ -250,14 +250,20 @@ pub fn run(args: Args) -> Result<()> {
         b"unpack ok\n".to_vec()
     };
 
+    // Connectivity/unpack failure diagnostics are written to the receive-pack process's real
+    // stderr even under side-band (matches `git receive-pack`, where these come from the unpack
+    // subprocess and are not relayed over band 2). Only the report itself is band-1 framed.
     if let Some(ref e) = traverse_err {
+        let stderr = io::stderr();
+        let mut err = stderr.lock();
         for line in e.lines() {
             if line.starts_with("fatal: ") {
-                diag.line(line);
+                let _ = writeln!(err, "{line}");
             } else {
-                diag.line(&format!("error: {line}"));
+                let _ = writeln!(err, "error: {line}");
             }
         }
+        let _ = err.flush();
     }
 
     // Refs already rejected by connectivity/hidden checks never reach the hook stage.
