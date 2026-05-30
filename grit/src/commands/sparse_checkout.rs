@@ -1606,16 +1606,12 @@ fn apply_sparse_patterns_inner(
     repo.write_index_at(&index_path, &mut index)
         .context("writing index")?;
 
-    // Prune sparse directories left behind after tracked-but-now-sparse files were removed,
-    // mirroring Git's `clean_tracked_sparse_directories` (builtin/sparse-checkout.c). Two hard
-    // constraints from that function, both relied on by the tests:
-    //   * It runs ONLY in cone mode (`use_cone_patterns`); non-cone `set` never deletes
-    //     directories (t7002 uses `set --no-cone a` / `set a`).
-    //   * It never removes UNTRACKED working-tree files. `remove_untracked_outside_sparse`
-    //     only removes now-empty directories outside the cone, leaving any untracked file in
-    //     place (t7002 stages helper files at the work-tree root and cats them afterwards).
-    // A full checkout (`disable`) includes everything, so there is nothing to prune.
-    if !force_include_all && effective_cone {
+    // Prune tracked sparse directories that fell out of the cone, mirroring Git's
+    // `clean_tracked_sparse_directories` (builtin/sparse-checkout.c). The helper runs ONLY in
+    // cone mode (it returns early when not cone, like Git's `!use_cone_patterns` guard) and
+    // never deletes untracked files: a directory containing untracked content is preserved.
+    // A full checkout (`disable`) includes everything, so there is nothing to prune (t7012).
+    if !force_include_all {
         let indexed_paths: HashSet<String> = index
             .entries
             .iter()
@@ -1632,7 +1628,6 @@ fn apply_sparse_patterns_inner(
             work_tree,
             &indexed_paths,
             &gitlink_paths,
-            patterns,
             effective_cone,
             cone_struct.as_ref(),
             &non_cone,
@@ -1708,13 +1703,65 @@ fn normalize_rel_path(p: &Path) -> String {
     }
 }
 
+/// Remove whole tracked directory subtrees that have fallen out of the sparse
+/// cone, mirroring Git's `clean_tracked_sparse_directories`
+/// (git/builtin/sparse-checkout.c).
+///
+/// Git only does this in cone mode (it returns early when
+/// `!use_cone_patterns`), and it never deletes individual untracked files. It
+/// considers each tracked sparse directory that exists on disk; if the
+/// directory contains any untracked-or-ignored files it warns
+/// ("contains untracked files") and leaves the directory in place, otherwise it
+/// removes the whole subtree. Top-level untracked/ignored files (e.g. `file.o`,
+/// `obj/`) are always preserved.
 fn remove_untracked_outside_sparse(
     work_tree: &Path,
     current: &Path,
     indexed_paths: &HashSet<String>,
     gitlink_paths: &HashSet<String>,
-    patterns: &[String],
     effective_cone: bool,
+    cone_struct: Option<&ConePatterns>,
+    non_cone: &NonConePatterns,
+) -> Result<()> {
+    // Non-cone mode: Git cannot safely delete directories outside the cone, so
+    // it cleans nothing here. Matches the early return in
+    // clean_tracked_sparse_directories.
+    if !effective_cone {
+        return Ok(());
+    }
+
+    // Directories that hold tracked content. A directory is "tracked" when some
+    // index entry lives inside it.
+    let mut tracked_dirs: HashSet<String> = HashSet::new();
+    for p in indexed_paths {
+        let mut rest = p.as_str();
+        while let Some(idx) = rest.rfind('/') {
+            let dir = &rest[..idx];
+            if !tracked_dirs.insert(dir.to_string()) {
+                break;
+            }
+            rest = dir;
+        }
+    }
+
+    clean_tracked_sparse_dirs(
+        work_tree,
+        current,
+        indexed_paths,
+        gitlink_paths,
+        &tracked_dirs,
+        cone_struct,
+        non_cone,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clean_tracked_sparse_dirs(
+    work_tree: &Path,
+    current: &Path,
+    indexed_paths: &HashSet<String>,
+    gitlink_paths: &HashSet<String>,
+    tracked_dirs: &HashSet<String>,
     cone_struct: Option<&ConePatterns>,
     non_cone: &NonConePatterns,
 ) -> Result<()> {
@@ -1734,43 +1781,88 @@ fn remove_untracked_outside_sparse(
             continue;
         }
         let meta = fs::symlink_metadata(&path).context("stat work tree path")?;
-        if meta.is_dir() {
-            if gitlink_paths.contains(&rel) {
-                continue;
-            }
-            remove_untracked_outside_sparse(
+        if !meta.is_dir() {
+            // Git never deletes loose untracked/ignored files here.
+            continue;
+        }
+        if gitlink_paths.contains(&rel) {
+            continue;
+        }
+
+        let included = path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree));
+        if included {
+            // Still in the cone: descend to find deeper out-of-cone tracked dirs.
+            clean_tracked_sparse_dirs(
                 work_tree,
                 &path,
                 indexed_paths,
                 gitlink_paths,
-                patterns,
-                effective_cone,
+                tracked_dirs,
                 cone_struct,
                 non_cone,
             )?;
-            if fs::read_dir(&path)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(false)
-            {
-                let included = if effective_cone {
-                    path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree))
-                } else {
-                    path_in_sparse_checkout_lines(&rel, patterns, Some(work_tree))
-                };
-                if !included && !indexed_paths.contains(&rel) {
-                    let _ = fs::remove_dir(&path);
-                    if let Some(parent) = path.parent() {
-                        remove_empty_dirs_up_to(parent, work_tree);
-                    }
-                }
-            }
             continue;
         }
-        // Untracked files outside the cone are NOT removed by sparse-checkout set/reapply — Git
-        // leaves them on disk (only `sparse-checkout clean` removes them). We only prune the now
-        // empty directories left behind after tracked excluded files are removed (handled above).
+        // Out of cone. Only remove a directory that holds tracked content (a
+        // tracked sparse directory). Purely untracked/ignored directories at the
+        // top level (e.g. `obj/`) are preserved, matching Git. Untracked files
+        // outside the cone are never removed (only `sparse-checkout clean` does).
+        if !tracked_dirs.contains(&rel) {
+            continue;
+        }
+
+        if dir_has_untracked(&path, work_tree, indexed_paths)? {
+            eprintln!(
+                "warning: directory '{rel}/' contains untracked files, but is not in the sparse-checkout cone"
+            );
+            continue;
+        }
+
+        // No untracked files: safe to remove the whole subtree.
+        let _ = fs::remove_dir_all(&path);
+        if let Some(parent) = path.parent() {
+            remove_empty_dirs_up_to(parent, work_tree);
+        }
     }
     Ok(())
+}
+
+/// Whether `dir` contains any file on disk that is not a tracked index entry
+/// (mirrors Git's `fill_directory` with `DIR_SHOW_IGNORED_TOO`: both untracked
+/// and ignored files count).
+fn dir_has_untracked(
+    dir: &Path,
+    work_tree: &Path,
+    indexed_paths: &HashSet<String>,
+) -> Result<bool> {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return Ok(false);
+    };
+    for ent in read_dir {
+        let ent = ent.context("reading work tree directory")?;
+        let path = ent.path();
+        let rel = path
+            .strip_prefix(work_tree)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == ".git"
+            || rel.starts_with(".git/")
+            || rel.ends_with("/.git")
+            || rel.contains("/.git/")
+        {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path).context("stat work tree path")?;
+        if meta.is_dir() {
+            if dir_has_untracked(&path, work_tree, indexed_paths)? {
+                return Ok(true);
+            }
+        } else if !indexed_paths.contains(&rel) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `path` is included in the sparse checkout for the given patterns.
