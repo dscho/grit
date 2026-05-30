@@ -717,23 +717,27 @@ fn cmd_disable(repo: &Repository) -> Result<()> {
     warn_sparse_apply_side_effects(repo, &patterns, false, false)?;
     apply_full_checkout(repo)?;
 
-    unset_sparse_keys_all_layers(repo)?;
+    // Git `set_config(MODE_NO_PATTERNS)`: record the sparse toggles as **false** in the worktree
+    // config (not unset). A later `sparse-checkout init` reads the recorded cone mode so a
+    // non-cone repo stays non-cone (t7817), and `index.sparse=false` is asserted directly (t1091).
+    set_sparse_config(repo, false)?;
+    set_cone_config(repo, false)?;
+    set_sparse_index_config(repo, false)?;
+    // Remove any stale keys recorded in the local (non-worktree) config layer so the worktree
+    // values win and `git config <key>` (default scope) reports them as absent (t1091 test 19).
+    clear_sparse_keys_local_layer(repo)?;
     Ok(())
 }
 
-fn unset_sparse_keys_all_layers(repo: &Repository) -> Result<()> {
-    for (path, scope) in [
-        (worktree_config_path(repo), ConfigScope::Worktree),
-        (repo.git_dir.join("config"), ConfigScope::Local),
-    ] {
-        if path.exists() {
-            let content = fs::read_to_string(&path).unwrap_or_default();
-            let mut cfg = ConfigFile::parse(&path, &content, scope)?;
-            let _ = cfg.unset("core.sparseCheckout");
-            let _ = cfg.unset("core.sparseCheckoutCone");
-            let _ = cfg.unset("index.sparse");
-            cfg.write()?;
-        }
+fn clear_sparse_keys_local_layer(repo: &Repository) -> Result<()> {
+    let path = repo.git_dir.join("config");
+    if path.exists() {
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let mut cfg = ConfigFile::parse(&path, &content, ConfigScope::Local)?;
+        let _ = cfg.unset("core.sparseCheckout");
+        let _ = cfg.unset("core.sparseCheckoutCone");
+        let _ = cfg.unset("index.sparse");
+        cfg.write()?;
     }
     Ok(())
 }
