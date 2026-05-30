@@ -681,8 +681,18 @@ fn cmd_list(repo: &Repository) -> Result<()> {
                 }
                 dirs.sort();
                 dirs.dedup();
+                // Git `sparse-checkout list` C-quotes directory names that contain bytes needing
+                // escaping (backslash, control chars, …) so output round-trips with `ls-tree`.
+                let quote_fully = config
+                    .get("core.quotePath")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
                 for d in dirs {
-                    writeln!(out, "{d}")?;
+                    writeln!(
+                        out,
+                        "{}",
+                        grit_lib::quote_path::quote_c_style(&d, quote_fully)
+                    )?;
                 }
             }
             None => {
@@ -1476,6 +1486,18 @@ fn open_gitlink_worktree_repo(sub_work_tree: &Path) -> Result<Repository> {
     }
 }
 
+/// Convert a worktree-relative path to a `/`-separated string. On Windows the native separator is
+/// `\`, so it is rewritten to `/`; on Unix a `\` is a *literal* filename character and must be
+/// preserved (t1091 escaped-characters: a directory literally named `zbad\dir`).
+fn normalize_rel_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '\\' {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
 fn remove_untracked_outside_sparse(
     work_tree: &Path,
     current: &Path,
@@ -1492,11 +1514,7 @@ fn remove_untracked_outside_sparse(
     for ent in read_dir {
         let ent = ent.context("reading work tree directory")?;
         let path = ent.path();
-        let rel = path
-            .strip_prefix(work_tree)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = normalize_rel_path(path.strip_prefix(work_tree).unwrap_or(&path));
         // Skip the main repo's `.git` and every nested `.git` (e.g. `sub/.git` for submodules).
         if rel == ".git"
             || rel.starts_with(".git/")

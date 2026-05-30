@@ -820,7 +820,8 @@ fn parse_expanded_cone_parent_recursive(lines: &[String]) -> Option<(Vec<String>
         if b != &expected_neg {
             break;
         }
-        parents.push(inner_a.to_string());
+        // On-disk patterns escape glob/backslash chars; match against the literal directory name.
+        parents.push(unescape_cone_pattern_path(inner_a));
         i += 2;
     }
     while i < lines.len() {
@@ -835,7 +836,7 @@ fn parse_expanded_cone_parent_recursive(lines: &[String]) -> Option<(Vec<String>
         if body.is_empty() {
             return None;
         }
-        recursive.push(body.to_string());
+        recursive.push(unescape_cone_pattern_path(body));
         i += 1;
     }
     Some((parents, recursive))
@@ -983,6 +984,26 @@ fn escape_cone_pattern_path(path_with_leading_slash: &str) -> String {
     out
 }
 
+/// Inverse of [`escape_cone_pattern_path`]: drop the escaping backslash before a glob/backslash
+/// character so a cone pattern body becomes the plain directory name.
+fn unescape_cone_pattern_path(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if matches!(next, '\\' | '[' | '*' | '?' | '#') {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn recursive_set_has_strict_ancestor(recursive: &BTreeSet<String>, path: &str) -> bool {
     let mut cur = path.to_string();
     loop {
@@ -1062,7 +1083,9 @@ pub fn parse_expanded_cone_recursive_dirs(lines: &[String]) -> Vec<String> {
             i += 2;
             continue;
         }
-        out.push(body.to_owned());
+        // On-disk cone patterns escape glob/backslash characters (`escaped_pattern`); the
+        // directory name itself (Git's recursive hashmap key) is the unescaped form.
+        out.push(unescape_cone_pattern_path(body));
         i += 1;
     }
     out
