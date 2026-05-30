@@ -868,6 +868,97 @@ fn cmd_check_rules(repo: &Repository, args: &CheckRulesArgs) -> Result<()> {
     Ok(())
 }
 
+/// Sparse directories `convert_to_sparse` would collapse: every stage-0 path under the directory
+/// is skip-worktree and the directory is entirely outside the cone. Unlike the sparse-*index*
+/// collapse this does not require entries to match HEAD (a staged out-of-cone edit still counts).
+/// Returns the shallowest such directories (so `folder2`, not `folder2/sub`).
+fn removable_sparse_directories(
+    index: &grit_lib::index::Index,
+    patterns: &[String],
+) -> Vec<String> {
+    let mut dir_state: BTreeSet<String> = BTreeSet::new();
+    let mut not_all_skip: HashSet<String> = HashSet::new();
+    for entry in &index.entries {
+        if entry.stage() != 0 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry.path);
+        let skip = entry.skip_worktree();
+        for (i, &b) in path.as_bytes().iter().enumerate() {
+            if b == b'/' {
+                let dir = path[..i].to_string();
+                if !skip {
+                    not_all_skip.insert(dir.clone());
+                }
+                dir_state.insert(dir);
+            }
+        }
+    }
+    let out_of_cone_dir = |dir: &str| -> bool {
+        let with_slash = format!("{}/", dir.trim_end_matches('/'));
+        !grit_lib::sparse_checkout::path_matches_sparse_patterns(&with_slash, patterns, true)
+    };
+    let mut removable: Vec<String> = dir_state
+        .into_iter()
+        .filter(|dir| !not_all_skip.contains(dir) && out_of_cone_dir(dir))
+        .collect();
+    removable.sort();
+    let mut shallow: Vec<String> = Vec::new();
+    for dir in removable {
+        if shallow
+            .iter()
+            .any(|p| dir == *p || dir.starts_with(&format!("{p}/")))
+        {
+            continue;
+        }
+        shallow.push(dir);
+    }
+    shallow
+}
+
+/// Whether a worktree directory contains any file on disk (recursively). Used to decide whether a
+/// sparse directory can be silently removed or must be left with a warning (Git
+/// `clean_tracked_sparse_directories`).
+fn dir_has_any_file(dir: &Path) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for ent in rd.flatten() {
+        let Ok(meta) = ent.metadata() else { continue };
+        if meta.is_dir() {
+            if dir_has_any_file(&ent.path()) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Git `clean_tracked_sparse_directories`: after applying sparse patterns, remove the now
+/// out-of-cone sparse directories that have no files on disk, and warn about those that still
+/// contain (untracked) files (t1091 'clean with sparse file states').
+fn clean_tracked_sparse_directories(
+    work_tree: &Path,
+    index: &grit_lib::index::Index,
+    patterns: &[String],
+) {
+    for name in removable_sparse_directories(index, patterns) {
+        let full = work_tree.join(&name);
+        if !full.is_dir() {
+            continue;
+        }
+        if dir_has_any_file(&full) {
+            eprintln!(
+                "warning: directory '{name}/' contains untracked files, but is not in the sparse-checkout cone"
+            );
+        } else {
+            let _ = fs::remove_dir_all(&full);
+        }
+    }
+}
+
 fn cmd_clean(repo: &Repository, args: &CleanArgs) -> Result<()> {
     let work_tree = repo
         .work_tree
@@ -913,26 +1004,11 @@ fn cmd_clean(repo: &Repository, args: &CleanArgs) -> Result<()> {
             .context("expanding sparse index before clean")?;
     }
     let patterns = read_sparse_patterns(repo)?;
-    if let Some(tree_oid) = head_tree_oid(repo)? {
-        // Force the in-memory collapse regardless of `index.sparse`.
-        index.try_collapse_sparse_directories(&repo.odb, &tree_oid, &patterns, true, true)?;
-    }
+    let placeholders = removable_sparse_directories(&index, &patterns);
 
     let msg_remove = "Removing ";
     let msg_would = "Would remove ";
     let msg = if args.dry_run { msg_would } else { msg_remove };
-
-    let mut placeholders: Vec<String> = index
-        .entries
-        .iter()
-        .filter(|e| e.mode == MODE_TREE && e.is_sparse_directory_placeholder())
-        .map(|e| {
-            String::from_utf8_lossy(&e.path)
-                .trim_end_matches('/')
-                .to_string()
-        })
-        .collect();
-    placeholders.sort();
 
     for name in placeholders {
         let full = work_tree.join(&name);
@@ -1454,6 +1530,14 @@ fn apply_sparse_patterns_inner(
         }
     }
 
+    // Git `clean_tracked_sparse_directories` (runs after `update_working_directory` for
+    // set/reapply): remove the now out-of-cone sparse directories with no files, warn about those
+    // still holding untracked files. Skip for a full checkout (everything is in-cone) and in cone
+    // mode only (matches Git). Computed from the pre-collapse per-file skip-worktree state.
+    if !force_include_all && effective_cone {
+        clean_tracked_sparse_directories(work_tree, &index, patterns);
+    }
+
     // In partial clones (`grit-promisor-missing` lists blobs not yet local), sparse
     // directory collapse would expand excluded subtrees into the index and pull blob
     // OIDs into scope — breaking `rev-list --missing=print` expectations (t5620).
@@ -1640,23 +1724,9 @@ fn remove_untracked_outside_sparse(
             }
             continue;
         }
-        if !meta.is_file() && !meta.file_type().is_symlink() {
-            continue;
-        }
-        if indexed_paths.contains(&rel) {
-            continue;
-        }
-        let included = if effective_cone {
-            path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree))
-        } else {
-            path_in_sparse_checkout_lines(&rel, patterns, Some(work_tree))
-        };
-        if !included {
-            let _ = fs::remove_file(&path);
-            if let Some(parent) = path.parent() {
-                remove_empty_dirs_up_to(parent, work_tree);
-            }
-        }
+        // Untracked files outside the cone are NOT removed by sparse-checkout set/reapply — Git
+        // leaves them on disk (only `sparse-checkout clean` removes them). We only prune the now
+        // empty directories left behind after tracked excluded files are removed (handled above).
     }
     Ok(())
 }
