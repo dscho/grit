@@ -952,7 +952,7 @@ t5531-deep-nested-push	t5	yes	4	4	0	true	ok	0
 t5531-deep-submodule-push	t5	yes	29	3	26	false	ok	0
 t5532-fetch-proxy	t5	yes	5	4	1	false	ok	0
 t5533-push-cas	t5	yes	23	20	3	false	ok	0
-t5534-push-signed	t5	skip	13	0	0	false	ok	0
+t5534-push-signed	t5	yes	13	0	0	false	ok	0
 t5535-fetch-push-symref	t5	yes	3	3	0	true	ok	0
 t5536-fetch-conflicts	t5	yes	7	7	0	true	ok	0
 t5537-fetch-shallow	t5	yes	16	14	2	false	ok	0
@@ -1159,7 +1159,7 @@ t7011-skip-worktree-reading	t7	yes	15	15	0	true	ok	0
 t7012-skip-worktree-writing	t7	yes	11	10	1	false	ok	6
 t7020-commit-encoding	t7	yes	26	2	24	false	ok	0
 t7030-verify-tag	t7	skip	16	0	0	false	ok	0
-t7031-verify-tag-signed-ssh	t7	skip	14	0	0	false	ok	0
+t7031-verify-tag-signed-ssh	t7	yes	14	0	0	false	ok	0
 t7040-log-formatting	t7	yes	36	1	35	false	ok	0
 t7060-status-output	t7	yes	25	4	21	false	ok	0
 t7060-wtstatus	t7	yes	17	11	6	false	ok	0
@@ -1232,7 +1232,7 @@ t7506-status-submodule	t7	yes	40	16	24	false	ok	0
 t7507-commit-verbose	t7	yes	45	35	10	false	ok	0
 t7508-status	t7	yes	126	101	25	false	ok	0
 t7509-commit-authorship	t7	yes	12	3	9	false	ok	0
-t7510-signed-commit	t7	skip	28	0	0	false	ok	0
+t7510-signed-commit	t7	yes	28	0	0	false	ok	0
 t7511-status-index	t7	yes	24	24	0	true	ok	0
 t7512-status-help	t7	yes	47	18	29	false	ok	0
 t7513-interpret-trailers	t7	yes	99	99	0	true	ok	0
@@ -1249,7 +1249,7 @@ t7524-commit-summary	t7	yes	2	2	0	true	ok	0
 t7525-status-rename	t7	yes	15	10	5	false	ok	0
 t7526-commit-pathspec-file	t7	yes	11	11	0	true	ok	0
 t7527-builtin-fsmonitor	t7	yes	0	0	0	false	ok	0
-t7528-signed-commit-ssh	t7	skip	29	0	0	false	ok	3
+t7528-signed-commit-ssh	t7	yes	29	0	0	false	ok	3
 t7600-merge	t7	skip	83	0	0	false	ok	0
 t7601-merge-pull-config	t7	yes	65	63	2	false	ok	0
 t7602-merge-octopus-many	t7	yes	5	2	3	false	ok	0
