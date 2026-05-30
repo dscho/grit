@@ -972,7 +972,7 @@ t5547-push-quarantine	t5	yes	6	6	0	true	ok	0
 t5548-push-porcelain	t5	yes	25	5	20	false	ok	0
 t5549-fetch-push-http	t5	yes	3	3	0	true	ok	0
 t5550-http-fetch-dumb	t5	skip	57	0	0	false	ok	0
-t5551-http-fetch-smart	t5	yes	37	29	2	false	ok	6
+t5551-http-fetch-smart	t5	yes	31	29	2	false	ok	6
 t5552-skipping-fetch-negotiator	t5	yes	6	3	3	false	ok	0
 t5553-set-upstream	t5	yes	21	6	15	false	ok	0
 t5554-noop-fetch-negotiator	t5	yes	1	0	1	false	ok	0
@@ -1151,7 +1151,7 @@ t7003-filter-branch	t7	skip	48	0	0	false	ok	0
 t7004-tag	t7	skip	219	0	0	false	ok	0
 t7005-editor	t7	yes	12	12	0	true	ok	0
 t7006-pager	t7	yes	109	108	1	false	ok	1
-t7007-show	t7	yes	0	0	0	false	timeout	0
+t7007-show	t7	yes	18	18	0	true	ok	0
 t7008-filter-branch-null-sha1	t7	yes	6	5	1	false	ok	0
 t7008-show-stat-raw-name	t7	yes	21	1	20	false	ok	0
 t7010-setup	t7	yes	16	11	5	false	ok	0
@@ -1181,7 +1181,7 @@ t7080-mv-advanced	t7	yes	29	1	28	false	ok	0
 t7090-rm-advanced	t7	yes	31	1	30	false	ok	0
 t7101-reset	t7	yes	11	11	0	true	ok	0
 t7101-reset-empty-subdirs	t7	yes	10	10	0	true	ok	0
-t7102-reset	t7	yes	38	33	5	false	ok	0
+t7102-reset	t7	yes	38	36	2	false	ok	0
 t7103-reset-bare	t7	yes	0	0	0	false	timeout	0
 t7104-reset-hard	t7	yes	3	3	0	true	ok	0
 t7105-reset-patch	t7	yes	0	0	0	false	timeout	0
@@ -1232,7 +1232,7 @@ t7506-status-submodule	t7	yes	40	16	24	false	ok	0
 t7507-commit-verbose	t7	yes	45	35	10	false	ok	0
 t7508-status	t7	yes	126	101	25	false	ok	0
 t7509-commit-authorship	t7	yes	12	3	9	false	ok	0
-t7510-signed-commit	t7	yes	28	0	0	false	ok	0
+t7510-signed-commit	t7	yes	28	28	0	true	ok	0
 t7511-status-index	t7	yes	24	24	0	true	ok	0
 t7512-status-help	t7	yes	47	18	29	false	ok	0
 t7513-interpret-trailers	t7	yes	99	99	0	true	ok	0
