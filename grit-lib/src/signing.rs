@@ -1543,6 +1543,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_signed_buffer_splits_appended_tag_signature() {
+        // A signed tag appends the armored signature directly after the body
+        // with no `gpgsig` header and no per-line indentation.
+        let body = b"object 0123\ntype commit\ntag v1\ntagger t <t@e> 1 +0000\n\nmessage\n";
+        let sig = b"-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+        let mut tag = body.to_vec();
+        tag.extend_from_slice(sig);
+        let (payload, signature) = parse_signed_buffer(&tag).expect("should split");
+        assert_eq!(payload, body);
+        assert_eq!(signature, sig);
+    }
+
+    #[test]
+    fn parse_signed_buffer_none_when_unsigned() {
+        let body = b"object 0123\ntype commit\ntag v1\ntagger t <t@e> 1 +0000\n\nmessage\n";
+        assert!(parse_signed_buffer(body).is_none());
+    }
+
+    #[test]
     fn parse_goodsig_and_trust() {
         let status = "\
 [GNUPG:] NEWSIG\n\
