@@ -36,6 +36,10 @@ pub struct Args {
     #[arg(short = 's', long = "sign")]
     pub sign: bool,
 
+    /// Use the given key to sign the tag (implies `-s`).
+    #[arg(short = 'u', long = "local-user", value_name = "KEY-ID")]
+    pub local_user: Option<String>,
+
     /// Tag message (implies `-a`).
     #[arg(short = 'm', long = "message")]
     pub message: Vec<String>,
@@ -122,14 +126,17 @@ pub fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    // `-u <keyid>` forces signing (git/builtin/tag.c:507).
+    let sign = args.sign || args.local_user.is_some();
+
     // If annotated/signed/force without a name, fail
     let is_create_mode =
-        args.annotate || args.sign || !args.message.is_empty() || args.file.is_some() || args.force;
+        args.annotate || sign || !args.message.is_empty() || args.file.is_some() || args.force;
     if name.is_none() && is_create_mode {
         bail!("tag name required");
     }
     let _is_annotated_mode =
-        args.annotate || args.sign || !args.message.is_empty() || args.file.is_some();
+        args.annotate || sign || !args.message.is_empty() || args.file.is_some();
 
     // If no name is given (or -l is given), list tags
     if name.is_none() || args.list > 0 {
@@ -208,7 +215,7 @@ pub fn run(args: Args) -> Result<()> {
         bail!("only one of -m or -F can be given.");
     }
 
-    let annotated = args.annotate || args.sign || !args.message.is_empty() || args.file.is_some();
+    let annotated = args.annotate || sign || !args.message.is_empty() || args.file.is_some();
 
     let tag_refname = format!("refs/tags/{name}");
     let tag_exists = grit_lib::refs::resolve_ref(&repo.git_dir, &tag_refname).is_ok();
@@ -282,7 +289,7 @@ fn create_annotated_tag(
     let now = OffsetDateTime::now_utc();
     let tagger = resolve_tagger(&config, now)?;
 
-    let mut tag_data = TagData {
+    let tag_data = TagData {
         object: target_oid,
         object_type,
         tag: name.to_owned(),
@@ -290,25 +297,23 @@ fn create_annotated_tag(
         message,
     };
 
-    if args.sign {
-        let unsigned_tag_bytes = serialize_tag(&tag_data);
-        let sig_format = config
-            .get("gpg.format")
-            .unwrap_or_else(|| "openpgp".to_owned())
-            .to_lowercase();
-        let signing_key = config
-            .get("user.signingkey")
-            .unwrap_or_else(|| "-".to_owned());
-        let sig_payload =
-            pseudo_tag_signature_payload(&sig_format, &signing_key, &unsigned_tag_bytes);
-        let sig_block = render_tag_signature_block(&sig_format, &sig_payload);
-        if !tag_data.message.ends_with('\n') {
-            tag_data.message.push('\n');
-        }
-        tag_data.message.push_str(&sig_block);
+    // `-u <keyid>` implies signing (git/builtin/tag.c:507).
+    let sign = args.sign || args.local_user.is_some();
+
+    let mut tag_bytes = serialize_tag(&tag_data);
+
+    if sign {
+        // Git appends the armored signature directly after the serialized tag
+        // body (git/builtin/tag.c:191 `strbuf_addbuf(buffer, &sig)`): no
+        // `gpgsig` header and no per-line indentation, unlike commits.
+        let cfg = grit_lib::signing::GpgConfig::from_config(&config)?;
+        let committer_default = grit_lib::signing::committer_signing_default(&tagger);
+        let signing_key = cfg.resolve_signing_key(args.local_user.as_deref(), &committer_default);
+        let signature = grit_lib::signing::sign_buffer(&cfg, &tag_bytes, &signing_key)
+            .map_err(|e| anyhow::anyhow!("failed to sign the tag: {e}"))?;
+        tag_bytes.extend_from_slice(&signature);
     }
 
-    let tag_bytes = serialize_tag(&tag_data);
     let tag_oid = repo.odb.write(ObjectKind::Tag, &tag_bytes)?;
 
     let refname = format!("refs/tags/{name}");
@@ -803,29 +808,6 @@ fn format_git_timestamp(dt: OffsetDateTime) -> String {
     let hours = offset.whole_hours();
     let minutes = offset.minutes_past_hour().unsigned_abs();
     format!("{epoch} {hours:+03}{minutes:02}")
-}
-
-fn pseudo_tag_signature_payload(format: &str, key: &str, unsigned_tag: &[u8]) -> String {
-    use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
-    hasher.update(unsigned_tag);
-    let digest = hasher.finalize();
-    format!(
-        "GRITTAGSIGV1 {} {} {}",
-        format,
-        key,
-        hex::encode(digest.as_slice())
-    )
-}
-
-fn render_tag_signature_block(format: &str, payload: &str) -> String {
-    match format {
-        "ssh" => format!("-----BEGIN SSH SIGNATURE-----\n{payload}\n-----END SSH SIGNATURE-----\n"),
-        "x509" => {
-            format!("-----BEGIN SIGNED MESSAGE-----\n{payload}\n-----END SIGNED MESSAGE-----\n")
-        }
-        _ => format!("-----BEGIN PGP SIGNATURE-----\n{payload}\n-----END PGP SIGNATURE-----\n"),
-    }
 }
 
 /// Simple glob pattern matching for tag names.
