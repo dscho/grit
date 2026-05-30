@@ -450,10 +450,14 @@ pub fn apply_sparse_checkout_skip_worktree(
         return;
     }
 
+    // Git default for core.sparseCheckoutCone is false (environment.c zero-init). When the key
+    // is absent, treat the sparse file as non-cone so we do not try to cone-parse a legitimate
+    // non-cone file (e.g. a bare `sub` pattern) and emit spurious "disabling cone pattern
+    // matching" warnings on every index update (t1011 subtest 21).
     let cone_config = config
         .get("core.sparsecheckoutcone")
         .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(true);
+        .unwrap_or(false);
 
     let mut warnings = Vec::new();
     let (_cone_ok, _cone_loaded, non_cone) =

@@ -763,9 +763,11 @@ impl SparsePattern {
 /// patterns with a trailing `/` in the sparse file (`PATTERN_FLAG_MUSTBEDIR`) only
 /// participate in those iterations.
 fn sparse_pattern_matches(p: &SparsePattern, pathname: &str, as_directory: bool) -> bool {
-    if p.nodir && as_directory {
-        return false;
-    }
+    // Git never gates basename (NODIR) or anchored `/*` patterns on dtype: `match_basename` /
+    // `match_pathname` run regardless of `DT_DIR` (dir.c). Earlier code rejected `nodir`
+    // patterns on the parent-directory pass, which wrongly excluded `subsub/added` under
+    // `/*` + `!sub` + `sub/added` (t1011 subtest 9). The `!/*/` directory-only rule still
+    // shadows `/*` for nested dirs via reverse-order first-match (t7817/t1091 preserved).
     if p.directory_only && !as_directory {
         return false;
     }
