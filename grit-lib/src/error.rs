@@ -83,6 +83,10 @@ pub enum Error {
     #[error("config error: {0}")]
     ConfigError(String),
 
+    /// A commit/tag signing or signature-verification error.
+    #[error("{0}")]
+    Signing(String),
+
     /// User-facing message that should be printed verbatim (no extra prefix).
     ///
     /// Used for revision errors that must match Git's `fatal:` lines exactly.
