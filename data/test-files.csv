@@ -589,12 +589,12 @@ t3314-notes-prune	t3	yes	3	3	0	true	ok	0
 t3315-notes-merge	t3	yes	4	4	0	true	ok	0
 t3320-notes-merge-worktrees	t3	yes	9	9	0	true	ok	0
 t3321-notes-stripspace	t3	yes	27	1	26	false	ok	0
-t3400-rebase	t3	yes	39	16	23	false	ok	0
+t3400-rebase	t3	yes	39	17	22	false	ok	0
 t3401-rebase-and-am-rename	t3	yes	10	8	2	false	ok	0
 t3401-rebase-basic	t3	yes	32	1	31	false	ok	0
 t3402-rebase-merge	t3	yes	13	2	11	false	ok	0
-t3403-rebase-skip	t3	yes	20	8	12	false	ok	0
-t3404-rebase-interactive	t3	yes	132	16	116	false	ok	0
+t3403-rebase-skip	t3	yes	20	7	13	false	ok	0
+t3404-rebase-interactive	t3	yes	132	25	107	false	ok	0
 t3405-rebase-malformed	t3	yes	5	5	0	true	ok	0
 t3406-rebase-message	t3	yes	32	15	17	false	ok	0
 t3407-rebase-abort	t3	yes	17	15	2	false	ok	0
@@ -1249,7 +1249,7 @@ t7524-commit-summary	t7	yes	2	2	0	true	ok	0
 t7525-status-rename	t7	yes	15	10	5	false	ok	0
 t7526-commit-pathspec-file	t7	yes	11	11	0	true	ok	0
 t7527-builtin-fsmonitor	t7	yes	0	0	0	false	ok	0
-t7528-signed-commit-ssh	t7	yes	29	0	0	false	ok	3
+t7528-signed-commit-ssh	t7	yes	29	26	0	true	ok	3
 t7600-merge	t7	skip	83	0	0	false	ok	0
 t7601-merge-pull-config	t7	yes	65	63	2	false	ok	0
 t7602-merge-octopus-many	t7	yes	5	2	3	false	ok	0
