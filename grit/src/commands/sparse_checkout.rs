@@ -1606,9 +1606,16 @@ fn apply_sparse_patterns_inner(
     repo.write_index_at(&index_path, &mut index)
         .context("writing index")?;
 
-    // Remove untracked paths outside the sparse cone (Git `sparse_checkout_set` / t7012).
+    // Prune sparse directories left behind after tracked-but-now-sparse files were removed,
+    // mirroring Git's `clean_tracked_sparse_directories` (builtin/sparse-checkout.c). Two hard
+    // constraints from that function, both relied on by the tests:
+    //   * It runs ONLY in cone mode (`use_cone_patterns`); non-cone `set` never deletes
+    //     directories (t7002 uses `set --no-cone a` / `set a`).
+    //   * It never removes UNTRACKED working-tree files. `remove_untracked_outside_sparse`
+    //     only removes now-empty directories outside the cone, leaving any untracked file in
+    //     place (t7002 stages helper files at the work-tree root and cats them afterwards).
     // A full checkout (`disable`) includes everything, so there is nothing to prune.
-    if !force_include_all {
+    if !force_include_all && effective_cone {
         let indexed_paths: HashSet<String> = index
             .entries
             .iter()
