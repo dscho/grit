@@ -974,6 +974,18 @@ fn cmd_add(args: AddArgs) -> Result<()> {
         crate::commands::sparse_checkout::copy_worktree_config_to_admin(&repo.git_dir, &wt_admin)?;
     }
 
+    // A new worktree inherits the main worktree's sparse-checkout patterns (copied above). Apply
+    // them to the freshly checked-out tree so out-of-cone paths (e.g. `folder2`) are excluded,
+    // matching Git's `worktree add` (t1091 'different sparse-checkouts with worktrees'). Only when
+    // the worktree actually has a sparse-checkout file, to avoid touching admin files (and the
+    // relative gitdir/commondir links) in the common non-sparse case.
+    if !args.no_checkout && wt_admin.join("info").join("sparse-checkout").exists() {
+        if let Ok(wt_repo) = Repository::open(&wt_admin, Some(&wt_path)) {
+            let _ =
+                crate::commands::sparse_checkout::reapply_sparse_checkout_if_configured(&wt_repo);
+        }
+    }
+
     if args.track && !args.no_track && !detach_head {
         if let Some(ref new_branch) = branch_name {
             if let Some(start) = args.branch.as_deref() {
@@ -1668,6 +1680,12 @@ fn has_dirty_files(
         }
         // Skip gitlinks (submodules) — they have special handling
         if entry.mode == 0o160000 {
+            continue;
+        }
+        // Sparse-checkout entries (skip-worktree / sparse-directory placeholders) are intentionally
+        // absent from the work tree; their missing files must not count as "dirty" or `worktree
+        // remove` of a sparse worktree would always fail (t1091 'worktree: add copies patterns').
+        if entry.skip_worktree() || entry.is_sparse_directory_placeholder() {
             continue;
         }
         let rel = String::from_utf8_lossy(&entry.path);

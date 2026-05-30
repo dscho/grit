@@ -1349,16 +1349,20 @@ fn path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
 }
 
 fn directory_in_cone(dir_path: &str, patterns: &[String], cone_mode: bool) -> bool {
-    // `path_matches_sparse_patterns` distinguishes a directory from a file by a trailing
-    // slash (expanded-cone matching uses dtype the way Git does). Collapse prefixes arrive
+    // Match Git `path_in_cone_mode_sparse_checkout`: a *directory* is in the cone when its
+    // contents are recursively included. `path_matches_sparse_patterns` distinguishes a
+    // directory from a file by a trailing slash (expanded-cone matching uses dtype the way
+    // Git does), so pass the directory with a trailing slash. Collapse prefixes arrive
     // without one (e.g. `before`, `folder1`), so append it to avoid a top-level directory
-    // being mistaken for an always-in-cone top-level file.
-    let dir_with_slash = if dir_path.ends_with('/') {
-        dir_path.to_string()
-    } else {
-        format!("{dir_path}/")
-    };
-    crate::sparse_checkout::path_matches_sparse_patterns(&dir_with_slash, patterns, cone_mode)
+    // being mistaken for an always-in-cone top-level file. The root (empty) directory is
+    // always in the cone (`/*` + `!/*/` excludes every top-level directory, so e.g. `deep`
+    // collapses to a single placeholder instead of leaving `deep/deeper1/` etc.).
+    let dir = dir_path.trim_end_matches('/');
+    if dir.is_empty() {
+        return true;
+    }
+    let with_slash = format!("{dir}/");
+    crate::sparse_checkout::path_matches_sparse_patterns(&with_slash, patterns, cone_mode)
 }
 
 fn collect_directory_prefixes(path: &[u8], out: &mut BTreeSet<Vec<u8>>) {

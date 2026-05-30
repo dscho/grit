@@ -59,6 +59,28 @@ impl NonConePatterns {
     }
 }
 
+/// Mirror Git `dup_and_filter_pattern` (dir.c): drop escape backslashes (once each), then
+/// if the result ends in `/*` truncate that trailing `/*`. Operates on a leading-`/` pattern.
+fn dup_and_filter_pattern(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if out.len() > 2 && out[out.len() - 1] == b'*' && out[out.len() - 2] == b'/' {
+        out.truncate(out.len() - 2);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn glob_special_unescaped(name: &[u8]) -> bool {
     let mut i = 0usize;
     while i < name.len() {
@@ -188,17 +210,24 @@ impl ConePatterns {
                 continue;
             }
 
-            if negated && rest.ends_with("/*/") && rest.starts_with('/') && rest.len() > 4 {
-                let inner = &rest[1..rest.len() - 3];
-                // Git (`add_pattern_to_hashsets`) accepts multi-segment cone parents
-                // such as `!/deep/deeper1/*/`; `/` is not a glob-special character.
-                // Only reject an empty inner or one containing real glob specials.
-                if inner.is_empty() || glob_special_unescaped(inner.as_bytes()) {
-                    warnings.push(format!("warning: unrecognized negative pattern: '{rest}'"));
+            // Git `add_pattern_to_hashsets`: a MUSTBEDIR pattern whose stored form (trailing
+            // dir-slash dropped) ends in `/*` is the "exclude immediate children" rule. For
+            // `!/foo/bar/*/` the stored pattern is `!/foo/bar/*`; `dup_and_filter_pattern`
+            // truncates the trailing `/*` to `/foo/bar`, which must already be recursive.
+            // This also accepts multi-segment cone parents (e.g. `!/deep/deeper1/*/`) since
+            // `/` is not a glob-special character.
+            let stored = rest.strip_suffix('/').unwrap_or(rest);
+            if stored.starts_with('/')
+                && stored.len() > 2
+                && stored.ends_with("/*")
+                && !stored.ends_with("\\*")
+            {
+                if !negated {
+                    warnings.push(format!("warning: unrecognized pattern: '{rest}'"));
                     warnings.push("warning: disabling cone pattern matching".to_string());
                     return None;
                 }
-                let key = format!("/{inner}");
+                let key = dup_and_filter_pattern(stored);
                 if !recursive.contains(&key) {
                     warnings.push(format!("warning: unrecognized negative pattern: '{rest}'"));
                     warnings.push("warning: disabling cone pattern matching".to_string());
@@ -253,7 +282,10 @@ impl ConePatterns {
                 return None;
             }
 
-            let key = format!("/{body}");
+            // Git applies `dup_and_filter_pattern` before hashing: escape backslashes are
+            // removed and a trailing `/*` is truncated. So `/foo/\*/` collapses to `/foo`,
+            // which lets the duplicate-with-parent check fire (t1091 malformed cone patterns).
+            let key = dup_and_filter_pattern(&format!("/{body}"));
             if parents.contains(&key) {
                 warnings.push(format!(
                     "warning: your sparse-checkout file may have issues: pattern '{rest}' is repeated"
@@ -262,7 +294,8 @@ impl ConePatterns {
                 return None;
             }
             recursive.insert(key.clone());
-            let parts: Vec<&str> = body.split('/').collect();
+            let key_body = key.trim_start_matches('/');
+            let parts: Vec<&str> = key_body.split('/').collect();
             for i in 1..parts.len() {
                 let prefix = parts[..i].join("/");
                 parents.insert(format!("/{prefix}"));
@@ -789,7 +822,8 @@ fn parse_expanded_cone_parent_recursive(lines: &[String]) -> Option<(Vec<String>
         if b != &expected_neg {
             break;
         }
-        parents.push(inner_a.to_string());
+        // On-disk patterns escape glob/backslash chars; match against the literal directory name.
+        parents.push(unescape_cone_pattern_path(inner_a));
         i += 2;
     }
     while i < lines.len() {
@@ -804,7 +838,7 @@ fn parse_expanded_cone_parent_recursive(lines: &[String]) -> Option<(Vec<String>
         if body.is_empty() {
             return None;
         }
-        recursive.push(body.to_string());
+        recursive.push(unescape_cone_pattern_path(body));
         i += 1;
     }
     Some((parents, recursive))
@@ -952,6 +986,26 @@ fn escape_cone_pattern_path(path_with_leading_slash: &str) -> String {
     out
 }
 
+/// Inverse of [`escape_cone_pattern_path`]: drop the escaping backslash before a glob/backslash
+/// character so a cone pattern body becomes the plain directory name.
+fn unescape_cone_pattern_path(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let mut chars = escaped.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(&next) = chars.peek() {
+                if matches!(next, '\\' | '[' | '*' | '?' | '#') {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn recursive_set_has_strict_ancestor(recursive: &BTreeSet<String>, path: &str) -> bool {
     let mut cur = path.to_string();
     loop {
@@ -1031,7 +1085,9 @@ pub fn parse_expanded_cone_recursive_dirs(lines: &[String]) -> Vec<String> {
             i += 2;
             continue;
         }
-        out.push(body.to_owned());
+        // On-disk cone patterns escape glob/backslash characters (`escaped_pattern`); the
+        // directory name itself (Git's recursive hashmap key) is the unescaped form.
+        out.push(unescape_cone_pattern_path(body));
         i += 1;
     }
     out
