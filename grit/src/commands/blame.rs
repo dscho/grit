@@ -2291,6 +2291,19 @@ pub fn run(mut args: Args) -> Result<()> {
     normalized_positional.extend(args.args.iter().cloned());
 
     let (rev, file_path) = parse_blame_args(&odb, &repo, &normalized_positional)?;
+
+    // Working-copy blame (no revision, no --contents) blames the file on disk; git lstat's
+    // it first and aborts when it is absent (e.g. a skip-worktree out-of-cone path that is
+    // not materialized). Match git's exact message (t1092 blame outside sparse definition).
+    if rev.is_none() && args.contents.is_none() {
+        if let Some(work_tree) = repo.work_tree.as_deref() {
+            let abs_path = work_tree.join(&file_path);
+            if std::fs::symlink_metadata(&abs_path).is_err() {
+                bail!("fatal: Cannot lstat '{file_path}': No such file or directory");
+            }
+        }
+    }
+
     let use_textconv = !args.no_textconv;
     let copy_depth = args.copy_detection.len();
     let textconv_ctx = Some(BlameTextconvContext::new(&repo));
