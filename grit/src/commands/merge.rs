@@ -132,6 +132,63 @@ fn run_pre_merge_commit_hook(
     Ok(())
 }
 
+/// Run `prepare-commit-msg` (and, when editing, the editor) on the merge commit message,
+/// mirroring `builtin/merge.c:prepare_to_commit`.
+///
+/// The message is written to `MERGE_MSG`, the hook is invoked with `arg1 = "merge"` (and
+/// `GIT_EDITOR=:` when no editor will be launched, so hooks can detect a non-interactive merge),
+/// the editor is launched on `MERGE_MSG` when `will_edit`, and the (possibly hook/editor-modified)
+/// message is read back, comment-stripped, and returned. `--no-verify` skips the hook.
+fn run_merge_prepare_commit_msg_hook(
+    repo: &Repository,
+    no_verify: bool,
+    will_edit: bool,
+    msg: String,
+    index: &mut Index,
+) -> Result<String> {
+    let merge_msg_path = repo.git_dir.join("MERGE_MSG");
+    fs::write(&merge_msg_path, msg.as_bytes())?;
+
+    if !no_verify {
+        let index_path = repo.index_path();
+        let merge_msg_str = merge_msg_path.to_string_lossy().to_string();
+        let hook_env = CommitHookEnv {
+            index_file: Some(index_path.as_path()),
+            git_editor: if will_edit { None } else { Some(":") },
+            git_prefix: None,
+            extra_env: &[],
+        };
+        let r = run_commit_hook(
+            repo,
+            "prepare-commit-msg",
+            &[merge_msg_str.as_str(), "merge"],
+            None,
+            &hook_env,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if let HookResult::Failed(code) = r {
+            bail!("prepare-commit-msg hook exited with status {code}");
+        }
+        if r.was_executed() {
+            // The hook may have updated the index (e.g. via `git add`); re-read it.
+            *index = match repo.load_index_at(&index_path) {
+                Ok(idx) => idx,
+                Err(grit_lib::error::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                    Index::new()
+                }
+                Err(e) => return Err(e.into()),
+            };
+        }
+    }
+
+    if will_edit {
+        crate::commands::commit::launch_commit_editor(repo, &merge_msg_path)?;
+    }
+
+    let edited = fs::read_to_string(&merge_msg_path)?;
+    Ok(cleanup_message(&edited, "default"))
+}
+
 /// Update `HEAD` (and branch ref when on a branch) then run `reference-transaction` with phase
 /// `committed` (t1800 client hook ordering).
 fn merge_update_head(
@@ -1866,7 +1923,6 @@ Aborting"
     run_pre_merge_commit_hook(repo, args.no_verify, args.edit && !args.no_edit, &mut index)?;
     repo.write_index(&mut index)?;
 
-    let tree_oid = write_tree_from_index(&repo.odb, &index, "")?;
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
     let effective_custom_msg = if let Some(ref file_path) = args.file {
         Some(read_merge_message_from_file(Path::new(file_path), &config)?)
@@ -1906,6 +1962,14 @@ Aborting"
     if let Some(ref mode) = args.cleanup {
         msg = cleanup_message(&msg, mode);
     }
+    // Run prepare-commit-msg (and the editor when -e) on the merge message, matching
+    // builtin/merge.c:prepare_to_commit. The index is re-read in case the hook updated it.
+    let will_edit = args.edit && !args.no_edit;
+    msg = run_merge_prepare_commit_msg_hook(repo, args.no_verify, will_edit, msg, &mut index)?;
+    if will_edit && msg.trim().is_empty() {
+        bail!("Empty commit message.");
+    }
+    let tree_oid = write_tree_from_index(&repo.odb, &index, "")?;
     let finalized = finalize_merge_commit_message(msg, &config);
     let commit_data = CommitData {
         tree: tree_oid,
@@ -2299,8 +2363,8 @@ Aborting"
     run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut merge_result.index)?;
     repo.write_index(&mut merge_result.index)?;
 
-    // Create merge commit
-    let tree_oid = write_tree_from_index(&repo.odb, &merge_result.index, "")?;
+    // Create merge commit. The tree is (re)computed after prepare-commit-msg below, since the
+    // hook may update the index.
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
     let effective_custom_msg = if let Some(ref file_path) = args.file {
         Some(read_merge_message_from_file(Path::new(file_path), &config)?)
@@ -2347,6 +2411,21 @@ Aborting"
     if let Some(ref mode) = args.cleanup {
         msg = cleanup_message(&msg, mode);
     }
+
+    // Run prepare-commit-msg (and the editor when -e) on the merge message, matching
+    // builtin/merge.c:prepare_to_commit. The index is re-read in case the hook updated it.
+    let will_edit = args.edit && !args.no_edit;
+    msg = run_merge_prepare_commit_msg_hook(
+        repo,
+        args.no_verify,
+        will_edit,
+        msg,
+        &mut merge_result.index,
+    )?;
+    if will_edit && msg.trim().is_empty() {
+        bail!("Empty commit message.");
+    }
+    let tree_oid = write_tree_from_index(&repo.odb, &merge_result.index, "")?;
 
     let finalized = finalize_merge_commit_message(msg, &config);
     let commit_data = CommitData {
