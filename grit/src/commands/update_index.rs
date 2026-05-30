@@ -634,6 +634,13 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
             };
             let mode = u32::from_str_radix(&mode_str, 8)
                 .with_context(|| format!("invalid mode '{mode_str}'"))?;
+            // Git `add_cacheinfo` runs `verify_path(path, mode)` which rejects directory
+            // (tree) entries and any path with a trailing slash. You cannot stage a sparse
+            // directory via `--cacheinfo 040000 <oid> folder2/` (t1092 update-index).
+            if mode == grit_lib::index::MODE_TREE || path_bytes.ends_with(b"/") {
+                let path_str = String::from_utf8_lossy(&path_bytes);
+                bail!("error: Invalid path '{path_str}'");
+            }
             let oid: ObjectId = parse_index_info_oid(&repo, mode, &oid_str)?;
             // Reject null (all-zero) SHA1 — print verbose but skip
             if oid.is_zero() {
