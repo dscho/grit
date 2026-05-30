@@ -1096,9 +1096,14 @@ fn verify_ssh_signed_buffer(
 
     let _ = std::fs::remove_file(&sig_path);
 
-    // Build sigc.output: stripped ssh stdout, then the captured stderrs.
-    let mut output = strip_trailing_ws(&verify_stdout);
-    strip_trailing_ws_in_place(&mut verify_stderr);
+    // Build sigc.output exactly as Git: stripspace the ssh stdout and stderr
+    // (each non-empty line keeps a trailing newline), then append the
+    // find-principals stderr and the verify/check stderr (gpg-interface.c
+    // 601-608). The trailing newline left by stripspace keeps the `Good "..."`
+    // line separate from any appended `No principal matched.` text so
+    // parse_ssh_output sees a clean first line.
+    let mut output = stripspace(&verify_stdout);
+    let verify_stderr = stripspace(&verify_stderr);
     output.push_str(&find_stderr);
     output.push_str(&verify_stderr);
 
@@ -1142,16 +1147,30 @@ fn run_with_stdin_status(cmd: &mut Command, input: &[u8]) -> (String, String, bo
     }
 }
 
-/// Return `s` with trailing ASCII whitespace removed (Git `strbuf_stripspace`
-/// trims trailing blank lines/whitespace).
-fn strip_trailing_ws(s: &str) -> String {
-    s.trim_end().to_owned()
-}
-
-/// In-place variant of [`strip_trailing_ws`].
-fn strip_trailing_ws_in_place(s: &mut String) {
-    let trimmed = s.trim_end().len();
-    s.truncate(trimmed);
+/// Port of Git's `strbuf_stripspace` (without comment handling): trim trailing
+/// whitespace from each line, collapse runs of blank lines to a single blank
+/// line, and terminate every non-empty line with a single `\n`. The retained
+/// trailing newline is what keeps the ssh `Good "..."` line separate from the
+/// appended `No principal matched.` stderr.
+fn stripspace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_empties = 0usize;
+    let mut wrote_any = false;
+    for line in s.split('\n') {
+        let trimmed = line.trim_end_matches([' ', '\t', '\r']);
+        if trimmed.is_empty() {
+            pending_empties += 1;
+            continue;
+        }
+        if pending_empties > 0 && wrote_any {
+            out.push('\n');
+        }
+        pending_empties = 0;
+        out.push_str(trimmed);
+        out.push('\n');
+        wrote_any = true;
+    }
+    out
 }
 
 /// Parse `[GNUPG:]` status lines into `sigc` (port of `parse_gpg_output`).
