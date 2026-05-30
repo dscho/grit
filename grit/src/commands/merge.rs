@@ -132,6 +132,79 @@ fn run_pre_merge_commit_hook(
     Ok(())
 }
 
+/// Run the `prepare-commit-msg` and `commit-msg` hooks for a merge commit, matching upstream
+/// `builtin/merge.c:prepare_to_commit`. Writes the built message to `MERGE_MSG`, runs
+/// `prepare-commit-msg <MERGE_MSG> merge` (always, like upstream), then `commit-msg <MERGE_MSG>`
+/// (skipped with `--no-verify`), and re-reads `MERGE_MSG` so a hook that rewrites the file (e.g.
+/// the t7504 commit-msg hook) is honoured. The returned message replaces `msg` before the commit
+/// is finalized.
+fn run_merge_commit_msg_hooks(
+    repo: &Repository,
+    msg: String,
+    merge_will_launch_editor: bool,
+    no_verify: bool,
+    cleanup_mode: &str,
+) -> Result<String> {
+    let merge_msg_path = repo.git_dir.join("MERGE_MSG");
+    fs::write(&merge_msg_path, &msg)?;
+    let merge_msg_str = merge_msg_path.to_string_lossy().to_string();
+
+    let index_path = repo.index_path();
+    let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+    let now = OffsetDateTime::now_utc();
+    let author_line = resolve_ident(&config, "author", now)?;
+    let author_env = author_env_for_commit_hooks(&author_line)?;
+    let author_refs: Vec<(&str, &str)> = author_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let hook_editor = if merge_will_launch_editor {
+        None
+    } else {
+        Some(":")
+    };
+    let hook_env = CommitHookEnv {
+        index_file: Some(index_path.as_path()),
+        git_editor: hook_editor,
+        git_prefix: None,
+        extra_env: author_refs.as_slice(),
+    };
+
+    // prepare-commit-msg runs even with `--no-verify` (only pre-commit/commit-msg are skipped),
+    // matching upstream `prepare_to_commit`.
+    let prepared = run_commit_hook(
+        repo,
+        "prepare-commit-msg",
+        &[merge_msg_str.as_str(), "merge"],
+        None,
+        &hook_env,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if let HookResult::Failed(code) = prepared {
+        bail!("prepare-commit-msg hook exited with status {code}");
+    }
+
+    if !no_verify {
+        let verified = run_commit_hook(
+            repo,
+            "commit-msg",
+            &[merge_msg_str.as_str()],
+            None,
+            &hook_env,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if let HookResult::Failed(code) = verified {
+            bail!("commit-msg hook exited with status {code}");
+        }
+    }
+
+    // Re-read MERGE_MSG so an edit by either hook is picked up, then re-apply cleanup
+    // (upstream `read_merge_msg` + `cleanup_message`).
+    let raw = fs::read(&merge_msg_path)?;
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    Ok(cleanup_message(&text, cleanup_mode))
+}
+
 /// Update `HEAD` (and branch ref when on a branch) then run `reference-transaction` with phase
 /// `committed` (t1800 client hook ordering).
 fn merge_update_head(
@@ -1906,6 +1979,14 @@ Aborting"
     if let Some(ref mode) = args.cleanup {
         msg = cleanup_message(&msg, mode);
     }
+    let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
+    msg = run_merge_commit_msg_hooks(
+        repo,
+        msg,
+        args.edit && !args.no_edit,
+        args.no_verify,
+        hook_cleanup,
+    )?;
     let finalized = finalize_merge_commit_message(msg, &config);
     let commit_data = CommitData {
         tree: tree_oid,
@@ -2347,6 +2428,17 @@ Aborting"
     if let Some(ref mode) = args.cleanup {
         msg = cleanup_message(&msg, mode);
     }
+
+    // Run prepare-commit-msg + commit-msg hooks (upstream `prepare_to_commit`); these may rewrite
+    // the merge message before it is committed.
+    let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
+    msg = run_merge_commit_msg_hooks(
+        repo,
+        msg,
+        args.edit && !args.no_edit,
+        args.no_verify,
+        hook_cleanup,
+    )?;
 
     let finalized = finalize_merge_commit_message(msg, &config);
     let commit_data = CommitData {
@@ -3614,6 +3706,14 @@ fn do_octopus_merge(
     let msg = build_octopus_merge_message(head, &merge_names, args.message.as_deref(), repo);
 
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+    let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
+    let msg = run_merge_commit_msg_hooks(
+        repo,
+        msg,
+        args.edit && !args.no_edit,
+        args.no_verify,
+        hook_cleanup,
+    )?;
     let now = OffsetDateTime::now_utc();
     let author = resolve_ident(&config, "author", now)?;
     let committer = resolve_ident(&config, "committer", now)?;
@@ -3837,6 +3937,15 @@ fn do_strategy_ours(
 
     let tree_oid = write_tree_from_index(&repo.odb, &idx, "")?;
 
+    let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
+    let msg = run_merge_commit_msg_hooks(
+        repo,
+        msg,
+        args.edit && !args.no_edit,
+        args.no_verify,
+        hook_cleanup,
+    )?;
+
     let commit_data = CommitData {
         tree: tree_oid,
         parents: vec![head_oid, merge_oid],
@@ -3899,6 +4008,15 @@ fn do_strategy_theirs(
     repo.write_index(&mut idx)?;
 
     let tree_oid = write_tree_from_index(&repo.odb, &idx, "")?;
+
+    let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
+    let msg = run_merge_commit_msg_hooks(
+        repo,
+        msg,
+        args.edit && !args.no_edit,
+        args.no_verify,
+        hook_cleanup,
+    )?;
 
     let commit_data = CommitData {
         tree: tree_oid,
