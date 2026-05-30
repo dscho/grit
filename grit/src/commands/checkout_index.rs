@@ -148,6 +148,21 @@ pub fn run(args: Args) -> Result<()> {
     let index_path = repo.index_path();
     let mut index = repo.load_index_at(&index_path).context("loading index")?;
 
+    // `load_index_at` transparently expands sparse-directory placeholders, losing the
+    // collapsed-directory distinction git relies on to print `is a sparse directory`.
+    // Parse the raw on-disk index to recover the set of sparse-directory prefixes.
+    let sparse_dir_prefixes: Vec<Vec<u8>> = std::fs::read(&index_path)
+        .ok()
+        .and_then(|bytes| Index::parse(&bytes).ok())
+        .map(|raw| {
+            raw.entries
+                .iter()
+                .filter(|e| e.stage() == 0 && e.is_sparse_directory_placeholder())
+                .map(|e| e.path.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let cwd = repo.effective_pathspec_cwd();
 
     let prefix = args.prefix.as_deref().unwrap_or("");
@@ -172,6 +187,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let mut selected: Vec<(Vec<u8>, String)> = Vec::new();
     let mut index_needs_write = false;
+    let mut had_error = false;
     if args.all {
         for entry in &index.entries {
             if entry.stage() != target_stage {
@@ -183,38 +199,58 @@ pub fn run(args: Args) -> Result<()> {
             let disp = display_path_for_index_entry(&entry.path, &cwd_prefix);
             selected.push((entry.path.clone(), disp));
         }
-    } else if args.stdin {
-        let paths = read_stdin_paths(args.null_terminated)?;
-        for input_path in paths {
-            let repo_path = resolve_repo_path(&work_tree, &cwd, &input_path)?;
-            let path_bytes = path_to_bytes(&repo_path);
-            if index.get(&path_bytes, target_stage).is_none() {
-                if args.quiet {
-                    continue;
-                }
-                bail!("'{}' is not in the cache", input_path.display());
-            }
-            selected.push((path_bytes, input_path.display().to_string()));
-        }
     } else {
-        for input_path in &args.files {
-            let repo_path = resolve_repo_path(&work_tree, &cwd, input_path)?;
-            let path_bytes = path_to_bytes(&repo_path);
-            let maybe_entry = index.get(&path_bytes, target_stage);
-            if maybe_entry.is_none()
-                || (maybe_entry
-                    .is_some_and(|e| e.skip_worktree() && !args.ignore_skip_worktree_bits))
-            {
-                if args.quiet {
-                    continue;
-                }
-                bail!("'{}' is not in the cache", input_path.display());
+        // Collect requested (path_bytes, display) pairs from stdin or argv.
+        let requested: Vec<(Vec<u8>, String)> = if args.stdin {
+            let paths = read_stdin_paths(args.null_terminated)?;
+            let mut out = Vec::new();
+            for input_path in paths {
+                let repo_path = resolve_repo_path(&work_tree, &cwd, &input_path)?;
+                out.push((path_to_bytes(&repo_path), input_path.display().to_string()));
             }
-            selected.push((path_bytes, input_path.display().to_string()));
+            out
+        } else {
+            let mut out = Vec::new();
+            for input_path in &args.files {
+                let repo_path = resolve_repo_path(&work_tree, &cwd, input_path)?;
+                out.push((path_to_bytes(&repo_path), input_path.display().to_string()));
+            }
+            out
+        };
+
+        for (path_bytes, display) in requested {
+            // Git `index_name_pos` expands the sparse index on lookup; mirror that by
+            // resolving the path against sparse-directory placeholders. The classification
+            // (has_same_name / is_file / is_skipped) reproduces git's checkout_file().
+            let class = classify_checkout_index_path(&index, &sparse_dir_prefixes, &path_bytes);
+            match class {
+                PathClass::File { skip_worktree } => {
+                    if skip_worktree && !args.ignore_skip_worktree_bits {
+                        if !args.quiet {
+                            eprintln!("git checkout-index: {display} has skip-worktree enabled; use '--ignore-skip-worktree-bits' to checkout");
+                        }
+                        had_error = true;
+                        continue;
+                    }
+                    selected.push((path_bytes, display));
+                }
+                PathClass::SparseDirectory => {
+                    if !args.quiet {
+                        eprintln!("git checkout-index: {display} is a sparse directory");
+                    }
+                    had_error = true;
+                }
+                PathClass::NotInCache => {
+                    if !args.quiet {
+                        eprintln!("git checkout-index: {display} is not in the cache");
+                    }
+                    had_error = true;
+                }
+            }
         }
     }
 
-    let mut has_errors = false;
+    let mut has_errors = had_error;
     for (path, display) in selected {
         let entry = index
             .get(&path, target_stage)
@@ -256,6 +292,39 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Classification of a requested checkout-index path, mirroring git's `checkout_file`
+/// (builtin/checkout-index.c) which inspects `has_same_name`, `is_file`, `is_skipped`.
+enum PathClass {
+    /// A regular blob entry exists at this exact path.
+    File { skip_worktree: bool },
+    /// The path resolves to a sparse-directory placeholder (a collapsed out-of-cone dir).
+    SparseDirectory,
+    /// No entry with this name exists in the index.
+    NotInCache,
+}
+
+fn classify_checkout_index_path(
+    index: &Index,
+    sparse_dir_prefixes: &[Vec<u8>],
+    path: &[u8],
+) -> PathClass {
+    // A request for a path that the (collapsed) on-disk index represented as a
+    // sparse-directory placeholder is reported as a sparse directory by git, even though
+    // grit has already expanded that placeholder in memory.
+    for pref in sparse_dir_prefixes {
+        let without_slash = pref.strip_suffix(b"/").unwrap_or(pref);
+        if path == pref.as_slice() || path == without_slash {
+            return PathClass::SparseDirectory;
+        }
+    }
+    if let Some(e) = index.get(path, 0) {
+        return PathClass::File {
+            skip_worktree: e.skip_worktree(),
+        };
+    }
+    PathClass::NotInCache
 }
 
 fn run_checkout_stage_all(
@@ -424,7 +493,9 @@ fn checkout_entry(
 
     let existing_meta = std::fs::symlink_metadata(&abs_path).ok();
     if let Some(ref meta) = existing_meta {
-        if !args.force && !args.ignore_skip_worktree_bits {
+        // `--ignore-skip-worktree-bits` only permits checking out skip-worktree entries; it
+        // does NOT bypass the force guard, so a changed file present on disk still errors.
+        if !args.force {
             let unchanged = if entry.mode == MODE_SYMLINK && symlinks_enabled {
                 meta.file_type().is_symlink()
                     && std::fs::read_link(&abs_path).ok().is_some_and(|t| {
@@ -449,12 +520,12 @@ fn checkout_entry(
             if unchanged {
                 return Ok(outcome);
             }
+            // Git `entry.c:write_entry`: a changed file present on disk without --force is
+            // an error (`<path> already exists, no checkout`), not a silent skip.
             if !args.quiet {
-                eprintln!(
-                    "warning: '{rel_path}' already exists, skipping (use --force to override)"
-                );
+                eprintln!("{rel_path} already exists, no checkout");
             }
-            return Ok(outcome);
+            return Err(anyhow::anyhow!("{rel_path} already exists, no checkout"));
         }
     }
 
