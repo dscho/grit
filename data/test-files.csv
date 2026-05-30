@@ -594,10 +594,10 @@ t3401-rebase-and-am-rename	t3	yes	10	8	2	false	ok	0
 t3401-rebase-basic	t3	yes	32	1	31	false	ok	0
 t3402-rebase-merge	t3	yes	13	2	11	false	ok	0
 t3403-rebase-skip	t3	yes	20	9	11	false	ok	0
-t3404-rebase-interactive	t3	yes	132	28	104	false	ok	0
+t3404-rebase-interactive	t3	yes	132	32	100	false	ok	0
 t3405-rebase-malformed	t3	yes	5	5	0	true	ok	0
 t3406-rebase-message	t3	yes	32	15	17	false	ok	0
-t3407-rebase-abort	t3	yes	17	13	4	false	ok	0
+t3407-rebase-abort	t3	yes	17	15	2	false	ok	0
 t3408-rebase-multi-line	t3	yes	2	2	0	true	ok	0
 t3409-rebase-environ	t3	yes	3	3	0	true	ok	0
 t3412-rebase-root	t3	yes	25	13	12	false	ok	0
@@ -633,7 +633,7 @@ t3450-history	t3	yes	2	1	1	false	ok	0
 t3451-history-reword	t3	yes	14	11	3	false	ok	0
 t3452-history-split	t3	yes	25	22	3	false	ok	0
 t3500-cherry	t3	yes	4	4	0	true	ok	0
-t3501-revert-cherry-pick	t3	yes	21	16	5	false	ok	0
+t3501-revert-cherry-pick	t3	yes	21	20	1	false	ok	0
 t3502-cherry-pick-merge	t3	yes	12	3	9	false	ok	0
 t3503-cherry-pick-root	t3	yes	6	6	0	true	ok	0
 t3504-cherry-pick-rerere	t3	yes	9	3	6	false	ok	0
@@ -1225,7 +1225,7 @@ t7501-commit-basic-functionality	t7	yes	0	0	0	false	timeout	0
 t7502-commit-porcelain	t7	yes	82	31	51	false	ok	0
 t7503-pre-commit-and-diff-whitespace	t7	yes	22	1	21	false	ok	0
 t7503-pre-commit-and-pre-merge-commit-hooks	t7	yes	22	22	0	true	ok	0
-t7504-commit-msg-hook	t7	yes	29	29	0	true	ok	1
+t7504-commit-msg-hook	t7	yes	30	29	0	true	ok	1
 t7505-prepare-commit-msg	t7	yes	30	1	29	false	ok	0
 t7505-prepare-commit-msg-hook	t7	yes	23	22	1	false	ok	0
 t7506-status-submodule	t7	yes	40	16	24	false	ok	0
