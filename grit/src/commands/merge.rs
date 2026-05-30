@@ -220,12 +220,20 @@ pub struct Args {
     pub edit: bool,
 
     /// Add Signed-off-by trailer to the merge commit message.
-    #[arg(short = 'S', long = "signoff")]
+    #[arg(long = "signoff")]
     pub signoff: bool,
 
     /// Do not add Signed-off-by trailer.
     #[arg(long = "no-signoff")]
     pub no_signoff: bool,
+
+    /// GPG-sign the resulting merge commit (Git's `merge -S`/`--gpg-sign`).
+    #[arg(short = 'S', long = "gpg-sign", value_name = "KEYID", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    pub gpg_sign: Option<String>,
+
+    /// Do not GPG-sign the merge commit.
+    #[arg(long = "no-gpg-sign")]
+    pub no_gpg_sign: bool,
 
     /// Show a diffstat at the end of the merge.
     #[arg(long = "stat")]
@@ -653,8 +661,14 @@ fn apply_mergeoptions(args: &mut Args, opts: &str) {
                 }
             }
             "--no-log" => args.no_log = true,
-            "--signoff" | "-S" if !args.no_signoff => args.signoff = true,
+            "--signoff" if !args.no_signoff => args.signoff = true,
             "--no-signoff" if !args.signoff => args.no_signoff = true,
+            "-S" | "--gpg-sign" if !args.no_gpg_sign => {
+                if args.gpg_sign.is_none() {
+                    args.gpg_sign = Some(String::new());
+                }
+            }
+            "--no-gpg-sign" => args.no_gpg_sign = true,
             "--edit" | "-e" if !args.no_edit => args.edit = true,
             "--no-edit" if !args.edit => args.no_edit = true,
             "--quiet" | "-q" => args.quiet = true,
@@ -1900,7 +1914,15 @@ Aborting"
         message: finalized.message,
         raw_message: finalized.raw_message,
     };
-    let commit_bytes = serialize_commit(&commit_data);
+    let mut commit_bytes = serialize_commit(&commit_data);
+    if should_sign_merge(args, &config) {
+        commit_bytes = sign_merge_commit_bytes(
+            &config,
+            &commit_data.committer,
+            args.gpg_sign.as_deref(),
+            commit_bytes,
+        )?;
+    }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
     update_head(&repo.git_dir, head, &commit_oid)?;
 
@@ -2335,7 +2357,15 @@ Aborting"
         raw_message: finalized.raw_message,
     };
 
-    let commit_bytes = serialize_commit(&commit_data);
+    let mut commit_bytes = serialize_commit(&commit_data);
+    if should_sign_merge(args, &config) {
+        commit_bytes = sign_merge_commit_bytes(
+            &config,
+            &commit_data.committer,
+            args.gpg_sign.as_deref(),
+            commit_bytes,
+        )?;
+    }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
     merge_update_head(repo, head, Some(head_oid), commit_oid)?;
 
@@ -3603,7 +3633,15 @@ fn do_octopus_merge(
         raw_message: None,
     };
 
-    let commit_bytes = serialize_commit(&commit_data);
+    let mut commit_bytes = serialize_commit(&commit_data);
+    if should_sign_merge(args, &config) {
+        commit_bytes = sign_merge_commit_bytes(
+            &config,
+            &commit_data.committer,
+            args.gpg_sign.as_deref(),
+            commit_bytes,
+        )?;
+    }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
     merge_update_head(repo, head, Some(head_oid), commit_oid)?;
 
@@ -3807,7 +3845,15 @@ fn do_strategy_ours(
         raw_message: None,
     };
 
-    let commit_bytes = serialize_commit(&commit_data);
+    let mut commit_bytes = serialize_commit(&commit_data);
+    if should_sign_merge(args, &config) {
+        commit_bytes = sign_merge_commit_bytes(
+            &config,
+            &commit_data.committer,
+            args.gpg_sign.as_deref(),
+            commit_bytes,
+        )?;
+    }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
     merge_update_head(repo, head, Some(head_oid), commit_oid)?;
 
@@ -3862,7 +3908,15 @@ fn do_strategy_theirs(
         raw_message: None,
     };
 
-    let commit_bytes = serialize_commit(&commit_data);
+    let mut commit_bytes = serialize_commit(&commit_data);
+    if should_sign_merge(args, &config) {
+        commit_bytes = sign_merge_commit_bytes(
+            &config,
+            &commit_data.committer,
+            args.gpg_sign.as_deref(),
+            commit_bytes,
+        )?;
+    }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
     merge_update_head(repo, head, Some(head_oid), commit_oid)?;
 
@@ -8562,6 +8616,36 @@ fn apply_autostash_entries(repo: &Repository, entries: &[AutoStashEntry]) -> Res
 
 /// Build the default merge commit message.
 /// Append Signed-off-by trailer to a message if not already present.
+/// Whether the resulting merge commit should be GPG-signed: `-S`/`--gpg-sign`
+/// or `commit.gpgsign`, unless `--no-gpg-sign` was given.
+fn should_sign_merge(args: &Args, config: &ConfigSet) -> bool {
+    if args.no_gpg_sign {
+        return false;
+    }
+    if args.gpg_sign.is_some() {
+        return true;
+    }
+    matches!(config.get_bool("commit.gpgsign"), Some(Ok(true)))
+}
+
+/// Sign a serialized merge commit object, splicing in the `gpgsig` header.
+fn sign_merge_commit_bytes(
+    config: &ConfigSet,
+    committer: &str,
+    key_override: Option<&str>,
+    commit_bytes: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let cfg = grit_lib::signing::GpgConfig::from_config(config)?;
+    let committer_default = grit_lib::signing::committer_signing_default(committer);
+    let signing_key = cfg.resolve_signing_key(key_override, &committer_default);
+    let signature = grit_lib::signing::sign_buffer(&cfg, &commit_bytes, &signing_key)?;
+    Ok(grit_lib::signing::add_header_signature(
+        &commit_bytes,
+        &signature,
+        grit_lib::signing::GPG_SIG_HEADER_SHA1,
+    ))
+}
+
 fn append_signoff(msg: &str, name: &str, email: &str) -> String {
     let trailer = format!("Signed-off-by: {} <{}>", name, email);
     if msg.contains(&trailer) {

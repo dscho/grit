@@ -42,6 +42,17 @@ pub struct Args {
     /// Override message encoding.
     #[arg(long)]
     pub encoding: Option<String>,
+
+    /// GPG-sign the commit, optionally with a specific key id.
+    ///
+    /// The optional key id must be attached (`-S<keyid>` / `--gpg-sign=<keyid>`)
+    /// so a following positional `<tree>` is not consumed as the key id.
+    #[arg(short = 'S', long = "gpg-sign", value_name = "KEYID", num_args = 0..=1, require_equals = true, default_missing_value = "")]
+    pub gpg_sign: Option<String>,
+
+    /// Do not GPG-sign the commit.
+    #[arg(long = "no-gpg-sign")]
+    pub no_gpg_sign: bool,
 }
 
 /// Run `grit commit-tree`.
@@ -89,7 +100,21 @@ pub fn run(args: Args) -> Result<()> {
         raw_message: None,
     };
 
-    let raw = serialize_commit(&commit_data);
+    let mut raw = serialize_commit(&commit_data);
+    // Unlike `git commit`, bare `git commit-tree` ignores `commit.gpgsign`; it
+    // only signs when `-S`/`--gpg-sign` is given (and not `--no-gpg-sign`).
+    if args.gpg_sign.is_some() && !args.no_gpg_sign {
+        let cfg = grit_lib::signing::GpgConfig::from_config(&config)?;
+        let committer_default =
+            grit_lib::signing::committer_signing_default(&commit_data.committer);
+        let signing_key = cfg.resolve_signing_key(args.gpg_sign.as_deref(), &committer_default);
+        let signature = grit_lib::signing::sign_buffer(&cfg, &raw, &signing_key)?;
+        raw = grit_lib::signing::add_header_signature(
+            &raw,
+            &signature,
+            grit_lib::signing::GPG_SIG_HEADER_SHA1,
+        );
+    }
     let oid = repo
         .odb
         .write(ObjectKind::Commit, &raw)
