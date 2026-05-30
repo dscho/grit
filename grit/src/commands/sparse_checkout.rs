@@ -527,11 +527,9 @@ fn cmd_add(repo: &Repository, args: &AddArgs) -> Result<()> {
     let _lock = acquire_sparse_lock(repo)?;
     let result = (|| {
         if cone {
-            let content = read_sparse_file_content(repo);
-            if ConePatterns::try_parse(&content).is_none() {
-                bail!("existing sparse-checkout patterns do not use cone mode");
-            }
-            let mut dirs = cone_directory_inputs_for_add(&content);
+            // Sanitize first (Git `sanitize_paths` runs before `modify_pattern_list`): a tracked
+            // regular file argument like `.gitignore` must die "is not a directory" even when the
+            // existing on-disk file is not cone-formatted (t1091 test 59).
             let inputs = if args.stdin {
                 let stdin = io::stdin();
                 let mut stdin = stdin.lock();
@@ -541,6 +539,11 @@ fn cmd_add(repo: &Repository, args: &AddArgs) -> Result<()> {
                 sanitize_add_paths(repo, worktree_prefix(repo)?, args.skip_checks, &mut p)?;
                 p
             };
+            let content = read_sparse_file_content(repo);
+            if ConePatterns::try_parse(&content).is_none() {
+                bail!("existing sparse-checkout patterns do not use cone mode");
+            }
+            let mut dirs = cone_directory_inputs_for_add(&content);
             for line in inputs {
                 let p = normalize_cone_input_line(&line)?;
                 if !args.skip_checks {
