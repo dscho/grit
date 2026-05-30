@@ -2363,6 +2363,33 @@ fn push_to_url(
         }
     }
 
+    // Run post-update hook on the remote after post-receive, matching
+    // receive-pack ordering. It receives the list of updated remote refnames
+    // as its arguments (not via stdin) and is purely informational, so its
+    // exit status is ignored (matches receive-pack.rs / githooks(5)).
+    if !args.dry_run && !applied_updates.is_empty() {
+        let post_update_arg_strings: Vec<String> = applied_updates
+            .iter()
+            .map(|(update, _)| update.remote_ref.clone())
+            .collect();
+        if !post_update_arg_strings.is_empty() {
+            let post_update_args: Vec<&str> =
+                post_update_arg_strings.iter().map(|s| s.as_str()).collect();
+            let (_, hook_output) = grit_lib::hooks::run_hook_in_git_dir(
+                &remote_repo,
+                "post-update",
+                &post_update_args,
+                None,
+                &push_option_env_refs,
+            );
+            if !hook_output.is_empty() {
+                let output_str = String::from_utf8_lossy(&hook_output);
+                let color_remote = RemoteMessageColorStyle::from_config(config);
+                colorize_remote_output(&output_str, &color_remote);
+            }
+        }
+    }
+
     // Set upstream tracking if requested (`--dry-run` only prints what Git would do).
     if set_upstream_after_push {
         use std::collections::BTreeMap;
