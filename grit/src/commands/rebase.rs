@@ -5393,15 +5393,22 @@ fn cherry_pick_for_rebase(
     } else {
         let onto_hex = fs::read_to_string(rb_dir.join("onto"))?;
         let onto_oid_state = ObjectId::from_hex(onto_hex.trim())?;
-        // `force_rewrite_commits && head_tree==parent_tree` identifies a clean
-        // replay of a *dependent* chain (e.g. `rebase -f HEAD^^`): the
-        // already-replayed predecessor reproduced its original tree, so the
-        // picked commit's parent tree is the correct cherry-pick base and
-        // base==ours makes sequential edits to the same file apply without
-        // spurious conflicts. The first pick (HEAD still at onto) likewise uses
+        // When the replayed predecessor's tree exactly reproduces the picked
+        // commit's parent tree, the parent tree is the correct cherry-pick base
+        // (base==ours, so the picked diff applies cleanly). This covers:
+        //   * a clean dependent-chain replay under force-rewrite (`rebase -f
+        //     HEAD^^`), where the already-replayed predecessor reproduced its
+        //     original tree, so sequential edits to the same file do not
+        //     spuriously conflict; and
+        //   * a `--continue` that resumes after a resolved conflict whose
+        //     resolution matches the original parent content — the next commit
+        //     must NOT be merged against the onto tree (which would conflict
+        //     spuriously on lines the resolved commit already settled).
+        // Matches Git's sequencer, which always uses the picked commit's parent
+        // tree as the base. The first pick (HEAD still at onto) likewise uses
         // the picked commit's parent tree.
-        let clean_dependent_chain = force_rewrite_commits && head_tree_oid == parent_tree_oid;
-        if head_oid == onto_oid_state || clean_dependent_chain {
+        let predecessor_matches_parent = head_tree_oid == parent_tree_oid;
+        if head_oid == onto_oid_state || predecessor_matches_parent {
             parent_tree_oid
         } else {
             // The replayed predecessor differs from the picked commit's original
@@ -6358,6 +6365,12 @@ fn do_continue() -> Result<()> {
     };
     let msg = format!("{ra} ({verb}): {subject}");
     let _ = append_reflog(git_dir, "HEAD", &head_oid, &new_oid, &ident, &msg, false);
+
+    // The conflict stop paths (RebaseReplayStep::PickLike / Pick `Err`) rewrite the todo as
+    // `todo[i..]`, leaving the *conflicting* commit as the first actionable line with msgnum=1.
+    // We have now committed that resolved commit and advanced HEAD, so drop it from the todo
+    // before resuming; otherwise replay_remaining would re-apply it (double "Applying: …").
+    pop_first_nonempty_todo_line(&repo, &rb_dir)?;
 
     // Continue with remaining
     replay_remaining(
