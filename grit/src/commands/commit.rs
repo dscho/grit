@@ -939,11 +939,34 @@ pub fn run(mut args: Args) -> Result<()> {
         }
         let msg_path_str = msg_file.to_string_lossy().to_string();
         let (hook_arg1, hook_arg2) = prepare_commit_msg_hook_args(&args, &repo.git_dir);
-        let hook_args: Vec<&str> = match hook_arg2.as_deref() {
-            Some(s) => vec![msg_path_str.as_str(), hook_arg1, s],
-            None => vec![msg_path_str.as_str(), hook_arg1],
+        let mut hook_args: Vec<&str> = vec![msg_path_str.as_str()];
+        if let Some(a1) = hook_arg1 {
+            hook_args.push(a1);
+            if let Some(ref a2) = hook_arg2 {
+                hook_args.push(a2.as_str());
+            }
+        }
+        // Match `run_commit_hook` upstream: when no editor is used, export GIT_EDITOR=:
+        // so hooks can detect a non-interactive commit. Also export GIT_INDEX_FILE.
+        let prepare_hook_env = CommitHookEnv {
+            index_file: Some(index_path.as_path()),
+            git_editor: if use_editor_for_message {
+                None
+            } else {
+                Some(":")
+            },
+            git_prefix: None,
+            extra_env: &[],
         };
-        if let HookResult::Failed(code) = run_hook(&repo, "prepare-commit-msg", &hook_args, None) {
+        let r = run_commit_hook(
+            &repo,
+            "prepare-commit-msg",
+            &hook_args,
+            None,
+            &prepare_hook_env,
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
+        if let HookResult::Failed(code) = r {
             bail!("prepare-commit-msg hook exited with status {code}");
         }
         let new_raw = fs::read(&msg_file)?;
@@ -2570,9 +2593,21 @@ fn commit_rename_settings(config: &ConfigSet) -> (Option<u32>, bool) {
 }
 
 fn commit_uses_editor(args: &Args, fixup: Option<&FixupParsed>) -> bool {
+    // Mirror `builtin/commit.c`: first derive a default `use_editor` from the message source,
+    // then let an explicit `-e`/`--no-edit` override it (upstream `edit_flag` tri-state).
+    let base = commit_uses_editor_default(args, fixup);
+    if args.edit {
+        return true;
+    }
     if args.no_edit {
         return false;
     }
+    base
+}
+
+/// Default `use_editor` before applying an explicit `-e`/`--no-edit` override.
+fn commit_uses_editor_default(args: &Args, fixup: Option<&FixupParsed>) -> bool {
+    // `-c`/`-C` (reuse), `-m`, and `-F` all disable the editor by default.
     if args.reuse_message.is_some() && args.reedit_message.is_none() {
         return false;
     }
@@ -2581,8 +2616,8 @@ fn commit_uses_editor(args: &Args, fixup: Option<&FixupParsed>) -> bool {
     }
     if let Some(f) = fixup {
         match f.mode {
-            // Plain `--fixup` uses a generated message unless `--edit` forces the editor.
-            FixupMode::Fixup => return args.edit,
+            // Plain `--fixup` uses a generated message (no editor) by default.
+            FixupMode::Fixup => return false,
             FixupMode::AmendStyle { .. } => return true,
         }
     }
@@ -4086,31 +4121,51 @@ fn format_git_timestamp(dt: OffsetDateTime) -> String {
 }
 
 /// First and optional second argument for `prepare-commit-msg` (Git `prepare_to_commit` semantics).
-fn prepare_commit_msg_hook_args(args: &Args, git_dir: &Path) -> (&'static str, Option<String>) {
+///
+/// Mirrors `builtin/commit.c:prepare_to_commit`: `hook_arg1` defaults to `NULL` (returned here
+/// as `None`, meaning the hook is invoked with only the message-file path). It becomes
+/// `"message"` only when a message was supplied directly via `-m`/`-F`/`--fixup`, `"commit"`
+/// for `-c`/`-C` reuse, and `"squash"`/`"merge"`/`"template"`/CHERRY_PICK for the respective
+/// sources. The `-m`/`-F`/`--fixup` cases are checked first to match upstream precedence.
+fn prepare_commit_msg_hook_args(
+    args: &Args,
+    git_dir: &Path,
+) -> (Option<&'static str>, Option<String>) {
+    // `-m`, `-F`/`-F -` (stdin) and `--fixup` all supply the message directly and set arg1.
+    if !args.message.is_empty() || args.file.is_some() || args.fixup.is_some() {
+        return (Some("message"), None);
+    }
+
     let merge_msg = git_dir.join("MERGE_MSG");
     let squash_msg = git_dir.join("SQUASH_MSG");
     if merge_msg.exists() {
         if squash_msg.exists() {
-            return ("squash", None);
+            return (Some("squash"), None);
         }
-        return ("merge", None);
+        return (Some("merge"), None);
     }
     if squash_msg.exists() {
-        return ("squash", None);
+        return (Some("squash"), None);
     }
     if args.template.is_some() {
-        return ("template", None);
+        return (Some("template"), None);
     }
     if git_dir.join("CHERRY_PICK_HEAD").exists() {
-        return ("commit", Some("CHERRY_PICK_HEAD".to_owned()));
+        return (Some("commit"), Some("CHERRY_PICK_HEAD".to_owned()));
     }
     if let Some(ref r) = args.reuse_message {
-        return ("commit", Some(r.clone()));
+        return (Some("commit"), Some(r.clone()));
     }
     if let Some(ref r) = args.reedit_message {
-        return ("commit", Some(r.clone()));
+        return (Some("commit"), Some(r.clone()));
     }
-    ("message", None)
+    // `--amend` with no other message source reuses HEAD's message: upstream sets
+    // `use_message = "HEAD"` (commit.c:1353), so the hook sees arg1="commit", arg2="HEAD".
+    if args.amend {
+        return (Some("commit"), Some("HEAD".to_owned()));
+    }
+    // Plain editor commit (no message source): hook_arg1 stays NULL upstream.
+    (None, None)
 }
 
 /// Update HEAD to point to the new commit.
