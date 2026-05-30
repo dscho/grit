@@ -1806,7 +1806,9 @@ fn clean_tracked_sparse_dirs(
         // Out of cone. Only remove a directory that holds tracked content (a
         // tracked sparse directory). Purely untracked/ignored directories at the
         // top level (e.g. `obj/`) are preserved, matching Git. Untracked files
-        // outside the cone are never removed (only `sparse-checkout clean` does).
+        // (and symlinks) outside the cone are NEVER removed here (only
+        // `sparse-checkout clean` does) — deleting them would destroy user data
+        // and breaks tests staging helper files outside the cone (t3602/t3705).
         if !tracked_dirs.contains(&rel) {
             continue;
         }
