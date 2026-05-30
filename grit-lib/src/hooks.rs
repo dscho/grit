@@ -251,12 +251,31 @@ fn hook_argv0(repo: &Repository, hooks_dir: &Path, hook_name: &str, cwd: &Path) 
             return PathBuf::from("hooks").join(hook_name);
         }
         if let Some(work_tree) = repo.work_tree.as_deref() {
-            if cwd == work_tree {
+            // Only relativise to `.git/hooks/<name>` when the git dir is literally
+            // `<work_tree>/.git`. When `GIT_DIR` points elsewhere (e.g.
+            // `GIT_DIR=clone1/.git` run from the parent dir, which makes the work
+            // tree default to the process cwd), the relative path would resolve
+            // against the wrong directory. In that case fall through to the
+            // absolute hook path, mirroring upstream `hook.c`, which absolutises
+            // the hook path whenever it runs the hook in a specific directory.
+            if cwd == work_tree && same_dir(repo.git_dir.as_path(), &work_tree.join(".git")) {
                 return PathBuf::from(".git").join("hooks").join(hook_name);
             }
         }
     }
     hooks_dir.join(hook_name)
+}
+
+/// Compare two paths for pointing at the same directory, tolerating symlinks and
+/// non-canonical components by canonicalising both ends when possible.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
 }
 
 fn traditional_hook_candidate(
