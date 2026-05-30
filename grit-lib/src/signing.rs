@@ -114,6 +114,34 @@ impl GpgFormat {
         }
     }
 
+    /// Detect the format from a signature's armor header
+    /// (Git `gpg-interface.c:get_format_by_sig`). Returns `None` for an
+    /// unrecognized signature.
+    pub fn from_signature(sig: &[u8]) -> Option<GpgFormat> {
+        const OPENPGP: &[&[u8]] = &[
+            b"-----BEGIN PGP SIGNATURE-----",
+            b"-----BEGIN PGP MESSAGE-----",
+        ];
+        const X509: &[&[u8]] = &[b"-----BEGIN SIGNED MESSAGE-----"];
+        const SSH: &[&[u8]] = &[b"-----BEGIN SSH SIGNATURE-----"];
+        for prefix in OPENPGP {
+            if sig.starts_with(prefix) {
+                return Some(GpgFormat::OpenPgp);
+            }
+        }
+        for prefix in X509 {
+            if sig.starts_with(prefix) {
+                return Some(GpgFormat::X509);
+            }
+        }
+        for prefix in SSH {
+            if sig.starts_with(prefix) {
+                return Some(GpgFormat::Ssh);
+            }
+        }
+        None
+    }
+
     /// Extra arguments passed before `--verify` for this format.
     fn verify_args(self) -> &'static [&'static str] {
         match self {
@@ -129,12 +157,25 @@ impl GpgFormat {
 pub struct GpgConfig {
     /// The selected format.
     pub format: GpgFormat,
-    /// The resolved program command (may be a bare name to look up on `$PATH`).
+    /// The resolved program command for [`Self::format`] (used for signing; may
+    /// be a bare name to look up on `$PATH`).
     pub program: String,
+    /// `gpg.program` (the format-agnostic fallback), if set.
+    pub generic_program: Option<String>,
+    /// `gpg.openpgp.program`, if set.
+    pub openpgp_program: Option<String>,
+    /// `gpg.x509.program`, if set.
+    pub x509_program: Option<String>,
+    /// `gpg.ssh.program`, if set.
+    pub ssh_program: Option<String>,
     /// `user.signingkey`, if set.
     pub signing_key: Option<String>,
     /// `gpg.minTrustLevel`, if set.
     pub min_trust_level: Option<TrustLevel>,
+    /// `gpg.ssh.allowedSignersFile`, if set (path; leading `~/` expanded).
+    pub ssh_allowed_signers: Option<String>,
+    /// `gpg.ssh.revocationFile`, if set (path; leading `~/` expanded).
+    pub ssh_revocation_file: Option<String>,
 }
 
 impl GpgConfig {
@@ -152,13 +193,23 @@ impl GpgConfig {
             None => GpgFormat::OpenPgp,
         };
 
+        let nonempty = |k: &str| config.get(k).filter(|p| !p.is_empty());
+        let generic_program = nonempty("gpg.program");
+        let fmt_program = |f: GpgFormat| nonempty(&format!("gpg.{}.program", f.name()));
+        let openpgp_program = fmt_program(GpgFormat::OpenPgp);
+        let x509_program = fmt_program(GpgFormat::X509);
+        let ssh_program = fmt_program(GpgFormat::Ssh);
+
         // `gpg.<fmt>.program` takes precedence over `gpg.program`.
-        let fmt_program_key = format!("gpg.{}.program", format.name());
-        let program = config
-            .get(&fmt_program_key)
-            .or_else(|| config.get("gpg.program"))
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| format.default_program().to_owned());
+        let program = resolve_program_for_format(
+            format,
+            generic_program.as_deref(),
+            match format {
+                GpgFormat::OpenPgp => openpgp_program.as_deref(),
+                GpgFormat::X509 => x509_program.as_deref(),
+                GpgFormat::Ssh => ssh_program.as_deref(),
+            },
+        );
 
         let signing_key = config.get("user.signingkey").filter(|k| !k.is_empty());
 
@@ -166,12 +217,42 @@ impl GpgConfig {
             .get("gpg.mintrustlevel")
             .and_then(|v| TrustLevel::from_config(&v));
 
+        // Path values: Git uses `git_config_pathname`, which expands a leading
+        // `~/` relative to $HOME. `ConfigSet` lowercases section/variable names.
+        let ssh_allowed_signers = config
+            .get("gpg.ssh.allowedsignersfile")
+            .filter(|p| !p.is_empty())
+            .map(|p| expand_tilde(&p));
+        let ssh_revocation_file = config
+            .get("gpg.ssh.revocationfile")
+            .filter(|p| !p.is_empty())
+            .map(|p| expand_tilde(&p));
+
         Ok(GpgConfig {
             format,
             program,
+            generic_program,
+            openpgp_program,
+            x509_program,
+            ssh_program,
             signing_key,
             min_trust_level,
+            ssh_allowed_signers,
+            ssh_revocation_file,
         })
+    }
+
+    /// Resolve the program for a specific format (honoring `gpg.<fmt>.program`
+    /// then `gpg.program`, falling back to the format default). Used by
+    /// verification, where the format is detected from the signature armor and
+    /// may differ from the configured [`Self::format`].
+    fn program_for(&self, format: GpgFormat) -> String {
+        let fmt_program = match format {
+            GpgFormat::OpenPgp => self.openpgp_program.as_deref(),
+            GpgFormat::X509 => self.x509_program.as_deref(),
+            GpgFormat::Ssh => self.ssh_program.as_deref(),
+        };
+        resolve_program_for_format(format, self.generic_program.as_deref(), fmt_program)
     }
 
     /// The signing key to use: the explicit `key_override`, else
@@ -200,6 +281,20 @@ impl GpgConfig {
     pub fn resolve_program_path(&self) -> Result<PathBuf> {
         resolve_program(&self.program)
     }
+}
+
+/// Resolve the program *string* for `format`: `gpg.<fmt>.program` (if set),
+/// else `gpg.program` (if set), else the format's built-in default.
+fn resolve_program_for_format(
+    format: GpgFormat,
+    generic_program: Option<&str>,
+    fmt_program: Option<&str>,
+) -> String {
+    fmt_program
+        .or(generic_program)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_owned())
+        .unwrap_or_else(|| format.default_program().to_owned())
 }
 
 /// Resolve a program string to an executable path.
@@ -266,6 +361,22 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
+/// Expand a leading `~/` (and a bare `~`) relative to `$HOME`, like Git's
+/// `interpolate_path` / `git_config_pathname` for the simple home case.
+fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        if let Some(home) = home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest).to_string_lossy().into_owned();
+        }
+    }
+    path.to_owned()
+}
+
 /// Sign `payload` with `signing_key` using the configured program.
 ///
 /// Spawns `<program> --status-fd=2 -bsau <signing_key>`, writes `payload` to
@@ -280,9 +391,7 @@ fn home_dir() -> Option<PathBuf> {
 /// non-zero, or fails to produce a signature.
 pub fn sign_buffer(cfg: &GpgConfig, payload: &[u8], signing_key: &str) -> Result<Vec<u8>> {
     if cfg.format == GpgFormat::Ssh {
-        return Err(Error::Signing(
-            "ssh signing is not supported by grit".to_owned(),
-        ));
+        return sign_buffer_ssh(cfg, payload, signing_key);
     }
 
     let program = cfg.resolve_program_path()?;
@@ -335,6 +444,149 @@ fn has_sig_created(status: &str) -> bool {
     status
         .lines()
         .any(|line| line.starts_with("[GNUPG:] SIG_CREATED "))
+}
+
+/// Detect a literal ssh key (Git `gpg-interface.c:is_literal_ssh_key`).
+///
+/// Returns `Some(rest)` for `key::<rest>`, `Some(s)` for a value starting with
+/// `ssh-`, else `None`.
+fn is_literal_ssh_key(s: &str) -> Option<&str> {
+    if let Some(rest) = s.strip_prefix("key::") {
+        return Some(rest);
+    }
+    if s.starts_with("ssh-") {
+        return Some(s);
+    }
+    None
+}
+
+/// Sign `payload` with an ssh key using `ssh-keygen -Y sign`.
+///
+/// Port of Git's `gpg-interface.c:sign_buffer_ssh`.  `signing_key` is either a
+/// literal public key (`key::...` or `ssh-...`) or a path to a key file
+/// (`~/` expanded).  Returns the armored `-----BEGIN SSH SIGNATURE-----` blob.
+///
+/// # Errors
+///
+/// Returns [`Error::Signing`] when `signing_key` is empty, a temp file cannot be
+/// written, `ssh-keygen` cannot be run or exits non-zero, or the `.sig` output
+/// cannot be read.
+fn sign_buffer_ssh(cfg: &GpgConfig, payload: &[u8], signing_key: &str) -> Result<Vec<u8>> {
+    if signing_key.is_empty() {
+        return Err(Error::Signing(
+            "user.signingKey needs to be set for ssh signing".to_owned(),
+        ));
+    }
+
+    let program = cfg.resolve_program_path()?;
+
+    // Resolve the key file: either a literal key written to a temp file (with
+    // the `-U` flag), or a path on disk.
+    let mut literal_key_tmp: Option<PathBuf> = None;
+    let (key_file, literal): (String, bool) = match is_literal_ssh_key(signing_key) {
+        Some(literal_key) => {
+            let path = write_temp_file_named(literal_key.as_bytes(), "git_signing_key")?;
+            let p = path.to_string_lossy().into_owned();
+            literal_key_tmp = Some(path);
+            (p, true)
+        }
+        None => (expand_tilde(signing_key), false),
+    };
+
+    // Write the payload to a temp buffer file; ssh-keygen reads it as the file
+    // to sign and writes `<file>.sig` alongside it.
+    let buffer_path = match write_temp_file_named(payload, "git_signing_buffer") {
+        Ok(p) => p,
+        Err(e) => {
+            if let Some(p) = &literal_key_tmp {
+                let _ = std::fs::remove_file(p);
+            }
+            return Err(e);
+        }
+    };
+
+    let mut cmd = Command::new(&program);
+    cmd.arg("-Y")
+        .arg("sign")
+        .arg("-n")
+        .arg("git")
+        .arg("-f")
+        .arg(&key_file);
+    if literal {
+        cmd.arg("-U");
+    }
+    cmd.arg(&buffer_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let cleanup = |literal_key_tmp: &Option<PathBuf>, buffer_path: &Path| {
+        if let Some(p) = literal_key_tmp {
+            let _ = std::fs::remove_file(p);
+        }
+        let _ = std::fs::remove_file(buffer_path);
+        let _ = std::fs::remove_file(sig_sibling(buffer_path));
+    };
+
+    let output = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            cleanup(&literal_key_tmp, &buffer_path);
+            return Err(Error::Signing(format!(
+                "could not run ssh-keygen program '{}': {e}",
+                program.display()
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        cleanup(&literal_key_tmp, &buffer_path);
+        if stderr.contains("usage:") {
+            return Err(Error::Signing(
+                "ssh-keygen -Y sign is needed for ssh signing (available in openssh version 8.2p1+)"
+                    .to_owned(),
+            ));
+        }
+        return Err(Error::Signing(stderr.into_owned()));
+    }
+
+    let sig_path = sig_sibling(&buffer_path);
+    let result = std::fs::read(&sig_path).map_err(|e| {
+        Error::Signing(format!(
+            "failed reading ssh signing data buffer from '{}': {e}",
+            sig_path.display()
+        ))
+    });
+    cleanup(&literal_key_tmp, &buffer_path);
+
+    let mut sig = result?;
+    // Strip a trailing CR (Windows line endings) from each line, mirroring
+    // Git's `remove_cr_after`.
+    strip_cr(&mut sig);
+    Ok(sig)
+}
+
+/// The `<path>.sig` sibling file produced by `ssh-keygen -Y sign`.
+fn sig_sibling(buffer_path: &Path) -> PathBuf {
+    let mut s = buffer_path.as_os_str().to_owned();
+    s.push(".sig");
+    PathBuf::from(s)
+}
+
+/// Remove `\r` characters that immediately precede a `\n` (Git `remove_cr_after`).
+fn strip_cr(buf: &mut Vec<u8>) {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        if buf[i] == b'\r' && buf.get(i + 1) == Some(&b'\n') {
+            i += 1;
+            continue;
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    *buf = out;
 }
 
 /// Splice a signature into a serialized commit object as a `gpgsig` header.
@@ -417,6 +669,11 @@ pub struct SignatureCheck {
     pub output: String,
     /// Raw `[GNUPG:]` status lines; shown by `verify-commit --raw`.
     pub gpg_status: String,
+    /// True when the underlying verifier reported failure regardless of the
+    /// parsed `%G?` result.  For ssh this captures Git's
+    /// `verify_ssh_signed_buffer` return code (e.g. an untrusted key that still
+    /// produces a `Good "git" signature with ...` line must fail verification).
+    pub verifier_failed: bool,
 }
 
 impl SignatureCheck {
@@ -438,6 +695,9 @@ impl SignatureCheck {
     /// Overall verification result honoring `min_trust_level`: `Ok(())` when the
     /// signature is good and meets the configured minimum trust level.
     pub fn verify_status(&self, min_trust_level: Option<TrustLevel>) -> bool {
+        if self.verifier_failed {
+            return false;
+        }
         if !self.is_good() {
             return false;
         }
@@ -526,20 +786,23 @@ pub fn verify_commit(cfg: &GpgConfig, raw_commit: &[u8]) -> Result<SignatureChec
         None => return Ok(SignatureCheck::default_none()),
     };
 
-    if cfg.format == GpgFormat::Ssh {
-        return Err(Error::Signing(
-            "ssh signature verification is not supported by grit".to_owned(),
-        ));
+    // Git picks the verifier from the *signature* armor (`get_format_by_sig`),
+    // not from `gpg.format`: a `git verify-commit` over an ssh-signed commit must
+    // use ssh-keygen even when `gpg.format` is unset/openpgp, and vice-versa.
+    let detected_format = GpgFormat::from_signature(&signature).unwrap_or(cfg.format);
+
+    if detected_format == GpgFormat::Ssh {
+        return verify_ssh_signed_buffer(cfg, payload, signature);
     }
 
-    let program = cfg.resolve_program_path()?;
+    let program = resolve_program(&cfg.program_for(detected_format))?;
 
     // Write the detached signature to a temp file.
     let sig_path = write_temp_file(&signature)?;
 
     let mut cmd = Command::new(&program);
     cmd.arg("--status-fd=1");
-    for a in cfg.format.verify_args() {
+    for a in detected_format.verify_args() {
         cmd.arg(a);
     }
     cmd.arg("--verify")
@@ -584,6 +847,331 @@ pub fn verify_commit(cfg: &GpgConfig, raw_commit: &[u8]) -> Result<SignatureChec
     parse_gpg_output(&mut sigc, &gpg_status);
 
     Ok(sigc)
+}
+
+/// Parse `ssh-keygen -Y verify` human output into `sigc`
+/// (port of Git `gpg-interface.c:parse_ssh_output`).
+///
+/// Expected first line of `sigc.output`:
+/// * `Good "git" signature for PRINCIPAL with ... key SHA256:FINGERPRINT`
+///   -> result `G`, trust `Fully`, signer = PRINCIPAL.
+/// * `Good "git" signature with ... key SHA256:FINGERPRINT`
+///   -> result `G`, trust `Undefined` (unknown key, signer unset).
+/// * anything else -> result `B`, trust `Never`.
+///
+/// In the two good cases the substring after `key ` becomes both the
+/// fingerprint (`%GF`) and the key (`%GK`); `%GP` is never set.
+fn parse_ssh_output(sigc: &mut SignatureCheck) {
+    sigc.result = 'B';
+    sigc.trust_level = TrustLevel::Never;
+    sigc.key = None;
+    sigc.signer = None;
+    sigc.fingerprint = None;
+    sigc.primary_key_fingerprint = None;
+
+    let first_line = sigc.output.split('\n').next().unwrap_or("");
+
+    let after_key;
+    if let Some(rest) = first_line.strip_prefix("Good \"git\" signature for ") {
+        // The principal can contain whitespace; the trailing
+        // ` with <algo> key <fpr>` is fixed, so split on the *last* " with ".
+        match rest.rfind(" with ") {
+            Some(idx) => {
+                let principal = &rest[..idx];
+                if principal.is_empty() {
+                    return;
+                }
+                sigc.result = 'G';
+                sigc.trust_level = TrustLevel::Fully;
+                sigc.signer = Some(principal.to_owned());
+                after_key = &rest[idx + " with ".len()..];
+            }
+            None => return,
+        }
+    } else if let Some(rest) = first_line.strip_prefix("Good \"git\" signature with ") {
+        sigc.result = 'G';
+        sigc.trust_level = TrustLevel::Undefined;
+        after_key = rest;
+    } else {
+        return;
+    }
+
+    // The fingerprint follows the literal `key ` token.
+    match after_key.find("key ") {
+        Some(pos) => {
+            let fpr = after_key[pos + "key ".len()..].to_owned();
+            sigc.fingerprint = Some(fpr.clone());
+            sigc.key = Some(fpr);
+        }
+        None => {
+            // Output did not match what we expected: treat as bad.
+            sigc.result = 'B';
+        }
+    }
+}
+
+/// Extract the committer (or tagger) unix timestamp from a signed payload,
+/// porting Git's `parse_payload_metadata` for the `committer`/`tagger` header.
+fn payload_committer_timestamp(payload: &[u8]) -> Option<u64> {
+    let ident_line =
+        find_header_line(payload, b"committer").or_else(|| find_header_line(payload, b"tagger"))?;
+    let line = std::str::from_utf8(ident_line).ok()?;
+    // Ident line: "Name <email> <timestamp> <tz>"; the timestamp is the
+    // second-to-last whitespace-separated token.
+    let mut it = line.split_whitespace().rev();
+    let _tz = it.next()?;
+    let ts = it.next()?;
+    ts.parse::<u64>().ok()
+}
+
+/// Return the bytes after `"<name> "` for the first header line matching `name`
+/// (within the header region, i.e. before the first blank line).
+fn find_header_line<'a>(payload: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let mut idx = 0;
+    while idx < payload.len() {
+        let line_end = memchr(payload, idx, b'\n').unwrap_or(payload.len());
+        let line = &payload[idx..line_end];
+        if line.is_empty() {
+            // End of header region.
+            return None;
+        }
+        if line.len() > name.len() + 1 && &line[..name.len()] == name && line[name.len()] == b' ' {
+            return Some(&line[name.len() + 1..]);
+        }
+        idx = line_end + 1;
+    }
+    None
+}
+
+/// Format a `-Overify-time=YYYYMMDDhhmmss` argument from a unix timestamp using
+/// the local timezone, mirroring Git's `verify_date_mode` (DATE_STRFTIME, local).
+fn verify_time_arg(timestamp: u64) -> String {
+    use crate::git_date::show::{show_date, DateMode, DateModeType};
+    let mut mode = DateMode {
+        ty: DateModeType::Strftime,
+        local: true,
+        strftime_fmt: Some("%Y%m%d%H%M%S".to_owned()),
+    };
+    let formatted = show_date(timestamp, 0, &mut mode);
+    format!("-Overify-time={formatted}")
+}
+
+/// Verify an ssh-signed `payload` against `signature` using `ssh-keygen -Y`.
+///
+/// Port of Git's `gpg-interface.c:verify_ssh_signed_buffer`.  Requires
+/// `gpg.ssh.allowedSignersFile`; runs `find-principals`, then either
+/// `check-novalidate` (no principal matched -> untrusted) or `verify` for each
+/// matched principal.  Populates `sigc.output`/`sigc.gpg_status` and parses them
+/// via [`parse_ssh_output`].
+fn verify_ssh_signed_buffer(
+    cfg: &GpgConfig,
+    payload: Vec<u8>,
+    signature: Vec<u8>,
+) -> Result<SignatureCheck> {
+    let mut sigc = SignatureCheck {
+        signature: signature.clone(),
+        payload: payload.clone(),
+        result: 'N',
+        trust_level: TrustLevel::Undefined,
+        ..Default::default()
+    };
+
+    let allowed = match &cfg.ssh_allowed_signers {
+        Some(a) if !a.is_empty() => a.clone(),
+        _ => {
+            sigc.result = 'B';
+            sigc.trust_level = TrustLevel::Never;
+            sigc.output = "gpg.ssh.allowedSignersFile needs to be configured and exist for ssh signature verification".to_owned();
+            sigc.gpg_status = sigc.output.clone();
+            return Ok(sigc);
+        }
+    };
+
+    // The format here is detected from the signature armor, which may differ
+    // from `cfg.format`; always resolve the ssh program (`gpg.ssh.program` /
+    // `gpg.program` / `ssh-keygen`).
+    let program = resolve_program(&cfg.program_for(GpgFormat::Ssh))?;
+
+    // Write the detached signature to a temp `.git_vtag` file.
+    let sig_path = write_temp_file_named(&signature, "git_vtag")?;
+
+    let verify_time = payload_committer_timestamp(&payload).map(verify_time_arg);
+
+    // 1. find-principals: which allowed principals can verify this signature?
+    let mut find_cmd = Command::new(&program);
+    find_cmd
+        .arg("-Y")
+        .arg("find-principals")
+        .arg("-f")
+        .arg(&allowed)
+        .arg("-s")
+        .arg(&sig_path);
+    if let Some(vt) = &verify_time {
+        find_cmd.arg(vt);
+    }
+    find_cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let find_out = find_cmd.output().map_err(|e| {
+        let _ = std::fs::remove_file(&sig_path);
+        Error::Signing(format!(
+            "could not run ssh-keygen program '{}': {e}",
+            program.display()
+        ))
+    })?;
+
+    let find_stdout = String::from_utf8_lossy(&find_out.stdout).into_owned();
+    let find_stderr = String::from_utf8_lossy(&find_out.stderr).into_owned();
+
+    if !find_out.status.success() && find_stderr.contains("usage:") {
+        let _ = std::fs::remove_file(&sig_path);
+        return Err(Error::Signing(
+            "ssh-keygen -Y find-principals/verify is needed for ssh signature verification (available in openssh version 8.2p1+)"
+                .to_owned(),
+        ));
+    }
+
+    let mut verify_stdout = String::new();
+    let mut verify_stderr = String::new();
+    // Tracks Git's `ret` in verify_ssh_signed_buffer: true means failure.
+    let mut verifier_failed;
+
+    if !find_out.status.success() || find_stdout.trim().is_empty() {
+        // No matching principal: run check-novalidate to surface signature info,
+        // but treat as untrusted (Git forces ret = -1).
+        let mut check = Command::new(&program);
+        check
+            .arg("-Y")
+            .arg("check-novalidate")
+            .arg("-n")
+            .arg("git")
+            .arg("-s")
+            .arg(&sig_path);
+        if let Some(vt) = &verify_time {
+            check.arg(vt);
+        }
+        let (out, err) = run_with_stdin(&mut check, &payload);
+        verify_stdout = out;
+        verify_stderr = err;
+        verifier_failed = true;
+    } else {
+        // Try each matched principal until one verifies as Good.
+        verifier_failed = true;
+        for principal in find_stdout.lines() {
+            let principal = principal.trim_end_matches('\r');
+            if principal.is_empty() {
+                continue;
+            }
+            let mut verify = Command::new(&program);
+            verify
+                .arg("-Y")
+                .arg("verify")
+                .arg("-n")
+                .arg("git")
+                .arg("-f")
+                .arg(&allowed)
+                .arg("-I")
+                .arg(principal)
+                .arg("-s")
+                .arg(&sig_path);
+            if let Some(vt) = &verify_time {
+                verify.arg(vt);
+            }
+            if let Some(rev) = &cfg.ssh_revocation_file {
+                if Path::new(rev).exists() {
+                    verify.arg("-r").arg(rev);
+                }
+            }
+            let (out, err, ok) = run_with_stdin_status(&mut verify, &payload);
+            verify_stdout = out;
+            verify_stderr = err;
+            // Git: ret = !ok; if !ret { ret = !starts_with("Good"); }
+            verifier_failed = !(ok && verify_stdout.starts_with("Good"));
+            if !verifier_failed {
+                break;
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&sig_path);
+
+    // Build sigc.output exactly as Git: stripspace the ssh stdout and stderr
+    // (each non-empty line keeps a trailing newline), then append the
+    // find-principals stderr and the verify/check stderr (gpg-interface.c
+    // 601-608). The trailing newline left by stripspace keeps the `Good "..."`
+    // line separate from any appended `No principal matched.` text so
+    // parse_ssh_output sees a clean first line.
+    let mut output = stripspace(&verify_stdout);
+    let verify_stderr = stripspace(&verify_stderr);
+    output.push_str(&find_stderr);
+    output.push_str(&verify_stderr);
+
+    sigc.output = output;
+    sigc.gpg_status = sigc.output.clone();
+    parse_ssh_output(&mut sigc);
+    // Git combines the verifier return code with the parsed result/trust; the
+    // parse already drives result/trust, so just carry the verifier failure.
+    sigc.verifier_failed = verifier_failed;
+
+    Ok(sigc)
+}
+
+/// Run `cmd` feeding `input` on stdin, returning `(stdout, stderr)` as lossy
+/// UTF-8.  Broken-pipe write errors are ignored (ssh-keygen may exit early).
+fn run_with_stdin(cmd: &mut Command, input: &[u8]) -> (String, String) {
+    let (out, err, _ok) = run_with_stdin_status(cmd, input);
+    (out, err)
+}
+
+/// Like [`run_with_stdin`] but also returns whether the child exited zero.
+fn run_with_stdin_status(cmd: &mut Command, input: &[u8]) -> (String, String, bool) {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return (String::new(), String::new(), false),
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(input);
+        drop(stdin);
+    }
+    match child.wait_with_output() {
+        Ok(o) => (
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+            o.status.success(),
+        ),
+        Err(_) => (String::new(), String::new(), false),
+    }
+}
+
+/// Port of Git's `strbuf_stripspace` (without comment handling): trim trailing
+/// whitespace from each line, collapse runs of blank lines to a single blank
+/// line, and terminate every non-empty line with a single `\n`. The retained
+/// trailing newline is what keeps the ssh `Good "..."` line separate from the
+/// appended `No principal matched.` stderr.
+fn stripspace(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_empties = 0usize;
+    let mut wrote_any = false;
+    for line in s.split('\n') {
+        let trimmed = line.trim_end_matches([' ', '\t', '\r']);
+        if trimmed.is_empty() {
+            pending_empties += 1;
+            continue;
+        }
+        if pending_empties > 0 && wrote_any {
+            out.push('\n');
+        }
+        pending_empties = 0;
+        out.push_str(trimmed);
+        out.push('\n');
+        wrote_any = true;
+    }
+    out
 }
 
 /// Parse `[GNUPG:]` status lines into `sigc` (port of `parse_gpg_output`).
@@ -772,14 +1360,24 @@ fn split_at_space(s: &str) -> (&str, &str) {
 
 /// Write `data` to a fresh temp file and return its path.
 fn write_temp_file(data: &[u8]) -> Result<PathBuf> {
+    write_temp_file_named(data, "git_vtag")
+}
+
+/// Build a fresh, reasonably unique temp path with the given name stem (without
+/// creating the file).
+fn temp_file_path(stem: &str) -> PathBuf {
     let dir = std::env::temp_dir();
-    // Build a reasonably unique name without external crates.
-    let unique = format!("git_vtag_{}_{}", std::process::id(), next_temp_counter());
-    let path = dir.join(unique);
+    let unique = format!("{stem}_{}_{}", std::process::id(), next_temp_counter());
+    dir.join(unique)
+}
+
+/// Write `data` to a fresh temp file named with `stem` and return its path.
+fn write_temp_file_named(data: &[u8], stem: &str) -> Result<PathBuf> {
+    let path = temp_file_path(stem);
     let mut f = std::fs::File::create(&path)
         .map_err(|e| Error::Signing(format!("could not create temporary file: {e}")))?;
     f.write_all(data)
-        .map_err(|e| Error::Signing(format!("failed writing detached signature: {e}")))?;
+        .map_err(|e| Error::Signing(format!("failed writing to temporary file: {e}")))?;
     Ok(path)
 }
 
@@ -894,5 +1492,104 @@ mod tests {
         );
         assert_eq!(TrustLevel::from_config("FULLY"), Some(TrustLevel::Fully));
         assert_eq!(TrustLevel::from_config("bogus"), None);
+    }
+
+    #[test]
+    fn format_detected_from_signature_armor() {
+        assert_eq!(
+            GpgFormat::from_signature(b"-----BEGIN SSH SIGNATURE-----\nABC\n"),
+            Some(GpgFormat::Ssh)
+        );
+        assert_eq!(
+            GpgFormat::from_signature(b"-----BEGIN PGP SIGNATURE-----\n"),
+            Some(GpgFormat::OpenPgp)
+        );
+        assert_eq!(
+            GpgFormat::from_signature(b"-----BEGIN PGP MESSAGE-----\n"),
+            Some(GpgFormat::OpenPgp)
+        );
+        assert_eq!(
+            GpgFormat::from_signature(b"-----BEGIN SIGNED MESSAGE-----\n"),
+            Some(GpgFormat::X509)
+        );
+        assert_eq!(GpgFormat::from_signature(b"garbage"), None);
+    }
+
+    #[test]
+    fn literal_ssh_key_detection() {
+        assert_eq!(
+            is_literal_ssh_key("key::ssh-ed25519 AAAA"),
+            Some("ssh-ed25519 AAAA")
+        );
+        assert_eq!(
+            is_literal_ssh_key("ssh-ed25519 AAAA"),
+            Some("ssh-ed25519 AAAA")
+        );
+        assert_eq!(is_literal_ssh_key("/home/u/.ssh/id_ed25519"), None);
+    }
+
+    #[test]
+    fn parse_ssh_output_trusted_principal() {
+        let mut sigc = SignatureCheck::default_none();
+        sigc.output =
+            "Good \"git\" signature for principal with number 1 with ED25519 key SHA256:ABC\n"
+                .to_owned();
+        parse_ssh_output(&mut sigc);
+        assert_eq!(sigc.result, 'G');
+        assert_eq!(sigc.trust_level, TrustLevel::Fully);
+        assert_eq!(sigc.signer.as_deref(), Some("principal with number 1"));
+        assert_eq!(sigc.key.as_deref(), Some("SHA256:ABC"));
+        assert_eq!(sigc.fingerprint.as_deref(), Some("SHA256:ABC"));
+        assert!(sigc.primary_key_fingerprint.is_none());
+    }
+
+    #[test]
+    fn parse_ssh_output_untrusted_unknown_key() {
+        let mut sigc = SignatureCheck::default_none();
+        // The trailing `No principal matched.` is appended on its own line by
+        // stripspace; only the first line should be parsed.
+        sigc.output = "Good \"git\" signature with ED25519 key SHA256:XYZ\nNo principal matched.\n"
+            .to_owned();
+        parse_ssh_output(&mut sigc);
+        assert_eq!(sigc.result, 'G');
+        assert_eq!(sigc.trust_level, TrustLevel::Undefined);
+        assert!(sigc.signer.is_none());
+        assert_eq!(sigc.key.as_deref(), Some("SHA256:XYZ"));
+        assert_eq!(sigc.fingerprint.as_deref(), Some("SHA256:XYZ"));
+    }
+
+    #[test]
+    fn parse_ssh_output_bad_signature() {
+        let mut sigc = SignatureCheck::default_none();
+        sigc.output = "Signature verification failed: incorrect signature\n".to_owned();
+        parse_ssh_output(&mut sigc);
+        assert_eq!(sigc.result, 'B');
+        assert_eq!(sigc.trust_level, TrustLevel::Never);
+        assert!(sigc.key.is_none());
+    }
+
+    #[test]
+    fn stripspace_keeps_line_terminators() {
+        // Each non-empty line keeps a trailing newline; trailing blanks dropped.
+        assert_eq!(stripspace("Good ... SHA256:FPR\n"), "Good ... SHA256:FPR\n");
+        assert_eq!(stripspace("a  \n\n\nb\n\n"), "a\n\nb\n");
+        assert_eq!(stripspace(""), "");
+        // Concatenating a stripspaced line with following stderr keeps them on
+        // separate lines.
+        let mut out = stripspace("Good ... SHA256:FPR\n");
+        out.push_str("No principal matched.\n");
+        assert_eq!(out.lines().next(), Some("Good ... SHA256:FPR"));
+    }
+
+    #[test]
+    fn payload_committer_timestamp_parsed() {
+        let payload =
+            b"tree 0123\nauthor A <a@x> 1112912173 -0700\ncommitter C <c@x> 1112912273 +0200\n\nmsg\n";
+        assert_eq!(payload_committer_timestamp(payload), Some(1112912273));
+        // Falls back to tagger for tag payloads.
+        let tag = b"object 0123\ntype commit\ntag v1\ntagger T <t@x> 1112912000 -0500\n\nmsg\n";
+        assert_eq!(payload_committer_timestamp(tag), Some(1112912000));
+        // No ident header.
+        assert_eq!(payload_committer_timestamp(b"tree 0123\n\nmsg\n"), None);
     }
 }

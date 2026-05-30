@@ -789,6 +789,8 @@ fn do_merge_or_rebase_after_fetch(
             rebase_merges: None,
             no_rebase_merges: false,
             no_ff: false,
+            gpg_sign: None,
+            no_gpg_sign: false,
             keep_base: 0,
             fork_point: false,
             no_fork_point: false,

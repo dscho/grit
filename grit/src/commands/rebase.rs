@@ -171,9 +171,19 @@ pub struct Args {
     #[arg(long = "no-rebase-merges", conflicts_with = "rebase_merges")]
     pub no_rebase_merges: bool,
 
-    /// Force rebase even if the current branch is up to date.
-    #[arg(long = "no-ff", alias = "force-rebase")]
+    /// Force rebase even if the current branch is up to date
+    /// (Git's `-f`/`--force-rebase`, also spelled `--no-ff`).
+    #[arg(short = 'f', long = "no-ff", visible_alias = "force-rebase")]
     pub no_ff: bool,
+
+    /// GPG/SSH-sign the replayed commits (Git's `-S`/`--gpg-sign`). The key id is
+    /// optional and only attached (`-S<keyid>` / `--gpg-sign=<keyid>`).
+    #[arg(short = 'S', long = "gpg-sign", value_name = "KEYID", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub gpg_sign: Option<String>,
+
+    /// Do not sign the replayed commits (overrides `commit.gpgsign`).
+    #[arg(long = "no-gpg-sign")]
+    pub no_gpg_sign: bool,
 
     /// Keep the base of the branch (rebase onto the merge-base of upstream and branch).
     /// May be passed multiple times for Git compatibility (`--keep-base --keep-base`).
@@ -2717,6 +2727,61 @@ fn load_rebase_replay_commit_opts(rb_dir: &Path) -> RebaseReplayCommitOpts {
     }
 }
 
+/// Decide whether replayed commits should be signed, mirroring Git's rebase
+/// `gpg_sign_opt`: `--no-gpg-sign` disables; `-S`/`--gpg-sign[=<key>]` enables
+/// (with the optional key id); otherwise `commit.gpgsign` decides. Returns the
+/// signing-key string to persist (empty = default key) or `None` to leave
+/// commits unsigned.
+fn resolve_rebase_gpg_sign_opt(args: &Args, config: &ConfigSet) -> Option<String> {
+    if args.no_gpg_sign {
+        return None;
+    }
+    if let Some(key) = &args.gpg_sign {
+        return Some(key.clone());
+    }
+    if matches!(config.get_bool("commit.gpgsign"), Some(Ok(true))) {
+        return Some(String::new());
+    }
+    None
+}
+
+/// Load the persisted signing-key string for replayed commits, if signing is
+/// enabled for this rebase.
+fn rebase_gpg_sign_opt(rb_dir: &Path) -> Option<String> {
+    fs::read_to_string(rb_dir.join("gpg-sign-opt")).ok()
+}
+
+/// Write a replayed commit object, signing it first when this rebase has signing
+/// enabled. Mirrors `git commit`/sequencer signing for rebase.
+fn write_replayed_commit(
+    repo: &Repository,
+    rb_dir: &Path,
+    config: &ConfigSet,
+    committer_line: &str,
+    commit_bytes: Vec<u8>,
+) -> Result<ObjectId> {
+    let bytes = match rebase_gpg_sign_opt(rb_dir) {
+        Some(key) => {
+            let cfg = grit_lib::signing::GpgConfig::from_config(config)?;
+            let committer_default = grit_lib::signing::committer_signing_default(committer_line);
+            let key_override = if key.is_empty() {
+                None
+            } else {
+                Some(key.as_str())
+            };
+            let signing_key = cfg.resolve_signing_key(key_override, &committer_default);
+            let signature = grit_lib::signing::sign_buffer(&cfg, &commit_bytes, &signing_key)?;
+            grit_lib::signing::add_header_signature(
+                &commit_bytes,
+                &signature,
+                grit_lib::signing::GPG_SIG_HEADER_SHA1,
+            )
+        }
+        None => commit_bytes,
+    };
+    Ok(repo.odb.write(ObjectKind::Commit, &bytes)?)
+}
+
 fn rebase_replayed_author_line(
     raw_author: &str,
     opts: RebaseReplayCommitOpts,
@@ -3836,6 +3901,12 @@ Use '--' to separate paths from revisions, like this:\n\
     }
     if args.keep_empty {
         fs::write(rb_dir.join("keep-empty"), "")?;
+    }
+    // Persist the GPG/SSH signing decision so each pick (including those run from
+    // a clean child process or after `--continue`) signs the replayed commit
+    // when `-S`/`--gpg-sign` was given or `commit.gpgsign` is set.
+    if let Some(opt) = resolve_rebase_gpg_sign_opt(&args, &config) {
+        fs::write(rb_dir.join("gpg-sign-opt"), opt)?;
     }
 
     let todo = rebase_todo_lines;
@@ -5033,7 +5104,7 @@ fn cherry_pick_for_rebase(
             raw_message,
         };
         let bytes = serialize_commit(&commit_data);
-        let new_oid = repo.odb.write(ObjectKind::Commit, &bytes)?;
+        let new_oid = write_replayed_commit(repo, rb_dir, &config, &commit_data.committer, bytes)?;
         fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
         if record_rewrite {
             record_rebase_in_rewritten_pending(git_dir, rb_dir, commit_oid, next_after_line)?;
@@ -5132,7 +5203,13 @@ fn cherry_pick_for_rebase(
                         raw_message,
                     };
                     let commit_bytes = serialize_commit(&commit_data);
-                    let new_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
+                    let new_oid = write_replayed_commit(
+                        repo,
+                        rb_dir,
+                        &config,
+                        &commit_data.committer,
+                        commit_bytes,
+                    )?;
                     fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
                     append_rebase_rewrite_line(rb_dir, commit_oid, &new_oid)?;
                 } else if replay_opts.committer_date_is_author_date || replay_opts.ignore_date {
@@ -5165,7 +5242,13 @@ fn cherry_pick_for_rebase(
                         raw_message,
                     };
                     let commit_bytes = serialize_commit(&commit_data);
-                    let new_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
+                    let new_oid = write_replayed_commit(
+                        repo,
+                        rb_dir,
+                        &config,
+                        &commit_data.committer,
+                        commit_bytes,
+                    )?;
                     fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
                     append_rebase_rewrite_line(rb_dir, commit_oid, &new_oid)?;
                 } else if force_rewrite_commits && !single_noop_same_tip {
@@ -5199,7 +5282,13 @@ fn cherry_pick_for_rebase(
                         raw_message,
                     };
                     let commit_bytes = serialize_commit(&commit_data);
-                    let new_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
+                    let new_oid = write_replayed_commit(
+                        repo,
+                        rb_dir,
+                        &config,
+                        &commit_data.committer,
+                        commit_bytes,
+                    )?;
                     fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
                     if record_rewrite {
                         record_rebase_in_rewritten_pending(
@@ -5267,7 +5356,13 @@ fn cherry_pick_for_rebase(
                     raw_message,
                 };
                 let commit_bytes = serialize_commit(&commit_data);
-                let new_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
+                let new_oid = write_replayed_commit(
+                    repo,
+                    rb_dir,
+                    &config,
+                    &commit_data.committer,
+                    commit_bytes,
+                )?;
                 fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
                 append_rebase_rewrite_line(rb_dir, commit_oid, &new_oid)?;
                 return Ok(());
@@ -5282,11 +5377,14 @@ fn cherry_pick_for_rebase(
 
     // Three-way merge: base=parent_tree, ours=HEAD_tree, theirs=commit_tree
     //
-    // While the first patch is applied with HEAD still at the recorded **onto** commit, use the
-    // picked commit's parent tree as the merge base (standard cherry-pick). After HEAD has moved
-    // past onto (a patch succeeded or `--continue` completed one), merge against the **onto**
-    // tree instead. Matching this split avoids both bogus clean merges on later picks (t3407
-    // `--continue`) and wrong conflict geometry on the first pick (t3407 `--skip` / apply).
+    // Standard cherry-pick semantics (Git's sequencer `do_recursive_merge`): the
+    // merge base is always the *picked commit's parent tree*. ours = the current
+    // HEAD tree (the series replayed so far), theirs = the picked commit's tree.
+    // When the replayed predecessor matches the original (the common case) this
+    // makes base == ours so the picked diff applies cleanly; when a force-rebase
+    // replays a chain of dependent commits (e.g. `rebase -f HEAD^^`) it keeps the
+    // base correct so sequential edits to the same file do not spuriously
+    // conflict.
     let base_tree_oid = if ws_fix_rule.is_some() {
         // After an earlier replay, HEAD can differ from the picked commit's parent tree in the ODB
         // (e.g. `rebase --whitespace=fix`). Use the current tip tree as the merge base so the
@@ -5295,12 +5393,24 @@ fn cherry_pick_for_rebase(
     } else {
         let onto_hex = fs::read_to_string(rb_dir.join("onto"))?;
         let onto_oid_state = ObjectId::from_hex(onto_hex.trim())?;
-        if head_oid != onto_oid_state {
+        // `force_rewrite_commits && head_tree==parent_tree` identifies a clean
+        // replay of a *dependent* chain (e.g. `rebase -f HEAD^^`): the
+        // already-replayed predecessor reproduced its original tree, so the
+        // picked commit's parent tree is the correct cherry-pick base and
+        // base==ours makes sequential edits to the same file apply without
+        // spurious conflicts. The first pick (HEAD still at onto) likewise uses
+        // the picked commit's parent tree.
+        let clean_dependent_chain = force_rewrite_commits && head_tree_oid == parent_tree_oid;
+        if head_oid == onto_oid_state || clean_dependent_chain {
+            parent_tree_oid
+        } else {
+            // The replayed predecessor differs from the picked commit's original
+            // parent (a conflict was resolved during `--continue`, or an
+            // `--onto <newbase>` moved the series). Merge against the onto tree so
+            // the conflict geometry matches Git's sequencer.
             let onto_obj = repo.odb.read(&onto_oid_state)?;
             let onto_commit = parse_commit(&onto_obj.data)?;
             onto_commit.tree
-        } else {
-            parent_tree_oid
         }
     };
     let base_entries = tree_to_map(tree_to_index_entries(repo, &base_tree_oid, "")?);
@@ -5558,7 +5668,8 @@ fn cherry_pick_for_rebase(
     };
 
     let commit_bytes = serialize_commit(&commit_data);
-    let new_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
+    let new_oid =
+        write_replayed_commit(repo, rb_dir, &config, &commit_data.committer, commit_bytes)?;
 
     // Update HEAD (detached)
     fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
