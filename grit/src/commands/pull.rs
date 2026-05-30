@@ -861,6 +861,8 @@ fn build_pull_merge_args(
         edit: false,
         signoff: false,
         no_signoff: false,
+        gpg_sign: None,
+        no_gpg_sign: false,
         stat: false,
         no_stat: false,
         log: args.log.as_ref().map(|v| {

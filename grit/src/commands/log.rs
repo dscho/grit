@@ -2968,6 +2968,7 @@ fn render_graph_commit_text(
                 mailmap,
                 use_mailmap,
                 args.expand_tabs_in_log,
+                None,
             );
         }
         if fmt.contains('%') {
@@ -2987,6 +2988,7 @@ fn render_graph_commit_text(
                 mailmap,
                 use_mailmap,
                 args.expand_tabs_in_log,
+                None,
             );
         }
     }
@@ -6466,6 +6468,31 @@ fn log_notes_enabled() -> bool {
 /// Whether `git show` should print the default `Notes:` block for medium-style headers.
 ///
 /// `git show --pretty` (no format) matches C Git: no notes. Plain `git show` and `--pretty=<fmt>` can show notes.
+/// Run signature verification on a raw commit object, returning the parsed
+/// [`SignatureCheck`].  Errors (e.g. gpg not runnable) collapse to a
+/// "no signature" result so callers can still format something sensible.
+pub fn verify_commit_signature(
+    config: &ConfigSet,
+    raw_commit: &[u8],
+) -> grit_lib::signing::SignatureCheck {
+    match grit_lib::signing::GpgConfig::from_config(config) {
+        Ok(cfg) => grit_lib::signing::verify_commit(&cfg, raw_commit)
+            .unwrap_or_else(|_| grit_lib::signing::SignatureCheck::default_none()),
+        Err(_) => grit_lib::signing::SignatureCheck::default_none(),
+    }
+}
+
+/// Format the GPG verification lines for `--show-signature`, mirroring git's
+/// `show_signature`: when the commit carries no signature, nothing is emitted;
+/// otherwise the human-readable gpg output (its stderr) is returned verbatim.
+pub fn format_commit_signature_lines(config: &ConfigSet, raw_commit: &[u8]) -> String {
+    if grit_lib::signing::extract_signed_payload(raw_commit).is_none() {
+        return String::new();
+    }
+    let sigc = verify_commit_signature(config, raw_commit);
+    sigc.output
+}
+
 pub fn show_notes_display_enabled() -> bool {
     if std::env::var("GIT_GRIT_SHOW_BARE_PRETTY").ok().as_deref() == Some("1") {
         return false;
@@ -7356,6 +7383,20 @@ fn format_commit(
     let format = args.format.as_deref();
     let date_format = args.date.as_deref();
 
+    // Verify the commit signature only when a `%G` placeholder is present in the
+    // format (avoids spawning gpg for every commit otherwise).
+    let signature: Option<grit_lib::signing::SignatureCheck> = match format {
+        Some(fmt) if fmt.contains("%G") => odb.read(oid).ok().map(|obj| {
+            let config = grit_lib::repo::Repository::discover(None)
+                .ok()
+                .and_then(|repo| ConfigSet::load(Some(&repo.git_dir), true).ok())
+                .unwrap_or_default();
+            verify_commit_signature(&config, &obj.data)
+        }),
+        _ => None,
+    };
+    let signature_ref = signature.as_ref();
+
     match format {
         Some(fmt) if fmt.starts_with("format:") || fmt.starts_with("tformat:") => {
             let is_tformat = fmt.starts_with("tformat:");
@@ -7381,6 +7422,7 @@ fn format_commit(
                 mailmap,
                 use_mailmap,
                 et,
+                signature_ref,
             );
             if is_tformat {
                 if args.null_terminator {
@@ -7614,6 +7656,7 @@ fn format_commit(
                 mailmap,
                 use_mailmap,
                 et,
+                signature_ref,
             );
             writeln!(out, "{formatted}")?;
         }
@@ -7639,6 +7682,7 @@ fn apply_format_string(
     mailmap: &MailmapTable,
     use_mailmap: bool,
     expand_tabs_in_log: usize,
+    signature: Option<&grit_lib::signing::SignatureCheck>,
 ) -> String {
     let hex = oid.to_hex();
 
@@ -8203,6 +8247,72 @@ fn apply_format_string(
                     chars.next();
                     if let Some(&_nc) = chars.peek() {
                         chars.next();
+                    }
+                }
+                Some('G') => {
+                    // Signature placeholders (%G?, %GS, %GK, %GF, %GP, %GT, %GG).
+                    // Unknown `%G<x>` (and a bare trailing `%G`) are passed
+                    // through literally, mirroring git's pretty.c `return 0`.
+                    use grit_lib::signing::{SignatureCheck, TrustLevel};
+                    let default_sig;
+                    let sig: &SignatureCheck = match signature {
+                        Some(s) => s,
+                        None => {
+                            default_sig = SignatureCheck::default_none();
+                            &default_sig
+                        }
+                    };
+                    // Peek the placeholder sub-character after `%G`.
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // consume 'G'
+                    let sub = lookahead.peek().copied();
+                    let handled = match sub {
+                        Some('?') => {
+                            // 'G' with untrusted trust level becomes 'U'.
+                            let ch = if sig.result == 'G'
+                                && matches!(
+                                    sig.trust_level,
+                                    TrustLevel::Undefined | TrustLevel::Never
+                                ) {
+                                'U'
+                            } else {
+                                sig.result
+                            };
+                            result.push(ch);
+                            true
+                        }
+                        Some('S') => {
+                            result.push_str(sig.signer.as_deref().unwrap_or(""));
+                            true
+                        }
+                        Some('K') => {
+                            result.push_str(sig.key.as_deref().unwrap_or(""));
+                            true
+                        }
+                        Some('F') => {
+                            result.push_str(sig.fingerprint.as_deref().unwrap_or(""));
+                            true
+                        }
+                        Some('P') => {
+                            result.push_str(sig.primary_key_fingerprint.as_deref().unwrap_or(""));
+                            true
+                        }
+                        Some('T') => {
+                            result.push_str(sig.trust_level.display_key());
+                            true
+                        }
+                        Some('G') => {
+                            result.push_str(&sig.output);
+                            true
+                        }
+                        _ => false,
+                    };
+                    if handled {
+                        chars.next(); // consume 'G'
+                        chars.next(); // consume sub-char
+                    } else {
+                        // Pass through `%` literally; leave `G...` as text.
+                        result.push('%');
                     }
                 }
                 _ => result.push('%'),
