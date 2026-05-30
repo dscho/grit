@@ -15,9 +15,8 @@ use grit_lib::repo::Repository;
 use grit_lib::sparse_checkout::{
     build_expanded_cone_sparse_checkout_lines, cone_directory_inputs_for_add,
     effective_cone_mode_for_sparse_file, load_sparse_checkout_with_warnings,
-    parse_expanded_cone_recursive_dirs, parse_expanded_cone_user_directories,
-    path_in_sparse_checkout, sparse_checkout_lines_look_like_expanded_cone, ConePatterns,
-    ConeWorkspace, NonConePatterns,
+    parse_expanded_cone_recursive_dirs, path_in_sparse_checkout, ConePatterns, ConeWorkspace,
+    NonConePatterns,
 };
 use grit_lib::state::resolve_head;
 use std::collections::{BTreeSet, HashSet};
@@ -663,34 +662,40 @@ fn cmd_list(repo: &Repository) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    if cone_cfg && sparse_checkout_lines_look_like_expanded_cone(&lines) {
-        let mut dirs = parse_expanded_cone_user_directories(&lines);
-        if dirs.is_empty() {
-            dirs = parse_expanded_cone_recursive_dirs(&lines);
+    if cone_cfg {
+        // Match Git `sparse-checkout list`: parse the file in cone mode, printing any
+        // structural warnings (repeated / unrecognized patterns). When cone parsing fails,
+        // Git disables cone matching and lists the raw pattern lines verbatim.
+        let mut warnings = Vec::new();
+        let parsed = ConePatterns::try_parse_with_warnings(&content, &mut warnings);
+        for w in &warnings {
+            eprintln!("{w}");
         }
-        dirs.sort();
-        dirs.dedup();
-        for d in dirs {
-            writeln!(out, "{d}")?;
+        match parsed {
+            Some(cp) => {
+                // List the leaf (recursive) cone directories the user added — Git uses the
+                // recursive hashset (the `/dir/` lines with no trailing `!/dir/*/`).
+                let mut dirs = parse_expanded_cone_recursive_dirs(&lines);
+                if dirs.is_empty() {
+                    dirs = ConeWorkspace::from_cone_patterns(&cp).list_cone_directories();
+                }
+                dirs.sort();
+                dirs.dedup();
+                for d in dirs {
+                    writeln!(out, "{d}")?;
+                }
+            }
+            None => {
+                for line in &lines {
+                    writeln!(out, "{line}")?;
+                }
+            }
         }
         return Ok(());
     }
 
-    if cone_cfg {
-        if let Some(cp) = ConePatterns::try_parse(&content) {
-            let ws = ConeWorkspace::from_cone_patterns(&cp);
-            for d in ws.list_cone_directories() {
-                writeln!(out, "{d}")?;
-            }
-        } else {
-            for line in &lines {
-                writeln!(out, "{line}")?;
-            }
-        }
-    } else {
-        for line in &lines {
-            writeln!(out, "{line}")?;
-        }
+    for line in &lines {
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }

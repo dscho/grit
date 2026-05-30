@@ -59,6 +59,28 @@ impl NonConePatterns {
     }
 }
 
+/// Mirror Git `dup_and_filter_pattern` (dir.c): drop escape backslashes (once each), then
+/// if the result ends in `/*` truncate that trailing `/*`. Operates on a leading-`/` pattern.
+fn dup_and_filter_pattern(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    if out.len() > 2 && out[out.len() - 1] == b'*' && out[out.len() - 2] == b'/' {
+        out.truncate(out.len() - 2);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn glob_special_unescaped(name: &[u8]) -> bool {
     let mut i = 0usize;
     while i < name.len() {
@@ -188,17 +210,22 @@ impl ConePatterns {
                 continue;
             }
 
-            if negated && rest.ends_with("/*/") && rest.starts_with('/') && rest.len() > 4 {
-                let inner = &rest[1..rest.len() - 3];
-                if inner.is_empty()
-                    || inner.contains('/')
-                    || glob_special_unescaped(inner.as_bytes())
-                {
-                    warnings.push(format!("warning: unrecognized negative pattern: '{rest}'"));
+            // Git `add_pattern_to_hashsets`: a MUSTBEDIR pattern whose stored form (trailing
+            // dir-slash dropped) ends in `/*` is the "exclude immediate children" rule. For
+            // `!/foo/bar/*/` the stored pattern is `!/foo/bar/*`; `dup_and_filter_pattern`
+            // truncates the trailing `/*` to `/foo/bar`, which must already be recursive.
+            let stored = rest.strip_suffix('/').unwrap_or(rest);
+            if stored.starts_with('/')
+                && stored.len() > 2
+                && stored.ends_with("/*")
+                && !stored.ends_with("\\*")
+            {
+                if !negated {
+                    warnings.push(format!("warning: unrecognized pattern: '{rest}'"));
                     warnings.push("warning: disabling cone pattern matching".to_string());
                     return None;
                 }
-                let key = format!("/{inner}");
+                let key = dup_and_filter_pattern(stored);
                 if !recursive.contains(&key) {
                     warnings.push(format!("warning: unrecognized negative pattern: '{rest}'"));
                     warnings.push("warning: disabling cone pattern matching".to_string());
@@ -253,7 +280,10 @@ impl ConePatterns {
                 return None;
             }
 
-            let key = format!("/{body}");
+            // Git applies `dup_and_filter_pattern` before hashing: escape backslashes are
+            // removed and a trailing `/*` is truncated. So `/foo/\*/` collapses to `/foo`,
+            // which lets the duplicate-with-parent check fire (t1091 malformed cone patterns).
+            let key = dup_and_filter_pattern(&format!("/{body}"));
             if parents.contains(&key) {
                 warnings.push(format!(
                     "warning: your sparse-checkout file may have issues: pattern '{rest}' is repeated"
@@ -262,7 +292,8 @@ impl ConePatterns {
                 return None;
             }
             recursive.insert(key.clone());
-            let parts: Vec<&str> = body.split('/').collect();
+            let key_body = key.trim_start_matches('/');
+            let parts: Vec<&str> = key_body.split('/').collect();
             for i in 1..parts.len() {
                 let prefix = parts[..i].join("/");
                 parents.insert(format!("/{prefix}"));
