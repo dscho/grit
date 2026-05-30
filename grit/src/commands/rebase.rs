@@ -4722,8 +4722,12 @@ fn replay_remaining(
                          hint:   grit rebase --continue",
                             exec_cmd
                         );
-                        let remaining: Vec<&str> = todo[i..].to_vec();
-                        write_rebase_todo_slice(rb_dir, &remaining)?;
+                        // The todo was already written as `todo[i+1..]` above (matching Git's
+                        // `save_todo` with `!reschedule`, which drops the executing command). With
+                        // `rebase.rescheduleFailedExec` unset (Git's default), a failed `exec` is
+                        // NOT rescheduled: `rebase --continue` must resume at the NEXT command, not
+                        // re-run the failed exec. Leave the todo as-is and exit; re-writing
+                        // `todo[i..]` here would re-add the exec and loop forever (t5407 `-i (exec)`).
                         std::process::exit(code);
                     }
                     continue 'rebase_loop;
@@ -5301,7 +5305,22 @@ fn cherry_pick_for_rebase(
                         append_rebase_rewrite_line(rb_dir, commit_oid, &new_oid)?;
                     }
                 } else {
+                    // True fast-forward: HEAD already matches the picked commit's parent and we
+                    // keep the original commit OID. Git still records this in the rewritten list
+                    // (sequencer.c `record_in_rewritten` after every successful pick, including the
+                    // fast-forward at `allow_ff && !is_fixup`). Recording is essential when a
+                    // following fixup/squash will amend this commit: the pending entry then flushes
+                    // to the amended OID, so both the picked commit and the fixup map to the final
+                    // commit in the post-rewrite hook input (t5407).
                     fs::write(git_dir.join("HEAD"), format!("{}\n", commit_oid.to_hex()))?;
+                    if record_rewrite {
+                        record_rebase_in_rewritten_pending(
+                            git_dir,
+                            rb_dir,
+                            commit_oid,
+                            next_after_line,
+                        )?;
+                    }
                 }
                 return Ok(());
             }
@@ -5407,18 +5426,8 @@ fn cherry_pick_for_rebase(
         // Matches Git's sequencer, which always uses the picked commit's parent
         // tree as the base. The first pick (HEAD still at onto) likewise uses
         // the picked commit's parent tree.
-        let predecessor_matches_parent = head_tree_oid == parent_tree_oid;
-        if head_oid == onto_oid_state || predecessor_matches_parent {
-            parent_tree_oid
-        } else {
-            // The replayed predecessor differs from the picked commit's original
-            // parent (a conflict was resolved during `--continue`, or an
-            // `--onto <newbase>` moved the series). Merge against the onto tree so
-            // the conflict geometry matches Git's sequencer.
-            let onto_obj = repo.odb.read(&onto_oid_state)?;
-            let onto_commit = parse_commit(&onto_obj.data)?;
-            onto_commit.tree
-        }
+        let _ = onto_oid_state;
+        parent_tree_oid
     };
     let base_entries = tree_to_map(tree_to_index_entries(repo, &base_tree_oid, "")?);
     let ours_entries = tree_to_map(tree_to_index_entries(repo, &head_tree_oid, "")?);
@@ -6337,10 +6346,17 @@ fn do_continue() -> Result<()> {
     let _ = fs::remove_file(rb_dir.join("message"));
     let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
 
-    let (oid_for_rewrite, next_after_continue) = if stopped_oid.is_some() {
+    // The just-resolved conflicting commit is still `todo[0]` in the post-conflict todo (the
+    // conflict stop wrote `todo[i..]`; we pop it only after recording, at the end of this
+    // function). Its "next command" for the rewritten-pending flush decision is therefore the
+    // command at index 1 — so a following `fixup`/`squash` defers the flush and both the resolved
+    // commit and the fixup/squash map to the final amended commit in the post-rewrite hook input
+    // (t5407 `-i (squash)`). Peeking index 0 here would see the resolved commit's own `pick` and
+    // flush early, mapping it to the intermediate (pre-squash) commit.
+    let (oid_for_rewrite, next_after_continue) = if let Some(stopped) = stopped_oid.as_ref() {
         (
-            stopped_oid.as_ref().unwrap(),
-            peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 0, interactive_continue),
+            stopped,
+            peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 1, interactive_continue),
         )
     } else {
         (
