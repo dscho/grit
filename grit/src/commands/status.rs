@@ -506,6 +506,17 @@ pub fn run(mut args: Args) -> Result<()> {
     let index_sparse_on_disk = index.sparse_directories;
     let _ = index.expand_sparse_directory_placeholders(&repo.odb);
 
+    // A skip-worktree entry whose file is actually present on disk is treated by git as a
+    // normal (no longer sparse) path, so worktree modifications are reported. `load_index_at`
+    // does this, but status loads the raw index directly; apply the same clearing here.
+    if let Some(wt) = repo.work_tree.as_deref() {
+        grit_lib::sparse_checkout::clear_skip_worktree_from_present_files(
+            &repo.git_dir,
+            wt,
+            &mut index,
+        );
+    }
+
     match config
         .get("core.untrackedCache")
         .map(|s| s.to_ascii_lowercase())

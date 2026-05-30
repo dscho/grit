@@ -634,6 +634,13 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
             };
             let mode = u32::from_str_radix(&mode_str, 8)
                 .with_context(|| format!("invalid mode '{mode_str}'"))?;
+            // Git `add_cacheinfo` runs `verify_path(path, mode)` which rejects directory
+            // (tree) entries and any path with a trailing slash. You cannot stage a sparse
+            // directory via `--cacheinfo 040000 <oid> folder2/` (t1092 update-index).
+            if mode == grit_lib::index::MODE_TREE || path_bytes.ends_with(b"/") {
+                let path_str = String::from_utf8_lossy(&path_bytes);
+                bail!("error: Invalid path '{path_str}'");
+            }
             let oid: ObjectId = parse_index_info_oid(&repo, mode, &oid_str)?;
             // Reject null (all-zero) SHA1 — print verbose but skip
             if oid.is_zero() {
@@ -753,6 +760,17 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
         let (rel_path, abs_path) = resolve_repo_path(work_tree, &cwd, input_path)?;
         let rel_bytes = path_to_bytes(&rel_path)?;
 
+        // Git `update_one` runs `verify_path(path, st.st_mode)` which rejects a path with a
+        // trailing slash, printing `Ignoring path <p>` to stderr and continuing (exit 0).
+        // This must happen before the bit-mark / not-in-index handling below.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            if input_path.as_os_str().as_bytes().ends_with(b"/") {
+                eprintln!("Ignoring path {}", input_path.display());
+                continue;
+            }
+        }
+
         // Refuse to add a path that traverses through a symbolic link.
         // Check every *parent* component of the repo-relative path.
         if check_symlink_in_path(work_tree, &rel_path).is_some() {
@@ -832,10 +850,19 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
 
         // `--remove`: remove the path from the index. Missing paths, existing files, and
         // directory/typechange cases are all dropped without error if tracked (matches
-        // `remove_file_from_index` semantics expected by the test suite).
+        // `remove_file_from_index` semantics expected by the test suite). Exception: when
+        // the path is an existing directory on disk that is not itself tracked but has
+        // tracked children, git's `process_directory` errors (`add individual files
+        // instead`) instead of removing — so fall through to the directory handling below.
         if path_mode == PathMode::Remove {
-            let _ = index.remove(&rel_bytes);
-            continue;
+            let exact_tracked = index.get(&rel_bytes, 0).is_some();
+            let dir_on_disk = std::fs::symlink_metadata(&abs_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            if !(dir_on_disk && !exact_tracked) {
+                let _ = index.remove(&rel_bytes);
+                continue;
+            }
         }
 
         // --chmod=+x or --chmod=-x without --add: change the mode of an existing entry.
@@ -873,6 +900,16 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
         let meta = match std::fs::symlink_metadata(&abs_path) {
             Ok(m) => m,
             Err(_) if args.ignore_missing => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Git `process_lstat_error`: a missing file is fine only when removing.
+                // Otherwise `remove_one_path` errors with the same message git prints.
+                let rel_str = String::from_utf8_lossy(&rel_bytes);
+                if path_mode == PathMode::Remove || args.remove {
+                    let _ = index.remove(&rel_bytes);
+                    continue;
+                }
+                bail!("{rel_str}: does not exist and --remove not passed");
+            }
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "cannot stat '{}': {e}",
@@ -880,6 +917,38 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
                 ))
             }
         };
+
+        // Git `process_path` -> `process_directory`: a directory argument (no trailing
+        // slash; the slash form was already ignored above) that is not itself a tracked
+        // gitlink/file but has tracked children must be rejected; you must add the files
+        // individually. A bare directory with no tracked children would be added as a
+        // gitlink, which here means erroring the same way git does.
+        if meta.file_type().is_dir() && !abs_path.join(".git").exists() {
+            let rel_str = String::from_utf8_lossy(&rel_bytes);
+            let dir_prefix = format!("{rel_str}/");
+            let has_children = index
+                .entries
+                .iter()
+                .any(|e| String::from_utf8_lossy(&e.path).starts_with(dir_prefix.as_str()));
+            let exact = index.get(&rel_bytes, 0);
+            match exact {
+                Some(e) if e.mode == grit_lib::index::MODE_GITLINK => {}
+                Some(_) => {
+                    // Tracked as a file but is now a directory: remove if allowed.
+                    if path_mode == PathMode::Remove || args.remove {
+                        let _ = index.remove(&rel_bytes);
+                        continue;
+                    }
+                    bail!("{rel_str}: does not exist and --remove not passed");
+                }
+                None => {
+                    if has_children {
+                        bail!("{rel_str}: is a directory - add individual files instead");
+                    }
+                    bail!("{rel_str}: is a directory - add files inside instead");
+                }
+            }
+        }
 
         // Check for D/F conflicts in the index before adding.
         // Skip for gitlinks (submodule directories).
@@ -1463,6 +1532,19 @@ fn run_update_index_again(
 
         if ce.mode == grit_lib::index::MODE_TREE {
             // Sparse directory placeholder — not handled; skip like unknown.
+            pos += 1;
+            continue;
+        }
+
+        // Git's `do_reupdate` calls `update_one`, which honors the bit-only modes
+        // (`--skip-worktree` / `--no-skip-worktree`) before any lstat. Replay the bit
+        // change on each differing path rather than touching the worktree.
+        if args.skip_worktree || args.no_skip_worktree {
+            let path = ce.path.clone();
+            if let Some(e) = index.get_mut(&path, 0) {
+                e.set_skip_worktree(args.skip_worktree);
+                index.version = index.version.max(3);
+            }
             pos += 1;
             continue;
         }
