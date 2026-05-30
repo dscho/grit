@@ -1341,7 +1341,16 @@ fn path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
 }
 
 fn directory_in_cone(dir_path: &str, patterns: &[String], cone_mode: bool) -> bool {
-    crate::sparse_checkout::path_matches_sparse_patterns(dir_path, patterns, cone_mode)
+    // Match Git `path_in_cone_mode_sparse_checkout`: a *directory* is in the cone when its
+    // contents are recursively included. Pass it with a trailing slash so the cone matcher uses
+    // directory semantics (`/*` + `!/*/` excludes every top-level directory, so e.g. `deep`
+    // collapses to a single placeholder instead of leaving `deep/deeper1/` etc.).
+    let dir = dir_path.trim_end_matches('/');
+    if dir.is_empty() {
+        return true;
+    }
+    let with_slash = format!("{dir}/");
+    crate::sparse_checkout::path_matches_sparse_patterns(&with_slash, patterns, cone_mode)
 }
 
 fn collect_directory_prefixes(path: &[u8], out: &mut BTreeSet<Vec<u8>>) {

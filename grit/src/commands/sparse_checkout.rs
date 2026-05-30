@@ -715,7 +715,7 @@ fn cmd_disable(repo: &Repository) -> Result<()> {
 
     let patterns = vec!["/*".to_string()];
     warn_sparse_apply_side_effects(repo, &patterns, false, false)?;
-    apply_sparse_patterns(repo, &patterns, false)?;
+    apply_full_checkout(repo)?;
 
     unset_sparse_keys_all_layers(repo)?;
     Ok(())
@@ -923,6 +923,11 @@ fn sanitize_set_paths(
     skip_checks: bool,
     args: &mut Vec<String>,
 ) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    // Mirrors Git `sanitize_paths` (builtin/sparse-checkout.c). Prefix-prepend only happens in
+    // cone mode (args are not pathspecs).
     if !prefix.is_empty() && cone {
         for a in args.iter_mut() {
             if let Some(p) =
@@ -931,6 +936,9 @@ fn sanitize_set_paths(
                 *a = p;
             }
         }
+    }
+    if skip_checks {
+        return Ok(());
     }
     if !prefix.is_empty() && !cone {
         bail!("please run from the toplevel directory in non-cone mode");
@@ -948,9 +956,9 @@ fn sanitize_set_paths(
             }
         }
     }
-    if !skip_checks {
-        validate_cone_patterns(repo, args)?;
-    }
+    // Index file-check: a tracked, non-sparse-dir entry is a regular file. Cone mode rejects it;
+    // non-cone mode warns about the missing leading slash (Git `sanitize_paths`).
+    check_tracked_file_args(repo, cone, args)?;
     Ok(())
 }
 
@@ -1036,6 +1044,13 @@ fn cone_patterns_are_all_tracked_files(repo: &Repository, patterns: &[String]) -
 }
 
 fn validate_cone_patterns(repo: &Repository, patterns: &[String]) -> Result<()> {
+    check_tracked_file_args(repo, true, patterns)
+}
+
+/// Git `sanitize_paths` index file-check: for each arg that is a tracked, non-sparse-dir index
+/// entry (i.e. a regular file), cone mode dies "is not a directory" while non-cone mode warns
+/// to use a leading slash for a single file (t1091).
+fn check_tracked_file_args(repo: &Repository, cone: bool, patterns: &[String]) -> Result<()> {
     let index_path = repo.index_path();
     let index =
         grit_lib::index::Index::load(&index_path).context("reading index for validation")?;
@@ -1048,15 +1063,16 @@ fn validate_cone_patterns(repo: &Repository, patterns: &[String]) -> Result<()> 
             if ce.is_sparse_directory_placeholder() {
                 continue;
             }
-            // Harness / sparse-checkout tests use `git sparse-checkout set a` where `a` is a
-            // tracked file; Git accepts this as a recursive cone directory name. Allow any
-            // single-segment path that is a non-tree index entry.
-            if !p.contains('/') && ce.mode != MODE_TREE {
-                continue;
+            if cone {
+                // A tracked, non-tree index entry is a regular file. Git's cone-mode set/add
+                // rejects files; pass --skip-checks to treat it as a directory anyway.
+                bail!(
+                    "'{}' is not a directory; to treat it as a directory anyway, rerun with --skip-checks",
+                    p
+                );
             }
-            bail!(
-                "'{}' is not a directory; to treat it as a directory anyway, rerun with --skip-checks",
-                p
+            eprintln!(
+                "warning: pass a leading slash before paths such as '{p}' if you want a single file (see NON-CONE PROBLEMS in the git-sparse-checkout manual)."
             );
         }
         // No exact index entry: allowed (matches Git `sanitize_paths` / `index_name_pos`).
@@ -1215,6 +1231,21 @@ fn warn_sparse_apply_side_effects(
 }
 
 fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool) -> Result<()> {
+    apply_sparse_patterns_inner(repo, patterns, cone_mode, false)
+}
+
+/// Expand the whole worktree to a full checkout (Git `sparse-checkout disable`): clear every
+/// skip-worktree bit, materialize all blobs, and never re-collapse the index.
+fn apply_full_checkout(repo: &Repository) -> Result<()> {
+    apply_sparse_patterns_inner(repo, &["/*".to_string()], false, true)
+}
+
+fn apply_sparse_patterns_inner(
+    repo: &Repository,
+    patterns: &[String],
+    cone_mode: bool,
+    force_include_all: bool,
+) -> Result<()> {
     let work_tree = repo
         .work_tree
         .as_deref()
@@ -1244,6 +1275,16 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         index.version = 3;
     }
 
+    // A sparse index collapses out-of-cone directories into MODE_TREE placeholders. To re-apply
+    // patterns per file (clear skip-worktree, materialize blobs) we must first expand those
+    // placeholders to a full index, otherwise widening the cone (e.g. `disable`) never writes the
+    // collapsed directories' files to disk (t1091 'sparse-checkout disable').
+    if index.has_sparse_directory_placeholders() {
+        index
+            .expand_sparse_directory_placeholders(&repo.odb)
+            .context("expanding sparse index before applying patterns")?;
+    }
+
     let file_content = read_sparse_file_content(repo);
     let expanded_cone_shape = effective_cone_mode_for_sparse_file(cone_mode, patterns);
     let cone_struct = if expanded_cone_shape {
@@ -1261,7 +1302,9 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         let path_str = String::from_utf8_lossy(&entry.path).to_string();
         // Non-cone mode must use Git's `path_in_sparse_checkout` (parent walk + last-match),
         // not `NonConePatterns::path_included` (sequential toggles). See t3602-rm-sparse-checkout.
-        let matches = if effective_cone {
+        let matches = if force_include_all {
+            true
+        } else if effective_cone {
             path_in_sparse_checkout(
                 &path_str,
                 true,
@@ -1324,7 +1367,10 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         })
         .unwrap_or(false);
 
-    if !skip_collapse {
+    if force_include_all {
+        // A full checkout (`disable`) must never re-collapse the index into sparse placeholders.
+        index.sparse_directories = false;
+    } else if !skip_collapse {
         if let Some(tree_oid) = head_tree_oid(repo)? {
             index.try_collapse_sparse_directories(
                 &repo.odb,
@@ -1344,27 +1390,30 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         .context("writing index")?;
 
     // Remove untracked paths outside the sparse cone (Git `sparse_checkout_set` / t7012).
-    let indexed_paths: HashSet<String> = index
-        .entries
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    let gitlink_paths: HashSet<String> = index
-        .entries
-        .iter()
-        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    remove_untracked_outside_sparse(
-        work_tree,
-        work_tree,
-        &indexed_paths,
-        &gitlink_paths,
-        patterns,
-        effective_cone,
-        cone_struct.as_ref(),
-        &non_cone,
-    )?;
+    // A full checkout (`disable`) includes everything, so there is nothing to prune.
+    if !force_include_all {
+        let indexed_paths: HashSet<String> = index
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        let gitlink_paths: HashSet<String> = index
+            .entries
+            .iter()
+            .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        remove_untracked_outside_sparse(
+            work_tree,
+            work_tree,
+            &indexed_paths,
+            &gitlink_paths,
+            patterns,
+            effective_cone,
+            cone_struct.as_ref(),
+            &non_cone,
+        )?;
+    }
 
     // Submodule work trees keep their own `info/sparse-checkout`. After the superproject applies
     // sparsity we skip cleaning inside gitlink dirs (so we do not delete `sub/B/b`), so re-run the
