@@ -114,6 +114,34 @@ impl GpgFormat {
         }
     }
 
+    /// Detect the format from a signature's armor header
+    /// (Git `gpg-interface.c:get_format_by_sig`). Returns `None` for an
+    /// unrecognized signature.
+    pub fn from_signature(sig: &[u8]) -> Option<GpgFormat> {
+        const OPENPGP: &[&[u8]] = &[
+            b"-----BEGIN PGP SIGNATURE-----",
+            b"-----BEGIN PGP MESSAGE-----",
+        ];
+        const X509: &[&[u8]] = &[b"-----BEGIN SIGNED MESSAGE-----"];
+        const SSH: &[&[u8]] = &[b"-----BEGIN SSH SIGNATURE-----"];
+        for prefix in OPENPGP {
+            if sig.starts_with(prefix) {
+                return Some(GpgFormat::OpenPgp);
+            }
+        }
+        for prefix in X509 {
+            if sig.starts_with(prefix) {
+                return Some(GpgFormat::X509);
+            }
+        }
+        for prefix in SSH {
+            if sig.starts_with(prefix) {
+                return Some(GpgFormat::Ssh);
+            }
+        }
+        None
+    }
+
     /// Extra arguments passed before `--verify` for this format.
     fn verify_args(self) -> &'static [&'static str] {
         match self {
@@ -129,8 +157,17 @@ impl GpgFormat {
 pub struct GpgConfig {
     /// The selected format.
     pub format: GpgFormat,
-    /// The resolved program command (may be a bare name to look up on `$PATH`).
+    /// The resolved program command for [`Self::format`] (used for signing; may
+    /// be a bare name to look up on `$PATH`).
     pub program: String,
+    /// `gpg.program` (the format-agnostic fallback), if set.
+    pub generic_program: Option<String>,
+    /// `gpg.openpgp.program`, if set.
+    pub openpgp_program: Option<String>,
+    /// `gpg.x509.program`, if set.
+    pub x509_program: Option<String>,
+    /// `gpg.ssh.program`, if set.
+    pub ssh_program: Option<String>,
     /// `user.signingkey`, if set.
     pub signing_key: Option<String>,
     /// `gpg.minTrustLevel`, if set.
@@ -156,13 +193,22 @@ impl GpgConfig {
             None => GpgFormat::OpenPgp,
         };
 
+        let nonempty = |k: &str| config.get(k).filter(|p| !p.is_empty());
+        let generic_program = nonempty("gpg.program");
+        let openpgp_program = nonempty("gpg.openpgp.program");
+        let x509_program = nonempty("gpg.x509.program");
+        let ssh_program = nonempty("gpg.ssh.program");
+
         // `gpg.<fmt>.program` takes precedence over `gpg.program`.
-        let fmt_program_key = format!("gpg.{}.program", format.name());
-        let program = config
-            .get(&fmt_program_key)
-            .or_else(|| config.get("gpg.program"))
-            .filter(|p| !p.is_empty())
-            .unwrap_or_else(|| format.default_program().to_owned());
+        let program = resolve_program_for_format(
+            format,
+            generic_program.as_deref(),
+            match format {
+                GpgFormat::OpenPgp => openpgp_program.as_deref(),
+                GpgFormat::X509 => x509_program.as_deref(),
+                GpgFormat::Ssh => ssh_program.as_deref(),
+            },
+        );
 
         let signing_key = config.get("user.signingkey").filter(|k| !k.is_empty());
 
@@ -184,11 +230,28 @@ impl GpgConfig {
         Ok(GpgConfig {
             format,
             program,
+            generic_program,
+            openpgp_program,
+            x509_program,
+            ssh_program,
             signing_key,
             min_trust_level,
             ssh_allowed_signers,
             ssh_revocation_file,
         })
+    }
+
+    /// Resolve the program for a specific format (honoring `gpg.<fmt>.program`
+    /// then `gpg.program`, falling back to the format default). Used by
+    /// verification, where the format is detected from the signature armor and
+    /// may differ from the configured [`Self::format`].
+    fn program_for(&self, format: GpgFormat) -> String {
+        let fmt_program = match format {
+            GpgFormat::OpenPgp => self.openpgp_program.as_deref(),
+            GpgFormat::X509 => self.x509_program.as_deref(),
+            GpgFormat::Ssh => self.ssh_program.as_deref(),
+        };
+        resolve_program_for_format(format, self.generic_program.as_deref(), fmt_program)
     }
 
     /// The signing key to use: the explicit `key_override`, else
@@ -217,6 +280,20 @@ impl GpgConfig {
     pub fn resolve_program_path(&self) -> Result<PathBuf> {
         resolve_program(&self.program)
     }
+}
+
+/// Resolve the program *string* for `format`: `gpg.<fmt>.program` (if set),
+/// else `gpg.program` (if set), else the format's built-in default.
+fn resolve_program_for_format(
+    format: GpgFormat,
+    generic_program: Option<&str>,
+    fmt_program: Option<&str>,
+) -> String {
+    fmt_program
+        .or(generic_program)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_owned())
+        .unwrap_or_else(|| format.default_program().to_owned())
 }
 
 /// Resolve a program string to an executable path.
@@ -708,18 +785,23 @@ pub fn verify_commit(cfg: &GpgConfig, raw_commit: &[u8]) -> Result<SignatureChec
         None => return Ok(SignatureCheck::default_none()),
     };
 
-    if cfg.format == GpgFormat::Ssh {
+    // Git picks the verifier from the *signature* armor (`get_format_by_sig`),
+    // not from `gpg.format`: a `git verify-commit` over an ssh-signed commit must
+    // use ssh-keygen even when `gpg.format` is unset/openpgp, and vice-versa.
+    let detected_format = GpgFormat::from_signature(&signature).unwrap_or(cfg.format);
+
+    if detected_format == GpgFormat::Ssh {
         return verify_ssh_signed_buffer(cfg, payload, signature);
     }
 
-    let program = cfg.resolve_program_path()?;
+    let program = resolve_program(&cfg.program_for(detected_format))?;
 
     // Write the detached signature to a temp file.
     let sig_path = write_temp_file(&signature)?;
 
     let mut cmd = Command::new(&program);
     cmd.arg("--status-fd=1");
-    for a in cfg.format.verify_args() {
+    for a in detected_format.verify_args() {
         cmd.arg(a);
     }
     cmd.arg("--verify")
@@ -904,7 +986,10 @@ fn verify_ssh_signed_buffer(
         }
     };
 
-    let program = cfg.resolve_program_path()?;
+    // The format here is detected from the signature armor, which may differ
+    // from `cfg.format`; always resolve the ssh program (`gpg.ssh.program` /
+    // `gpg.program` / `ssh-keygen`).
+    let program = resolve_program(&cfg.program_for(GpgFormat::Ssh))?;
 
     // Write the detached signature to a temp `.git_vtag` file.
     let sig_path = write_temp_file_named(&signature, "git_vtag")?;
