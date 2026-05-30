@@ -1405,6 +1405,105 @@ pub fn committer_signing_default(committer_ident: &str) -> String {
     }
 }
 
+/// Split a signed buffer (e.g. a tag object) into `(payload, signature)`.
+///
+/// Port of Git's `gpg-interface.c:parse_signed_buffer`/`parse_signature`: scans
+/// the buffer line by line and records the offset of the *last* line that begins
+/// a recognized signature armor ([`GpgFormat::from_signature`]).  The payload is
+/// everything before that offset and the signature is everything from it to the
+/// end.  Unlike commits, a signed tag appends the armored signature directly
+/// after the tag body with no `gpgsig` header and no per-line indentation.
+///
+/// Returns `None` when no armor line is found (the buffer is unsigned).
+pub fn parse_signed_buffer(buf: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let size = buf.len();
+    let mut len = 0usize;
+    let mut matched: Option<usize> = None;
+    while len < size {
+        if GpgFormat::from_signature(&buf[len..]).is_some() {
+            matched = Some(len);
+        }
+        let eol = memchr(buf, len, b'\n');
+        len = match eol {
+            Some(p) => p + 1,
+            None => size,
+        };
+    }
+    let m = matched?;
+    Some((buf[..m].to_vec(), buf[m..].to_vec()))
+}
+
+/// Verify a raw tag object's appended signature.
+///
+/// Mirrors [`verify_commit`] but uses [`parse_signed_buffer`] (tag signatures are
+/// appended, not stored in a `gpgsig` header).  The verifier is chosen from the
+/// signature armor (`get_format_by_sig`), reusing [`verify_ssh_signed_buffer`]
+/// for ssh and the gpg/gpgsm path otherwise.  Returns the "no signature" result
+/// when the tag carries no signature.
+pub fn verify_tag(cfg: &GpgConfig, raw_tag: &[u8]) -> Result<SignatureCheck> {
+    let (payload, signature) = match parse_signed_buffer(raw_tag) {
+        Some(parts) => parts,
+        None => return Ok(SignatureCheck::default_none()),
+    };
+
+    let detected_format = GpgFormat::from_signature(&signature).unwrap_or(cfg.format);
+
+    if detected_format == GpgFormat::Ssh {
+        return verify_ssh_signed_buffer(cfg, payload, signature);
+    }
+
+    let program = resolve_program(&cfg.program_for(detected_format))?;
+
+    let sig_path = write_temp_file(&signature)?;
+
+    let mut cmd = Command::new(&program);
+    cmd.arg("--status-fd=1");
+    for a in detected_format.verify_args() {
+        cmd.arg(a);
+    }
+    cmd.arg("--verify")
+        .arg(&sig_path)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_file(&sig_path);
+        Error::Signing(format!(
+            "could not run gpg program '{}': {e}",
+            program.display()
+        ))
+    })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&payload);
+        drop(stdin);
+    }
+
+    let output = child.wait_with_output();
+    let _ = std::fs::remove_file(&sig_path);
+    let output =
+        output.map_err(|e| Error::Signing(format!("failed waiting for gpg program: {e}")))?;
+
+    let gpg_status = String::from_utf8_lossy(&output.stdout).into_owned();
+    let human = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    let mut sigc = SignatureCheck {
+        signature,
+        payload,
+        result: 'N',
+        trust_level: TrustLevel::Undefined,
+        gpg_status: gpg_status.clone(),
+        output: human,
+        ..Default::default()
+    };
+
+    parse_gpg_output(&mut sigc, &gpg_status);
+
+    Ok(sigc)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1441,6 +1540,25 @@ mod tests {
     fn extract_none_when_unsigned() {
         let commit = b"tree 0123\ncommitter c\n\nmsg\n";
         assert!(extract_signed_payload(commit).is_none());
+    }
+
+    #[test]
+    fn parse_signed_buffer_splits_appended_tag_signature() {
+        // A signed tag appends the armored signature directly after the body
+        // with no `gpgsig` header and no per-line indentation.
+        let body = b"object 0123\ntype commit\ntag v1\ntagger t <t@e> 1 +0000\n\nmessage\n";
+        let sig = b"-----BEGIN SSH SIGNATURE-----\nAAAA\n-----END SSH SIGNATURE-----\n";
+        let mut tag = body.to_vec();
+        tag.extend_from_slice(sig);
+        let (payload, signature) = parse_signed_buffer(&tag).expect("should split");
+        assert_eq!(payload, body);
+        assert_eq!(signature, sig);
+    }
+
+    #[test]
+    fn parse_signed_buffer_none_when_unsigned() {
+        let body = b"object 0123\ntype commit\ntag v1\ntagger t <t@e> 1 +0000\n\nmessage\n";
+        assert!(parse_signed_buffer(body).is_none());
     }
 
     #[test]

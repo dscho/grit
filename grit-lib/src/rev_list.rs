@@ -1478,6 +1478,21 @@ pub fn render_commit_with_color(
             } else {
                 fmt.as_str()
             };
+
+            // Verify the commit signature only when a `%G` placeholder is present
+            // in the format (matches git's lazy `%G?`/`%GS` evaluation).
+            let signature: Option<crate::signing::SignatureCheck> = if raw_fmt.contains("%G") {
+                repo.odb.read(&oid).ok().map(|obj| {
+                    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+                    match crate::signing::GpgConfig::from_config(&config) {
+                        Ok(cfg) => crate::signing::verify_commit(&cfg, &obj.data)
+                            .unwrap_or_else(|_| crate::signing::SignatureCheck::default_none()),
+                        Err(_) => crate::signing::SignatureCheck::default_none(),
+                    }
+                })
+            } else {
+                None
+            };
             // Body: everything after the first line (skip blank separator line)
             let body = {
                 let mut lines = commit.message.lines();
@@ -2140,6 +2155,70 @@ pub fn render_commit_with_color(
                         if let Some(&_nc) = chars.peek() {
                             chars.next(); // consume the sub-specifier
                                           // For non-reflog commits, these expand to empty
+                        }
+                    }
+                    Some('G') => {
+                        // Signature placeholders (%G?, %GS, %GK, %GF, %GP, %GT, %GG).
+                        // Unknown `%G<x>` (and a bare trailing `%G`) pass through
+                        // literally, mirroring git's pretty.c `return 0`.
+                        use crate::signing::{SignatureCheck, TrustLevel};
+                        let default_sig;
+                        let sig: &SignatureCheck = match &signature {
+                            Some(s) => s,
+                            None => {
+                                default_sig = SignatureCheck::default_none();
+                                &default_sig
+                            }
+                        };
+                        let mut lookahead = chars.clone();
+                        lookahead.next(); // consume 'G'
+                        let sub = lookahead.peek().copied();
+                        let handled = match sub {
+                            Some('?') => {
+                                let ch = if sig.result == 'G'
+                                    && matches!(
+                                        sig.trust_level,
+                                        TrustLevel::Undefined | TrustLevel::Never
+                                    ) {
+                                    'U'
+                                } else {
+                                    sig.result
+                                };
+                                target.push(ch);
+                                true
+                            }
+                            Some('S') => {
+                                target.push_str(sig.signer.as_deref().unwrap_or(""));
+                                true
+                            }
+                            Some('K') => {
+                                target.push_str(sig.key.as_deref().unwrap_or(""));
+                                true
+                            }
+                            Some('F') => {
+                                target.push_str(sig.fingerprint.as_deref().unwrap_or(""));
+                                true
+                            }
+                            Some('P') => {
+                                target
+                                    .push_str(sig.primary_key_fingerprint.as_deref().unwrap_or(""));
+                                true
+                            }
+                            Some('T') => {
+                                target.push_str(sig.trust_level.display_key());
+                                true
+                            }
+                            Some('G') => {
+                                target.push_str(&sig.output);
+                                true
+                            }
+                            _ => false,
+                        };
+                        if handled {
+                            chars.next(); // consume 'G'
+                            chars.next(); // consume sub-char
+                        } else {
+                            target.push('%');
                         }
                     }
                     Some(&other) => {
