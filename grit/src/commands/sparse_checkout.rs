@@ -1338,28 +1338,37 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
     repo.write_index_at(&index_path, &mut index)
         .context("writing index")?;
 
-    // Remove untracked paths outside the sparse cone (Git `sparse_checkout_set` / t7012).
-    let indexed_paths: HashSet<String> = index
-        .entries
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    let gitlink_paths: HashSet<String> = index
-        .entries
-        .iter()
-        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    remove_untracked_outside_sparse(
-        work_tree,
-        work_tree,
-        &indexed_paths,
-        &gitlink_paths,
-        patterns,
-        effective_cone,
-        cone_struct.as_ref(),
-        &non_cone,
-    )?;
+    // Clean tracked sparse directories that have gone out of scope (Git
+    // `clean_tracked_sparse_directories`, builtin/sparse-checkout.c). This is
+    // cone-mode only: in non-cone mode Git returns early and removes nothing, and
+    // in cone mode it only removes whole TRACKED directories that no longer
+    // contain any untracked content. It never deletes individual untracked files,
+    // which is why the untracked `expected-index`/`expected-merge` files in
+    // t6428 must survive a `sparse-checkout set --no-cone` (see t1091's
+    // untracked-preservation subtests as well).
+    if effective_cone {
+        let indexed_paths: HashSet<String> = index
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        let gitlink_paths: HashSet<String> = index
+            .entries
+            .iter()
+            .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        remove_untracked_outside_sparse(
+            work_tree,
+            work_tree,
+            &indexed_paths,
+            &gitlink_paths,
+            patterns,
+            effective_cone,
+            cone_struct.as_ref(),
+            &non_cone,
+        )?;
+    }
 
     // Submodule work trees keep their own `info/sparse-checkout`. After the superproject applies
     // sparsity we skip cleaning inside gitlink dirs (so we do not delete `sub/B/b`), so re-run the
@@ -1418,6 +1427,14 @@ fn open_gitlink_worktree_repo(sub_work_tree: &Path) -> Result<Repository> {
     }
 }
 
+/// Mirror Git's `clean_tracked_sparse_directories` (builtin/sparse-checkout.c).
+///
+/// Only ever called in cone mode. It removes whole tracked directories that have
+/// gone out of the sparse cone, but ONLY when they no longer contain any untracked
+/// content. It must never delete an individual untracked file: Git's
+/// `update_sparsity`/unpack-trees removes tracked SKIP_WORKTREE files (done earlier
+/// in `apply_sparse_patterns`), while `clean_tracked_sparse_directories` removes
+/// only directories and bails out (with a warning) on any untracked content.
 fn remove_untracked_outside_sparse(
     work_tree: &Path,
     current: &Path,
@@ -1448,54 +1465,60 @@ fn remove_untracked_outside_sparse(
             continue;
         }
         let meta = fs::symlink_metadata(&path).context("stat work tree path")?;
-        if meta.is_dir() {
-            if gitlink_paths.contains(&rel) {
-                continue;
-            }
-            remove_untracked_outside_sparse(
-                work_tree,
-                &path,
-                indexed_paths,
-                gitlink_paths,
-                patterns,
-                effective_cone,
-                cone_struct,
-                non_cone,
-            )?;
-            if fs::read_dir(&path)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(false)
-            {
-                let included = if effective_cone {
-                    path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree))
-                } else {
-                    path_in_sparse_checkout_lines(&rel, patterns, Some(work_tree))
-                };
-                if !included && !indexed_paths.contains(&rel) {
-                    let _ = fs::remove_dir(&path);
-                    if let Some(parent) = path.parent() {
-                        remove_empty_dirs_up_to(parent, work_tree);
-                    }
-                }
-            }
+        // Never touch individual files (tracked or untracked) here. Tracked
+        // out-of-scope files were already removed via SKIP_WORKTREE in the entry
+        // pass above; untracked files must be preserved (t6428, t1091).
+        if !meta.is_dir() {
             continue;
         }
-        if !meta.is_file() && !meta.file_type().is_symlink() {
+        if gitlink_paths.contains(&rel) {
             continue;
         }
-        if indexed_paths.contains(&rel) {
+        // Only tracked directories (those with at least one indexed path under
+        // them) are candidates for removal. A directory that was never tracked is
+        // entirely user content and must be left alone.
+        let prefix = format!("{rel}/");
+        let is_tracked_dir =
+            indexed_paths.contains(&rel) || indexed_paths.iter().any(|p| p.starts_with(&prefix));
+        if !is_tracked_dir {
             continue;
         }
+        // Recurse first so nested empty tracked directories get cleaned up before
+        // we evaluate this one.
+        remove_untracked_outside_sparse(
+            work_tree,
+            &path,
+            indexed_paths,
+            gitlink_paths,
+            patterns,
+            effective_cone,
+            cone_struct,
+            non_cone,
+        )?;
         let included = if effective_cone {
             path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree))
         } else {
             path_in_sparse_checkout_lines(&rel, patterns, Some(work_tree))
         };
-        if !included {
-            let _ = fs::remove_file(&path);
+        if included {
+            continue;
+        }
+        // Out-of-scope tracked directory: only remove it when it is now empty
+        // (no untracked content survived). If anything remains, keep it and warn,
+        // matching Git's "contains untracked files" behavior (t1091).
+        let is_empty = fs::read_dir(&path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if is_empty {
+            let _ = fs::remove_dir(&path);
             if let Some(parent) = path.parent() {
                 remove_empty_dirs_up_to(parent, work_tree);
             }
+        } else {
+            eprintln!(
+                "warning: directory '{rel}' contains untracked files, \
+                 but is not in the sparse-checkout cone"
+            );
         }
     }
     Ok(())
