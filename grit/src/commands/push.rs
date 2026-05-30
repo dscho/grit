@@ -2363,6 +2363,33 @@ fn push_to_url(
         }
     }
 
+    // Run post-update hook on the remote after post-receive, matching
+    // receive-pack ordering. It receives the list of updated remote refnames
+    // as its arguments (not via stdin) and is purely informational, so its
+    // exit status is ignored (matches receive-pack.rs / githooks(5)).
+    if !args.dry_run && !applied_updates.is_empty() {
+        let post_update_arg_strings: Vec<String> = applied_updates
+            .iter()
+            .map(|(update, _)| update.remote_ref.clone())
+            .collect();
+        if !post_update_arg_strings.is_empty() {
+            let post_update_args: Vec<&str> =
+                post_update_arg_strings.iter().map(|s| s.as_str()).collect();
+            let (_, hook_output) = grit_lib::hooks::run_hook_in_git_dir(
+                &remote_repo,
+                "post-update",
+                &post_update_args,
+                None,
+                &push_option_env_refs,
+            );
+            if !hook_output.is_empty() {
+                let output_str = String::from_utf8_lossy(&hook_output);
+                let color_remote = RemoteMessageColorStyle::from_config(config);
+                colorize_remote_output(&output_str, &color_remote);
+            }
+        }
+    }
+
     // Set upstream tracking if requested (`--dry-run` only prints what Git would do).
     if set_upstream_after_push {
         use std::collections::BTreeMap;
@@ -2496,6 +2523,54 @@ fn worktree_clean_for_update_instead(remote_repo: &Repository) -> std::result::R
 fn update_worktree_after_push_update_instead(
     remote_repo: &Repository,
     new_oid: ObjectId,
+) -> std::result::Result<Vec<u8>, String> {
+    let wt = remote_repo
+        .work_tree
+        .as_ref()
+        .ok_or_else(|| "denyCurrentBranch = updateInstead needs a worktree".to_owned())?;
+
+    // Mirror git's update_worktree(): give the push-to-checkout hook first
+    // refusal. Only when the hook is not installed do we fall back to the
+    // diff-files/diff-index cleanliness checks + checkout (push_to_deploy).
+    let new_hex = new_oid.to_hex();
+    let git_dir_abs = remote_repo
+        .git_dir
+        .canonicalize()
+        .unwrap_or_else(|_| remote_repo.git_dir.clone());
+    let wt_abs = wt.canonicalize().unwrap_or_else(|_| wt.clone());
+    let git_dir_str = git_dir_abs.to_string_lossy().into_owned();
+    let wt_str = wt_abs.to_string_lossy().into_owned();
+    let hook_env: Vec<(&str, &str)> = vec![
+        ("GIT_DIR", git_dir_str.as_str()),
+        ("GIT_WORK_TREE", wt_str.as_str()),
+    ];
+    let (hook_result, hook_output) = grit_lib::hooks::run_hook_in_git_dir(
+        remote_repo,
+        "push-to-checkout",
+        &[new_hex.as_str()],
+        None,
+        &hook_env,
+    );
+    if hook_result.was_executed() {
+        // The hook was installed and ran. On success it is responsible for
+        // updating the work tree, so skip the cleanliness check + checkout.
+        if let HookResult::Failed(_) = hook_result {
+            return Err("push-to-checkout hook declined".to_owned());
+        }
+        return Ok(hook_output);
+    }
+
+    // No push-to-checkout hook: fall back to the cleanliness checks before
+    // updating the work tree, matching git's push_to_deploy.
+    worktree_clean_for_update_instead(remote_repo)?;
+
+    update_worktree_after_push_update_instead_checkout(remote_repo, new_oid)?;
+    Ok(hook_output)
+}
+
+fn update_worktree_after_push_update_instead_checkout(
+    remote_repo: &Repository,
+    new_oid: ObjectId,
 ) -> std::result::Result<(), String> {
     let wt = remote_repo
         .work_tree
@@ -2597,7 +2672,11 @@ fn check_receive_pack_policy(
                 return Err("branch is currently checked out".to_owned());
             }
             ReceiveDenyAction::UpdateInstead => {
-                worktree_clean_for_update_instead(remote_repo)?;
+                // Worktree handling (push-to-checkout hook, else cleanliness
+                // check + checkout) happens in the worktree-update step that
+                // runs after the ref is written, mirroring git's
+                // update_worktree(): the hook gets first refusal and the
+                // diff-files/diff-index checks only run as a fallback.
             }
         }
     } else {
@@ -2751,10 +2830,18 @@ fn apply_ref_update(
                 refs::write_ref(&remote_repo.git_dir, &update.remote_ref, new_oid)
                     .with_context(|| format!("updating remote ref {}", update.remote_ref))?;
                 if update_instead_after_ref {
-                    if let Err(msg) =
-                        update_worktree_after_push_update_instead(remote_repo, *new_oid)
-                    {
-                        return Ok(ApplyRefResult::RemoteRejected(msg));
+                    match update_worktree_after_push_update_instead(remote_repo, *new_oid) {
+                        Ok(hook_output) => {
+                            if !hook_output.is_empty() {
+                                let output_str = String::from_utf8_lossy(&hook_output);
+                                let color_remote =
+                                    RemoteMessageColorStyle::from_config(pushing_config);
+                                colorize_remote_output(&output_str, &color_remote);
+                            }
+                        }
+                        Err(msg) => {
+                            return Ok(ApplyRefResult::RemoteRejected(msg));
+                        }
                     }
                 }
                 update_remote_tracking_ref(repo, remote_name, &update.remote_ref, Some(*new_oid))?;
