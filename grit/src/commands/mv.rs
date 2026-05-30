@@ -793,6 +793,30 @@ pub fn run(args: Args) -> Result<()> {
         emit_dirty_sparse_advice(&mut std::io::stderr(), &config, &dirty_advice)?;
     }
 
+    // Git's `remove_empty_src_dirs`: after moving a whole directory, if no index entries remain
+    // under the source directory, remove it from the worktree recursively (clearing any leftover
+    // untracked empty subdirs like `sub/dir/deep`). See git/builtin/mv.c:625,171. We only do this
+    // for sources where the on-disk directory still exists (sparse moves remove tracked files in
+    // place rather than renaming the directory).
+    if !args.dry_run {
+        for root in &moved_dir_roots {
+            let prefix_nfc = format!("{}/", precompose_utf8_path(root.trim_end_matches('/')));
+            let still_tracked = index.entries.iter().any(|e| {
+                e.stage() == 0
+                    && precompose_utf8_path(String::from_utf8_lossy(&e.path).as_ref())
+                        .as_ref()
+                        .starts_with(prefix_nfc.as_str())
+            });
+            if still_tracked {
+                continue;
+            }
+            let dir_abs = work_tree.join(root.trim_end_matches('/'));
+            if dir_abs.is_dir() {
+                let _ = fs::remove_dir_all(&dir_abs);
+            }
+        }
+    }
+
     if !args.dry_run {
         repo.write_index(&mut index)?;
     }
