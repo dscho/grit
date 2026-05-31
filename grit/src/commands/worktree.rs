@@ -1498,10 +1498,23 @@ fn cmd_remove(args: RemoveArgs) -> Result<()> {
 
     // Check for dirty/untracked files unless --force >= 1
     if args.force < 1 && wt_path.exists() {
-        // Load the linked worktree's index (stored in the admin directory)
+        // Load the linked worktree's index (stored in the admin directory). Open a Repository
+        // SCOPED TO THE WORKTREE BEING REMOVED (git_dir = admin, work_tree = wt_path) rather than
+        // reusing the discovered (main) repo: `load_index_at` runs
+        // `clear_skip_worktree_from_present_files`, which clears the skip-worktree bit for any
+        // sparse entry whose file is present in the repo's work_tree. With the main repo's work
+        // tree those files exist, so the bits are wrongly cleared and a sparse worktree (whose
+        // out-of-cone files are intentionally absent) is misreported as dirty
+        // (t1091 'worktree: add copies sparse-checkout patterns'). Scoping to wt_path keeps the
+        // skip-worktree bits, so `has_dirty_files` correctly skips those entries.
         let index_path = admin.join("index");
         if index_path.exists() {
-            if let Ok(index) = repo.load_index_at(&index_path) {
+            let wt_repo = Repository::open(&admin, Some(&wt_path)).ok();
+            let load = match wt_repo {
+                Some(ref r) => r.load_index_at(&index_path),
+                None => repo.load_index_at(&index_path),
+            };
+            if let Ok(index) = load {
                 // Check for untracked files
                 if has_untracked_files(&wt_path, &index) {
                     bail!("worktree '{}' contains modified or untracked files; use --force to delete it", wt_path.display());

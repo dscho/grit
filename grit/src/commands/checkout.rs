@@ -5329,11 +5329,16 @@ fn warn_sparse_paths_already_present(
         }
         let rel = String::from_utf8_lossy(&entry.path);
         let old_entry = old_stage0.get(entry.path.as_slice());
-        // Git (unpack-trees.c apply_sparse_checkout) only warns when the path
-        // previously existed as a skip_worktree entry and is now non-sparse
-        // (`was_skip_worktree && !ce_skip_worktree`). A path absent from the old
-        // index (new in the target tree) or already non-sparse must not warn.
-        let materializing = old_entry.map(|e| e.skip_worktree()).unwrap_or(false);
+        // Git (unpack-trees.c apply_sparse_checkout) warns when an entry transitions to
+        // non-skip-worktree while its path is already present on disk
+        // (`was_skip_worktree && !ce_skip_worktree` → verify_absent_sparse rejects). A path
+        // that is already non-sparse in the old index (was_skip_worktree == false) must not
+        // warn. A path absent from the old index but tracked in the new tree IS materialized
+        // into the cone, so it warns too when an untracked file already occupies that path
+        // (t1011 'print warnings when some worktree updates disabled': untracked sub/added,
+        // sub/addedtoo become tracked-and-in-cone on `checkout top`). The disk-presence check
+        // below distinguishes a genuinely new path (nothing on disk → no warning, t1092).
+        let materializing = old_entry.map(|e| e.skip_worktree()).unwrap_or(true);
         if !materializing {
             continue;
         }
