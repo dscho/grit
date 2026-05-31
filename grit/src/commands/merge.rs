@@ -2419,9 +2419,12 @@ Aborting"
             format!("{}\n", auto_merge_tree.to_hex()),
         );
         if args.squash {
-            // For squash + conflict: write SQUASH_MSG with conflict info, no MERGE_HEAD
+            // For squash + conflict: write SQUASH_MSG with conflict info, no MERGE_HEAD.
+            // `build_squash_msg` ends with the last commit body (no trailing blank line, to
+            // match `git log`); git's `squash_message` then adds a blank line before the
+            // `# Conflicts:` block (builtin/merge.c append_conflicts_hint).
             let mut msg = build_squash_msg(repo, head_oid, &[merge_oid])?;
-            // Append conflict info
+            msg.push('\n');
             msg.push_str("# Conflicts:\n");
             for desc in &merge_result.conflict_descriptions {
                 msg.push_str(&format!("#\t{}\n", desc.subject_path));
@@ -4297,8 +4300,14 @@ fn build_squash_msg(
         ts_b.cmp(&ts_a)
     });
 
+    // The `git log` body follows a single blank line (git's `squash_message` joins
+    // `"Squashed commit of the following:\n\n"` with the log output). Each commit renders
+    // exactly as `git log` (medium format) does — no extra blank line between commits —
+    // so a byte-for-byte `test_cmp` against `git log --no-merges` output succeeds.
     for (i, (oid, commit)) in commits_to_show.iter().enumerate() {
-        msg.push('\n');
+        if i == 0 {
+            msg.push('\n');
+        }
         msg.push_str(&format!("commit {}\n", oid.to_hex()));
         msg.push_str(&format!(
             "Author: {}\n",
@@ -4311,10 +4320,6 @@ fn build_squash_msg(
         msg.push('\n');
         for line in commit.message.trim_end().lines() {
             msg.push_str(&format!("    {}\n", line));
-        }
-        // Add trailing blank line only after the last commit
-        if i == commits_to_show.len() - 1 {
-            msg.push('\n');
         }
     }
 
@@ -4388,9 +4393,9 @@ fn format_date_for_log(ident: &str) -> String {
                     let day = dt.day();
                     let (h, m, s) = (dt.hour(), dt.minute(), dt.second());
                     let year = dt.year();
-                    return format!(
-                        "{weekday} {month} {day:>2} {h:02}:{m:02}:{s:02} {year} {tz_str}"
-                    );
+                    // Git's default log date uses an UNPADDED day (date.c `"%.3s %d "`),
+                    // e.g. `Thu Apr 7 ...`, not the strftime `%e` space-padded form.
+                    return format!("{weekday} {month} {day} {h:02}:{m:02}:{s:02} {year} {tz_str}");
                 }
             }
         }

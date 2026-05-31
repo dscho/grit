@@ -2282,8 +2282,11 @@ fn format_date(ident: &str) -> String {
         time::Month::November => "Nov",
         time::Month::December => "Dec",
     };
+    // Git's default ("medium") date format uses an UNPADDED day: date.c emits `"%.3s %d "`
+    // (e.g. `Thu Apr 7 ...`), not the space-padded `%e` form. (t7600 squash messages,
+    // generated from `git show -s`, compare byte-for-byte against this.)
     format!(
-        "{} {} {:>2} {:02}:{:02}:{:02} {} {}",
+        "{} {} {} {:02}:{:02}:{:02} {} {}",
         weekday,
         month,
         dt.day(),
