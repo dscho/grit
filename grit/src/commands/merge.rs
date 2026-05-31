@@ -9142,6 +9142,34 @@ fn finalize_merge_commit_message(msg: String, config: &ConfigSet) -> MergeCommit
     }
 }
 
+/// If `spec` is `<base>^^^...` or `<base>~<number>`, return `(base, is_early)` where `is_early`
+/// is true for the ancestor expressions git marks "(early part)" — any trailing `^`, a bare
+/// `name~` (== `name~1`), or `name~<nonzero>`. `name~0` returns `is_early == false`.
+/// Mirrors git's `merge_name` suffix detection (builtin/merge.c).
+fn early_part_branch_base(spec: &str) -> Option<(&str, bool)> {
+    // Trailing carets: `name^`, `name^^`, ...
+    let caret_trim = spec.trim_end_matches('^');
+    if caret_trim.len() < spec.len() && !caret_trim.is_empty() {
+        return Some((caret_trim, true));
+    }
+    // `name~<number>` (including bare `name~` == `name~1`).
+    if let Some(pos) = spec.rfind('~') {
+        let (base, rest) = spec.split_at(pos);
+        let digits = &rest[1..];
+        if base.is_empty() {
+            return None;
+        }
+        if digits.is_empty() {
+            return Some((base, true)); // "name~" == "name~1"
+        }
+        if digits.chars().all(|c| c.is_ascii_digit()) {
+            let seen_nonzero = digits.chars().any(|c| c != '0');
+            return Some((base, seen_nonzero));
+        }
+    }
+    None
+}
+
 fn build_merge_message(
     head: &HeadState,
     branch_name: &str,
@@ -9178,11 +9206,34 @@ fn build_merge_message(
     } else {
         branch_name.to_string()
     };
+    // `<branch>~<n>` / `<branch>^...` early-part merges: when the suffix-stripped base names a
+    // local branch, git emits `Merge branch '<base>' (early part)` (builtin/merge.c merge_name).
+    // Otherwise (e.g. a tag base) it falls through to the `commit '<full spec>'` form below.
+    if let Some((base, is_early)) = early_part_branch_base(&display_branch) {
+        if resolve_ref(&repo.git_dir, &format!("refs/heads/{base}")).is_ok() {
+            let suffix = if is_early { " (early part)" } else { "" };
+            let base_msg = format!("Merge branch '{base}'{suffix}");
+            let msg = match head.branch_name() {
+                Some(name) if name != "main" && name != "master" => {
+                    format!("{base_msg} into {name}")
+                }
+                _ => base_msg,
+            };
+            return ensure_trailing_newline(&msg);
+        }
+    }
     // Determine if the merge target is a tag, branch, or commit
     let kind = if resolve_ref(&repo.git_dir, &format!("refs/tags/{display_branch}")).is_ok() {
         "tag"
     } else if resolve_ref(&repo.git_dir, &format!("refs/remotes/{display_branch}")).is_ok() {
         "remote-tracking branch"
+    } else if resolve_ref(&repo.git_dir, &format!("refs/heads/{display_branch}")).is_ok() {
+        "branch"
+    } else if display_branch.contains(['~', '^', ':', '@'])
+        || (display_branch.len() >= 4 && display_branch.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        // A revision expression / object id that is not a plain ref: `Merge commit '<spec>'`.
+        "commit"
     } else {
         "branch"
     };
