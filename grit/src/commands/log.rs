@@ -1690,6 +1690,44 @@ fn graph_show_remainder_lines(
 /// Strip `git log`-only flags from the revision list and expand revision pseudo-options
 /// (`--all`, `--glob`, `--branches`, …) into concrete revision strings, matching `git log` /
 /// `setup_revisions` behavior.
+/// Whether a `git log` option (in the long `--opt` or short `-x` form, *without* an inline
+/// `=value`) consumes the following argv token as its value. Used by the revision/pathspec
+/// splitter so a space-separated option value (`--grep sec`) is not misread as a revision.
+fn log_option_consumes_separate_value(arg: &str) -> bool {
+    // Inline `--opt=value` already carries its value; nothing further to consume.
+    if arg.starts_with("--") && arg.contains('=') {
+        return false;
+    }
+    matches!(
+        arg,
+        "--grep"
+            | "--grep-reflog"
+            | "--author"
+            | "--committer"
+            | "--diff-filter"
+            | "--find-object"
+            | "--decorate-refs"
+            | "--decorate-refs-exclude"
+            | "--date"
+            | "--pretty"
+            | "--format"
+            | "--encoding"
+            | "--skip"
+            | "--max-count"
+            | "-n"
+            | "--since"
+            | "--after"
+            | "--until"
+            | "--before"
+            | "--grep-reflog="
+            | "--line-prefix"
+            | "-S"
+            | "-G"
+            | "-L"
+            | "-O"
+    )
+}
+
 fn merge_log_revision_argv(repo: &Repository, args: &Args) -> Result<Vec<String>> {
     let src: &[String] = if args.raw_argv_tail.is_empty() {
         &args.revisions
@@ -1831,7 +1869,13 @@ fn merge_log_revision_argv(repo: &Repository, args: &Args) -> Result<Vec<String>
                     }
                 }
                 _ => {
-                    // Log-only or already-handled flags: skip.
+                    // Log-only or already-handled flags: skip. If this is a long/short option
+                    // that takes its value as the *next* argv token (space-separated form, e.g.
+                    // `--grep sec` / `--diff-filter A`), also skip the value so it is not
+                    // mistaken for a revision/pathspec.
+                    if log_option_consumes_separate_value(arg) {
+                        i += 1;
+                    }
                 }
             }
             i += 1;
@@ -1898,6 +1942,9 @@ fn extract_log_cli_revision_specs(
                     {
                         implied_pathspecs.push(stripped.to_owned());
                     }
+                    Err(_err) if token_names_existing_path(repo, stripped) => {
+                        implied_pathspecs.push(stripped.to_owned());
+                    }
                     Err(err) => return Err(err.into()),
                 },
             }
@@ -1914,6 +1961,11 @@ fn extract_log_cli_revision_specs(
                             &repo.git_dir,
                         )) && grit_lib::unicode_normalization::has_non_ascii_utf8(rev) =>
                     {
+                        implied_pathspecs.push(rev.clone());
+                    }
+                    // git's verify_filename: a token that fails to resolve as a revision but
+                    // names an existing worktree/index path is an implied pathspec.
+                    Err(_err) if token_names_existing_path(repo, rev) => {
                         implied_pathspecs.push(rev.clone());
                     }
                     Err(err) => return Err(err.into()),
@@ -8859,6 +8911,40 @@ fn resolve_revision_as_commit_after_precompose(repo: &Repository, rev: &str) -> 
 }
 
 /// Heuristic used for rev/pathspec DWIM when no `--` separator is present.
+/// Whether `token` names an existing path in the worktree or the index. Git's `verify_filename`
+/// uses this to decide that a token which fails to resolve as a revision is actually a pathspec
+/// (e.g. `git log ichi` where `ichi` is a tracked file, used by `--follow`).
+fn token_names_existing_path(repo: &Repository, token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    // Worktree path (relative to the worktree root).
+    if let Some(wt) = repo.work_tree.as_ref() {
+        if wt.join(token).exists() {
+            return true;
+        }
+    }
+    // Index path: an exact entry, or a directory prefix of some entry.
+    if let Ok(index_path) = repo.index_path_for_env() {
+        if let Ok(index) = grit_lib::index::Index::load(&index_path) {
+            let token_bytes = token.as_bytes();
+            let dir_prefix = {
+                let mut p = token.to_owned();
+                if !p.ends_with('/') {
+                    p.push('/');
+                }
+                p.into_bytes()
+            };
+            for entry in &index.entries {
+                if entry.path == token_bytes || entry.path.starts_with(&dir_prefix) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 fn is_likely_pathspec_during_rev_parse(token: &str) -> bool {
     if token.contains("^{") || token.contains("@{") {
         return false;
