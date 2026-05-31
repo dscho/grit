@@ -103,7 +103,7 @@ t1009-read-tree-new-index	t1	yes	3	3	0	true	ok	0
 t10090-write-tree-idempotent	t1	yes	34	1	33	false	ok	0
 t1010-mktree	t1	yes	8	8	0	true	ok	0
 t10100-ls-tree-long-format	t1	yes	36	1	35	false	ok	0
-t1011-read-tree-sparse-checkout	t1	yes	23	21	2	false	ok	0
+t1011-read-tree-sparse-checkout	t1	yes	23	23	0	true	ok	0
 t10110-ls-files-pathspec-filter	t1	yes	37	1	36	false	ok	0
 t1012-read-tree-df	t1	yes	5	5	0	true	ok	0
 t10120-config-unset-all	t1	yes	33	1	32	false	ok	0
@@ -188,11 +188,11 @@ t10860-switch-force-create	t1	yes	30	1	29	false	ok	0
 t10870-restore-head-source	t1	yes	31	1	30	false	ok	0
 t10880-reset-hard-soft-path	t1	yes	31	1	30	false	ok	0
 t10890-cherry-pick-message	t1	yes	30	2	28	false	ok	0
-t1090-sparse-checkout-scope	t1	yes	7	6	1	false	ok	0
+t1090-sparse-checkout-scope	t1	yes	7	7	0	true	ok	0
 t10900-for-each-ref-pattern-sort	t1	yes	34	2	32	false	ok	0
-t1091-sparse-checkout-builtin	t1	yes	76	55	21	false	ok	1
+t1091-sparse-checkout-builtin	t1	yes	77	76	0	true	ok	1
 t10910-show-ref-tags-branches	t1	yes	35	3	32	false	ok	0
-t1092-sparse-checkout-compatibility	t1	yes	106	48	58	false	ok	0
+t1092-sparse-checkout-compatibility	t1	yes	106	64	42	false	ok	0
 t10920-update-ref-create-delete	t1	yes	29	2	27	false	ok	0
 t10930-symbolic-ref-read-write	t1	yes	29	3	26	false	ok	0
 t10940-check-ignore-dir-pattern	t1	yes	35	1	34	false	ok	0
@@ -650,7 +650,7 @@ t3513-revert-submodule	t3	yes	14	1	13	false	ok	0
 t3514-cherry-pick-revert-gpg	t3	skip	2	0	0	false	ok	0
 t3600-rm	t3	yes	82	57	25	false	ok	0
 t3601-rm-pathspec-file	t3	yes	5	5	0	true	ok	0
-t3602-rm-sparse-checkout	t3	yes	13	7	6	false	ok	0
+t3602-rm-sparse-checkout	t3	yes	13	13	0	true	ok	0
 t3650-replay-basics	t3	yes	31	13	18	false	ok	0
 t3700-add	t3	yes	58	48	10	false	ok	0
 t3700-add-pathspec-file	t3	yes	24	2	22	false	ok	0
@@ -658,7 +658,7 @@ t3701-add-interactive	t3	yes	130	44	86	false	ok	0
 t3702-add-edit	t3	yes	3	2	1	false	ok	0
 t3703-add-magic-pathspec	t3	yes	6	5	1	false	ok	0
 t3704-add-pathspec-file	t3	yes	11	11	0	true	ok	0
-t3705-add-sparse-checkout	t3	yes	20	15	5	false	ok	0
+t3705-add-sparse-checkout	t3	yes	20	20	0	true	ok	0
 t3800-mktag	t3	yes	151	151	0	true	ok	0
 t3900-i18n-commit	t3	yes	38	11	27	false	ok	0
 t3901-i18n-patch	t3	yes	20	18	2	false	ok	0
@@ -1124,7 +1124,7 @@ t6424-merge-unrelated-index-changes	t6	yes	19	17	2	false	ok	0
 t6425-merge-rename-delete	t6	yes	1	0	1	false	ok	0
 t6426-merge-skip-unneeded-updates	t6	yes	13	13	0	true	ok	0
 t6427-diff3-conflict-markers	t6	yes	9	7	2	false	ok	0
-t6428-merge-conflicts-sparse	t6	yes	2	1	1	false	ok	0
+t6428-merge-conflicts-sparse	t6	yes	2	2	0	true	ok	0
 t6429-merge-sequence-rename-caching	t6	yes	11	11	0	true	ok	0
 t6430-merge-recursive	t6	yes	36	23	13	false	ok	0
 t6430-merge-strategy-option	t6	yes	6	0	6	false	ok	0
@@ -1146,7 +1146,7 @@ t6600-test-reach	t6	yes	47	16	31	false	ok	0
 t6601-path-walk	t6	yes	15	15	0	true	ok	0
 t6700-tree-depth	t6	yes	10	10	0	true	ok	0
 t7001-mv	t7	yes	54	52	2	false	ok	0
-t7002-mv-sparse-checkout	t7	yes	22	4	18	false	ok	0
+t7002-mv-sparse-checkout	t7	yes	22	22	0	true	ok	0
 t7003-filter-branch	t7	skip	48	0	0	false	ok	0
 t7004-tag	t7	skip	219	0	0	false	ok	0
 t7005-editor	t7	yes	12	12	0	true	ok	0
@@ -1225,12 +1225,12 @@ t7501-commit-basic-functionality	t7	yes	0	0	0	false	timeout	0
 t7502-commit-porcelain	t7	yes	82	31	51	false	ok	0
 t7503-pre-commit-and-diff-whitespace	t7	yes	22	1	21	false	ok	0
 t7503-pre-commit-and-pre-merge-commit-hooks	t7	yes	22	22	0	true	ok	0
-t7504-commit-msg-hook	t7	yes	30	29	0	true	ok	1
+t7504-commit-msg-hook	t7	yes	29	29	0	true	ok	1
 t7505-prepare-commit-msg	t7	yes	30	1	29	false	ok	0
 t7505-prepare-commit-msg-hook	t7	yes	23	22	1	false	ok	0
 t7506-status-submodule	t7	yes	40	16	24	false	ok	0
 t7507-commit-verbose	t7	yes	45	35	10	false	ok	0
-t7508-status	t7	yes	126	101	25	false	ok	0
+t7508-status	t7	yes	126	99	27	false	ok	0
 t7509-commit-authorship	t7	yes	12	3	9	false	ok	0
 t7510-signed-commit	t7	yes	28	28	0	true	ok	0
 t7511-status-index	t7	yes	24	24	0	true	ok	0
