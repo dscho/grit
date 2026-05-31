@@ -1673,14 +1673,25 @@ fn incr_auto(repo: &Repository, cfg: &ConfigSet) -> bool {
         return false;
     }
     let pack_dir = repo.git_dir.join("objects").join("pack");
-    let midx = pack_dir.join("multi-pack-index");
+    // Git counts packs that are NOT covered by the multi-pack-index
+    // (`!p->multi_pack_index`). Read the MIDX pack-name set and count `.pack`
+    // files whose `.idx` is absent from it.
+    let objects_dir = repo.git_dir.join("objects");
+    let in_midx: HashSet<String> = grit_lib::midx::read_midx_pack_idx_names(&objects_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
     let Ok(rd) = fs::read_dir(&pack_dir) else {
         return false;
     };
-    let mut c = 0;
+    let mut c = 0usize;
     for e in rd.flatten() {
         let n = e.file_name().to_string_lossy().to_string();
-        if n.starts_with("pack-") && n.ends_with(".pack") && !midx.exists() {
+        let Some(stem) = n.strip_suffix(".pack") else {
+            continue;
+        };
+        let idx_name = format!("{stem}.idx");
+        if !in_midx.contains(&idx_name) {
             c += 1;
         }
         if c >= lim as usize {
