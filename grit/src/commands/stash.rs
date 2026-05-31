@@ -3881,6 +3881,128 @@ pub fn save_autostash_for_rebase_quit(repo: &Repository, stash_oid: &ObjectId) -
     Ok(())
 }
 
+/// Create an autostash and record its OID under `<git_dir>/<refname>` (e.g. `MERGE_AUTOSTASH`).
+///
+/// Mirrors git's `create_autostash_ref` (sequencer.c): snapshot the dirty index + worktree as a
+/// stash commit, write the OID to the named pseudo-ref, print `Created autostash: <abbrev>`, and
+/// reset the index and working tree hard to HEAD. Returns the stash commit OID, or `None` when
+/// there is nothing to stash.
+pub fn create_autostash_ref(repo: &Repository, refname: &str) -> Result<Option<ObjectId>> {
+    let work_tree = repo
+        .work_tree
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("cannot autostash in a bare repository"))?;
+
+    let head = resolve_head(&repo.git_dir)?;
+    let head_oid = head
+        .oid()
+        .ok_or_else(|| anyhow::anyhow!("cannot autostash on an unborn branch"))?
+        .to_owned();
+
+    let index = match repo.load_index() {
+        Ok(idx) => idx,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    let head_obj = repo.odb.read(&head_oid)?;
+    let head_commit = parse_commit(&head_obj.data)?;
+    let staged = diff_index_to_tree(&repo.odb, &index, Some(&head_commit.tree), false)?;
+    let unstaged = diff_index_to_worktree(&repo.odb, &index, work_tree, false, false)?;
+
+    if staged.is_empty() && unstaged.is_empty() {
+        return Ok(None);
+    }
+
+    let stash_oid =
+        create_stash_commit(repo, &head, &head_oid, &index, work_tree, None, false, &[])?;
+
+    write_pseudo_ref_oid(&repo.git_dir, refname, &stash_oid)?;
+    reset_to_head(repo, &head_oid, work_tree)?;
+
+    println!("Created autostash: {}", &stash_oid.to_hex()[..7]);
+    let _ = io::stdout().flush();
+    Ok(Some(stash_oid))
+}
+
+/// Read the OID recorded under `<git_dir>/<refname>`, if present.
+fn read_pseudo_ref_oid(git_dir: &Path, refname: &str) -> Option<ObjectId> {
+    let raw = std::fs::read_to_string(git_dir.join(refname)).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    ObjectId::from_hex(trimmed).ok()
+}
+
+/// Write an OID to `<git_dir>/<refname>` as a plain (non-symbolic) pseudo-ref.
+fn write_pseudo_ref_oid(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
+    let path = git_dir.join(refname);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, format!("{}\n", oid.to_hex()))?;
+    Ok(())
+}
+
+/// True if an autostash pseudo-ref `<git_dir>/<refname>` currently exists and is non-empty.
+#[must_use]
+pub fn autostash_ref_exists(git_dir: &Path, refname: &str) -> bool {
+    read_pseudo_ref_oid(git_dir, refname).is_some()
+}
+
+/// Apply the autostash recorded under `<git_dir>/<refname>` (git `apply_autostash_ref`).
+///
+/// On a clean apply prints `Applied autostash.` to stderr. On conflict, stores the stash commit
+/// back to `refs/stash` and prints `Applying autostash resulted in conflicts.` plus the
+/// "safe in the stash" guidance. The pseudo-ref is always removed afterwards.
+pub fn apply_autostash_ref(repo: &Repository, refname: &str) -> Result<()> {
+    apply_or_save_autostash_ref(repo, refname, true)
+}
+
+/// Store the autostash recorded under `<git_dir>/<refname>` back to `refs/stash` without applying
+/// it (git `save_autostash_ref`, used by merge --abort / --quit / reset --hard).
+pub fn save_autostash_ref(repo: &Repository, refname: &str) -> Result<()> {
+    apply_or_save_autostash_ref(repo, refname, false)
+}
+
+fn apply_or_save_autostash_ref(
+    repo: &Repository,
+    refname: &str,
+    attempt_apply: bool,
+) -> Result<()> {
+    let Some(stash_oid) = read_pseudo_ref_oid(&repo.git_dir, refname) else {
+        return Ok(());
+    };
+
+    let work_tree = repo
+        .work_tree
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("cannot apply autostash in a bare repository"))?;
+
+    let conflicted = if attempt_apply {
+        apply_stash_impl(repo, work_tree, &stash_oid, false, true)?
+    } else {
+        true
+    };
+
+    if attempt_apply && !conflicted {
+        eprintln!("Applied autostash.");
+    } else {
+        update_stash_ref(repo, &stash_oid, "autostash")?;
+        if attempt_apply {
+            eprintln!("Applying autostash resulted in conflicts.");
+        } else {
+            eprintln!("Autostash exists; creating a new stash entry.");
+        }
+        eprintln!("Your changes are safe in the stash.");
+        eprintln!("You can run \"git stash pop\" or \"git stash drop\" at any time.");
+    }
+
+    let _ = std::fs::remove_file(repo.git_dir.join(refname));
+    Ok(())
+}
+
 /// Helper to add a staged entry at a specific stage to the index.
 fn add_stage_entry(
     index: &mut Index,
