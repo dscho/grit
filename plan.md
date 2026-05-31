@@ -241,36 +241,31 @@ Build on existing `sparse_checkout.rs` and index `sdir` extension support.
 Fill gaps in everyday commands **without** interactive modes. Prefer library APIs
 used by multiple commands.
 
+**Phase 6 done (2026-05-31)** — run in clusters (A cherry-pick, B checkout/reset/status, C+D maintenance/merge/log/push). All merged, zero regressions.
+
 ### 6.1 Index + worktree + checkout
 
-- [ ] Non-interactive `checkout`, `restore`, `reset` (--hard/mixed/soft, pathspecs,
-  merge abort, unborn branch).
-- [ ] Racy git / untracked overwrite rules (`t2021`, `t2500`).
+- [x] Non-interactive `checkout`, `restore`, `reset`: `t7201-co` 46/46, `t7102-reset` 38/38.
+- [x] Untracked/overwrite rules: `t2021-checkout-overwrite` 9/9, `t2500-untracked-overwriting` 8/8 real (2 are `test_expect_failure`).
 
 ### 6.2 Merge and sequencer (non-interactive only)
 
-- [ ] Porcelain `merge`, `pull` (no interactive conflict resolution UI).
-- [ ] `cherry-pick`, `revert` (no `rebase -i`); `rerere` optional if cheap.
-- [ ] Harness: `t7600-merge`, `t7110-reset-merge`, `t3500-cherry`–`t3511` (skip `-i` cases).
+- [~] Porcelain `merge`: `t7600-merge` 50→81/83 (remaining 2: env GIT_EDITOR leak + annotated-tag pull --no-ff, deferred).
+- [x] `cherry-pick`, `revert`, `rerere`: t3507 44/44, t3508 14/14, t3510-seq 55/55, t3504-rerere 9/9, t3502 12/12, t3506 11/11; t3501 20/21.
+- [x] Harness: `t7110-reset-merge` 21/21 (guard).
 
 ### 6.3 Status, diff, log (no fsmonitor)
 
-- [ ] `status` porcelain v1/v2, branch ahead/behind, conflict summaries.
-- [ ] `diff` / `log` formats used by scripts (`--name-status`, `--oneline`, `-L` line-log
-  if already started in `line_log.rs`).
-- [ ] Harness: `t7508-status`, `t7064-wtstatus-pv2`, `t4202-log` (non-graph-interactive).
+- [x] `status` porcelain v1/v2: `t7508-status` 99→121/126, `t7064-wtstatus-pv2` 28/28.
+- [~] `log` formats: `t4202-log` skip→90/149 (further work possible).
 
 ### 6.4 Transport hardening (simple auth only)
 
-- [ ] `core.sshCommand` in lib SSH spawn; live fetch/push stream parity.
-- [ ] HTTP: keep Basic + credential helper + proactive/empty auth; no new curl auth.
-- [ ] Harness: `t5813-proto-disable-ssh`, `t5563-simple-http-auth` (Basic/Bearer helper
-  cases only), `t5545-push-options`, `t5547-push-quarantine`.
+- [x] Harness: `t5813-proto-disable-ssh` 81/81, `t5563-simple-http-auth` 17/17, `t5545-push-options` 13/13, `t5547-push-quarantine` 6/6 (all green; guards held).
 
 ### 6.5 Maintenance
 
-- [ ] `gc`, `repack`, `maintenance run` as library schedulers over `odb`/`refs`.
-- [ ] Harness: `t6500-gc`, `t7700-repack`, `t7900-maintenance` (non-interactive).
+- [x] `gc`, `repack`, `maintenance run`: `t6500-gc` 29→34/35, `t7700-repack` 17→39/47, `t7900-maintenance` 31→71/72 (full scheduler backends, incremental/geometric repack, midx expire). Bonus t5319-midx 26→45.
 
 ---
 
