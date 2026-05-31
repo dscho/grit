@@ -2657,13 +2657,14 @@ fn count_stash_reflog_entries(git_dir: &Path) -> usize {
 }
 
 fn long_format_comment_leader(config: &ConfigSet) -> String {
+    // Git accepts a multi-character `core.commentChar` (a comment *string*); the whole value is
+    // used as the prefix, not just the first byte (t7508 two-char commentchar).
     let raw = config
         .get("core.commentChar")
         .or_else(|| config.get("core.commentchar"))
         .filter(|s| !s.is_empty() && !s.contains('\n'))
         .unwrap_or_else(|| "#".to_owned());
-    let c = raw.chars().next().unwrap_or('#');
-    format!("{c} ")
+    format!("{raw} ")
 }
 
 fn comment_prefixed_block(body: &str, leader: &str) -> String {
@@ -3252,11 +3253,14 @@ fn format_long(
             )?;
         }
         let comment_line = if use_comment_prefix {
-            comment_leader_string
-                .chars()
-                .next()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "#".to_string())
+            // Column indent uses the bare comment string (no trailing space) + tab; a multi-char
+            // `core.commentChar` keeps all its characters (t7508 two-char commentchar).
+            let bare = comment_leader_string.trim_end_matches(' ');
+            if bare.is_empty() {
+                "#".to_string()
+            } else {
+                bare.to_string()
+            }
         } else {
             String::new()
         };
@@ -3285,11 +3289,14 @@ fn format_long(
             )?;
         }
         let comment_line = if use_comment_prefix {
-            comment_leader_string
-                .chars()
-                .next()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "#".to_string())
+            // Column indent uses the bare comment string (no trailing space) + tab; a multi-char
+            // `core.commentChar` keeps all its characters (t7508 two-char commentchar).
+            let bare = comment_leader_string.trim_end_matches(' ');
+            if bare.is_empty() {
+                "#".to_string()
+            } else {
+                bare.to_string()
+            }
         } else {
             String::new()
         };
