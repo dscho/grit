@@ -133,6 +133,10 @@ pub struct Args {
     #[arg(long = "max-pack-size")]
     pub max_pack_size: Option<String>,
 
+    /// Object name hash version forwarded to `pack-objects` (`git repack --name-hash-version`).
+    #[arg(long = "name-hash-version", value_name = "N")]
+    pub name_hash_version: Option<i32>,
+
     /// Do not update server info (`git repack -n` / `--no-update-server-info`).
     #[arg(short = 'n', long = "no-update-server-info")]
     pub no_update_server_info: bool,
@@ -408,6 +412,19 @@ pub fn run(args: Args) -> Result<()> {
                         // Git maps `--max-cruft-size` on repack to `pack-objects --max-pack-size`.
                         cmd.arg(format!("--max-pack-size={n}"));
                     }
+                    // Git forwards `repack.cruft{Window,WindowMemory,Depth,Threads}` to the cruft
+                    // `pack-objects` pass as the corresponding delta options. An invalid value
+                    // (e.g. `repack.cruftWindow=bogus`) must make the cruft pass fail so repack
+                    // exits non-zero and leaves no `.tmp-*` packs (t7700-repack subtest 38).
+                    for (key_lc, key_cc, flag) in [
+                        ("repack.cruftwindow", "repack.cruftWindow", "--window"),
+                        ("repack.cruftdepth", "repack.cruftDepth", "--depth"),
+                        ("repack.cruftthreads", "repack.cruftThreads", "--threads"),
+                    ] {
+                        if let Some(v) = cfg.get(key_lc).or_else(|| cfg.get(key_cc)) {
+                            cmd.arg(format!("{flag}={v}"));
+                        }
+                    }
                 }
                 if main_phase {
                     if let Some(exp) = args.unpack_unreachable.as_deref() {
@@ -432,6 +449,9 @@ pub fn run(args: Args) -> Result<()> {
                 if !to.is_empty() {
                     cmd.arg("--filter-to").arg(to);
                 }
+            }
+            if let Some(v) = args.name_hash_version {
+                cmd.arg(format!("--name-hash-version={v}"));
             }
 
             cmd.arg(base);
@@ -478,6 +498,17 @@ pub fn run(args: Args) -> Result<()> {
             }
             if args.no_write_bitmap_index {
                 cmd.arg("--no-write-bitmap-index");
+            }
+
+            // Emit a trace2 subcommand line for the spawned `pack-objects` child so trace-based
+            // assertions (`test_subcommand_flex git pack-objects ...`) can observe forwarded
+            // options such as `--name-hash-version` (t7700-repack subtest 40).
+            {
+                let mut po_argv = vec!["git".to_string()];
+                for a in cmd.get_args() {
+                    po_argv.push(a.to_string_lossy().into_owned());
+                }
+                trace2_emit_git_subcommand_argv(&po_argv);
             }
 
             if let Some(lines) = stdin_lines {
