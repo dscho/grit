@@ -306,7 +306,7 @@ fn parse_conflict_style_name(raw: &str) -> Result<ConflictStyle> {
     match raw.to_ascii_lowercase().as_str() {
         "merge" => Ok(ConflictStyle::Merge),
         "diff3" | "zdiff3" => Ok(ConflictStyle::Diff3),
-        _ => bail!("error: unknown conflict style '{}'", raw),
+        _ => bail!("unknown conflict style '{}'", raw),
     }
 }
 
@@ -599,6 +599,32 @@ pub fn run(mut args: Args) -> Result<()> {
                 continue;
             }
             filtered.push(s);
+        }
+        args.rest = filtered;
+    }
+
+    // The merge tri-state flags (`-m`/`--merge`/`--no-merge`/`--conflict[=<style>]`/`--no-conflict`)
+    // are interpreted from the raw argv via `merge_cli`. `--no-merge` and `--no-conflict` are not
+    // clap options, so clap's `allow_hyphen_values` trailing_var_arg captures them into `rest`,
+    // where they would otherwise be mistaken for a revision or pathspec (t7201 38-41). Peel every
+    // merge-control token (and a following `--conflict <style>` argument) out of `rest`.
+    {
+        let original = std::mem::take(&mut args.rest);
+        let mut filtered: Vec<String> = Vec::with_capacity(original.len());
+        let mut iter = original.into_iter().peekable();
+        while let Some(s) = iter.next() {
+            match s.as_str() {
+                "-m" | "--merge" | "--no-merge" | "--no-conflict" => continue,
+                "--conflict" => {
+                    // Consume the following style argument (`--conflict diff3`).
+                    if iter.peek().is_some() {
+                        iter.next();
+                    }
+                    continue;
+                }
+                other if other.starts_with("--conflict=") => continue,
+                _ => filtered.push(s),
+            }
         }
         args.rest = filtered;
     }
@@ -1761,7 +1787,8 @@ fn merge_branch_working_tree(
         recurse_submodules_after_checkout(repo)?;
     }
 
-    let mut merged_index = merged.index;
+    let merged_index = merged.index;
+    // Write the merged content (auto-resolved blobs and conflict markers) into the work tree.
     // Compare against the pre-merge index (still reflects the branch we came from), not the
     // post-`switch_to_tree` index (which matches the destination and would skip writes when the
     // merge result OID equals the tip).
@@ -1773,12 +1800,48 @@ fn merge_branch_working_tree(
         &merged.conflict_content,
     )?;
 
-    for entry in &mut merged_index.entries {
+    // Build the final index the way Git's `checkout -m` does: stage-0 entries hold the
+    // **destination tree** blob (so `git diff --cached` is empty — the index matches the branch we
+    // switched to), while the *work tree* keeps the merged content. The index/work-tree disagreement
+    // is what makes `git diff` report `M <path>` for cleanly auto-merged files (t7201 5, 6). Only
+    // genuinely conflicting paths keep their unmerged stages 1/2/3 from the merge result.
+    let conflicted_paths: HashSet<Vec<u8>> = merged_index
+        .entries
+        .iter()
+        .filter(|e| e.stage() != 0)
+        .map(|e| e.path.clone())
+        .collect();
+    let mut final_index = Index::new();
+    for e in &dest_index.entries {
+        if conflicted_paths.contains(&e.path) {
+            continue;
+        }
+        final_index.entries.push(e.clone());
+    }
+    for e in &merged_index.entries {
+        if e.stage() != 0 {
+            final_index.entries.push(e.clone());
+        }
+    }
+    final_index.sort();
+
+    // Refresh the cached stat only for entries whose work-tree content actually matches the index
+    // blob (truly clean). Auto-merged paths have an index blob (destination tree) that differs from
+    // the merged work-tree content; leaving their stat stale forces `diff_index_to_worktree` to
+    // re-hash and report `M` instead of being fooled by a matching size/mtime (the t7201 4 trap).
+    for entry in &mut final_index.entries {
         if entry.stage() != 0 {
             continue;
         }
         let path_str = String::from_utf8_lossy(&entry.path);
         let abs = work_tree.join(path_str.as_ref());
+        let worktree_matches_index = match std::fs::read(&abs) {
+            Ok(data) => Odb::hash_object_data(ObjectKind::Blob, &data) == entry.oid,
+            Err(_) => false,
+        };
+        if !worktree_matches_index {
+            continue;
+        }
         if let Ok(meta) = std::fs::symlink_metadata(&abs) {
             use std::os::unix::fs::MetadataExt as _;
             entry.ctime_sec = meta.ctime() as u32;
@@ -1790,7 +1853,8 @@ fn merge_branch_working_tree(
             entry.size = meta.size() as u32;
         }
     }
-    repo.write_index_at(&index_path, &mut merged_index)
+    let mut final_index = final_index;
+    repo.write_index_at(&index_path, &mut final_index)
         .context("writing index after merge checkout")?;
 
     if recurse_submodules {
@@ -2881,13 +2945,25 @@ fn switch_to_tree(
 
     warn_sparse_paths_already_present(repo, &old_index, &new_index, &work_tree);
 
-    // Update stat info in the new index to match the freshly checked-out files
+    // Update cached stat in the new index to match the freshly checked-out files. Only do so when
+    // the work-tree content actually hashes to the index blob: a locally-modified file whose blob
+    // is unchanged across the branch switch is carried over WITHOUT being rewritten, so refreshing
+    // its stat would make `diff_index_to_worktree`'s stat fast-path treat it as clean and drop the
+    // `M <path>` report. Leaving the stale stat forces a re-hash that correctly reports the change
+    // (Git only lstats files it actually wrote; t7201 4).
     for entry in &mut new_index.entries {
         if entry.stage() != 0 {
             continue;
         }
         let path_str = String::from_utf8_lossy(&entry.path);
         let abs = work_tree.join(path_str.as_ref());
+        if entry.mode != MODE_SYMLINK && entry.mode != MODE_GITLINK {
+            let clean = matches!(std::fs::read(&abs), Ok(data)
+                if Odb::hash_object_data(ObjectKind::Blob, &data) == entry.oid);
+            if !clean {
+                continue;
+            }
+        }
         if let Ok(meta) = std::fs::symlink_metadata(&abs) {
             use std::os::unix::fs::MetadataExt as _;
             entry.ctime_sec = meta.ctime() as u32;
@@ -3128,6 +3204,33 @@ pub(crate) fn check_dirty_worktree(
                 let rel_path = String::from_utf8_lossy(path_bytes);
                 staged_conflicts.push(rel_path.into_owned());
             }
+
+            // Staged deletions: a path present in HEAD but removed from the index (e.g. after
+            // `git rm <path>`) does not appear in `old_index`, so the loop above never sees it.
+            // Git still refuses the switch when the target branch *modifies* that same path
+            // (the staged deletion would be overwritten by the target's content — t7201 10).
+            let old_stage0: HashSet<&[u8]> = old_index
+                .entries
+                .iter()
+                .filter(|e| e.stage() == 0)
+                .map(|e| e.path.as_slice())
+                .collect();
+            for (path_bytes, head_oid) in &head_tree_map {
+                if old_stage0.contains(path_bytes.as_slice()) {
+                    continue; // still tracked in the index; handled above
+                }
+                // Path deleted from the index relative to HEAD. Refuse only when the target
+                // changes the path's content (target != HEAD); if the target also deletes or
+                // keeps it unchanged there is nothing to overwrite.
+                if let Some(ne) = new_map.get(path_bytes.as_slice()) {
+                    if ne.oid != *head_oid {
+                        let rel_path = String::from_utf8_lossy(path_bytes);
+                        staged_conflicts.push(rel_path.into_owned());
+                    }
+                }
+            }
+            staged_conflicts.sort();
+            staged_conflicts.dedup();
             if !staged_conflicts.is_empty() {
                 let mut msg = String::from(
                     "Your local changes to the following files would be overwritten by checkout:\n",
@@ -3529,15 +3632,38 @@ fn reject_ambiguous_short_ref(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mirror Git's `unmerge_index`/`unmerge_index_entry` (git/resolve-undo.c:124,155): for `checkout -m`
+/// restore conflict stages from the resolve-undo extension for paths matching `rel`.
+///
+/// For each resolve-undo record whose path matches the pathspec:
+/// - if the path is ALREADY unmerged (live stages 1/2/3 present), the record is dropped and the
+///   live stages are left untouched (Git returns early in `unmerge_index_entry`);
+/// - otherwise the stage-0 (or removed) entry is replaced with stages 1/2/3 from resolve-undo.
+///
+/// Paths that are unmerged but have no resolve-undo record are left untouched (Git's `unmerge_index`
+/// only iterates resolve-undo entries), so a still-conflicted path keeps its live stages and the
+/// subsequent merge runs against them.
 fn unmerge_paths_in_index(index: &mut Index, rel: &str) {
-    let paths: HashSet<Vec<u8>> = index
-        .entries
-        .iter()
-        .filter(|e| e.stage() != 0 && index_path_matches_spec(rel, &e.path))
-        .map(|e| e.path.clone())
-        .collect();
-    for p in paths {
-        index.entries.retain(|e| e.path != p);
+    let matching: Vec<Vec<u8>> = match index.resolve_undo.as_ref() {
+        Some(map) => map
+            .keys()
+            .filter(|p| index_path_matches_spec(rel, p))
+            .cloned()
+            .collect(),
+        None => return,
+    };
+    for path in matching {
+        let already_unmerged = index
+            .entries
+            .iter()
+            .any(|e| e.path == path && e.stage() != 0);
+        if already_unmerged {
+            // Already unmerged: leave the live stages in place, just consume the record.
+            index.take_resolve_undo_record(&path);
+        } else {
+            // Resolved to stage 0 or removed: restore the unmerged stages from resolve-undo.
+            index.unmerge_path_from_resolve_undo(&path);
+        }
     }
 }
 
@@ -3598,6 +3724,26 @@ checking out of the index."
                 }
             }
 
+            // Mirror Git's `checkout_paths` (git/builtin/checkout.c:599): before checking out any
+            // path, scan every matched pathspec for unmerged entries. When none of `-f`/`--ours`/
+            // `--theirs`/`--merge` is given, an unmerged path is a hard error and NO file is written
+            // (t7201 'checkout an unmerged path should fail' expects `fild` to be left untouched).
+            if !force_paths && !ours && !theirs && !merge_mode {
+                for path_str in paths {
+                    let rel = resolve_pathspec(path_str, work_tree, &cwd);
+                    if is_glob_pattern(&rel) {
+                        continue;
+                    }
+                    let is_root = rel.is_empty() || rel == "." || rel == "./";
+                    if is_root {
+                        continue;
+                    }
+                    if index_has_unmerged_matching(&index, &rel) {
+                        bail!("path '{}' is unmerged", rel);
+                    }
+                }
+            }
+
             for path_str in paths {
                 let rel = resolve_pathspec(path_str, work_tree, &cwd);
                 let path_bytes = rel.as_bytes();
@@ -3607,12 +3753,12 @@ checking out of the index."
                         let s2 = index.get(path_bytes, 2);
                         let s3 = index.get(path_bytes, 3);
                         if s2.is_none() || s3.is_none() {
-                            bail!("error: path '{}' does not have all necessary versions", rel);
+                            bail!("path '{}' does not have all necessary versions", rel);
                         }
                     } else if ours || theirs {
                         // Resolved below via stage 2/3 checkout.
                     } else if !force_paths {
-                        bail!("error: path '{}' is unmerged", rel);
+                        bail!("path '{}' is unmerged", rel);
                     } else {
                         // `checkout -f`: only paths with stage 0 are refreshed; unmerged-only paths
                         // are left as-is on disk (t7201).
@@ -3673,10 +3819,7 @@ checking out of the index."
                                     let s2 = index.get(pb.as_slice(), 2);
                                     let s3 = index.get(pb.as_slice(), 3);
                                     if s2.is_none() || s3.is_none() {
-                                        bail!(
-                                            "error: path '{}' does not have all necessary versions",
-                                            p
-                                        );
+                                        bail!("path '{}' does not have all necessary versions", p);
                                     }
                                 } else if force_paths && !ours && !theirs {
                                     // `checkout -f`: only refresh paths that have stage 0; leave
@@ -3695,7 +3838,7 @@ checking out of the index."
                                     }
                                     continue;
                                 } else if !ours && !theirs && !merge_mode {
-                                    bail!("error: path '{}' is unmerged", p);
+                                    bail!("path '{}' is unmerged", p);
                                 }
                             }
                             if ours || theirs {
@@ -5911,14 +6054,12 @@ fn checkout_conflicted_path_with_merge(
         style = ConflictStyle::Merge;
     }
 
-    if let Some((driver_cmd, recursive_binary)) = resolve_path_merge_driver_command(repo, rel_path)
+    if let Some((driver_cmd, _recursive_binary)) = resolve_path_merge_driver_command(repo, rel_path)
     {
-        if recursive_binary
-            || merge_file::is_binary(&ours_obj.data)
-            || merge_file::is_binary(&theirs_obj.data)
-        {
-            return write_to_worktree(work_tree, rel_path, &ours_obj.data, ours_entry.mode);
-        }
+        // `merge.<driver>.recursive` only selects how the *virtual ancestor* is merged when there
+        // is more than one merge base; it does NOT make the leaf content merge binary. The leaf
+        // merge always runs the configured driver (t7201 45). (A genuinely binary blob is already
+        // handled by the unconditional is_binary short-circuit above.)
         let (merged, _code) = execute_custom_merge_driver(
             &driver_cmd,
             rel_path,
