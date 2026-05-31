@@ -983,6 +983,7 @@ fn show_commit(
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
 
+            let is_tformat = fmt.starts_with("tformat:");
             let template = if let Some(t) = fmt.strip_prefix("format:") {
                 t
             } else {
@@ -991,7 +992,15 @@ fn show_commit(
             let note_bytes = notes_map.get(oid).map(|v| v.as_slice());
             let formatted =
                 apply_format_string(template, oid, &commit, note_bytes, expand_tabs_in_log);
-            write_formatted_line(out, &formatted)?;
+            // `--pretty=format:` separates entries with a newline but does NOT terminate the
+            // last one, so an empty expansion (e.g. `%b` for a body-less commit with `-s`)
+            // prints nothing — unlike `tformat:`, which always appends a terminator newline
+            // (`git show -s --pretty=format:%b` is empty; `tformat:%b` is a lone newline).
+            if !is_tformat && formatted.is_empty() {
+                // emit nothing
+            } else {
+                write_formatted_line(out, &formatted)?;
+            }
         }
         Some("short") => {
             writeln!(out, "commit {hex}")?;
