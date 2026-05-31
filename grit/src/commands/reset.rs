@@ -2349,7 +2349,7 @@ fn path_is_ignored_for_obstruction(
     false
 }
 
-fn find_untracked_obstruction(
+pub(crate) fn find_untracked_obstruction(
     repo: &Repository,
     old_index: &Index,
     new_index: &Index,
