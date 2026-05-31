@@ -3070,18 +3070,15 @@ fn format_long(
             .insert(path.clone(), Some(format!(" ({})", parts.join(", "))));
     }
 
+    // Only the command-line `--ignore-submodules=all` suppresses the gitlink from
+    // "Changes to be committed" (it sets the diff flag globally). A per-submodule
+    // `submodule.<name>.ignore=all` from config only affects worktree dirtiness and the
+    // submodule summary, not the staged index-vs-HEAD diff (t7508 93/94).
+    let cli_ignore_all = cli_ignore.as_deref() == Some("all");
     let staged_normal: Vec<&DiffEntry> = staged
         .iter()
         .filter(|e| e.status != DiffStatus::Unmerged)
-        .filter(|e| {
-            // `--ignore-submodules=all` (and `submodule.<name>.ignore=all`) hides the gitlink from
-            // "Changes to be committed" too (Git `set_diffopt_flags_from_submodule_config`).
-            if gitlink_oid_by_path.contains_key(e.path()) {
-                submodule_ignore_for(e.path()) != SubmoduleIgnore::All
-            } else {
-                true
-            }
-        })
+        .filter(|e| !(cli_ignore_all && gitlink_oid_by_path.contains_key(e.path())))
         .collect();
     let unstaged_normal: Vec<&DiffEntry> = unstaged
         .iter()

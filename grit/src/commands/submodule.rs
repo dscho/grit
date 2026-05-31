@@ -3492,35 +3492,82 @@ fn submodule_work_tree_for_summary(work_tree: &Path, logical_path: &str) -> Path
     direct
 }
 
+/// Submodule path -> (declared name, `.gitmodules` ignore value), read URL-independently from the
+/// work-tree `.gitmodules`. Git's `--for-status` ignore lookup does not require a `url` entry.
+#[derive(Default)]
+struct GitmodulesIgnoreAll {
+    /// submodule path -> declared name (for `.git/config submodule.<name>.ignore`).
+    name_by_path: BTreeMap<String, String>,
+    /// submodule path -> `.gitmodules submodule.<name>.ignore` value.
+    ignore_by_path: BTreeMap<String, String>,
+}
+
+/// Read `submodule.<name>.path` / `submodule.<name>.ignore` from the work-tree `.gitmodules`.
+fn gitmodules_ignore_all_map(work_tree: &Path) -> GitmodulesIgnoreAll {
+    let path = work_tree.join(".gitmodules");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return GitmodulesIgnoreAll::default();
+    };
+    let (entries, _) =
+        ConfigFile::parse_gitmodules_best_effort(&path, &content, ConfigScope::Local);
+    let mut path_by_name: BTreeMap<String, String> = BTreeMap::new();
+    let mut ignore_by_name: BTreeMap<String, String> = BTreeMap::new();
+    for e in &entries {
+        let Some(rest) = e.key.strip_prefix("submodule.") else {
+            continue;
+        };
+        let Some(dot) = rest.rfind('.') else { continue };
+        let name = &rest[..dot];
+        match &rest[dot + 1..] {
+            "path" => {
+                if let Some(v) = e.value.as_deref() {
+                    path_by_name.insert(name.to_owned(), v.to_owned());
+                }
+            }
+            "ignore" => {
+                if let Some(v) = e.value.as_deref() {
+                    ignore_by_name.insert(name.to_owned(), v.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = GitmodulesIgnoreAll::default();
+    for (name, sm_path) in path_by_name {
+        if let Some(ig) = ignore_by_name.get(&name) {
+            result.ignore_by_path.insert(sm_path.clone(), ig.clone());
+        }
+        result.name_by_path.insert(sm_path, name);
+    }
+    result
+}
+
 /// True when `submodule.<name>.ignore` is `all` in local config or in `.gitmodules` (Git `prepare_submodule_summary`).
 fn submodule_ignore_all_for_summary(
     local_cfg: Option<&ConfigFile>,
-    modules: &[SubmoduleInfo],
+    modules: &GitmodulesIgnoreAll,
     sm_path: &str,
 ) -> bool {
-    let Some(m) = modules
-        .iter()
-        .find(|mm| mm.path == sm_path || mm.name == sm_path)
-    else {
-        return false;
-    };
-    let key = format!("submodule.{}.ignore", m.name);
-    if let Some(cfg) = local_cfg {
-        if let Ok(canon) = canonical_key(&key) {
-            if cfg
-                .entries
-                .iter()
-                .rev()
-                .find(|e| e.key == canon)
-                .and_then(|e| e.value.as_deref())
-                .is_some_and(|v| v.eq_ignore_ascii_case("all"))
-            {
-                return true;
+    // `.git/config submodule.<name>.ignore` (any value) takes precedence over `.gitmodules`.
+    if let Some(name) = modules.name_by_path.get(sm_path) {
+        let key = format!("submodule.{name}.ignore");
+        if let Some(cfg) = local_cfg {
+            if let Ok(canon) = canonical_key(&key) {
+                if let Some(v) = cfg
+                    .entries
+                    .iter()
+                    .rev()
+                    .find(|e| e.key == canon)
+                    .and_then(|e| e.value.as_deref())
+                {
+                    return v.eq_ignore_ascii_case("all");
+                }
             }
         }
     }
-    m.ignore
-        .as_deref()
+    modules
+        .ignore_by_path
+        .get(sm_path)
         .is_some_and(|v| v.eq_ignore_ascii_case("all"))
 }
 
@@ -3565,13 +3612,13 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
         .load_index()
         .context("load index for submodule summary")?;
 
-    let (modules_for_ignore, local_cfg_for_ignore) = if args.for_status {
+    let (ignore_all_for_status, local_cfg_for_ignore) = if args.for_status {
         (
-            parse_gitmodules_with_repo(work_tree, Some(&repo)).unwrap_or_default(),
+            gitmodules_ignore_all_map(work_tree),
             parse_local_config(&repo.git_dir).ok(),
         )
     } else {
-        (Vec::new(), None)
+        (GitmodulesIgnoreAll::default(), None)
     };
 
     let entries: Vec<DiffEntry> = if args.files {
@@ -3672,7 +3719,7 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
             && e.status != DiffStatus::Added
             && submodule_ignore_all_for_summary(
                 local_cfg_for_ignore.as_ref(),
-                &modules_for_ignore,
+                &ignore_all_for_status,
                 sm_path,
             )
         {
