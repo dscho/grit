@@ -472,7 +472,10 @@ fn run_commit_sequence(
     }
 
     for (i, commit_oid) in oids.iter().enumerate() {
-        let remaining = &oids[i + 1..];
+        // When the sequence stops on `oids[i]` (conflict / empty / hook failure), git
+        // keeps the *current* (failing) pick at the head of `sequencer/todo` so that a
+        // later `--continue` / `--skip` operates on it. Include `oids[i]` in `remaining`.
+        let remaining = &oids[i..];
         match cherry_pick_one_commit(repo, *commit_oid, args) {
             Ok(()) => {
                 if oids.len() > 1 && !args.no_commit {
@@ -537,18 +540,18 @@ fn run_commit_sequence(
 
     let nested_single_in_sequence = oids.len() == 1 && !args.no_commit && head_file_path.exists();
     if nested_single_in_sequence {
-        remove_pick_oid_from_sequencer_todo_if_present(git_dir, oids[0])?;
-        if load_sequencer_todo(git_dir).is_empty() {
-            cleanup_sequencer_state(git_dir);
-        } else {
-            write_abort_safety_file(git_dir)?;
-        }
+        // "git cherry-pick <single commit>" in the middle of a sequence is a plain
+        // single_pick (sequencer.c:5565-5571): it commits on top of HEAD, clears
+        // CHERRY_PICK_HEAD, and DOES NOT touch the sequencer state (todo/head/opts).
+        // Leaving the todo intact lets a later `--continue` advance past the original
+        // (still-listed) conflicting pick and replay the remaining commits correctly.
     } else {
         cleanup_sequencer_state(git_dir);
     }
     Ok(())
 }
 
+#[allow(dead_code)]
 fn remove_pick_oid_from_sequencer_todo_if_present(git_dir: &Path, oid: ObjectId) -> Result<()> {
     let path = git_dir.join("sequencer").join("todo");
     let Ok(content) = fs::read_to_string(&path) else {
@@ -1157,9 +1160,11 @@ fn do_continue(mut args: Args) -> Result<()> {
         return super::revert::do_continue();
     }
 
+    // Compatibility check uses command-line flags only (git's `verify_opt_compatible`
+    // runs before `read_populate_opts`); merge persisted sequencer/opts afterwards.
+    verify_pick_flags_not_with_operation(&args, "--continue");
     merge_sequencer_opts(git_dir, &mut args);
     let args = &args;
-    verify_pick_flags_not_with_operation(args, "--continue");
 
     let has_cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD").exists();
     let sequencer_todo = git_dir.join("sequencer").join("todo");
@@ -1175,12 +1180,43 @@ fn do_continue(mut args: Args) -> Result<()> {
     }
 
     if !has_cherry_pick_head && sequencer_todo_exists {
+        // CHERRY_PICK_HEAD is gone: the user resolved the conflict and committed it
+        // manually (or the conflicting pick was already committed). Git's
+        // `sequencer_continue` requires the index to match HEAD here, then advances
+        // past the just-committed pick (`todo_list.current++`) and runs the rest.
+        let index = load_index(&repo)?;
+        if index.entries.iter().any(|e| e.stage() != 0) {
+            eprintln!(
+                "error: commit is not possible because you have unmerged files\n\
+                 hint: fix conflicts and then commit the result with 'git cherry-pick --continue'"
+            );
+            std::process::exit(128);
+        }
+        let head = resolve_head(git_dir)?;
+        let head_tree_oid = if let Some(h) = head.oid() {
+            let ho = repo.odb.read(h)?;
+            parse_commit(&ho.data)?.tree
+        } else {
+            repo.odb.write(ObjectKind::Tree, &[])?
+        };
+        let new_tree_oid = write_tree_from_index(&repo.odb, &index, "")?;
+        if new_tree_oid != head_tree_oid {
+            eprintln!(
+                "error: your local changes would be overwritten by cherry-pick.\n\
+                 hint: commit your changes or stash them to proceed.\n\
+                 fatal: cherry-pick failed"
+            );
+            std::process::exit(128);
+        }
+
         let head_file = git_dir.join("sequencer").join("head");
         let stored_orig = if let Ok(s) = fs::read_to_string(&head_file) {
             ObjectId::from_hex(s.trim()).ok()
         } else {
             None
         };
+        // Drop the already-committed pick from the head of the todo (`current++`).
+        strip_first_sequencer_todo_line(git_dir)?;
         let remaining = load_sequencer_todo(git_dir);
         cleanup_sequencer_state(git_dir);
         if !remaining.is_empty() {
@@ -1273,7 +1309,9 @@ fn do_continue(mut args: Args) -> Result<()> {
 }
 
 /// After a manual `git commit` finished the current pick, resume any remaining `sequencer/todo`
-/// picks (matches Git: conflict resolution via plain commit, not only `cherry-pick --continue`).
+/// picks. NOTE: git does NOT auto-resume on a plain commit (only `--continue` advances the
+/// sequence), so this is currently unused; kept for reference/potential future use.
+#[allow(dead_code)]
 pub(crate) fn try_resume_pick_sequence_after_commit(repo: &Repository) -> Result<()> {
     let git_dir = &repo.git_dir;
     if !git_dir.join("sequencer").join("todo").exists() {
@@ -1434,9 +1472,13 @@ fn do_skip(mut args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let git_dir = &repo.git_dir;
 
+    // git's `verify_opt_compatible` (builtin/revert.c) runs against the command-line
+    // options ONLY, *before* `read_populate_opts` loads the persisted sequencer/opts.
+    // Run the compat check on the raw argv flags first, then merge persisted opts so
+    // flags carried forward from the original pick don't spuriously trip the check.
+    verify_pick_flags_not_with_operation(&args, "--skip");
     merge_sequencer_opts(git_dir, &mut args);
     let args = &args;
-    verify_pick_flags_not_with_operation(args, "--skip");
 
     if git_dir.join("REVERT_HEAD").exists() {
         eprintln!("error: no cherry-pick in progress");
