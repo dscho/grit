@@ -1337,16 +1337,17 @@ fn build_task_list(cfg: &ConfigSet, schedule: Option<SchedulePriority>) -> Resul
                 continue;
             }
             let need = schedule.unwrap();
-            if strategy.schedules[i] < need {
-                continue;
-            }
+            // The task's effective schedule is the `maintenance.<task>.schedule`
+            // config override when present, otherwise the strategy default. The
+            // task runs when its effective schedule is at least as frequent as
+            // the requested one (Git compares enum priorities).
             let sk = format!("maintenance.{}.schedule", t.name());
-            if let Some(sv) = cfg.get(&sk) {
-                if let Some(ps) = SchedulePriority::parse(&sv) {
-                    if ps < need {
-                        continue;
-                    }
-                }
+            let effective = cfg
+                .get(&sk)
+                .and_then(|sv| SchedulePriority::parse(&sv))
+                .unwrap_or(strategy.schedules[i]);
+            if effective < need {
+                continue;
             }
         } else if f & MaintBits::MAN == 0 {
             continue;
