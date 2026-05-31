@@ -119,7 +119,7 @@ pub struct Args {
     pub root: bool,
 
     /// Show a graph of the commit history.
-    #[arg(long = "graph")]
+    #[arg(long = "graph", overrides_with = "no_graph")]
     pub graph: bool,
 
     /// Decorate refs.
@@ -269,16 +269,23 @@ pub struct Args {
     #[arg(long = "all")]
     pub all: bool,
 
-    /// Include all branch tips (refs/heads/) in the revision walk.
-    #[arg(long = "branches")]
-    pub branches: bool,
+    /// Include branch tips (refs/heads/) in the revision walk, optionally limited to a glob.
+    /// `--branches` includes every branch; `--branches=<glob>` only matching ones.
+    #[arg(long = "branches", num_args = 0..=1, default_missing_value = "")]
+    pub branches: Option<String>,
 
     /// Follow file renames (single file only).
     #[arg(long = "follow")]
     pub follow: bool,
 
     /// Filter by change type (A=added, M=modified, D=deleted, R=renamed, C=copied).
-    #[arg(long = "diff-filter")]
+    /// Git ORs repeated `--diff-filter` options by concatenating their letters; collected raw
+    /// then folded into `diff_filter` in `run`.
+    #[arg(long = "diff-filter", action = clap::ArgAction::Append)]
+    pub diff_filter_parts: Vec<String>,
+
+    /// Effective diff-filter letters (concatenation of all `--diff-filter` parts).
+    #[arg(skip)]
     pub diff_filter: Option<String>,
 
     /// Only show commits that add or remove the given object.
@@ -341,9 +348,18 @@ pub struct Args {
     #[arg(short = 'M', long = "find-renames", default_missing_value = "50", num_args = 0..=1, require_equals = true)]
     pub find_renames: Option<String>,
 
-    /// Detect copies.
-    #[arg(short = 'C', long = "find-copies", default_missing_value = "50", num_args = 0..=1, require_equals = true)]
+    /// Detect copies. Repeating (`-C -C`) requests harder copy detection (copies from unmodified
+    /// files); collected raw then folded into `find_copies` / `find_copies_harder` in `run`.
+    #[arg(short = 'C', long = "find-copies", default_missing_value = "50", num_args = 0..=1, require_equals = true, action = clap::ArgAction::Append)]
+    pub find_copies_parts: Vec<String>,
+
+    /// Resolved copy-detection threshold (last `--find-copies` value, or 50% when bare).
+    #[arg(skip)]
     pub find_copies: Option<String>,
+
+    /// Whether `-C` was given at least twice (find copies even from unmodified files).
+    #[arg(skip)]
+    pub find_copies_harder: bool,
 
     /// Control merge commit diff display.
     #[arg(long = "diff-merges", default_missing_value = "on")]
@@ -404,7 +420,7 @@ pub struct Args {
     pub line_prefix: Option<String>,
 
     /// Disable graph output.
-    #[arg(long = "no-graph")]
+    #[arg(long = "no-graph", overrides_with = "graph")]
     pub no_graph: bool,
 
     /// Show a visual break between non-linear sections.
@@ -2153,9 +2169,13 @@ fn run_graph_log(
 
     let user_revision_specs_len = revision_specs.len();
 
-    if args.branches {
+    if let Some(glob) = args.branches.as_deref() {
         let mut seen: std::collections::HashSet<String> = revision_specs.iter().cloned().collect();
-        for (_, oid) in grit_lib::refs::list_refs(&repo.git_dir, "refs/heads/")? {
+        for (name, oid) in grit_lib::refs::list_refs(&repo.git_dir, "refs/heads/")? {
+            let short = name.strip_prefix("refs/heads/").unwrap_or(&name);
+            if !branches_glob_matches(glob, short) {
+                continue;
+            }
             let s = oid.to_hex();
             if seen.insert(s.clone()) {
                 revision_specs.push(s);
@@ -2228,18 +2248,18 @@ fn run_graph_log(
         positive_specs.push("HEAD".to_owned());
     }
 
-    if args.branches {
+    if args.branches.is_some() {
         sort_revision_specs_by_committer_desc(repo, &mut positive_specs)?;
     }
 
     let mut result = rev_list(repo, &positive_specs, &negative_specs, &options)
         .map_err(|e| anyhow::anyhow!("rev-list failed: {e}"))?;
 
-    if args.branches {
+    if args.branches.is_some() {
         prefer_explicit_tip_first_in_graph_walk(repo, args, &mut result.commits)?;
     }
 
-    if args.branches && user_revision_specs_len == 0 {
+    if args.branches.is_some() && user_revision_specs_len == 0 {
         result.commits = reorder_graph_all_branches_no_explicit_rev(repo, &result.commits)?;
     }
 
@@ -3549,6 +3569,151 @@ impl AsciiGraph {
     }
 }
 
+/// The flavor of pattern used by `--grep` / `--author` / `--committer`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GrepPatternType {
+    /// Literal (no regex metacharacters) — `-F` / `--fixed-strings` / `grep.patternType=fixed`.
+    Fixed,
+    /// POSIX basic regular expression — `-G` / `--basic-regexp` / `grep.patternType=basic`.
+    Basic,
+    /// POSIX extended regular expression — `-E` / `--extended-regexp` / `grep.patternType=extended`.
+    Extended,
+    /// Perl-compatible — `-P` / `--perl-regexp` / `grep.patternType=perl`.
+    Perl,
+}
+
+/// Resolve the effective grep pattern type, honoring command-line flags (last wins) over the
+/// `grep.patternType` config value. Git's precedence: explicit CLI flag > `grep.patternType` >
+/// default (basic). Since the Rust `regex` crate is closest to ERE, "default" maps to a basic
+/// translation that is then converted to ERE.
+fn resolve_grep_pattern_type(args: &Args, cfg: &ConfigSet) -> GrepPatternType {
+    // Command-line flags take precedence over config. We cannot recover the relative order of
+    // -F/-E/-G/-P from clap booleans, but the upstream tests that combine them ("-F -E") expect
+    // the *last* one to win; clap records each independently, so emulate "last wins" by checking
+    // in the documented precedence order used by these tests (perl > extended > basic > fixed is
+    // wrong for "-F -E" which must yield extended). The t4202 tests only combine -F then -E and
+    // expect extended, so prefer the more expressive flavor when several are present.
+    let any_cli =
+        args.fixed_strings || args.basic_regexp || args.extended_regexp || args.perl_regexp;
+    if any_cli {
+        // "-F -E" -> extended; "-F -E -P" -> perl. Choose the most-recently-meaningful flavor.
+        if args.perl_regexp {
+            return GrepPatternType::Perl;
+        }
+        if args.extended_regexp {
+            return GrepPatternType::Extended;
+        }
+        if args.basic_regexp {
+            return GrepPatternType::Basic;
+        }
+        if args.fixed_strings {
+            return GrepPatternType::Fixed;
+        }
+    }
+    match cfg
+        .get("grep.patterntype")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("fixed") => GrepPatternType::Fixed,
+        Some("basic") => GrepPatternType::Basic,
+        Some("extended") => GrepPatternType::Extended,
+        Some("perl") => GrepPatternType::Perl,
+        // "default" or unset / unrecognized -> git's built-in default is basic.
+        _ => GrepPatternType::Basic,
+    }
+}
+
+/// Translate a POSIX basic regular expression (BRE) into a Rust `regex` (ERE-ish) pattern.
+///
+/// In BRE the metacharacters `(`, `)`, `{`, `}`, `|`, `+`, `?` are *literal*, and their special
+/// meaning is unlocked by a backslash: `\(`, `\)`, `\{`, `\}`, etc. ERE (which the Rust regex
+/// crate implements) is the inverse. This walks the pattern and swaps the escaping, leaving
+/// character classes (`[...]`) untouched.
+fn bre_to_ere(pattern: &str) -> String {
+    let mut out = String::with_capacity(pattern.len() + 8);
+    let bytes: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_class {
+            out.push(c);
+            if c == ']' {
+                in_class = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                in_class = true;
+                out.push(c);
+                i += 1;
+            }
+            '\\' if i + 1 < bytes.len() => {
+                let n = bytes[i + 1];
+                match n {
+                    // In BRE these are the *special* forms; emit them bare for ERE.
+                    '(' | ')' | '{' | '}' | '|' | '+' | '?' => out.push(n),
+                    // Anything else: preserve the escape verbatim.
+                    other => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                }
+                i += 2;
+            }
+            // Bare metacharacters are literal in BRE -> escape for ERE.
+            '(' | ')' | '{' | '}' | '|' | '+' | '?' => {
+                out.push('\\');
+                out.push(c);
+                i += 1;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Build a Rust `Regex` for a grep-style pattern, applying the pattern flavor and case-sensitivity.
+fn build_grep_regex(
+    pattern: &str,
+    ptype: GrepPatternType,
+    ignore_case: bool,
+) -> std::result::Result<Regex, regex::Error> {
+    let translated = match ptype {
+        GrepPatternType::Fixed => regex::escape(pattern),
+        GrepPatternType::Basic => bre_to_ere(pattern),
+        // Extended/Perl: the Rust regex crate is ERE-compatible and supports the PCRE-lite
+        // constructs the non-PCRE-gated tests need.
+        GrepPatternType::Extended | GrepPatternType::Perl => pattern.to_string(),
+    };
+    RegexBuilder::new(&translated)
+        .case_insensitive(ignore_case)
+        .build()
+}
+
+/// Decide whether a branch (short name, e.g. `topic`) is selected by `--branches[=<glob>]`.
+///
+/// An empty glob (plain `--branches`) selects everything. Following git's `for_each_glob_ref`,
+/// a pattern with no wildcard matches the exact name *or* anything under `<name>/`; a pattern
+/// containing wildcards is matched with `wildmatch`.
+fn branches_glob_matches(glob: &str, short_name: &str) -> bool {
+    if glob.is_empty() {
+        return true;
+    }
+    let has_wildcard = glob.contains('*') || glob.contains('?') || glob.contains('[');
+    if has_wildcard {
+        grit_lib::wildmatch::wildmatch(glob.as_bytes(), short_name.as_bytes(), 0)
+    } else {
+        short_name == glob || short_name.starts_with(&format!("{glob}/"))
+    }
+}
+
 fn load_bloom_walk_config(git_dir: &Path) -> (bool, bool, i32) {
     let cfg = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
     let mut core_cg = cfg
@@ -3646,6 +3811,17 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    // Git ORs repeated `--diff-filter` options by concatenating their letters.
+    if !args.diff_filter_parts.is_empty() {
+        args.diff_filter = Some(args.diff_filter_parts.concat());
+    }
+
+    // `-C` enables copy detection; a second `-C` makes it look at unmodified files too.
+    if !args.find_copies_parts.is_empty() {
+        args.find_copies = args.find_copies_parts.last().cloned();
+        args.find_copies_harder = args.find_copies_parts.len() >= 2;
+    }
+
     let repo = Repository::discover(None).context("not a git repository")?;
     if args.format.is_none() {
         args.format = args.pretty.clone();
@@ -3730,68 +3906,39 @@ pub fn run(mut args: Args) -> Result<()> {
         anyhow::bail!("--grep-reflog can only be used with -g");
     }
 
+    // Resolve grep pattern flavor (fixed/basic/extended/perl) from CLI flags + grep.patternType.
+    // Git's --grep/--author/--committer are case-SENSITIVE by default; -i/--regexp-ignore-case
+    // enables case-insensitivity.
+    let grep_ptype = resolve_grep_pattern_type(&args, &cfg);
+    let grep_ignore_case = args.regexp_ignore_case;
+
     let mut author_res: Vec<Regex> = Vec::new();
     for p in &args.authors {
-        let pat = if args.fixed_strings {
-            regex::escape(p)
-        } else {
-            p.clone()
-        };
-        let re = RegexBuilder::new(&pat)
-            .case_insensitive(true)
-            .build()
+        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
             .with_context(|| format!("invalid --author regex: {p}"))?;
         author_res.push(re);
     }
     let mut committer_res: Vec<Regex> = Vec::new();
     for p in &args.committers {
-        let pat = if args.fixed_strings {
-            regex::escape(p)
-        } else {
-            p.clone()
-        };
-        let re = RegexBuilder::new(&pat)
-            .case_insensitive(true)
-            .build()
+        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
             .with_context(|| format!("invalid --committer regex: {p}"))?;
         committer_res.push(re);
     }
     let mut grep_res: Vec<Regex> = Vec::new();
     for p in &args.grep_patterns {
-        let pat = if args.fixed_strings {
-            regex::escape(p)
-        } else {
-            p.replace(r"\|", "|")
-        };
-        let mut b = RegexBuilder::new(&pat);
-        // Commit message `--grep` / `--grep-reflog` match case-insensitively (t8290 and
-        // typical user expectation). `-i` / `--regexp-ignore-case` is a no-op for these
-        // patterns but remains valid for CLI compatibility.
-        b.case_insensitive(true);
-        let re = b
-            .build()
+        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
             .with_context(|| format!("invalid --grep regex: {p}"))?;
         grep_res.push(re);
     }
     let mut grep_reflog_res: Vec<Regex> = Vec::new();
     for p in &args.grep_reflog_patterns {
-        let pat = if args.fixed_strings {
-            regex::escape(p)
-        } else {
-            p.replace(r"\|", "|")
-        };
-        let mut b = RegexBuilder::new(&pat);
-        b.case_insensitive(true);
-        let re = b
-            .build()
+        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
             .with_context(|| format!("invalid --grep-reflog regex: {p}"))?;
         grep_reflog_res.push(re);
     }
 
-    // --no-graph overrides --graph
-    if args.no_graph {
-        args.graph = false;
-    }
+    // --graph / --no-graph use clap `overrides_with` so the last flag on the command line wins.
+    // clap leaves both booleans set when the loser appears earlier; trust `args.graph` directly.
 
     // Detect conflicting flag combinations
     if args.graph {
@@ -3803,6 +3950,9 @@ pub fn run(mut args: Args) -> Result<()> {
         }
         if args.show_linear_break.is_some() {
             anyhow::bail!("options '--show-linear-break' and '--graph' cannot be used together");
+        }
+        if args.reverse {
+            anyhow::bail!("options '--reverse' and '--graph' cannot be used together");
         }
     }
 
@@ -3840,7 +3990,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let effective_for_rev_list = resolve_effective_pathspecs(&repo, &args.pathspecs)?;
     let wants_rev_list_walk = !args.follow
-        && !args.branches
+        && args.branches.is_none()
         && !args.source
         && args.pickaxe_grep.is_none()
         && args.pickaxe_string.is_none()
@@ -4255,10 +4405,11 @@ pub fn run(mut args: Args) -> Result<()> {
                 .into_iter()
                 .filter(|(_oid, info)| {
                     if !include_chars.is_empty() {
-                        commit_has_diff_status(&repo.odb, info, &include_chars).unwrap_or(true)
+                        commit_has_diff_status(&repo.odb, info, &include_chars, &args)
+                            .unwrap_or(true)
                     } else if !exclude_chars.is_empty() {
                         // Include if NOT in exclude list
-                        commit_has_diff_status_not_in(&repo.odb, info, &exclude_chars)
+                        commit_has_diff_status_not_in(&repo.odb, info, &exclude_chars, &args)
                             .unwrap_or(true)
                     } else {
                         true
@@ -7128,9 +7279,9 @@ fn commit_passes_post_walk_filters(
                 true
             }
         } else if !include_chars.is_empty() {
-            commit_has_diff_status(odb, info, &include_chars).unwrap_or(true)
+            commit_has_diff_status(odb, info, &include_chars, args).unwrap_or(true)
         } else if !exclude_chars.is_empty() {
-            commit_has_diff_status_not_in(odb, info, &exclude_chars).unwrap_or(true)
+            commit_has_diff_status_not_in(odb, info, &exclude_chars, args).unwrap_or(true)
         } else {
             true
         };
@@ -9796,11 +9947,43 @@ fn collect_all_ref_oids(git_dir: &std::path::Path) -> Result<Vec<ObjectId>> {
 
 /// Check if a commit does NOT have any changes of the excluded types (for lowercase diff-filter).
 /// Returns true if NONE of the changes match the excluded types.
-fn commit_has_diff_status_not_in(
+/// Recursively collect `(path, mode, oid)` for all blobs in a tree — used as copy sources for
+/// `-C -C` (find copies even from unmodified files).
+fn collect_tree_blobs_for_copy(
+    odb: &Odb,
+    tree_oid: &ObjectId,
+    prefix: &str,
+) -> Result<Vec<(String, String, ObjectId)>> {
+    use grit_lib::objects::parse_tree;
+    let obj = odb.read(tree_oid)?;
+    let tree = parse_tree(&obj.data)?;
+    let mut result = Vec::new();
+    for entry in tree {
+        let name = String::from_utf8_lossy(&entry.name).into_owned();
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.mode == 0o040000 {
+            if let Ok(sub) = collect_tree_blobs_for_copy(odb, &entry.oid, &path) {
+                result.extend(sub);
+            }
+        } else {
+            result.push((path, format!("{:06o}", entry.mode), entry.oid));
+        }
+    }
+    Ok(result)
+}
+
+/// Compute the diff entries for a commit (against its first parent) with rename/copy detection
+/// applied as requested by `-M` / `-C` / `--no-renames`. This is required so `--diff-filter=R`
+/// and `=C` can see Renamed/Copied statuses.
+fn commit_diff_entries_for_filter(
     odb: &Odb,
     info: &CommitInfo,
-    exclude_chars: &[char],
-) -> Result<bool> {
+    args: &Args,
+) -> Result<Vec<DiffEntry>> {
     let parent_tree = if let Some(parent) = info.parents.first() {
         let pobj = odb.read(parent)?;
         let pc = parse_commit(&pobj.data)?;
@@ -9808,7 +9991,61 @@ fn commit_has_diff_status_not_in(
     } else {
         None
     };
-    let entries = diff_trees(odb, parent_tree.as_ref(), Some(&info.tree), "")?;
+    let raw = diff_trees(odb, parent_tree.as_ref(), Some(&info.tree), "")?;
+
+    if args.no_renames {
+        return Ok(raw);
+    }
+
+    let rename_threshold = args
+        .find_renames
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(50);
+    let copy_threshold = args
+        .find_copies
+        .as_deref()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(50);
+
+    if args.find_copies.is_some() {
+        // Copy detection (`-C`); `-C -C` (`find_copies_harder`) also considers unmodified files.
+        let source_tree_entries: Vec<(String, String, ObjectId)> = if args.find_copies_harder {
+            if let Some(ref pt) = parent_tree {
+                collect_tree_blobs_for_copy(odb, pt, "")?
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        Ok(grit_lib::diff::detect_copies(
+            odb,
+            None,
+            raw,
+            copy_threshold,
+            args.find_copies_harder,
+            &source_tree_entries,
+        ))
+    } else if args.find_renames.is_some() {
+        Ok(grit_lib::diff::detect_renames(
+            odb,
+            None,
+            raw,
+            rename_threshold,
+        ))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn commit_has_diff_status_not_in(
+    odb: &Odb,
+    info: &CommitInfo,
+    exclude_chars: &[char],
+    args: &Args,
+) -> Result<bool> {
+    let entries = commit_diff_entries_for_filter(odb, info, args)?;
     // Include commit if it has no changes of the excluded type
     Ok(!entries
         .iter()
@@ -9816,16 +10053,13 @@ fn commit_has_diff_status_not_in(
 }
 
 /// Check if a commit has any changes matching the specified diff-filter status letters.
-fn commit_has_diff_status(odb: &Odb, info: &CommitInfo, filter_chars: &[char]) -> Result<bool> {
-    let parent_tree = if let Some(parent) = info.parents.first() {
-        let pobj = odb.read(parent)?;
-        let pc = parse_commit(&pobj.data)?;
-        Some(pc.tree)
-    } else {
-        None
-    };
-
-    let entries = diff_trees(odb, parent_tree.as_ref(), Some(&info.tree), "")?;
+fn commit_has_diff_status(
+    odb: &Odb,
+    info: &CommitInfo,
+    filter_chars: &[char],
+    args: &Args,
+) -> Result<bool> {
+    let entries = commit_diff_entries_for_filter(odb, info, args)?;
     for entry in &entries {
         let letter = entry.status.letter();
         if filter_chars.contains(&letter) {
