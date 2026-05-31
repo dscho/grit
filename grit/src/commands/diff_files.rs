@@ -951,8 +951,17 @@ fn collect_changes(
                 WorktreeStatus::Modified(wt_mode, wt_oid) => {
                     let idx_canonical = canonicalize_mode(*idx_mode);
                     let content_matches = wt_oid == *idx_oid && wt_mode == idx_canonical;
+                    // Git's `run_diff_files` reports a file as modified whenever the worktree
+                    // stat tuple disagrees with the index, even if re-hashing the content would
+                    // yield the same OID (it never re-hashes to clear the change). Only suppress
+                    // a content-equal entry when its on-disk stat *also* matches the index; a
+                    // stat-dirty entry must still be reported as `M` (t7508 read-only repo).
+                    let stat_agrees = fs::symlink_metadata(&abs)
+                        .map(|m| stat_matches(idx_entry, &m))
+                        .unwrap_or(false);
                     if content_matches
                         && index_stat_is_trusted(idx_entry)
+                        && stat_agrees
                         && !idx_entry.intent_to_add()
                     {
                         continue;
