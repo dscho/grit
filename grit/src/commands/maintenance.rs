@@ -963,10 +963,13 @@ fn schtasks_xml(freq: &str, minute: u32) -> String {
 
 fn schtasks_schedule_task(repo: &Repository, freq: &str, minute: u32) -> Result<()> {
     let name = schtasks_task_name(freq);
-    // Git writes the XML to a temp file under the common dir (`.git`).
+    // Git writes the XML to a mkstemp file `schedule_<freq>_XXXXXX` under the
+    // common dir (`.git`) with NO extension; the test's mock copies it to
+    // `<file>.xml` and then `ls .git/schedule_<freq>*.xml` must match exactly
+    // that single copy.
     let xml_path = repo
         .git_dir
-        .join(format!("schedule_{freq}_{}.xml", std::process::id()));
+        .join(format!("schedule_{freq}_{}", std::process::id()));
     fs::write(&xml_path, schtasks_xml(freq, minute))?;
     let mut c = cmd_parts("schtasks");
     if c.is_empty() {
@@ -980,8 +983,10 @@ fn schtasks_schedule_task(repo: &Repository, freq: &str, minute: u32) -> Result<
         "/xml".into(),
         xml_path.to_string_lossy().to_string(),
     ]);
-    run_cmd(&c)?;
-    Ok(())
+    let result = run_cmd(&c);
+    // Git deletes the temp XML after schtasks consumes it.
+    let _ = fs::remove_file(&xml_path);
+    result
 }
 
 fn schtasks_add_tasks(repo: &Repository) -> Result<()> {
