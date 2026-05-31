@@ -1288,6 +1288,71 @@ pub fn stat_matches(ie: &IndexEntry, meta: &fs::Metadata) -> bool {
     true
 }
 
+/// Refresh cached stat data for stage-0 file/symlink entries whose worktree content still matches
+/// the recorded OID but whose on-disk stat went stale.
+///
+/// This mirrors Git's `refresh_index` / `refresh_cache_ent`: an entry is only marked clean (stat
+/// adopted from the worktree) after its content is re-verified against the index OID. A genuinely
+/// modified entry keeps its stale stat so `diff-files` / `status` continue to report it. Operations
+/// that rewrite the worktree (`status`, `reset --mixed`, `stash`) call this before writing the
+/// index so a subsequent `git diff-files` sees refreshed entries as clean.
+///
+/// Gitlinks, sparse (`skip_worktree`), `assume_unchanged` and intent-to-add entries are skipped.
+/// The blob comparison is a raw-content hash, so a CRLF-smudged match is conservatively missed
+/// (the entry simply stays stat-dirty and is re-hashed next time — never the reverse).
+pub fn refresh_index_stat_content_verified(index: &mut Index, work_tree: &Path) {
+    use crate::index::{MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
+    for ie in &mut index.entries {
+        if ie.stage() != 0 || ie.skip_worktree() || ie.assume_unchanged() || ie.intent_to_add() {
+            continue;
+        }
+        if ie.mode != MODE_REGULAR && ie.mode != MODE_EXECUTABLE && ie.mode != MODE_SYMLINK {
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(&ie.path) else {
+            continue;
+        };
+        let abs = work_tree.join(path);
+        let Ok(meta) = fs::symlink_metadata(&abs) else {
+            continue;
+        };
+        if stat_matches(ie, &meta) {
+            continue;
+        }
+        let content_matches = if ie.mode == MODE_SYMLINK {
+            if !meta.file_type().is_symlink() {
+                continue;
+            }
+            use std::os::unix::ffi::OsStrExt as _;
+            fs::read_link(&abs)
+                .map(|t| {
+                    Odb::hash_object_data(ObjectKind::Blob, t.as_os_str().as_bytes()) == ie.oid
+                })
+                .unwrap_or(false)
+        } else {
+            if !meta.file_type().is_file() {
+                continue;
+            }
+            fs::read(&abs)
+                .map(|bytes| Odb::hash_object_data(ObjectKind::Blob, &bytes) == ie.oid)
+                .unwrap_or(false)
+        };
+        if !content_matches {
+            continue;
+        }
+        let refreshed = crate::index::entry_from_metadata(&meta, &ie.path, ie.oid, ie.mode);
+        ie.ctime_sec = refreshed.ctime_sec;
+        ie.ctime_nsec = refreshed.ctime_nsec;
+        ie.mtime_sec = refreshed.mtime_sec;
+        ie.mtime_nsec = refreshed.mtime_nsec;
+        ie.dev = refreshed.dev;
+        ie.ino = refreshed.ino;
+        ie.uid = refreshed.uid;
+        ie.gid = refreshed.gid;
+        ie.size = refreshed.size;
+    }
+}
+
 /// Hash a working tree file as a blob to get its OID.
 /// Check if any parent component of `rel_path` (relative to `work_tree`) is a symlink.
 fn has_symlink_in_path(work_tree: &Path, rel_path: &str) -> bool {

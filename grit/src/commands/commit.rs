@@ -804,7 +804,23 @@ pub fn run(mut args: Args) -> Result<()> {
     let unmerged_keys: BTreeSet<String> = unmerged_full.keys().cloned().collect();
     staged.retain(|e| !unmerged_keys.contains(e.path()));
     unstaged.retain(|e| !unmerged_keys.contains(e.path()));
-    let untracked = if let Some(wt) = work_tree {
+    // `-u<mode>` / `--untracked-files`: `no` suppresses the untracked listing entirely (Git prints
+    // "Untracked files not listed (use -u option to show untracked files)" instead). The default
+    // and `normal`/`all` collect untracked files (t7508 commit -uno --dry-run).
+    let untracked_mode = args
+        .untracked_files
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase())
+        .or_else(|| {
+            config
+                .get("status.showUntrackedFiles")
+                .map(|v| v.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| "normal".to_owned());
+    let hide_untracked = matches!(untracked_mode.as_str(), "no" | "false" | "off" | "0");
+    let untracked = if hide_untracked {
+        Vec::new()
+    } else if let Some(wt) = work_tree {
         find_untracked_files(&repo, wt, &index, None)?
     } else {
         Vec::new()
@@ -840,6 +856,7 @@ pub fn run(mut args: Args) -> Result<()> {
             args.amend,
             &index_path,
             &index,
+            hide_untracked,
         )?;
         if has_unmerged_entries {
             std::process::exit(1);
@@ -1548,9 +1565,35 @@ fn print_dry_run(
     amend: bool,
     index_path: &Path,
     loaded_index: &Index,
+    hide_untracked: bool,
 ) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
+
+    // Per-submodule ignore decisions (annotation / suppression) for gitlink entries, matching
+    // `git status` (t7508 'commit --dry-run will show a staged but ignored submodule').
+    let gitlink_oid_by_path: HashMap<String, grit_lib::objects::ObjectId> = loaded_index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+        .map(|e| (String::from_utf8_lossy(&e.path).into_owned(), e.oid))
+        .collect();
+    let mut submodule_decisions: HashMap<String, (String, bool, bool)> = HashMap::new();
+    let mut any_dirty_submodule_shown = false;
+    if let Some(wt) = repo.work_tree.as_deref() {
+        for (path, recorded) in &gitlink_oid_by_path {
+            let d = crate::commands::status::submodule_display_decision(
+                config, wt, None, path, *recorded,
+            );
+            if d.has_dirty_content {
+                any_dirty_submodule_shown = true;
+            }
+            submodule_decisions.insert(
+                path.clone(),
+                (d.annotation, d.suppress_unstaged, d.suppress_staged),
+            );
+        }
+    }
 
     let config_hints = match config.get("advice.statusHints") {
         Some(v) if v == "false" || v == "no" || v == "off" || v == "0" => false,
@@ -1652,6 +1695,26 @@ fn print_dry_run(
         (staged.to_vec(), unstaged.to_vec(), Vec::new())
     };
 
+    // Apply submodule ignore decisions: drop suppressed gitlinks from staged/unstaged sections.
+    let staged_show: Vec<DiffEntry> = staged_show
+        .into_iter()
+        .filter(|e| {
+            submodule_decisions
+                .get(e.path())
+                .map(|(_, _, suppress_staged)| !suppress_staged)
+                .unwrap_or(true)
+        })
+        .collect();
+    let unstaged_show: Vec<DiffEntry> = unstaged_show
+        .into_iter()
+        .filter(|e| {
+            submodule_decisions
+                .get(e.path())
+                .map(|(_, suppress_unstaged, _)| !suppress_unstaged)
+                .unwrap_or(true)
+        })
+        .collect();
+
     if !staged_show.is_empty() {
         begin_section(&mut out)?;
         writeln!(out, "Changes to be committed:")?;
@@ -1692,9 +1755,19 @@ fn print_dry_run(
             out,
             "  (use \"git restore <file>...\" to discard changes in working directory)"
         )?;
+        if any_dirty_submodule_shown {
+            writeln!(
+                out,
+                "  (commit or discard the untracked or modified content in submodules)"
+            )?;
+        }
         for entry in &unstaged_show {
             let label = status_label_unstaged(entry.status);
-            writeln!(out, "\t{label}:   {}", entry.path())?;
+            let suffix = submodule_decisions
+                .get(entry.path())
+                .map(|(annotation, _, _)| annotation.as_str())
+                .unwrap_or("");
+            writeln!(out, "\t{label}:   {}{suffix}", entry.path())?;
         }
     }
 
@@ -1793,19 +1866,39 @@ fn print_dry_run(
         all_untracked = collapsed;
     }
 
-    if !all_untracked.is_empty() {
-        begin_section(&mut out)?;
-        writeln!(out, "Untracked files:")?;
-        writeln!(
-            out,
-            "  (use \"git add <file>...\" to include in what will be committed)"
-        )?;
-        for path in &all_untracked {
-            writeln!(out, "\t{path}")?;
+    if hide_untracked {
+        // `-uno`: list nothing but note it (Git `wt_longstatus_print`) when there is something
+        // to commit. The note follows a blank line separating it from the previous section
+        // (t7508 commit -uno --dry-run).
+        let committable = !staged_show.is_empty();
+        if committable {
+            if printed_body_section {
+                writeln!(out)?;
+            }
+            if show_hints {
+                writeln!(
+                    out,
+                    "Untracked files not listed (use -u option to show untracked files)"
+                )?;
+            } else {
+                writeln!(out, "Untracked files not listed")?;
+            }
         }
-    }
-    if printed_body_section && unmerged.is_empty() {
-        writeln!(out)?;
+    } else {
+        if !all_untracked.is_empty() {
+            begin_section(&mut out)?;
+            writeln!(out, "Untracked files:")?;
+            writeln!(
+                out,
+                "  (use \"git add <file>...\" to include in what will be committed)"
+            )?;
+            for path in &all_untracked {
+                writeln!(out, "\t{path}")?;
+            }
+        }
+        if printed_body_section && unmerged.is_empty() {
+            writeln!(out)?;
+        }
     }
 
     if !unmerged.is_empty() && staged_show.is_empty() {
@@ -2033,6 +2126,7 @@ fn run_commit_patch_mode(
             args.amend,
             &index_path,
             &disk_index,
+            false,
         )?;
         std::process::exit(1);
     }
@@ -2234,6 +2328,7 @@ fn run_commit_patch_mode(
             args.amend,
             &index_path,
             &disk_index,
+            false,
         )?;
         std::process::exit(1);
     }
