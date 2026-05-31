@@ -616,6 +616,51 @@ pub fn read_midx_pack_idx_names(objects_dir: &Path) -> Result<Vec<String>> {
     parse_pack_names_blob(&data[pn_off..pn_off + pn_len])
 }
 
+/// A single MIDX-referenced object together with the pack it is attributed to.
+pub struct MidxObjectRef {
+    pub oid: ObjectId,
+    /// Index into the pack-names list returned alongside this.
+    pub pack_int_id: usize,
+}
+
+/// Read the tip MIDX and return `(pack_names, objects)`, where each object names
+/// the pack it is attributed to (`pack_int_id`). Mirrors the per-object
+/// `nth_midxed_pack_int_id` iteration in Git used by expire/repack.
+pub fn read_midx_objects(objects_dir: &Path) -> Result<(Vec<String>, Vec<MidxObjectRef>)> {
+    let pack_dir = objects_dir.join("pack");
+    let path = resolve_tip_midx_path(&pack_dir)
+        .ok_or_else(|| Error::CorruptObject("no multi-pack-index found".to_owned()))?;
+    let data = fs::read(&path).map_err(Error::Io)?;
+    let (_, hdr_end, _) = parse_midx_header(&data)?;
+    let (pn_off, pn_len) = find_chunk(&data, hdr_end, MIDX_CHUNKID_PACKNAMES)?;
+    let names = parse_pack_names_blob(&data[pn_off..pn_off + pn_len])?;
+    let (oidl_off, oidl_len) = find_chunk(&data, hdr_end, MIDX_CHUNKID_OIDLOOKUP)?;
+    let (ooff_off, ooff_len) = find_chunk(&data, hdr_end, MIDX_CHUNKID_OBJECTOFFSETS)?;
+    if oidl_len % 20 != 0 || ooff_len % 8 != 0 {
+        return Err(Error::CorruptObject(
+            "bad MIDX oid-lookup / object-offsets size".to_owned(),
+        ));
+    }
+    let num = oidl_len / 20;
+    if num * 8 != ooff_len {
+        return Err(Error::CorruptObject(
+            "MIDX oid count does not match object-offsets".to_owned(),
+        ));
+    }
+    let mut objects = Vec::with_capacity(num);
+    for i in 0..num {
+        let oid = ObjectId::from_bytes(&data[oidl_off + i * 20..oidl_off + (i + 1) * 20])
+            .map_err(|e| Error::CorruptObject(e.to_string()))?;
+        let base = ooff_off + i * 8;
+        let pack_id = u32::from_be_bytes(data[base..base + 4].try_into().unwrap()) as usize;
+        objects.push(MidxObjectRef {
+            oid,
+            pack_int_id: pack_id,
+        });
+    }
+    Ok((names, objects))
+}
+
 /// Trailing 40-character SHA-1 hex of the active MIDX (root or chain tip).
 pub fn midx_checksum_hex(objects_dir: &Path) -> Result<String> {
     let pack_dir = objects_dir.join("pack");

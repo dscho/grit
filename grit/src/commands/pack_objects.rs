@@ -100,6 +100,10 @@ pub struct Args {
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
 
+    /// Explicitly enable progress output (accepted for compat; counterpart of `--quiet`).
+    #[arg(long = "no-quiet")]
+    pub no_quiet: bool,
+
     /// Keep unreachable objects (accepted for compat).
     #[arg(long = "keep-unreachable")]
     pub keep_unreachable: bool,
@@ -620,7 +624,9 @@ pub fn run(mut args: Args) -> Result<()> {
         if delay > 0 {
             thread::sleep(Duration::from_secs(delay));
         }
-        eprintln!("Enumerating objects");
+        // Mirror Git's `display_progress` final line, e.g.
+        // "Enumerating objects: 50, done." (t7900 loose-objects.batchSize).
+        eprintln!("Enumerating objects: {}, done.", pack_list.oids.len());
     }
 
     if pack_list.oids.is_empty() {

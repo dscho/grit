@@ -839,19 +839,12 @@ fn cmd_run(rest: &[String]) -> Result<()> {
         bail!("fatal: --task and --schedule cannot be used together");
     }
 
-    let detach_effective = detach.unwrap_or_else(|| {
-        cfg.get_bool("maintenance.autoDetach")
-            .or_else(|| cfg.get_bool("maintenance.autodetach"))
-            .or_else(|| cfg.get_bool("gc.autoDetach"))
-            .or_else(|| cfg.get_bool("gc.autodetach"))
-            .and_then(|r| r.ok())
-            .unwrap_or_else(|| {
-                std::env::var("GIT_TEST_MAINT_AUTO_DETACH")
-                    .ok()
-                    .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
-                    .unwrap_or(true)
-            })
-    });
+    // Upstream Git's `maintenance_run()` never detaches unless `--detach` is
+    // explicitly passed (it does not consult gc.autoDetach / maintenance.autoDetach;
+    // only `cmd_gc` honors gc.autodetach). See git/builtin/gc.c MAINTENANCE_RUN_OPTS_INIT
+    // (.detach = -1) and maintenance_run(). The auto-maintenance-after-commit path
+    // (`run_auto_after_commit`) keeps detaching by default.
+    let detach_effective = detach.unwrap_or(false);
 
     if detach_effective {
         if let Ok(p) = std::env::var("GIT_TRACE2_EVENT") {
@@ -1106,25 +1099,34 @@ fn run_background(
             if auto && !loose_auto(cfg) {
                 return Ok(());
             }
-            run_grit(
-                repo,
-                &["prune-packed", if quiet { "--quiet" } else { "--no-quiet" }],
-            )?;
+            // Upstream `prune_packed` only passes `--quiet` when quiet; it never
+            // passes `--no-quiet` (git/builtin/gc.c:1287).
+            if quiet {
+                run_grit(repo, &["prune-packed", "--quiet"])?;
+            } else {
+                run_grit(repo, &["prune-packed"])?;
+            }
             pack_loose(repo, quiet)?;
         }
         TaskId::IncrementalRepack => {
+            // Upstream skips this task entirely (with a warning) when
+            // core.multiPackIndex is disabled (git/builtin/gc.c:1552).
+            if !core_multi_pack_index(cfg) {
+                if !quiet {
+                    eprintln!(
+                        "warning: skipping incremental-repack task because core.multiPackIndex is disabled"
+                    );
+                }
+                return Ok(());
+            }
             if auto && !incr_auto(repo, cfg) {
                 return Ok(());
             }
-            run_grit(
-                repo,
-                &[
-                    "multi-pack-index",
-                    "repack",
-                    "--no-progress",
-                    "--batch-size=2147483647",
-                ],
-            )?;
+            let prog = if quiet { "--no-progress" } else { "--progress" };
+            run_grit(repo, &["multi-pack-index", "write", prog])?;
+            run_grit(repo, &["multi-pack-index", "expire", prog])?;
+            let batch = format!("--batch-size={}", get_auto_pack_size(repo));
+            run_grit(repo, &["multi-pack-index", "repack", prog, batch.as_str()])?;
         }
         TaskId::GeometricRepack => {
             if auto && !geom_auto(repo, cfg) {
@@ -1184,6 +1186,21 @@ fn core_commit_graph(cfg: &ConfigSet) -> bool {
         .unwrap_or(true)
 }
 
+fn core_multi_pack_index(cfg: &ConfigSet) -> bool {
+    // Git defaults core.multiPackIndex to true (repo-settings.c). The
+    // GIT_TEST_MULTI_PACK_INDEX env var forces it on when set truthy.
+    if std::env::var("GIT_TEST_MULTI_PACK_INDEX")
+        .ok()
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    cfg.get_bool("core.multiPackIndex")
+        .and_then(|r| r.ok())
+        .unwrap_or(true)
+}
+
 fn cfg_i32(cfg: &ConfigSet, key: &str, d: i32) -> i32 {
     cfg.get_i64(key)
         .and_then(|r| r.ok())
@@ -1239,11 +1256,7 @@ fn incr_auto(repo: &Repository, cfg: &ConfigSet) -> bool {
     if lim < 0 {
         return true;
     }
-    if !cfg
-        .get_bool("core.multiPackIndex")
-        .and_then(|r| r.ok())
-        .unwrap_or(false)
-    {
+    if !core_multi_pack_index(cfg) {
         return false;
     }
     let pack_dir = repo.git_dir.join("objects").join("pack");
@@ -1278,6 +1291,32 @@ fn geom_auto(repo: &Repository, cfg: &ConfigSet) -> bool {
     Repository::discover(None)
         .map(|r| loose_count_at_least(&r, v as usize))
         .unwrap_or(false)
+}
+
+/// Git `get_auto_pack_size` (git/builtin/gc.c): one more than the second
+/// largest pack-file size, capped at 2GiB (INT32_MAX). For tiny test repos this
+/// is `1`, which t7900 asserts as the incremental-repack `--batch-size`.
+fn get_auto_pack_size(repo: &Repository) -> u64 {
+    let d = repo.git_dir.join("objects").join("pack");
+    let mut max_size: u64 = 0;
+    let mut second: u64 = 0;
+    if let Ok(rd) = fs::read_dir(&d) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if !(n.starts_with("pack-") && n.ends_with(".pack")) {
+                continue;
+            }
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            if size > max_size {
+                second = max_size;
+                max_size = size;
+            } else if size > second {
+                second = size;
+            }
+        }
+    }
+    let result = second.saturating_add(1);
+    result.min(i32::MAX as u64)
 }
 
 fn count_packs(repo: &Repository) -> usize {
@@ -1595,23 +1634,13 @@ fn pack_loose(repo: &Repository, quiet: bool) -> Result<()> {
     } else if batch > 0 {
         batch -= 1;
     }
-    let work = repo.work_tree.as_deref().unwrap_or(&repo.git_dir);
-    let base = if repo.work_tree.is_some() {
-        ".git/objects/pack/loose"
-    } else {
-        "objects/pack/loose"
-    };
-    let grit = grit_exe::grit_executable();
-    let mut cmd = Command::new(&grit);
-    cmd.current_dir(work)
-        .arg("pack-objects")
-        .arg(if quiet { "--quiet" } else { "--no-quiet" })
-        .arg(base)
-        .stdin(Stdio::piped());
-    let mut child = cmd.spawn().context("pack-objects")?;
-    let mut stdin = child.stdin.take().context("stdin")?;
+
+    // Collect loose object names up front. Upstream Git does not start a
+    // `pack-objects` process at all when there are no loose objects
+    // (git/builtin/gc.c pack_loose / bail_on_loose); doing so here keeps
+    // `--no-quiet` runs from emitting a spurious "Total 0" line on stderr.
     let objects = repo.git_dir.join("objects");
-    let mut count = 0i32;
+    let mut loose: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(&objects) {
         'outer: for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
@@ -1624,14 +1653,36 @@ fn pack_loose(repo: &Repository, quiet: bool) -> Result<()> {
             for f in sub.flatten() {
                 let fname = f.file_name().to_string_lossy().to_string();
                 if fname.len() == 38 && fname.chars().all(|c| c.is_ascii_hexdigit()) {
-                    writeln!(stdin, "{name}{fname}")?;
-                    count += 1;
-                    if count > batch {
+                    loose.push(format!("{name}{fname}"));
+                    if loose.len() as i32 > batch {
                         break 'outer;
                     }
                 }
             }
         }
+    }
+    if loose.is_empty() {
+        return Ok(());
+    }
+
+    let work = repo.work_tree.as_deref().unwrap_or(&repo.git_dir);
+    let base = if repo.work_tree.is_some() {
+        ".git/objects/pack/loose"
+    } else {
+        "objects/pack/loose"
+    };
+    let grit = grit_exe::grit_executable();
+    let mut cmd = Command::new(&grit);
+    cmd.current_dir(work)
+        .arg("pack-objects")
+        .arg(if quiet { "--quiet" } else { "--no-quiet" })
+        .arg(base)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null());
+    let mut child = cmd.spawn().context("pack-objects")?;
+    let mut stdin = child.stdin.take().context("stdin")?;
+    for oid in &loose {
+        writeln!(stdin, "{oid}")?;
     }
     drop(stdin);
     let st = child.wait()?;
