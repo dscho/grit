@@ -1676,9 +1676,14 @@ fn reset_commit(
 
     update_head_ref(&repo.git_dir, &head, &target_oid)?;
     write_reset_reflog(repo, &head, &old_oid, &target_oid, commit_spec);
+    // Git's `remove_branch_state` -> `remove_merge_branch_state` saves any pending
+    // MERGE_AUTOSTASH back to refs/stash before clearing the merge state files.
+    let _ = crate::commands::stash::save_autostash_ref(repo, "MERGE_AUTOSTASH");
     let _ = std::fs::remove_file(repo.git_dir.join("MERGE_HEAD"));
+    let _ = std::fs::remove_file(repo.git_dir.join("MERGE_RR"));
     let _ = std::fs::remove_file(repo.git_dir.join("MERGE_MSG"));
     let _ = std::fs::remove_file(repo.git_dir.join("MERGE_MODE"));
+    let _ = std::fs::remove_file(repo.git_dir.join("AUTO_MERGE"));
     if !extra.skip_sequencer_head_cleanup {
         // Mirror git's `sequencer_post_commit_cleanup` (via `remove_branch_state`):
         // CHERRY_PICK_HEAD/REVERT_HEAD are always removed, but the sequencer dir

@@ -1427,6 +1427,10 @@ pub fn run(mut args: Args) -> Result<()> {
             )?;
         }
     }
+    // A merge that was started with `--autostash --no-commit` records its WIP under
+    // `MERGE_AUTOSTASH`; concluding the merge with `git commit` re-applies it
+    // (git finish()/apply_autostash_ref). No-op when the ref is absent.
+    let _ = crate::commands::stash::apply_autostash_ref(&repo, "MERGE_AUTOSTASH");
     cleanup_merge_state(&repo.git_dir);
     // A plain `git commit` that resolves a cherry-pick/revert conflict only removes
     // CHERRY_PICK_HEAD/REVERT_HEAD (done via cleanup_merge_state). It must NOT advance

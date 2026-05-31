@@ -215,10 +215,72 @@ fn merge_update_head(
     old_head_commit: Option<ObjectId>,
     new_oid: ObjectId,
 ) -> Result<()> {
+    merge_update_head_with_reflog(repo, head, old_head_commit, new_oid, None)
+}
+
+/// Like [`merge_update_head`] but also appends a reflog entry to the branch ref (when on a
+/// branch) and to `HEAD`, mirroring git's `finish()` / `update_ref` reflog behaviour. The
+/// reflog message is the full `<GIT_REFLOG_ACTION>: <msg>` string (e.g.
+/// `"merge c1: Fast-forward"`), or a standalone message such as `"initial pull"`.
+fn merge_update_head_with_reflog(
+    repo: &Repository,
+    head: &HeadState,
+    old_head_commit: Option<ObjectId>,
+    new_oid: ObjectId,
+    reflog: Option<&str>,
+) -> Result<()> {
     update_head(&repo.git_dir, head, &new_oid)?;
+    if let Some(msg) = reflog {
+        let zero = ObjectId::from_bytes(&[0u8; 20]).unwrap_or(new_oid);
+        let old_oid = old_head_commit.unwrap_or(zero);
+        let identity = reflog_identity(repo);
+        if let HeadState::Branch { refname, .. } = head {
+            let _ = grit_lib::refs::append_reflog(
+                &repo.git_dir,
+                refname,
+                &old_oid,
+                &new_oid,
+                &identity,
+                msg,
+                false,
+            );
+        }
+        let _ = grit_lib::refs::append_reflog(
+            &repo.git_dir,
+            "HEAD",
+            &old_oid,
+            &new_oid,
+            &identity,
+            msg,
+            false,
+        );
+    }
     let _ =
         run_reference_transaction_committed_for_head_update(repo, head, old_head_commit, new_oid);
     Ok(())
+}
+
+/// Build the `Name <email> <timestamp> <tz>` reflog identity string from the committer ident.
+fn reflog_identity(repo: &Repository) -> String {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let now = OffsetDateTime::now_utc();
+    resolve_ident(&config, "committer", now).unwrap_or_else(|_| "unknown <unknown> 0 +0000".into())
+}
+
+/// The default `GIT_REFLOG_ACTION` for a merge: `"merge <name1> <name2> ..."` over the original
+/// command-line ref arguments (git `cmd_merge` setenv at builtin/merge.c:1582).
+fn merge_reflog_action(args: &Args) -> String {
+    if let Ok(action) = std::env::var("GIT_REFLOG_ACTION") {
+        if !action.is_empty() {
+            return action;
+        }
+    }
+    let mut buf = String::from("merge");
+    for name in &args.commits {
+        buf.push(' ');
+        buf.push_str(name);
+    }
+    buf
 }
 
 /// Arguments for `grit merge`.
@@ -249,8 +311,8 @@ pub struct Args {
     #[arg(long = "squash")]
     pub squash: bool,
 
-    /// Skip the pre-merge-commit hook (Git `--no-verify` / `-n`).
-    #[arg(long = "no-verify", short = 'n')]
+    /// Skip the pre-merge-commit hook (Git `--no-verify`; note: git merge's `-n` is `--no-stat`).
+    #[arg(long = "no-verify")]
     pub no_verify: bool,
 
     /// Abort in-progress merge.
@@ -811,6 +873,12 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
         }
+        // Read merge.autoStash config (CLI `--autostash` already wins if set).
+        if !args.autostash {
+            if let Some(Ok(true)) = config.get_bool("merge.autostash") {
+                args.autostash = true;
+            }
+        }
         if args.strategy.is_empty() {
             let key = if args.commits.len() > 1 {
                 "pull.octopus"
@@ -1223,7 +1291,13 @@ fn merge_unborn(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
         bail!("Can merge only exactly one commit into empty head");
     }
     let merge_oid = resolve_merge_target(repo, &args.commits[0])?;
-    merge_update_head(repo, head, head.oid().copied(), merge_oid)?;
+    merge_update_head_with_reflog(
+        repo,
+        head,
+        head.oid().copied(),
+        merge_oid,
+        Some("initial pull"),
+    )?;
     // Update index and working tree
     let commit_obj = repo.odb.read(&merge_oid)?;
     let commit = parse_commit(&commit_obj.data)?;
@@ -1291,6 +1365,31 @@ fn do_fast_forward(
         return do_squash(repo, head_oid, merge_oid, args);
     }
 
+    // Git creates `MERGE_AUTOSTASH` before the fast-forward checkout (builtin/merge.c:1674); on a
+    // clean FF it is applied below, and on a failing FF checkout it is re-applied before erroring.
+    if args.autostash {
+        create_merge_autostash(repo)?;
+        return match do_fast_forward_inner(repo, head, head_oid, merge_oid, args) {
+            Ok(()) => {
+                apply_merge_autostash(repo)?;
+                Ok(())
+            }
+            Err(e) => {
+                apply_merge_autostash(repo)?;
+                Err(e)
+            }
+        };
+    }
+    do_fast_forward_inner(repo, head, head_oid, merge_oid, args)
+}
+
+fn do_fast_forward_inner(
+    repo: &Repository,
+    head: &HeadState,
+    head_oid: ObjectId,
+    merge_oid: ObjectId,
+    args: &Args,
+) -> Result<()> {
     // Save ORIG_HEAD
     fs::write(
         repo.git_dir.join("ORIG_HEAD"),
@@ -1325,7 +1424,8 @@ Aborting"
         bail_if_merge_would_overwrite_local_changes(repo, &old_entries, &new_index, false)?;
     }
 
-    merge_update_head(repo, head, Some(head_oid), merge_oid)?;
+    let ff_reflog = format!("{}: Fast-forward", merge_reflog_action(args));
+    merge_update_head_with_reflog(repo, head, Some(head_oid), merge_oid, Some(&ff_reflog))?;
 
     if let Some(ref wt) = repo.work_tree {
         // Remove files that existed in old HEAD but not in new
@@ -2018,7 +2118,11 @@ Aborting"
         )?;
     }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
-    update_head(&repo.git_dir, head, &commit_oid)?;
+    let reflog = format!(
+        "{}: Merge made by the '{strategy_name}' strategy.",
+        merge_reflog_action(args)
+    );
+    merge_update_head_with_reflog(repo, head, Some(head_oid), commit_oid, Some(&reflog))?;
 
     if !args.quiet {
         let short = &commit_oid.to_hex()[..7];
@@ -2029,7 +2133,7 @@ Aborting"
         let show_stat = args.stat || args.summary || !args.no_stat;
         if show_stat {
             let old_tree = commit_tree(repo, head_oid)?;
-            let new_tree = commit_tree(repo, merge_oid)?;
+            let new_tree = commit_tree(repo, commit_oid)?;
             if let Ok(diff_entries) = diff_trees(&repo.odb, Some(&old_tree), Some(&new_tree), "") {
                 print_diffstat(repo, &diff_entries, args.compact_summary);
             }
@@ -2037,6 +2141,178 @@ Aborting"
     }
     run_post_merge_hook(repo, false);
     Ok(())
+}
+
+/// Whether the chosen merge strategy permits git's "really trivial in-index merge"
+/// (`allow_trivial`). Only `resolve` and `octopus` keep it; `recursive`/`ort`/`ours`/`subtree`
+/// (and the default `ort`) carry `NO_TRIVIAL` (builtin/merge.c all_strategy).
+fn strategy_allows_trivial(args: &Args) -> bool {
+    matches!(primary_merge_strategy(args), Some("resolve" | "octopus"))
+}
+
+/// Git's "Trying really trivial in-index merge..." path (builtin/merge.c merge_trivial), attempted
+/// for a single-head, non-fast-forward merge before running the real strategy. Performs a per-path
+/// trivial 3-way at the tree level: each path must be unchanged on at least one side (or identical
+/// on both). On success it commits with parents `[head, merge]`, prints `Wonderful.`, and records
+/// reflog `In-index merge`; returns `Ok(true)`. On any non-trivial path it prints `Nope.` and
+/// returns `Ok(false)` so the caller falls through to the strategy.
+fn attempt_trivial_in_index_merge(
+    repo: &Repository,
+    head: &HeadState,
+    head_oid: ObjectId,
+    merge_oid: ObjectId,
+    args: &Args,
+) -> Result<bool> {
+    // Index must match HEAD before a trivial merge (builtin/merge.c:1709).
+    if !index_matches_head_tree(repo, head_oid)? {
+        return Ok(false);
+    }
+    let bases = grit_lib::merge_base::merge_bases_first_vs_rest(repo, head_oid, &[merge_oid])?;
+    if bases.len() != 1 {
+        return Ok(false); // criss-cross / no base: not "really trivial"
+    }
+    let base_oid = bases[0];
+
+    let base_tree = commit_tree(repo, base_oid)?;
+    let ours_tree = commit_tree(repo, head_oid)?;
+    let theirs_tree = commit_tree(repo, merge_oid)?;
+    let base = tree_to_map(tree_to_index_entries(repo, &base_tree, "")?);
+    let ours = tree_to_map(tree_to_index_entries(repo, &ours_tree, "")?);
+    let theirs = tree_to_map(tree_to_index_entries(repo, &theirs_tree, "")?);
+
+    if !args.quiet {
+        println!("Trying really trivial in-index merge...");
+    }
+
+    let Some(result) = trivial_three_way_index(&base, &ours, &theirs) else {
+        if !args.quiet {
+            println!("Nope.");
+        }
+        return Ok(false);
+    };
+
+    if !args.quiet {
+        println!("Wonderful.");
+    }
+
+    fs::write(
+        repo.git_dir.join("ORIG_HEAD"),
+        format!("{}\n", head_oid.to_hex()),
+    )?;
+
+    let mut new_index = result;
+    new_index.sort();
+    let tree_oid = write_tree_from_index(&repo.odb, &new_index, "")?;
+
+    let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+    let now = OffsetDateTime::now_utc();
+    let author = resolve_ident(&config, "author", now)?;
+    let committer = resolve_ident(&config, "committer", now)?;
+    let msg = build_merge_message(head, &args.commits[0], args.message.as_deref(), repo);
+    let finalized = finalize_merge_commit_message(msg, &config);
+    let commit_data = CommitData {
+        tree: tree_oid,
+        parents: vec![head_oid, merge_oid],
+        author,
+        committer,
+        author_raw: Vec::new(),
+        committer_raw: Vec::new(),
+        encoding: finalized.encoding,
+        message: finalized.message,
+        raw_message: finalized.raw_message,
+    };
+    let mut commit_bytes = serialize_commit(&commit_data);
+    if should_sign_merge(args, &config) {
+        commit_bytes = sign_merge_commit_bytes(
+            &config,
+            &commit_data.committer,
+            args.gpg_sign.as_deref(),
+            commit_bytes,
+        )?;
+    }
+    let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
+
+    apply_sparse_checkout_skip_worktree(
+        &repo.git_dir,
+        repo.work_tree.as_deref(),
+        &mut new_index,
+        false,
+    );
+    if let Some(ref wt) = repo.work_tree {
+        let old_entries = tree_to_map(tree_to_index_entries(repo, &ours_tree, "")?);
+        remove_deleted_files(
+            wt,
+            &old_entries,
+            &new_index,
+            sparse_checkout_enabled(&repo.git_dir),
+        )?;
+        checkout_entries(
+            repo,
+            wt,
+            &new_index,
+            None,
+            sparse_checkout_enabled(&repo.git_dir),
+        )?;
+    }
+    refresh_index_stat_cache_from_worktree(repo, &mut new_index)?;
+    repo.write_index(&mut new_index)?;
+
+    merge_update_head_with_reflog(
+        repo,
+        head,
+        Some(head_oid),
+        commit_oid,
+        Some("In-index merge"),
+    )?;
+
+    if !args.quiet {
+        let short = &commit_oid.to_hex()[..7];
+        let branch = head.branch_name().unwrap_or("HEAD");
+        let first_line = commit_data.message.lines().next().unwrap_or("");
+        println!("[{branch} {short}] {first_line}");
+    }
+    run_post_merge_hook(repo, false);
+    Ok(true)
+}
+
+/// Per-path trivial 3-way merge over tree maps. Returns the merged index on success, or `None` if
+/// any path requires a non-trivial (content) resolution. For each path: if ours == base take
+/// theirs; if theirs == base take ours; if ours == theirs take either; otherwise not trivial.
+fn trivial_three_way_index(
+    base: &HashMap<Vec<u8>, IndexEntry>,
+    ours: &HashMap<Vec<u8>, IndexEntry>,
+    theirs: &HashMap<Vec<u8>, IndexEntry>,
+) -> Option<Index> {
+    let mut paths: BTreeSet<&Vec<u8>> = BTreeSet::new();
+    paths.extend(base.keys());
+    paths.extend(ours.keys());
+    paths.extend(theirs.keys());
+
+    let mut out = Index::new();
+    for path in paths {
+        let b = base.get(path);
+        let o = ours.get(path);
+        let t = theirs.get(path);
+        let same = |x: Option<&IndexEntry>, y: Option<&IndexEntry>| match (x, y) {
+            (Some(a), Some(c)) => a.oid == c.oid && a.mode == c.mode,
+            (None, None) => true,
+            _ => false,
+        };
+        let chosen: Option<&IndexEntry> = if same(o, t) {
+            o
+        } else if same(o, b) {
+            t
+        } else if same(t, b) {
+            o
+        } else {
+            // Both sides changed differently: not a trivial merge.
+            return None;
+        };
+        if let Some(entry) = chosen {
+            out.entries.push(entry.clone());
+        }
+    }
+    Some(out)
 }
 
 fn do_real_merge(
@@ -2052,6 +2328,17 @@ fn do_real_merge(
     trial_for_multi_strategy: bool,
     exit_on_merge_conflict: bool,
 ) -> Result<()> {
+    // Git's "really trivial in-index merge" runs before the strategy for single-head, non-FF
+    // merges when the strategy allows it (`-s resolve`/`octopus`). `allow_trivial && !FF_ONLY`.
+    if !trial_for_multi_strategy
+        && !args.ff_only
+        && !args.squash
+        && strategy_allows_trivial(args)
+        && attempt_trivial_in_index_merge(repo, head, head_oid, merge_oid, args)?
+    {
+        return Ok(());
+    }
+
     if primary_merge_strategy(args) == Some("resolve") {
         bail_if_resolve_index_not_clean_vs_head(repo, head_oid, args.autostash)?;
     } else if matches!(
@@ -2118,11 +2405,11 @@ fn do_real_merge(
     // otherwise downstream byte-exact comparisons against the real index misfire (t6110).
     let spelling_table = build_original_spelling_table(repo, &base_tree, &ours_tree, &theirs_tree)?;
 
-    let autostash_entries = if args.autostash {
-        capture_dirty_tracked_entries(repo)?
-    } else {
-        Vec::new()
-    };
+    // Git creates the `MERGE_AUTOSTASH` ref (snapshot dirty WIP, reset --hard to HEAD) before
+    // running any merge strategy (builtin/merge.c:1766). After this the index/worktree match HEAD.
+    if args.autostash {
+        create_merge_autostash(repo)?;
+    }
 
     // Sparse checkout safety: if a SKIP_WORKTREE path is currently present in
     // the working tree and this merge would update that path, abort before
@@ -2315,13 +2602,17 @@ Aborting"
             format!("{}\n", auto_merge_tree.to_hex()),
         );
         if args.squash {
-            // For squash + conflict: write SQUASH_MSG with conflict info, no MERGE_HEAD
+            // For squash + conflict: write SQUASH_MSG with conflict info, no MERGE_HEAD.
+            // `build_squash_msg` ends with the last commit body (no trailing blank line, to
+            // match `git log`); git's `squash_message` then appends the conflict hint (with the
+            // scissors block under cleanup=scissors) — builtin/merge.c append_conflicts_hint.
             let mut msg = build_squash_msg(repo, head_oid, &[merge_oid])?;
-            // Append conflict info
-            msg.push_str("# Conflicts:\n");
-            for desc in &merge_result.conflict_descriptions {
-                msg.push_str(&format!("#\t{}\n", desc.subject_path));
-            }
+            let paths: Vec<String> = merge_result
+                .conflict_descriptions
+                .iter()
+                .map(|d| d.subject_path.clone())
+                .collect();
+            append_merge_conflicts_hint(&mut msg, &paths, merge_cleanup_is_scissors(args, repo));
             fs::write(repo.git_dir.join("SQUASH_MSG"), &msg)?;
         } else {
             // Write MERGE_HEAD and MERGE_MSG for conflict resolution
@@ -2329,7 +2620,17 @@ Aborting"
                 repo.git_dir.join("MERGE_HEAD"),
                 format!("{}\n", merge_oid.to_hex()),
             )?;
-            let msg = build_merge_message(head, &args.commits[0], args.message.as_deref(), repo);
+            let mut msg =
+                build_merge_message(head, &args.commits[0], args.message.as_deref(), repo);
+            // Git appends the conflict hint (with the scissors block under cleanup=scissors)
+            // to MERGE_MSG so a follow-up `git commit` carries it (builtin/merge.c
+            // suggest_conflicts -> append_conflicts_hint).
+            let paths: Vec<String> = merge_result
+                .conflict_descriptions
+                .iter()
+                .map(|d| d.subject_path.clone())
+                .collect();
+            append_merge_conflicts_hint(&mut msg, &paths, merge_cleanup_is_scissors(args, repo));
             fs::write(repo.git_dir.join("MERGE_MSG"), &msg)?;
             fs::write(repo.git_dir.join("MERGE_MODE"), "")?;
         }
@@ -2360,11 +2661,18 @@ Aborting"
             let n = unmerged_path_count(&merge_result.index);
             return Err(anyhow::Error::new(StrategyTrialConflict(n)));
         }
+        if args.autostash {
+            println!("When finished, apply stashed changes with `git stash pop`");
+        }
         return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
     }
 
     if args.squash {
-        return do_squash_from_merge(repo, merge_result.index, head, head_oid, merge_oid, args);
+        let r = do_squash_from_merge(repo, merge_result.index, head, head_oid, merge_oid, args);
+        if args.autostash {
+            println!("When finished, apply stashed changes with `git stash pop`");
+        }
+        return r;
     }
 
     if args.no_commit {
@@ -2381,6 +2689,9 @@ Aborting"
 
         if !args.quiet {
             eprintln!("Automatic merge went well; stopped before committing as requested");
+        }
+        if args.autostash {
+            println!("When finished, apply stashed changes with `git stash pop`");
         }
         run_post_merge_hook(repo, false);
         return Ok(());
@@ -2478,11 +2789,15 @@ Aborting"
         )?;
     }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
-    merge_update_head(repo, head, Some(head_oid), commit_oid)?;
+    let strategy_name = primary_merge_strategy(args).unwrap_or("ort");
+    let reflog = format!(
+        "{}: Merge made by the '{strategy_name}' strategy.",
+        merge_reflog_action(args)
+    );
+    merge_update_head_with_reflog(repo, head, Some(head_oid), commit_oid, Some(&reflog))?;
 
-    if args.autostash && !autostash_entries.is_empty() {
-        apply_autostash_entries(repo, &autostash_entries)?;
-        eprintln!("Applied autostash.");
+    if args.autostash {
+        apply_merge_autostash(repo)?;
     }
 
     if !args.quiet {
@@ -2492,14 +2807,13 @@ Aborting"
         println!("[{branch} {short}] {first_line}");
 
         // Print strategy message (to stdout, as git does)
-        let strategy_name = primary_merge_strategy(args).unwrap_or("ort");
         println!("Merge made by the '{}' strategy.", strategy_name);
 
         // Show diffstat unless suppressed
         let show_stat = args.stat || args.summary || !args.no_stat;
         if show_stat {
             let old_tree = commit_tree(repo, head_oid)?;
-            let new_tree = commit_tree(repo, merge_oid)?;
+            let new_tree = commit_tree(repo, commit_oid)?;
             if let Ok(diff_entries) = diff_trees(&repo.odb, Some(&old_tree), Some(&new_tree), "") {
                 print_diffstat(repo, &diff_entries, args.compact_summary);
             }
@@ -3414,6 +3728,12 @@ fn do_octopus_merge(
         && args.strategy.len() == 1
         && matches!(args.strategy[0].as_str(), "recursive" | "ort")
     {
+        // Git creates the autostash before trying the strategy (builtin/merge.c:1766), so when
+        // the strategy bails with exit 2 the autostash is re-applied (line 1852).
+        if args.autostash {
+            create_merge_autostash(repo)?;
+            apply_merge_autostash(repo)?;
+        }
         bail!("Not handling anything other than two heads merge.");
     }
 
@@ -3472,6 +3792,12 @@ fn do_octopus_merge(
                 return do_fast_forward(repo, head, head_oid, merge_oid, args);
             }
         }
+    }
+
+    // Git creates `MERGE_AUTOSTASH` (snapshot WIP + reset --hard to HEAD) before the octopus
+    // strategy runs (builtin/merge.c:1766); afterwards the index/worktree match HEAD.
+    if args.autostash {
+        create_merge_autostash(repo)?;
     }
 
     // True octopus (multiple merge heads): index must match HEAD — unlike two-parent merge,
@@ -3763,7 +4089,16 @@ fn do_octopus_merge(
         )?;
     }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
-    merge_update_head(repo, head, Some(head_oid), commit_oid)?;
+    let strategy_name = primary_merge_strategy(args).unwrap_or("octopus");
+    let reflog = format!(
+        "{}: Merge made by the '{strategy_name}' strategy.",
+        merge_reflog_action(args)
+    );
+    merge_update_head_with_reflog(repo, head, Some(head_oid), commit_oid, Some(&reflog))?;
+
+    if args.autostash {
+        apply_merge_autostash(repo)?;
+    }
 
     if !args.quiet {
         let short = &commit_oid.to_hex()[..7];
@@ -4159,8 +4494,14 @@ fn build_squash_msg(
         ts_b.cmp(&ts_a)
     });
 
+    // The `git log` body follows a single blank line (git's `squash_message` joins
+    // `"Squashed commit of the following:\n\n"` with the log output). Each commit renders
+    // exactly as `git log` (medium format) does — no extra blank line between commits —
+    // so a byte-for-byte `test_cmp` against `git log --no-merges` output succeeds.
     for (i, (oid, commit)) in commits_to_show.iter().enumerate() {
-        msg.push('\n');
+        if i == 0 {
+            msg.push('\n');
+        }
         msg.push_str(&format!("commit {}\n", oid.to_hex()));
         msg.push_str(&format!(
             "Author: {}\n",
@@ -4173,10 +4514,6 @@ fn build_squash_msg(
         msg.push('\n');
         for line in commit.message.trim_end().lines() {
             msg.push_str(&format!("    {}\n", line));
-        }
-        // Add trailing blank line only after the last commit
-        if i == commits_to_show.len() - 1 {
-            msg.push('\n');
         }
     }
 
@@ -4250,9 +4587,9 @@ fn format_date_for_log(ident: &str) -> String {
                     let day = dt.day();
                     let (h, m, s) = (dt.hour(), dt.minute(), dt.second());
                     let year = dt.year();
-                    return format!(
-                        "{weekday} {month} {day:>2} {h:02}:{m:02}:{s:02} {year} {tz_str}"
-                    );
+                    // Git's default log date uses an UNPADDED day (date.c `"%.3s %d "`),
+                    // e.g. `Thu Apr 7 ...`, not the strftime `%e` space-padded form.
+                    return format!("{weekday} {month} {day} {h:02}:{m:02}:{s:02} {year} {tz_str}");
                 }
             }
         }
@@ -4420,8 +4757,13 @@ fn merge_abort() -> Result<()> {
 
     // Clean up merge state files
     let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
+    let _ = fs::remove_file(git_dir.join("MERGE_RR"));
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(git_dir.join("MERGE_MODE"));
+
+    // Git's `--abort` re-applies a pending MERGE_AUTOSTASH after `reset --merge`
+    // (builtin/merge.c:1437 apply_autostash_oid), printing "Applied autostash.".
+    apply_merge_autostash(&repo)?;
 
     Ok(())
 }
@@ -4432,8 +4774,14 @@ fn merge_quit() -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let git_dir = &repo.git_dir;
 
-    // Clean up merge state files
+    // Git's `remove_merge_branch_state` saves any pending MERGE_AUTOSTASH back to refs/stash
+    // (branch.c:837 save_autostash_ref) before removing the state files, printing
+    // "Autostash exists; creating a new stash entry.".
+    save_merge_autostash(&repo)?;
+
+    // Clean up merge state files (git's remove_merge_branch_state unlinks MERGE_RR too).
     let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
+    let _ = fs::remove_file(git_dir.join("MERGE_RR"));
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(git_dir.join("MERGE_MODE"));
     let _ = fs::remove_file(git_dir.join("AUTO_MERGE"));
@@ -4501,16 +4849,22 @@ fn merge_continue(message: Option<String>) -> Result<()> {
 
     let commit_bytes = serialize_commit(&commit_data);
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
-    merge_update_head(&repo, &head, Some(head_oid), commit_oid)?;
+    let first_line = msg.lines().next().unwrap_or("").to_string();
+    let reflog = format!("commit (merge): {first_line}");
+    merge_update_head_with_reflog(&repo, &head, Some(head_oid), commit_oid, Some(&reflog))?;
 
     // Clean up
     let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
+    let _ = fs::remove_file(git_dir.join("MERGE_RR"));
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
     let _ = fs::remove_file(git_dir.join("MERGE_MODE"));
+    let _ = fs::remove_file(git_dir.join("AUTO_MERGE"));
+
+    // A merge concluded via `merge --continue` re-applies any pending MERGE_AUTOSTASH.
+    apply_merge_autostash(&repo)?;
 
     let branch = head.branch_name().unwrap_or("HEAD");
     let short = &commit_oid.to_hex()[..7];
-    let first_line = msg.lines().next().unwrap_or("");
     println!("[{branch} {short}] {first_line}");
 
     Ok(())
@@ -8694,7 +9048,109 @@ fn resolve_merge_target(repo: &Repository, spec: &str) -> Result<ObjectId> {
             return Ok(oid);
         }
     }
+    // Git resolves the merge argument with `get_merge_parent` (rev-parse / `dwim_ref`), which for
+    // a *bare* name only follows `ref_rev_parse_rules` — it never expands `<name>` to
+    // `refs/remotes/<remote>/<name>`. A bare name that does not resolve dies with a suggestion
+    // (`<name> - not something we can merge` + `Did you mean ...`), so do NOT fall through to the
+    // looser `resolve_revision_as_commit` DWIM for plain names (t7600 #82/#83).
+    let is_plain_name = !spec.contains(['~', '^', ':', '@'])
+        && !is_hex_like(spec)
+        && spec != "HEAD"
+        && spec != "FETCH_HEAD";
+    if is_plain_name {
+        let (count, dwim) = grit_lib::refs::resolve_ref_dwim(&repo.git_dir, spec);
+        let _ = count;
+        if let Some(oid) = dwim {
+            return peel_to_commit_oid(repo, oid);
+        }
+        return Err(merge_unknown_ref_error(repo, spec));
+    }
     resolve_revision_as_commit(repo, spec).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Whether `spec` looks like an (abbreviated) object id rather than a ref name.
+fn is_hex_like(spec: &str) -> bool {
+    spec.len() >= 4 && spec.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Peel `oid` to a commit (following tag objects), as `get_merge_parent` does.
+fn peel_to_commit_oid(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
+    let mut cur = oid;
+    for _ in 0..10 {
+        let obj = repo.odb.read(&cur)?;
+        match obj.kind {
+            ObjectKind::Commit => return Ok(cur),
+            ObjectKind::Tag => {
+                let tag = grit_lib::objects::parse_tag(&obj.data)?;
+                cur = tag.object;
+            }
+            _ => break,
+        }
+    }
+    Ok(cur)
+}
+
+/// Build git's `help_unknown_ref`-style error for an unmergeable bare ref name: the headline plus
+/// `Did you mean ...` suggestions drawn from `refs/remotes/*` whose last component matches.
+fn merge_unknown_ref_error(repo: &Repository, spec: &str) -> anyhow::Error {
+    let suggestions = guess_merge_refs(repo, spec);
+    let mut msg = format!("merge: {spec} - not something we can merge\n");
+    if !suggestions.is_empty() {
+        if suggestions.len() == 1 {
+            msg.push_str("\nDid you mean this?\n");
+        } else {
+            msg.push_str("\nDid you mean one of these?\n");
+        }
+        for s in &suggestions {
+            msg.push_str(&format!("\t{s}\n"));
+        }
+    }
+    anyhow::Error::new(ExplicitExit {
+        code: 1,
+        message: msg.trim_end_matches('\n').to_string(),
+    })
+}
+
+/// Suggest remote-tracking refs whose final path component equals `base` (git `guess_refs` /
+/// `append_similar_ref`), returning each as a shortened-unambiguous ref name.
+fn guess_merge_refs(repo: &Repository, base: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(remotes) = grit_lib::refs::list_refs(&repo.git_dir, "refs/remotes/") else {
+        return out;
+    };
+    for (name, _oid) in remotes {
+        let last = name.rsplit('/').next().unwrap_or("");
+        if last == base {
+            out.push(shorten_unambiguous_merge_ref(repo, &name));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Shorten a full ref to the most concise `ref_rev_parse_rules` form that still resolves back to
+/// it unambiguously (git `refs_shorten_unambiguous_ref` with `strict`). Falls back to stripping
+/// `refs/`.
+fn shorten_unambiguous_merge_ref(repo: &Repository, full: &str) -> String {
+    // Candidate short names in the same order git's rules prefer, shortest first.
+    let candidates: Vec<&str> = if let Some(rest) = full.strip_prefix("refs/remotes/") {
+        // `refs/remotes/origin/x` -> try `origin/x` then `remotes/origin/x`.
+        vec![rest, full.strip_prefix("refs/").unwrap_or(full)]
+    } else if let Some(rest) = full.strip_prefix("refs/heads/") {
+        vec![rest]
+    } else if let Some(rest) = full.strip_prefix("refs/tags/") {
+        vec![rest]
+    } else {
+        vec![full.strip_prefix("refs/").unwrap_or(full)]
+    };
+    for cand in candidates {
+        let (count, _) = grit_lib::refs::resolve_ref_dwim(&repo.git_dir, cand);
+        if count == 1 {
+            return cand.to_string();
+        }
+    }
+    full.strip_prefix("refs/").unwrap_or(full).to_string()
 }
 
 pub(crate) fn read_fetch_head_merge_oids(repo: &Repository) -> Result<Vec<String>> {
@@ -8710,48 +9166,64 @@ pub(crate) fn read_fetch_head_merge_oids(repo: &Repository) -> Result<Vec<String
     Ok(oids)
 }
 
-#[derive(Clone)]
-struct AutoStashEntry {
-    path: String,
-    content: Vec<u8>,
-}
+/// The pseudo-ref name git uses to hold the autostash commit during a merge.
+const MERGE_AUTOSTASH_REF: &str = "MERGE_AUTOSTASH";
 
-fn capture_dirty_tracked_entries(repo: &Repository) -> Result<Vec<AutoStashEntry>> {
-    let Some(work_tree) = repo.work_tree.as_deref() else {
-        return Ok(Vec::new());
-    };
-    let index = repo.load_index()?;
-    let mut entries = Vec::new();
-    for entry in &index.entries {
-        if entry.stage() != 0 {
-            continue;
-        }
-        let path = String::from_utf8_lossy(&entry.path).to_string();
-        let abs = work_tree.join(&path);
-        if fs::symlink_metadata(&abs).is_err() {
-            continue;
-        }
-        if is_worktree_entry_dirty(repo, entry, &abs)? {
-            if let Ok(content) = fs::read(&abs) {
-                entries.push(AutoStashEntry { path, content });
-            }
-        }
-    }
-    Ok(entries)
-}
-
-fn apply_autostash_entries(repo: &Repository, entries: &[AutoStashEntry]) -> Result<()> {
-    let Some(work_tree) = repo.work_tree.as_deref() else {
-        return Ok(());
-    };
-    for entry in entries {
-        let abs = work_tree.join(&entry.path);
-        if let Some(parent) = abs.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&abs, &entry.content)?;
-    }
+/// Create the `MERGE_AUTOSTASH` autostash before a merge that may touch the dirty working tree.
+///
+/// Snapshots the dirty index/worktree as a stash commit (recorded under `.git/MERGE_AUTOSTASH`),
+/// then resets the index and working tree hard to HEAD so the merge starts from a clean state —
+/// matching git's `create_autostash_ref(the_repository, "MERGE_AUTOSTASH")`.
+fn create_merge_autostash(repo: &Repository) -> Result<()> {
+    crate::commands::stash::create_autostash_ref(repo, MERGE_AUTOSTASH_REF)?;
     Ok(())
+}
+
+/// Apply the pending `MERGE_AUTOSTASH` (git `apply_autostash_ref`): re-apply the stashed local
+/// delta on top of the merge result, print `Applied autostash.` (or, on conflict, store it back
+/// to the stash and print `Applying autostash resulted in conflicts.`), and clear the ref.
+fn apply_merge_autostash(repo: &Repository) -> Result<()> {
+    crate::commands::stash::apply_autostash_ref(repo, MERGE_AUTOSTASH_REF)
+}
+
+/// Save the pending `MERGE_AUTOSTASH` to `refs/stash` without applying it (git
+/// `save_autostash_ref`), used when an in-progress autostash merge is aborted/quit/reset.
+fn save_merge_autostash(repo: &Repository) -> Result<()> {
+    crate::commands::stash::save_autostash_ref(repo, MERGE_AUTOSTASH_REF)
+}
+
+/// Whether the effective merge message cleanup mode is `scissors`.
+///
+/// Mirrors git's `get_cleanup_mode(cleanup_arg, 1)` evaluated *as if editing* (the conflict
+/// hint always uses the editor cleanup mode even with `--no-edit`, so a follow-up `git commit`
+/// sees the scissors block — see builtin/merge.c:suggest_conflicts comment).
+fn merge_cleanup_is_scissors(args: &Args, repo: &Repository) -> bool {
+    if let Some(c) = args.cleanup.as_deref() {
+        return c == "scissors";
+    }
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    config
+        .get("commit.cleanup")
+        .map(|v| v.trim() == "scissors")
+        .unwrap_or(false)
+}
+
+/// Append git's conflict hint to a MERGE_MSG/SQUASH_MSG body, matching
+/// `append_conflicts_hint` (sequencer.c). With scissors cleanup the cut line and its
+/// explanation precede the `# Conflicts:` list; the comment prefix is `#`.
+fn append_merge_conflicts_hint(msg: &mut String, paths: &[String], scissors: bool) {
+    if scissors {
+        msg.push('\n');
+        msg.push_str("# ------------------------ >8 ------------------------\n");
+        msg.push_str("# Do not modify or remove the line above.\n");
+        msg.push_str("# Everything below it will be ignored.\n");
+        msg.push('#');
+    }
+    msg.push('\n');
+    msg.push_str("# Conflicts:\n");
+    for path in paths {
+        msg.push_str(&format!("#\t{path}\n"));
+    }
 }
 
 /// Build the default merge commit message.
@@ -8853,6 +9325,34 @@ fn finalize_merge_commit_message(msg: String, config: &ConfigSet) -> MergeCommit
     }
 }
 
+/// If `spec` is `<base>^^^...` or `<base>~<number>`, return `(base, is_early)` where `is_early`
+/// is true for the ancestor expressions git marks "(early part)" — any trailing `^`, a bare
+/// `name~` (== `name~1`), or `name~<nonzero>`. `name~0` returns `is_early == false`.
+/// Mirrors git's `merge_name` suffix detection (builtin/merge.c).
+fn early_part_branch_base(spec: &str) -> Option<(&str, bool)> {
+    // Trailing carets: `name^`, `name^^`, ...
+    let caret_trim = spec.trim_end_matches('^');
+    if caret_trim.len() < spec.len() && !caret_trim.is_empty() {
+        return Some((caret_trim, true));
+    }
+    // `name~<number>` (including bare `name~` == `name~1`).
+    if let Some(pos) = spec.rfind('~') {
+        let (base, rest) = spec.split_at(pos);
+        let digits = &rest[1..];
+        if base.is_empty() {
+            return None;
+        }
+        if digits.is_empty() {
+            return Some((base, true)); // "name~" == "name~1"
+        }
+        if digits.chars().all(|c| c.is_ascii_digit()) {
+            let seen_nonzero = digits.chars().any(|c| c != '0');
+            return Some((base, seen_nonzero));
+        }
+    }
+    None
+}
+
 fn build_merge_message(
     head: &HeadState,
     branch_name: &str,
@@ -8889,11 +9389,34 @@ fn build_merge_message(
     } else {
         branch_name.to_string()
     };
+    // `<branch>~<n>` / `<branch>^...` early-part merges: when the suffix-stripped base names a
+    // local branch, git emits `Merge branch '<base>' (early part)` (builtin/merge.c merge_name).
+    // Otherwise (e.g. a tag base) it falls through to the `commit '<full spec>'` form below.
+    if let Some((base, is_early)) = early_part_branch_base(&display_branch) {
+        if resolve_ref(&repo.git_dir, &format!("refs/heads/{base}")).is_ok() {
+            let suffix = if is_early { " (early part)" } else { "" };
+            let base_msg = format!("Merge branch '{base}'{suffix}");
+            let msg = match head.branch_name() {
+                Some(name) if name != "main" && name != "master" => {
+                    format!("{base_msg} into {name}")
+                }
+                _ => base_msg,
+            };
+            return ensure_trailing_newline(&msg);
+        }
+    }
     // Determine if the merge target is a tag, branch, or commit
     let kind = if resolve_ref(&repo.git_dir, &format!("refs/tags/{display_branch}")).is_ok() {
         "tag"
     } else if resolve_ref(&repo.git_dir, &format!("refs/remotes/{display_branch}")).is_ok() {
         "remote-tracking branch"
+    } else if resolve_ref(&repo.git_dir, &format!("refs/heads/{display_branch}")).is_ok() {
+        "branch"
+    } else if display_branch.contains(['~', '^', ':', '@'])
+        || (display_branch.len() >= 4 && display_branch.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        // A revision expression / object id that is not a plain ref: `Merge commit '<spec>'`.
+        "commit"
     } else {
         "branch"
     };
