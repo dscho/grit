@@ -2033,13 +2033,66 @@ fn wt_auto(repo: &Repository, cfg: &ConfigSet) -> bool {
     if lim <= 0 {
         return lim < 0;
     }
+    let expire_spec = cfg
+        .get("gc.worktreePruneExpire")
+        .unwrap_or_else(|| "3.months.ago".into());
+    let expire = grit_lib::git_date::approx::approxidate_careful(&expire_spec, None) as i64;
     let wt = repo.git_dir.join("worktrees");
-    if !wt.is_dir() {
+    let Ok(rd) = fs::read_dir(&wt) else {
+        return false;
+    };
+    let mut prunable = 0i32;
+    for e in rd.flatten() {
+        if should_prune_worktree(&e.path(), expire) {
+            prunable += 1;
+            if prunable >= lim {
+                return true;
+            }
+        }
+    }
+    prunable >= lim
+}
+
+/// Reduced port of git's `should_prune_worktree`: a registered worktree is
+/// prunable when its admin dir is invalid, locked-free and its working `.git`
+/// pointer is gone, with the `index` mtime older than `expire`.
+fn should_prune_worktree(wt_dir: &Path, expire: i64) -> bool {
+    if !wt_dir.is_dir() {
+        return true;
+    }
+    if wt_dir.join("locked").exists() {
         return false;
     }
-    fs::read_dir(&wt)
-        .map(|d| d.count() >= lim as usize)
-        .unwrap_or(false)
+    let gitdir_file = wt_dir.join("gitdir");
+    let Ok(contents) = fs::read_to_string(&gitdir_file) else {
+        // gitdir file missing => prunable.
+        return true;
+    };
+    let pointer = contents.trim();
+    if pointer.is_empty() {
+        return true;
+    }
+    let dotgit = if Path::new(pointer).is_absolute() {
+        PathBuf::from(pointer)
+    } else {
+        wt_dir.join(pointer)
+    };
+    if dotgit.exists() {
+        // Working tree still present: not prunable.
+        return false;
+    }
+    // Working `.git` pointer gone: prunable only once the worktree index is
+    // older than the expiry (or absent).
+    match fs::metadata(wt_dir.join("index")).and_then(|m| m.modified()) {
+        Ok(mtime) => {
+            let secs = mtime
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            secs <= expire
+        }
+        Err(_) => true,
+    }
 }
 
 fn rerere_auto(repo: &Repository, cfg: &ConfigSet) -> bool {
