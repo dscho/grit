@@ -2912,7 +2912,42 @@ fn preprocess_config_argv(rest: &[String]) -> Vec<String> {
 }
 
 fn preprocess_sparse_checkout_argv(rest: &[String]) -> Vec<String> {
-    if rest.first().map(|s| s.as_str()) != Some("set") {
+    // Match Git's "unknown option" wording (exit 129) for mistyped flags on `set`/`add`,
+    // instead of clap's "unexpected argument" text (t1091 'error on mistyped command line
+    // options').
+    let sub = rest.first().map(|s| s.as_str());
+    let known: Option<&[&str]> = match sub {
+        Some("set") => Some(&[
+            "--cone",
+            "--no-cone",
+            "--sparse-index",
+            "--no-sparse-index",
+            "--skip-checks",
+            "--stdin",
+            "--end-of-options",
+        ]),
+        Some("add") => Some(&["--skip-checks", "--stdin", "--end-of-options"]),
+        _ => None,
+    };
+    if let Some(known) = known {
+        for a in &rest[1..] {
+            if a == "--" {
+                break;
+            }
+            if a.starts_with("--") && a.len() > 2 {
+                let opt = a.split_once('=').map(|(o, _)| o).unwrap_or(a.as_str());
+                if !known.contains(&opt) {
+                    eprintln!("error: unknown option `{}'", opt.trim_start_matches('-'));
+                    std::process::exit(129);
+                }
+            } else if !a.starts_with('-') {
+                // First positional ends option scanning.
+                break;
+            }
+        }
+    }
+
+    if sub != Some("set") {
         return rest.to_vec();
     }
     const SET_FLAGS: &[&str] = &[

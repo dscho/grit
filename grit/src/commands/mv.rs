@@ -8,6 +8,7 @@ use clap::Args as ClapArgs;
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::diff::worktree_differs_from_index_entry;
 use grit_lib::error::Error;
+use grit_lib::ignore::path_in_sparse_checkout as path_in_sparse_checkout_lines;
 use grit_lib::index::{Index, MODE_GITLINK};
 use grit_lib::objects::ObjectKind;
 use grit_lib::odb::Odb;
@@ -82,6 +83,21 @@ struct MoveRow {
     index_only: bool,
     /// Source was skip-worktree (sparse) before the move.
     sparse_source: bool,
+}
+
+/// Whether `path` is inside the sparse-checkout, mirroring Git's `path_in_sparse_checkout`.
+///
+/// In cone mode the expanded-cone prefix rules apply (`path_in_sparse_checkout_patterns`).
+/// In non-cone mode Git walks each parent directory with last-match-wins, tri-state
+/// (`UNDECIDED` → check parent) semantics so a pattern like `!x/y/z` excludes `x/y/z/new-a`
+/// and an unanchored `y/` matches a `y` directory at any depth (t7002 #8, #9). Routing
+/// through `grit_lib::ignore::path_in_sparse_checkout` reproduces that exactly.
+fn path_in_sparse(path: &str, patterns: &[String], cone_cfg: bool) -> bool {
+    if cone_cfg {
+        path_in_sparse_checkout_patterns(path, patterns, true)
+    } else {
+        path_in_sparse_checkout_lines(path, patterns, None)
+    }
 }
 
 /// Run the `mv` command.
@@ -293,11 +309,11 @@ pub fn run(args: Args) -> Result<()> {
         if !args.sparse && sparse_enabled {
             let mut blocked = false;
             for (fsrc, fdst) in &sparse_path_pairs {
-                if !path_in_sparse_checkout_patterns(fsrc, &sparse_patterns, cone_cfg) {
+                if !path_in_sparse(fsrc, &sparse_patterns, cone_cfg) {
                     sparse_blocklist.push(fsrc.clone());
                     blocked = true;
                 }
-                if !path_in_sparse_checkout_patterns(fdst, &sparse_patterns, cone_cfg) {
+                if !path_in_sparse(fdst, &sparse_patterns, cone_cfg) {
                     sparse_blocklist.push(fdst.clone());
                     blocked = true;
                 }
@@ -324,7 +340,7 @@ pub fn run(args: Args) -> Result<()> {
                     {
                         if !args.force {
                             let msg = format!(
-                                "destination exists, source='{src_rel}', destination='{dst_rel}'"
+                                "fatal: destination exists, source={src_rel}, destination={dst_rel}"
                             );
                             if args.skip_errors {
                                 continue;
@@ -333,7 +349,7 @@ pub fn run(args: Args) -> Result<()> {
                         }
                         if dst_abs.is_dir() {
                             let msg = format!(
-                                "Cannot overwrite, source='{src_rel}', destination='{dst_rel}'"
+                                "fatal: Cannot overwrite, source={src_rel}, destination={dst_rel}"
                             );
                             if args.skip_errors {
                                 continue;
@@ -365,6 +381,14 @@ pub fn run(args: Args) -> Result<()> {
                         continue;
                     }
                     bail!("{msg}");
+                }
+                if let Some((cs, cd)) =
+                    first_index_collision(&expanded, &index, args.sparse, dst_mode, args.force)
+                {
+                    if args.skip_errors {
+                        continue;
+                    }
+                    bail!("fatal: destination exists in the index, source={cs}, destination={cd}");
                 }
                 moved_dir_roots.insert(index_src_rel.clone());
                 rows.push(MoveRow {
@@ -412,6 +436,14 @@ pub fn run(args: Args) -> Result<()> {
                     }
                     bail!("{msg}");
                 }
+                if let Some((cs, cd)) =
+                    first_index_collision(&expanded, &index, args.sparse, dst_mode, args.force)
+                {
+                    if args.skip_errors {
+                        continue;
+                    }
+                    bail!("fatal: destination exists in the index, source={cs}, destination={cd}");
+                }
                 moved_dir_roots.insert(index_src_rel.clone());
                 rows.push(MoveRow {
                     src: index_src_rel.clone(),
@@ -438,7 +470,7 @@ pub fn run(args: Args) -> Result<()> {
                 let ce = &index.entries[p];
                 if !ce.skip_worktree() {
                     let msg = format!(
-                        "not under version control, source='{src_rel}', destination='{dst_rel}'"
+                        "fatal: not under version control, source={src_rel}, destination={dst_rel}"
                     );
                     if args.skip_errors {
                         continue;
@@ -452,8 +484,9 @@ pub fn run(args: Args) -> Result<()> {
                 if index.get(dst_rel.as_bytes(), 0).is_none() {
                     sparse_source = true;
                 } else if !args.force {
-                    let msg =
-                        format!("destination exists, source='{src_rel}', destination='{dst_rel}'");
+                    let msg = format!(
+                        "fatal: destination exists, source={src_rel}, destination={dst_rel}"
+                    );
                     if args.skip_errors {
                         continue;
                     }
@@ -463,7 +496,7 @@ pub fn run(args: Args) -> Result<()> {
                 }
             } else {
                 let msg = format!(
-                    "not under version control, source='{src_rel}', destination='{dst_rel}'"
+                    "fatal: not under version control, source={src_rel}, destination={dst_rel}"
                 );
                 if args.skip_errors {
                     continue;
@@ -478,7 +511,7 @@ pub fn run(args: Args) -> Result<()> {
                     == precompose_utf8_path(&index_src_rel).as_ref()
         });
         if has_conflict {
-            let msg = format!("conflicted, source='{src_rel}', destination='{dst_rel}'");
+            let msg = format!("fatal: conflicted, source={src_rel}, destination={dst_rel}");
             if args.skip_errors {
                 continue;
             }
@@ -487,8 +520,9 @@ pub fn run(args: Args) -> Result<()> {
 
         let stage0 = index.get(index_src_rel.as_bytes(), 0);
         if stage0.is_none() && !src_abs.is_dir() {
-            let msg =
-                format!("not under version control, source='{src_rel}', destination='{dst_rel}'");
+            let msg = format!(
+                "fatal: not under version control, source={src_rel}, destination={dst_rel}"
+            );
             if args.skip_errors {
                 continue;
             }
@@ -504,7 +538,7 @@ pub fn run(args: Args) -> Result<()> {
             && !args.force
         {
             let msg = format!(
-                "destination exists in the index, source='{src_rel}', destination='{dst_rel}'"
+                "fatal: destination exists in the index, source={src_rel}, destination={dst_rel}"
             );
             if args.skip_errors {
                 continue;
@@ -514,7 +548,7 @@ pub fn run(args: Args) -> Result<()> {
 
         if index_src_rel == dst_rel {
             let msg = format!(
-                "source and destination are the same, source='{src_rel}', destination='{dst_rel}'"
+                "fatal: source and destination are the same, source={src_rel}, destination={dst_rel}"
             );
             if args.skip_errors {
                 continue;
@@ -533,14 +567,15 @@ pub fn run(args: Args) -> Result<()> {
         {
             if !args.force {
                 let msg =
-                    format!("destination exists, source='{src_rel}', destination='{dst_rel}'");
+                    format!("fatal: destination exists, source={src_rel}, destination={dst_rel}");
                 if args.skip_errors {
                     continue;
                 }
                 bail!("{msg}");
             }
             if dst_abs.is_dir() {
-                let msg = format!("Cannot overwrite, source='{src_rel}', destination='{dst_rel}'");
+                let msg =
+                    format!("fatal: Cannot overwrite, source={src_rel}, destination={dst_rel}");
                 if args.skip_errors {
                     continue;
                 }
@@ -565,8 +600,9 @@ pub fn run(args: Args) -> Result<()> {
         });
     }
 
-    sparse_blocklist.sort();
-    sparse_blocklist.dedup();
+    // Match Git's `only_match_skip_worktree` (STRING_LIST_INIT_DUP, `string_list_append`):
+    // paths are listed in insertion order — for each blocked move, src then dst — with no
+    // sorting or de-duplication. See git/builtin/mv.c and git/advice.c.
     if !sparse_blocklist.is_empty() {
         emit_sparse_path_advice(&mut std::io::stderr(), &config, &sparse_blocklist)?;
         if !args.skip_errors {
@@ -755,6 +791,30 @@ pub fn run(args: Args) -> Result<()> {
     dirty_advice.dedup();
     if !dirty_advice.is_empty() {
         emit_dirty_sparse_advice(&mut std::io::stderr(), &config, &dirty_advice)?;
+    }
+
+    // Git's `remove_empty_src_dirs`: after moving a whole directory, if no index entries remain
+    // under the source directory, remove it from the worktree recursively (clearing any leftover
+    // untracked empty subdirs like `sub/dir/deep`). See git/builtin/mv.c:625,171. We only do this
+    // for sources where the on-disk directory still exists (sparse moves remove tracked files in
+    // place rather than renaming the directory).
+    if !args.dry_run {
+        for root in &moved_dir_roots {
+            let prefix_nfc = format!("{}/", precompose_utf8_path(root.trim_end_matches('/')));
+            let still_tracked = index.entries.iter().any(|e| {
+                e.stage() == 0
+                    && precompose_utf8_path(String::from_utf8_lossy(&e.path).as_ref())
+                        .as_ref()
+                        .starts_with(prefix_nfc.as_str())
+            });
+            if still_tracked {
+                continue;
+            }
+            let dir_abs = work_tree.join(root.trim_end_matches('/'));
+            if dir_abs.is_dir() {
+                let _ = fs::remove_dir_all(&dir_abs);
+            }
+        }
     }
 
     if !args.dry_run {
@@ -1041,6 +1101,33 @@ fn refresh_index_gitmodules(repo: &Repository, work_tree: &Path, index: &mut Ind
 ///
 /// Returns a list of `(old_index_path, new_index_path)` pairs for every file
 /// inside the directory.
+/// Find the first expanded (src, dst) pair whose destination already exists in the index.
+///
+/// Mirrors Git's per-entry `destination exists in the index` guard for directory moves into a
+/// `SKIP_WORKTREE_DIR` / `SPARSE` destination with `--sparse` and without `--force`
+/// (git/builtin/mv.c). The entries are walked in index order so the reported pair matches Git.
+fn first_index_collision(
+    expanded: &[(String, String)],
+    index: &Index,
+    sparse: bool,
+    dst_mode: DstSparseMode,
+    force: bool,
+) -> Option<(String, String)> {
+    if !sparse
+        || force
+        || !matches!(
+            dst_mode,
+            DstSparseMode::SkipWorktreeDir | DstSparseMode::SparseFile
+        )
+    {
+        return None;
+    }
+    expanded
+        .iter()
+        .find(|(_, fdst)| index.get(fdst.as_bytes(), 0).is_some())
+        .cloned()
+}
+
 fn expand_dir_sources(src_dir: &str, dst_dir: &str, index: &Index) -> Vec<(String, String)> {
     let src_key = precompose_utf8_path(src_dir.trim_end_matches('/'));
     let prefix_nfc = format!("{}/", src_key.as_ref());

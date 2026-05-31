@@ -15,9 +15,8 @@ use grit_lib::repo::Repository;
 use grit_lib::sparse_checkout::{
     build_expanded_cone_sparse_checkout_lines, cone_directory_inputs_for_add,
     effective_cone_mode_for_sparse_file, load_sparse_checkout_with_warnings,
-    parse_expanded_cone_recursive_dirs, parse_expanded_cone_user_directories,
-    path_in_sparse_checkout, sparse_checkout_lines_look_like_expanded_cone, ConePatterns,
-    ConeWorkspace, NonConePatterns,
+    parse_expanded_cone_recursive_dirs, path_in_sparse_checkout, ConePatterns, ConeWorkspace,
+    NonConePatterns,
 };
 use grit_lib::state::resolve_head;
 use std::collections::{BTreeSet, HashSet};
@@ -528,11 +527,9 @@ fn cmd_add(repo: &Repository, args: &AddArgs) -> Result<()> {
     let _lock = acquire_sparse_lock(repo)?;
     let result = (|| {
         if cone {
-            let content = read_sparse_file_content(repo);
-            if ConePatterns::try_parse(&content).is_none() {
-                bail!("existing sparse-checkout patterns do not use cone mode");
-            }
-            let mut dirs = cone_directory_inputs_for_add(&content);
+            // Sanitize first (Git `sanitize_paths` runs before `modify_pattern_list`): a tracked
+            // regular file argument like `.gitignore` must die "is not a directory" even when the
+            // existing on-disk file is not cone-formatted (t1091 test 59).
             let inputs = if args.stdin {
                 let stdin = io::stdin();
                 let mut stdin = stdin.lock();
@@ -542,6 +539,11 @@ fn cmd_add(repo: &Repository, args: &AddArgs) -> Result<()> {
                 sanitize_add_paths(repo, worktree_prefix(repo)?, args.skip_checks, &mut p)?;
                 p
             };
+            let content = read_sparse_file_content(repo);
+            if ConePatterns::try_parse(&content).is_none() {
+                bail!("existing sparse-checkout patterns do not use cone mode");
+            }
+            let mut dirs = cone_directory_inputs_for_add(&content);
             for line in inputs {
                 let p = normalize_cone_input_line(&line)?;
                 if !args.skip_checks {
@@ -617,6 +619,7 @@ fn cmd_reapply(repo: &Repository, args: &ReapplyArgs) -> Result<()> {
     crate::commands::promisor_hydrate::hydrate_sparse_patterns_after_sparse_checkout_update(
         repo, &patterns, cone,
     )?;
+    warn_sparse_apply_side_effects(repo, &patterns, cone, true)?;
     apply_sparse_patterns(repo, &patterns, cone)?;
     Ok(())
 }
@@ -663,34 +666,50 @@ fn cmd_list(repo: &Repository) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    if cone_cfg && sparse_checkout_lines_look_like_expanded_cone(&lines) {
-        let mut dirs = parse_expanded_cone_user_directories(&lines);
-        if dirs.is_empty() {
-            dirs = parse_expanded_cone_recursive_dirs(&lines);
+    if cone_cfg {
+        // Match Git `sparse-checkout list`: parse the file in cone mode, printing any
+        // structural warnings (repeated / unrecognized patterns). When cone parsing fails,
+        // Git disables cone matching and lists the raw pattern lines verbatim.
+        let mut warnings = Vec::new();
+        let parsed = ConePatterns::try_parse_with_warnings(&content, &mut warnings);
+        for w in &warnings {
+            eprintln!("{w}");
         }
-        dirs.sort();
-        dirs.dedup();
-        for d in dirs {
-            writeln!(out, "{d}")?;
+        match parsed {
+            Some(cp) => {
+                // List the leaf (recursive) cone directories the user added — Git uses the
+                // recursive hashset (the `/dir/` lines with no trailing `!/dir/*/`).
+                let mut dirs = parse_expanded_cone_recursive_dirs(&lines);
+                if dirs.is_empty() {
+                    dirs = ConeWorkspace::from_cone_patterns(&cp).list_cone_directories();
+                }
+                dirs.sort();
+                dirs.dedup();
+                // Git `sparse-checkout list` C-quotes directory names that contain bytes needing
+                // escaping (backslash, control chars, …) so output round-trips with `ls-tree`.
+                let quote_fully = config
+                    .get("core.quotePath")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                for d in dirs {
+                    writeln!(
+                        out,
+                        "{}",
+                        grit_lib::quote_path::quote_c_style(&d, quote_fully)
+                    )?;
+                }
+            }
+            None => {
+                for line in &lines {
+                    writeln!(out, "{line}")?;
+                }
+            }
         }
         return Ok(());
     }
 
-    if cone_cfg {
-        if let Some(cp) = ConePatterns::try_parse(&content) {
-            let ws = ConeWorkspace::from_cone_patterns(&cp);
-            for d in ws.list_cone_directories() {
-                writeln!(out, "{d}")?;
-            }
-        } else {
-            for line in &lines {
-                writeln!(out, "{line}")?;
-            }
-        }
-    } else {
-        for line in &lines {
-            writeln!(out, "{line}")?;
-        }
+    for line in &lines {
+        writeln!(out, "{line}")?;
     }
     Ok(())
 }
@@ -710,25 +729,29 @@ fn cmd_disable(repo: &Repository) -> Result<()> {
 
     let patterns = vec!["/*".to_string()];
     warn_sparse_apply_side_effects(repo, &patterns, false, false)?;
-    apply_sparse_patterns(repo, &patterns, false)?;
+    apply_full_checkout(repo)?;
 
-    unset_sparse_keys_all_layers(repo)?;
+    // Git `set_config(MODE_NO_PATTERNS)`: record the sparse toggles as **false** in the worktree
+    // config (not unset). A later `sparse-checkout init` reads the recorded cone mode so a
+    // non-cone repo stays non-cone (t7817), and `index.sparse=false` is asserted directly (t1091).
+    set_sparse_config(repo, false)?;
+    set_cone_config(repo, false)?;
+    set_sparse_index_config(repo, false)?;
+    // Remove any stale keys recorded in the local (non-worktree) config layer so the worktree
+    // values win and `git config <key>` (default scope) reports them as absent (t1091 test 19).
+    clear_sparse_keys_local_layer(repo)?;
     Ok(())
 }
 
-fn unset_sparse_keys_all_layers(repo: &Repository) -> Result<()> {
-    for (path, scope) in [
-        (worktree_config_path(repo), ConfigScope::Worktree),
-        (repo.git_dir.join("config"), ConfigScope::Local),
-    ] {
-        if path.exists() {
-            let content = fs::read_to_string(&path).unwrap_or_default();
-            let mut cfg = ConfigFile::parse(&path, &content, scope)?;
-            let _ = cfg.unset("core.sparseCheckout");
-            let _ = cfg.unset("core.sparseCheckoutCone");
-            let _ = cfg.unset("index.sparse");
-            cfg.write()?;
-        }
+fn clear_sparse_keys_local_layer(repo: &Repository) -> Result<()> {
+    let path = repo.git_dir.join("config");
+    if path.exists() {
+        let content = fs::read_to_string(&path).unwrap_or_default();
+        let mut cfg = ConfigFile::parse(&path, &content, ConfigScope::Local)?;
+        let _ = cfg.unset("core.sparseCheckout");
+        let _ = cfg.unset("core.sparseCheckoutCone");
+        let _ = cfg.unset("index.sparse");
+        cfg.write()?;
     }
     Ok(())
 }
@@ -815,20 +838,147 @@ fn cmd_check_rules(repo: &Repository, args: &CheckRulesArgs) -> Result<()> {
             while line.last() == Some(&b'\n') || line.last() == Some(&b'\r') {
                 line.pop();
             }
-            let path = String::from_utf8_lossy(&line);
-            let path = path.as_ref();
+            let raw = String::from_utf8_lossy(&line);
+            // Git `check_rules`: C-unquote a `"`-quoted input line before matching, then re-quote
+            // the matched path on output via `write_name_quoted` (t1091 check-rules quoting).
+            let path = if raw.starts_with('"') {
+                unquote_c_style(raw.as_ref())?
+            } else {
+                raw.into_owned()
+            };
             if path_in_sparse_checkout(
-                path,
+                &path,
                 effective_cone,
                 cone_pat.as_ref(),
                 &non_cone,
                 repo.work_tree.as_deref(),
             ) {
-                writeln!(out, "{path}")?;
+                let quote_fully = config
+                    .get("core.quotePath")
+                    .map(|v| v != "false")
+                    .unwrap_or(true);
+                writeln!(
+                    out,
+                    "{}",
+                    grit_lib::quote_path::quote_c_style(&path, quote_fully)
+                )?;
             }
         }
     }
     Ok(())
+}
+
+/// Sparse directories `convert_to_sparse` would collapse: every stage-0 path under the directory
+/// is skip-worktree and the directory is entirely outside the cone. Unlike the sparse-*index*
+/// collapse this does not require entries to match HEAD (a staged out-of-cone edit still counts).
+/// Returns the shallowest such directories (so `folder2`, not `folder2/sub`).
+fn removable_sparse_directories(
+    index: &grit_lib::index::Index,
+    patterns: &[String],
+) -> Vec<String> {
+    let mut dir_state: BTreeSet<String> = BTreeSet::new();
+    let mut not_all_skip: HashSet<String> = HashSet::new();
+    for entry in &index.entries {
+        if entry.stage() != 0 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry.path);
+        let skip = entry.skip_worktree();
+        for (i, &b) in path.as_bytes().iter().enumerate() {
+            if b == b'/' {
+                let dir = path[..i].to_string();
+                if !skip {
+                    not_all_skip.insert(dir.clone());
+                }
+                dir_state.insert(dir);
+            }
+        }
+    }
+    let out_of_cone_dir = |dir: &str| -> bool {
+        let with_slash = format!("{}/", dir.trim_end_matches('/'));
+        !grit_lib::sparse_checkout::path_matches_sparse_patterns(&with_slash, patterns, true)
+    };
+    let mut removable: Vec<String> = dir_state
+        .into_iter()
+        .filter(|dir| !not_all_skip.contains(dir) && out_of_cone_dir(dir))
+        .collect();
+    removable.sort();
+    let mut shallow: Vec<String> = Vec::new();
+    for dir in removable {
+        if shallow
+            .iter()
+            .any(|p| dir == *p || dir.starts_with(&format!("{p}/")))
+        {
+            continue;
+        }
+        shallow.push(dir);
+    }
+    shallow
+}
+
+/// Whether a sparse directory holds a *non-ignored* untracked file on disk (recursively). Git's
+/// `clean_tracked_sparse_directories` uses `fill_directory` (which excludes gitignored paths), so a
+/// directory whose only contents are gitignored files is still removable.
+fn dir_has_unignored_file(
+    repo: &Repository,
+    matcher: &mut grit_lib::ignore::IgnoreMatcher,
+    index: Option<&grit_lib::index::Index>,
+    work_tree: &Path,
+    dir: &Path,
+) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for ent in rd.flatten() {
+        let Ok(meta) = ent.metadata() else { continue };
+        let path = ent.path();
+        let rel = normalize_rel_path(path.strip_prefix(work_tree).unwrap_or(&path));
+        let ignored = matcher
+            .check_path(repo, index, &rel, meta.is_dir())
+            .map(|(i, _)| i)
+            .unwrap_or(false);
+        if ignored {
+            // An ignored directory (and everything under it) is removable; an ignored file too.
+            continue;
+        }
+        if meta.is_dir() {
+            if dir_has_unignored_file(repo, matcher, index, work_tree, &path) {
+                return true;
+            }
+        } else {
+            return true;
+        }
+    }
+    false
+}
+
+/// Git `clean_tracked_sparse_directories`: after applying sparse patterns, remove the now
+/// out-of-cone sparse directories that hold only tracked/ignored content, and warn about those
+/// that still contain non-ignored untracked files (t1091 'cone mode clears ignored subdirectories'
+/// / 'clean with sparse file states').
+fn clean_tracked_sparse_directories(
+    repo: &Repository,
+    work_tree: &Path,
+    index: &grit_lib::index::Index,
+    patterns: &[String],
+) {
+    let mut matcher = match grit_lib::ignore::IgnoreMatcher::from_repository(repo) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    for name in removable_sparse_directories(index, patterns) {
+        let full = work_tree.join(&name);
+        if !full.is_dir() {
+            continue;
+        }
+        if dir_has_unignored_file(repo, &mut matcher, Some(index), work_tree, &full) {
+            eprintln!(
+                "warning: directory '{name}/' contains untracked files, but is not in the sparse-checkout cone"
+            );
+        } else {
+            let _ = fs::remove_dir_all(&full);
+        }
+    }
 }
 
 fn cmd_clean(repo: &Repository, args: &CleanArgs) -> Result<()> {
@@ -862,18 +1012,28 @@ fn cmd_clean(repo: &Repository, args: &CleanArgs) -> Result<()> {
     }
 
     let index_path = repo.index_path();
-    let index = repo.load_index_at(&index_path).context("reading index")?;
+    let mut index = repo.load_index_at(&index_path).context("reading index")?;
+
+    // Git `sparse_checkout_clean`: convert the index to a sparse index in memory and remove the
+    // sparse-directory placeholders. Unmerged entries block the conversion, mirroring
+    // `convert_to_sparse` failing (t1091 'operations with merge conflicts').
+    if index.entries.iter().any(|e| e.stage() != 0) {
+        bail!("failed to convert index to a sparse index; resolve merge conflicts and try again");
+    }
+    if index.has_sparse_directory_placeholders() {
+        index
+            .expand_sparse_directory_placeholders(&repo.odb)
+            .context("expanding sparse index before clean")?;
+    }
+    let patterns = read_sparse_patterns(repo)?;
+    let placeholders = removable_sparse_directories(&index, &patterns);
 
     let msg_remove = "Removing ";
     let msg_would = "Would remove ";
     let msg = if args.dry_run { msg_would } else { msg_remove };
 
-    for entry in &index.entries {
-        if entry.mode != MODE_TREE || !entry.is_sparse_directory_placeholder() {
-            continue;
-        }
-        let path_str = String::from_utf8_lossy(&entry.path);
-        let full = work_tree.join(path_str.as_ref());
+    for name in placeholders {
+        let full = work_tree.join(&name);
         if !full.is_dir() {
             continue;
         }
@@ -882,7 +1042,7 @@ fn cmd_clean(repo: &Repository, args: &CleanArgs) -> Result<()> {
                 writeln!(io::stdout(), "{msg}{rel}")?;
             }
         } else {
-            writeln!(io::stdout(), "{msg}{path_str}/")?;
+            writeln!(io::stdout(), "{msg}{name}/")?;
         }
         if !args.dry_run {
             let _ = fs::remove_dir_all(&full);
@@ -918,6 +1078,11 @@ fn sanitize_set_paths(
     skip_checks: bool,
     args: &mut Vec<String>,
 ) -> Result<()> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    // Mirrors Git `sanitize_paths` (builtin/sparse-checkout.c). Prefix-prepend only happens in
+    // cone mode (args are not pathspecs).
     if !prefix.is_empty() && cone {
         for a in args.iter_mut() {
             if let Some(p) =
@@ -926,6 +1091,9 @@ fn sanitize_set_paths(
                 *a = p;
             }
         }
+    }
+    if skip_checks {
+        return Ok(());
     }
     if !prefix.is_empty() && !cone {
         bail!("please run from the toplevel directory in non-cone mode");
@@ -943,9 +1111,9 @@ fn sanitize_set_paths(
             }
         }
     }
-    if !skip_checks {
-        validate_cone_patterns(repo, args)?;
-    }
+    // Index file-check: a tracked, non-sparse-dir entry is a regular file. Cone mode rejects it;
+    // non-cone mode warns about the missing leading slash (Git `sanitize_paths`).
+    check_tracked_file_args(repo, cone, args)?;
     Ok(())
 }
 
@@ -1031,6 +1199,13 @@ fn cone_patterns_are_all_tracked_files(repo: &Repository, patterns: &[String]) -
 }
 
 fn validate_cone_patterns(repo: &Repository, patterns: &[String]) -> Result<()> {
+    check_tracked_file_args(repo, true, patterns)
+}
+
+/// Git `sanitize_paths` index file-check: for each arg that is a tracked, non-sparse-dir index
+/// entry (i.e. a regular file), cone mode dies "is not a directory" while non-cone mode warns
+/// to use a leading slash for a single file (t1091).
+fn check_tracked_file_args(repo: &Repository, cone: bool, patterns: &[String]) -> Result<()> {
     let index_path = repo.index_path();
     let index =
         grit_lib::index::Index::load(&index_path).context("reading index for validation")?;
@@ -1043,15 +1218,16 @@ fn validate_cone_patterns(repo: &Repository, patterns: &[String]) -> Result<()> 
             if ce.is_sparse_directory_placeholder() {
                 continue;
             }
-            // Harness / sparse-checkout tests use `git sparse-checkout set a` where `a` is a
-            // tracked file; Git accepts this as a recursive cone directory name. Allow any
-            // single-segment path that is a non-tree index entry.
-            if !p.contains('/') && ce.mode != MODE_TREE {
-                continue;
+            if cone {
+                // A tracked, non-tree index entry is a regular file. Git's cone-mode set/add
+                // rejects files; pass --skip-checks to treat it as a directory anyway.
+                bail!(
+                    "'{}' is not a directory; to treat it as a directory anyway, rerun with --skip-checks",
+                    p
+                );
             }
-            bail!(
-                "'{}' is not a directory; to treat it as a directory anyway, rerun with --skip-checks",
-                p
+            eprintln!(
+                "warning: pass a leading slash before paths such as '{p}' if you want a single file (see NON-CONE PROBLEMS in the git-sparse-checkout manual)."
             );
         }
         // No exact index entry: allowed (matches Git `sanitize_paths` / `index_name_pos`).
@@ -1123,22 +1299,22 @@ fn path_included_for_sparse_apply(
     }
 }
 
-/// Warn about worktree paths Git leaves when applying sparse patterns (`unpack-trees` / t1091).
-fn warn_sparse_apply_side_effects(
+/// Excluded paths Git leaves on disk when applying sparse patterns: unmerged entries and
+/// not-up-to-date entries (on-disk content differs from the indexed OID). These are reported as
+/// warnings and must NOT be removed / marked skip-worktree (`unpack-trees` `verify_uptodate` /
+/// t1091 tests 27, 31, 32).
+struct SparseSideEffects {
+    unmerged: BTreeSet<String>,
+    not_uptodate: BTreeSet<String>,
+}
+
+fn compute_sparse_side_effect_paths(
     repo: &Repository,
+    index: &grit_lib::index::Index,
     patterns: &[String],
     cone_mode: bool,
-    warn_not_uptodate: bool,
-) -> Result<()> {
-    let Some(work_tree) = repo.work_tree.as_deref() else {
-        return Ok(());
-    };
-    if !repo.index_path().exists() {
-        return Ok(());
-    }
-    let index = repo
-        .load_index()
-        .context("reading index for sparse warnings")?;
+) -> SparseSideEffects {
+    let work_tree = repo.work_tree.as_deref();
     let file_content = read_sparse_file_content(repo);
     let cone_struct = if effective_cone_mode_for_sparse_file(cone_mode, patterns) {
         ConePatterns::try_parse(&file_content)
@@ -1153,56 +1329,80 @@ fn warn_sparse_apply_side_effects(
             unmerged.insert(String::from_utf8_lossy(&entry.path).into_owned());
         }
     }
-    if !unmerged.is_empty() {
+
+    let mut not_uptodate = BTreeSet::new();
+    if let Some(work_tree) = work_tree {
+        for entry in &index.entries {
+            if entry.stage() != 0 || entry.mode == MODE_TREE {
+                continue;
+            }
+            let path_str = String::from_utf8_lossy(&entry.path);
+            // A path being excluded by the new patterns is what matters; the current skip-worktree
+            // bit is irrelevant (a second sparse op over an already-excluded dirty file must still
+            // warn, t1091 test 31).
+            if path_included_for_sparse_apply(
+                path_str.as_ref(),
+                patterns,
+                cone_mode,
+                &file_content,
+                cone_struct.as_ref(),
+                &non_cone,
+                Some(work_tree),
+            ) {
+                continue;
+            }
+            let full = work_tree.join(path_str.as_ref());
+            let Ok(meta) = fs::symlink_metadata(&full) else {
+                continue;
+            };
+            if !meta.is_file() && !meta.file_type().is_symlink() {
+                continue;
+            }
+            let differs = match (repo.odb.read(&entry.oid), fs::read(&full)) {
+                (Ok(obj), Ok(disk)) => obj.data != disk,
+                _ => true,
+            };
+            if differs {
+                not_uptodate.insert(path_str.into_owned());
+            }
+        }
+    }
+
+    SparseSideEffects {
+        unmerged,
+        not_uptodate,
+    }
+}
+
+/// Warn about worktree paths Git leaves when applying sparse patterns (`unpack-trees` / t1091).
+fn warn_sparse_apply_side_effects(
+    repo: &Repository,
+    patterns: &[String],
+    cone_mode: bool,
+    warn_not_uptodate: bool,
+) -> Result<()> {
+    if repo.work_tree.is_none() || !repo.index_path().exists() {
+        return Ok(());
+    }
+    let index = repo
+        .load_index()
+        .context("reading index for sparse warnings")?;
+    let effects = compute_sparse_side_effect_paths(repo, &index, patterns, cone_mode);
+
+    if !effects.unmerged.is_empty() {
         eprintln!(
             "warning: The following paths are unmerged and were left despite sparse patterns:"
         );
-        for path in &unmerged {
+        for path in &effects.unmerged {
             eprintln!("{path}");
         }
     }
 
-    if !warn_not_uptodate {
-        return Ok(());
-    }
-
-    let mut not_uptodate = BTreeSet::new();
-    for entry in &index.entries {
-        if entry.stage() != 0 || entry.mode == MODE_TREE || entry.skip_worktree() {
-            continue;
-        }
-        let path_str = String::from_utf8_lossy(&entry.path);
-        if path_included_for_sparse_apply(
-            path_str.as_ref(),
-            patterns,
-            cone_mode,
-            &file_content,
-            cone_struct.as_ref(),
-            &non_cone,
-            Some(work_tree),
-        ) {
-            continue;
-        }
-        let full = work_tree.join(path_str.as_ref());
-        let Ok(meta) = fs::symlink_metadata(&full) else {
-            continue;
-        };
-        if !meta.is_file() && !meta.file_type().is_symlink() {
-            continue;
-        }
-        let differs = match (repo.odb.read(&entry.oid), fs::read(&full)) {
-            (Ok(obj), Ok(disk)) => obj.data != disk,
-            _ => true,
-        };
-        if differs {
-            not_uptodate.insert(path_str.into_owned());
-        }
-    }
-    if !not_uptodate.is_empty() {
+    if warn_not_uptodate && !effects.not_uptodate.is_empty() {
         eprintln!(
             "warning: The following paths are not up to date and were left despite sparse patterns:"
         );
-        for path in &not_uptodate {
+        for path in &effects.not_uptodate {
             eprintln!("{path}");
         }
     }
@@ -1210,6 +1410,21 @@ fn warn_sparse_apply_side_effects(
 }
 
 fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool) -> Result<()> {
+    apply_sparse_patterns_inner(repo, patterns, cone_mode, false)
+}
+
+/// Expand the whole worktree to a full checkout (Git `sparse-checkout disable`): clear every
+/// skip-worktree bit, materialize all blobs, and never re-collapse the index.
+fn apply_full_checkout(repo: &Repository) -> Result<()> {
+    apply_sparse_patterns_inner(repo, &["/*".to_string()], false, true)
+}
+
+fn apply_sparse_patterns_inner(
+    repo: &Repository,
+    patterns: &[String],
+    cone_mode: bool,
+    force_include_all: bool,
+) -> Result<()> {
     let work_tree = repo
         .work_tree
         .as_deref()
@@ -1239,6 +1454,16 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         index.version = 3;
     }
 
+    // A sparse index collapses out-of-cone directories into MODE_TREE placeholders. To re-apply
+    // patterns per file (clear skip-worktree, materialize blobs) we must first expand those
+    // placeholders to a full index, otherwise widening the cone (e.g. `disable`) never writes the
+    // collapsed directories' files to disk (t1091 'sparse-checkout disable').
+    if index.has_sparse_directory_placeholders() {
+        index
+            .expand_sparse_directory_placeholders(&repo.odb)
+            .context("expanding sparse index before applying patterns")?;
+    }
+
     let file_content = read_sparse_file_content(repo);
     let expanded_cone_shape = effective_cone_mode_for_sparse_file(cone_mode, patterns);
     let cone_struct = if expanded_cone_shape {
@@ -1249,6 +1474,20 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
     let effective_cone = expanded_cone_shape && cone_struct.is_some();
     let non_cone = NonConePatterns::from_lines(patterns.to_vec());
 
+    // Git's `unpack-trees` refuses to drop not-up-to-date / unmerged paths (`verify_uptodate`).
+    // Keep those excluded files on disk (do not clear/remove) so sparsifying never destroys local
+    // edits — only warn (t1091 tests 27, 31, 32). A full checkout includes everything anyway.
+    let protected: HashSet<String> = if force_include_all {
+        HashSet::new()
+    } else {
+        let effects = compute_sparse_side_effect_paths(repo, &index, patterns, cone_mode);
+        effects
+            .not_uptodate
+            .into_iter()
+            .chain(effects.unmerged)
+            .collect()
+    };
+
     for entry in &mut index.entries {
         if entry.mode == MODE_TREE {
             continue;
@@ -1256,7 +1495,9 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         let path_str = String::from_utf8_lossy(&entry.path).to_string();
         // Non-cone mode must use Git's `path_in_sparse_checkout` (parent walk + last-match),
         // not `NonConePatterns::path_included` (sequential toggles). See t3602-rm-sparse-checkout.
-        let matches = if effective_cone {
+        let matches = if force_include_all {
+            true
+        } else if effective_cone {
             path_in_sparse_checkout(
                 &path_str,
                 true,
@@ -1295,7 +1536,23 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
                         let _ = fs::write(&full_path, &data);
                     }
                 }
+                // Refresh the cached stat data so subsequent stat-only comparisons
+                // (diff-files, status) see the materialized file as up to date rather
+                // than reporting a spurious modification. Mirrors checkout's stat-fill.
+                if let Ok(meta) = fs::symlink_metadata(&full_path) {
+                    use std::os::unix::fs::MetadataExt as _;
+                    entry.ctime_sec = meta.ctime() as u32;
+                    entry.ctime_nsec = meta.ctime_nsec() as u32;
+                    entry.mtime_sec = meta.mtime() as u32;
+                    entry.mtime_nsec = meta.mtime_nsec() as u32;
+                    entry.dev = meta.dev() as u32;
+                    entry.ino = meta.ino() as u32;
+                    entry.size = meta.size() as u32;
+                }
             }
+        } else if protected.contains(&path_str) {
+            // Not-up-to-date or unmerged: leave the file on disk and keep it in the worktree (do
+            // not set skip-worktree) so the local edit/conflict is preserved (t1091 27/31/32).
         } else {
             entry.set_skip_worktree(true);
             let full_path = work_tree.join(&path_str);
@@ -1306,6 +1563,14 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
                 }
             }
         }
+    }
+
+    // Git `clean_tracked_sparse_directories` (runs after `update_working_directory` for
+    // set/reapply): remove the now out-of-cone sparse directories with no files, warn about those
+    // still holding untracked files. Skip for a full checkout (everything is in-cone) and in cone
+    // mode only (matches Git). Computed from the pre-collapse per-file skip-worktree state.
+    if !force_include_all && effective_cone {
+        clean_tracked_sparse_directories(repo, work_tree, &index, patterns);
     }
 
     // In partial clones (`grit-promisor-missing` lists blobs not yet local), sparse
@@ -1319,7 +1584,10 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
         })
         .unwrap_or(false);
 
-    if !skip_collapse {
+    if force_include_all {
+        // A full checkout (`disable`) must never re-collapse the index into sparse placeholders.
+        index.sparse_directories = false;
+    } else if !skip_collapse {
         if let Some(tree_oid) = head_tree_oid(repo)? {
             index.try_collapse_sparse_directories(
                 &repo.odb,
@@ -1338,28 +1606,33 @@ fn apply_sparse_patterns(repo: &Repository, patterns: &[String], cone_mode: bool
     repo.write_index_at(&index_path, &mut index)
         .context("writing index")?;
 
-    // Remove untracked paths outside the sparse cone (Git `sparse_checkout_set` / t7012).
-    let indexed_paths: HashSet<String> = index
-        .entries
-        .iter()
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    let gitlink_paths: HashSet<String> = index
-        .entries
-        .iter()
-        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
-        .map(|e| String::from_utf8_lossy(&e.path).into_owned())
-        .collect();
-    remove_untracked_outside_sparse(
-        work_tree,
-        work_tree,
-        &indexed_paths,
-        &gitlink_paths,
-        patterns,
-        effective_cone,
-        cone_struct.as_ref(),
-        &non_cone,
-    )?;
+    // Prune tracked sparse directories that fell out of the cone, mirroring Git's
+    // `clean_tracked_sparse_directories` (builtin/sparse-checkout.c). The helper runs ONLY in
+    // cone mode (it returns early when not cone, like Git's `!use_cone_patterns` guard) and
+    // never deletes untracked files: a directory containing untracked content is preserved.
+    // A full checkout (`disable`) includes everything, so there is nothing to prune (t7012).
+    if !force_include_all {
+        let indexed_paths: HashSet<String> = index
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        let gitlink_paths: HashSet<String> = index
+            .entries
+            .iter()
+            .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect();
+        remove_untracked_outside_sparse(
+            work_tree,
+            work_tree,
+            &indexed_paths,
+            &gitlink_paths,
+            effective_cone,
+            cone_struct.as_ref(),
+            &non_cone,
+        )?;
+    }
 
     // Submodule work trees keep their own `info/sparse-checkout`. After the superproject applies
     // sparsity we skip cleaning inside gitlink dirs (so we do not delete `sub/B/b`), so re-run the
@@ -1418,13 +1691,77 @@ fn open_gitlink_worktree_repo(sub_work_tree: &Path) -> Result<Repository> {
     }
 }
 
+/// Convert a worktree-relative path to a `/`-separated string. On Windows the native separator is
+/// `\`, so it is rewritten to `/`; on Unix a `\` is a *literal* filename character and must be
+/// preserved (t1091 escaped-characters: a directory literally named `zbad\dir`).
+fn normalize_rel_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '\\' {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
+
+/// Remove whole tracked directory subtrees that have fallen out of the sparse
+/// cone, mirroring Git's `clean_tracked_sparse_directories`
+/// (git/builtin/sparse-checkout.c).
+///
+/// Git only does this in cone mode (it returns early when
+/// `!use_cone_patterns`), and it never deletes individual untracked files. It
+/// considers each tracked sparse directory that exists on disk; if the
+/// directory contains any untracked-or-ignored files it warns
+/// ("contains untracked files") and leaves the directory in place, otherwise it
+/// removes the whole subtree. Top-level untracked/ignored files (e.g. `file.o`,
+/// `obj/`) are always preserved.
 fn remove_untracked_outside_sparse(
     work_tree: &Path,
     current: &Path,
     indexed_paths: &HashSet<String>,
     gitlink_paths: &HashSet<String>,
-    patterns: &[String],
     effective_cone: bool,
+    cone_struct: Option<&ConePatterns>,
+    non_cone: &NonConePatterns,
+) -> Result<()> {
+    // Non-cone mode: Git cannot safely delete directories outside the cone, so
+    // it cleans nothing here. Matches the early return in
+    // clean_tracked_sparse_directories.
+    if !effective_cone {
+        return Ok(());
+    }
+
+    // Directories that hold tracked content. A directory is "tracked" when some
+    // index entry lives inside it.
+    let mut tracked_dirs: HashSet<String> = HashSet::new();
+    for p in indexed_paths {
+        let mut rest = p.as_str();
+        while let Some(idx) = rest.rfind('/') {
+            let dir = &rest[..idx];
+            if !tracked_dirs.insert(dir.to_string()) {
+                break;
+            }
+            rest = dir;
+        }
+    }
+
+    clean_tracked_sparse_dirs(
+        work_tree,
+        current,
+        indexed_paths,
+        gitlink_paths,
+        &tracked_dirs,
+        cone_struct,
+        non_cone,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clean_tracked_sparse_dirs(
+    work_tree: &Path,
+    current: &Path,
+    indexed_paths: &HashSet<String>,
+    gitlink_paths: &HashSet<String>,
+    tracked_dirs: &HashSet<String>,
     cone_struct: Option<&ConePatterns>,
     non_cone: &NonConePatterns,
 ) -> Result<()> {
@@ -1434,11 +1771,7 @@ fn remove_untracked_outside_sparse(
     for ent in read_dir {
         let ent = ent.context("reading work tree directory")?;
         let path = ent.path();
-        let rel = path
-            .strip_prefix(work_tree)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = normalize_rel_path(path.strip_prefix(work_tree).unwrap_or(&path));
         // Skip the main repo's `.git` and every nested `.git` (e.g. `sub/.git` for submodules).
         if rel == ".git"
             || rel.starts_with(".git/")
@@ -1448,57 +1781,90 @@ fn remove_untracked_outside_sparse(
             continue;
         }
         let meta = fs::symlink_metadata(&path).context("stat work tree path")?;
-        if meta.is_dir() {
-            if gitlink_paths.contains(&rel) {
-                continue;
-            }
-            remove_untracked_outside_sparse(
+        if !meta.is_dir() {
+            // Git never deletes loose untracked/ignored files here.
+            continue;
+        }
+        if gitlink_paths.contains(&rel) {
+            continue;
+        }
+
+        let included = path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree));
+        if included {
+            // Still in the cone: descend to find deeper out-of-cone tracked dirs.
+            clean_tracked_sparse_dirs(
                 work_tree,
                 &path,
                 indexed_paths,
                 gitlink_paths,
-                patterns,
-                effective_cone,
+                tracked_dirs,
                 cone_struct,
                 non_cone,
             )?;
-            if fs::read_dir(&path)
-                .map(|mut d| d.next().is_none())
-                .unwrap_or(false)
-            {
-                let included = if effective_cone {
-                    path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree))
-                } else {
-                    path_in_sparse_checkout_lines(&rel, patterns, Some(work_tree))
-                };
-                if !included && !indexed_paths.contains(&rel) {
-                    let _ = fs::remove_dir(&path);
-                    if let Some(parent) = path.parent() {
-                        remove_empty_dirs_up_to(parent, work_tree);
-                    }
-                }
-            }
             continue;
         }
-        if !meta.is_file() && !meta.file_type().is_symlink() {
+        // Out of cone. Only remove a directory that holds tracked content (a
+        // tracked sparse directory). Purely untracked/ignored directories at the
+        // top level (e.g. `obj/`) are preserved, matching Git. Untracked files
+        // (and symlinks) outside the cone are NEVER removed here (only
+        // `sparse-checkout clean` does) — deleting them would destroy user data
+        // and breaks tests staging helper files outside the cone (t3602/t3705).
+        if !tracked_dirs.contains(&rel) {
             continue;
         }
-        if indexed_paths.contains(&rel) {
+
+        if dir_has_untracked(&path, work_tree, indexed_paths)? {
+            eprintln!(
+                "warning: directory '{rel}/' contains untracked files, but is not in the sparse-checkout cone"
+            );
             continue;
         }
-        let included = if effective_cone {
-            path_in_sparse_checkout(&rel, true, cone_struct, non_cone, Some(work_tree))
-        } else {
-            path_in_sparse_checkout_lines(&rel, patterns, Some(work_tree))
-        };
-        if !included {
-            let _ = fs::remove_file(&path);
-            if let Some(parent) = path.parent() {
-                remove_empty_dirs_up_to(parent, work_tree);
-            }
+
+        // No untracked files: safe to remove the whole subtree.
+        let _ = fs::remove_dir_all(&path);
+        if let Some(parent) = path.parent() {
+            remove_empty_dirs_up_to(parent, work_tree);
         }
     }
     Ok(())
+}
+
+/// Whether `dir` contains any file on disk that is not a tracked index entry
+/// (mirrors Git's `fill_directory` with `DIR_SHOW_IGNORED_TOO`: both untracked
+/// and ignored files count).
+fn dir_has_untracked(
+    dir: &Path,
+    work_tree: &Path,
+    indexed_paths: &HashSet<String>,
+) -> Result<bool> {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return Ok(false);
+    };
+    for ent in read_dir {
+        let ent = ent.context("reading work tree directory")?;
+        let path = ent.path();
+        let rel = path
+            .strip_prefix(work_tree)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == ".git"
+            || rel.starts_with(".git/")
+            || rel.ends_with("/.git")
+            || rel.contains("/.git/")
+        {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&path).context("stat work tree path")?;
+        if meta.is_dir() {
+            if dir_has_untracked(&path, work_tree, indexed_paths)? {
+                return Ok(true);
+            }
+        } else if !indexed_paths.contains(&rel) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether `path` is included in the sparse checkout for the given patterns.

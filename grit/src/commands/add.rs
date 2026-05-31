@@ -576,6 +576,8 @@ pub fn run(mut args: Args) -> Result<()> {
                         work_tree,
                         &sparse_state,
                         precompose_unicode,
+                        &repo,
+                        &mut ignore_matcher,
                     ) {
                         sparse_advice_paths.push(spec.clone());
                     }
@@ -655,6 +657,8 @@ pub fn run(mut args: Args) -> Result<()> {
                     work_tree,
                     &sparse_state,
                     precompose_unicode,
+                    &repo,
+                    &mut ignore_matcher,
                 ) {
                     sparse_advice_paths.push(spec.clone());
                 }
@@ -904,7 +908,10 @@ impl AddSparseState {
 /// Match a user pathspec against an index path (Git `ce_path_match` semantics for `.` and globs).
 fn pathspec_matches_index_path(spec: &str, resolved_under_cwd: &str, index_path: &str) -> bool {
     if spec == "." {
-        if resolved_under_cwd.is_empty() {
+        // `.` at the repo root matches the whole tree. `resolve_pathspec` keeps
+        // it as the literal "." (rather than ""), so treat both "" and "." as
+        // "match everything"; a non-trivial prefix matches that subtree.
+        if resolved_under_cwd.is_empty() || resolved_under_cwd == "." {
             return true;
         }
         return index_path == resolved_under_cwd
@@ -936,6 +943,7 @@ fn pathspec_has_dense_index_match(
 }
 
 /// True if `spec` matches at least one path we could update without `--sparse` (index or work tree).
+#[allow(clippy::too_many_arguments)]
 fn pathspec_has_unblocked_target(
     spec: &str,
     resolved: &str,
@@ -943,23 +951,114 @@ fn pathspec_has_unblocked_target(
     work_tree: &Path,
     sparse: &AddSparseState,
     precompose_unicode: bool,
+    repo: &Repository,
+    ignore_matcher: &mut Option<IgnoreMatcher>,
 ) -> bool {
     if pathspec_has_dense_index_match(spec, resolved, index, sparse) {
         return true;
     }
     for rel in expand_glob_pathspec(resolved, work_tree, precompose_unicode) {
+        // A directory pathspec (e.g. `.`, `:/`, `dir`) matches every work-tree
+        // file beneath it. Git's pathspec advice mirrors `fill_directory`: an
+        // untracked ignored file is excluded and does not count as an addable
+        // target, so it must not suppress the sparse-path advice. Walk the
+        // directory and look for any genuinely addable file. (t3705 `git add .`)
+        let abs = if rel.is_empty() || rel == "." {
+            work_tree.to_path_buf()
+        } else {
+            work_tree.join(&rel)
+        };
+        let is_dir = fs::symlink_metadata(&abs)
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            if dir_has_addable_target(&abs, work_tree, index, sparse, repo, ignore_matcher) {
+                return true;
+            }
+            continue;
+        }
+
         if rel.is_empty() {
             continue;
         }
         let ie = index.get(rel.as_bytes(), 0);
-        if !sparse.add_update_blocked(false, ie, rel.as_str()) {
-            return true;
+        if sparse.add_update_blocked(false, ie, rel.as_str()) {
+            continue;
+        }
+        if ie.is_none() && path_is_ignored(repo, index, ignore_matcher, rel.as_str(), false) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// Whether `repo_rel_path` is ignored by `.gitignore`/excludes (best effort).
+fn path_is_ignored(
+    repo: &Repository,
+    index: &Index,
+    ignore_matcher: &mut Option<IgnoreMatcher>,
+    repo_rel_path: &str,
+    is_dir: bool,
+) -> bool {
+    if let Some(matcher) = ignore_matcher.as_mut() {
+        if let Ok((ignored, _)) = matcher.check_path(repo, Some(index), repo_rel_path, is_dir) {
+            return ignored;
         }
     }
     false
 }
 
+/// Recursively look for a work-tree file under `dir` that `git add` could stage
+/// without `--sparse`: tracked-and-not-sparse-blocked, or untracked-and-not-ignored.
+/// Mirrors Git's `fill_directory` walk used for the sparse-path advice decision.
+fn dir_has_addable_target(
+    dir: &Path,
+    work_tree: &Path,
+    index: &Index,
+    sparse: &AddSparseState,
+    repo: &Repository,
+    ignore_matcher: &mut Option<IgnoreMatcher>,
+) -> bool {
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return false;
+    };
+    for ent in read_dir.flatten() {
+        let path = ent.path();
+        let rel = match path.strip_prefix(work_tree) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        if rel == ".git" || rel.starts_with(".git/") || rel.ends_with("/.git") {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.file_type().is_dir() {
+            // An ignored directory prunes the whole subtree (Git stops descending).
+            if path_is_ignored(repo, index, ignore_matcher, &rel, true) {
+                continue;
+            }
+            if dir_has_addable_target(&path, work_tree, index, sparse, repo, ignore_matcher) {
+                return true;
+            }
+            continue;
+        }
+        let ie = index.get(rel.as_bytes(), 0);
+        if sparse.add_update_blocked(false, ie, rel.as_str()) {
+            continue;
+        }
+        if ie.is_none() && path_is_ignored(repo, index, ignore_matcher, &rel, false) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// Pathspec matched only skip-worktree / outside-sparse index entries (Git `matches_skip_worktree`).
+#[allow(clippy::too_many_arguments)]
 fn pathspec_only_matches_sparse_blocked(
     spec: &str,
     resolved: &str,
@@ -967,8 +1066,19 @@ fn pathspec_only_matches_sparse_blocked(
     work_tree: &Path,
     sparse: &AddSparseState,
     precompose_unicode: bool,
+    repo: &Repository,
+    ignore_matcher: &mut Option<IgnoreMatcher>,
 ) -> bool {
-    if pathspec_has_unblocked_target(spec, resolved, index, work_tree, sparse, precompose_unicode) {
+    if pathspec_has_unblocked_target(
+        spec,
+        resolved,
+        index,
+        work_tree,
+        sparse,
+        precompose_unicode,
+        repo,
+        ignore_matcher,
+    ) {
         return false;
     }
     index.entries.iter().any(|ie| {
@@ -1500,6 +1610,7 @@ fn run_renormalize(
 
     if !add_cfg.include_sparse {
         let mut sparse_renorm: Vec<String> = Vec::new();
+        let mut ignore_matcher = IgnoreMatcher::from_repository(repo).ok();
         for spec in &args.pathspec {
             let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix);
             if pathspec_only_matches_sparse_blocked(
@@ -1509,6 +1620,8 @@ fn run_renormalize(
                 work_tree,
                 &add_cfg.sparse,
                 add_cfg.precompose_unicode,
+                repo,
+                &mut ignore_matcher,
             ) {
                 sparse_renorm.push(spec.clone());
             }
@@ -2070,6 +2183,7 @@ fn update_tracked(
     }
 
     if explicit_pathspecs && !add_cfg.include_sparse {
+        let mut ignore_matcher = IgnoreMatcher::from_repository(repo).ok();
         for spec in &args.pathspec {
             let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix);
             if pathspec_only_matches_sparse_blocked(
@@ -2079,6 +2193,8 @@ fn update_tracked(
                 work_tree,
                 &add_cfg.sparse,
                 add_cfg.precompose_unicode,
+                repo,
+                &mut ignore_matcher,
             ) {
                 sparse_advice_paths.push(spec.clone());
             }
@@ -2196,9 +2312,12 @@ fn add_path(
         // Check unmerged entries (stages 1, 2, 3)
         let has_unmerged = (1..=3).any(|stage| index.get(path_bytes, stage).is_some());
         if has_unmerged {
-            // Can't resolve a conflict if file doesn't exist
+            // Can't resolve a conflict if file doesn't exist. Git uses die()
+            // here (`fatal:` + exit 128); prefix with `fatal: ` so main.rs
+            // re-emits the message verbatim and exits 128. The multi-pathspec
+            // arm still matches "did not match any files" to `continue`.
             return Err(AddPathError::Other(anyhow::anyhow!(
-                "pathspec '{}' did not match any files",
+                "fatal: pathspec '{}' did not match any files",
                 path
             )));
         }
@@ -2226,8 +2345,11 @@ fn add_path(
                 message: format!("fatal: pathspec '{path}' did not match any files"),
             });
         }
+        // Git die()s here (`fatal:` + exit 128). Prefix so main.rs re-emits
+        // the message verbatim and exits 128; the multi-pathspec arm still
+        // matches "did not match any files" to `continue`.
         return Err(AddPathError::Other(anyhow::anyhow!(
-            "pathspec '{}' did not match any files",
+            "fatal: pathspec '{}' did not match any files",
             path
         )));
     }

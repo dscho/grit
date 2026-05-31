@@ -890,13 +890,16 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 }
 
 fn glob_matches_inner(pattern: &[u8], path: &[u8]) -> bool {
+    // Git pathspec matching uses `wildmatch(pattern, string, 0)` (no WM_PATHNAME) for plain
+    // pathspecs, so `*`, `?`, and bracket classes all match `/` too. Thus `folder1/*`
+    // matches `folder1/0/0/0`, not just `folder1/a` (t1092 rm pathspec outside cone).
     let mut pi = 0;
     let mut si = 0;
     let mut star_pi = usize::MAX;
     let mut star_si = 0;
 
     while si < path.len() {
-        if pi < pattern.len() && pattern[pi] == b'?' && path[si] != b'/' {
+        if pi < pattern.len() && pattern[pi] == b'?' {
             pi += 1;
             si += 1;
         } else if pi < pattern.len() && pattern[pi] == b'*' {
@@ -942,7 +945,7 @@ fn glob_matches_inner(pattern: &[u8], path: &[u8]) -> bool {
                 pi += 1;
             }
             if found == negate {
-                if star_pi != usize::MAX && path[si] != b'/' {
+                if star_pi != usize::MAX {
                     pi = star_pi + 1;
                     star_si += 1;
                     si = star_si;
@@ -955,7 +958,7 @@ fn glob_matches_inner(pattern: &[u8], path: &[u8]) -> bool {
         } else if pi < pattern.len() && pattern[pi] == path[si] {
             pi += 1;
             si += 1;
-        } else if star_pi != usize::MAX && path[si] != b'/' {
+        } else if star_pi != usize::MAX {
             pi = star_pi + 1;
             star_si += 1;
             si = star_si;
