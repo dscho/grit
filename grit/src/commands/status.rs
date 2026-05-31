@@ -880,6 +880,10 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     if !args.no_optional_locks {
+        // Git refreshes the index during `status`: entries whose worktree content still matches
+        // the recorded OID but whose stat went stale (e.g. `touch`) get their cached stat updated
+        // so a subsequent `diff-files` sees them as clean (t7508 'status refreshes the index').
+        grit_lib::diff::refresh_index_stat_content_verified(&mut index, work_tree);
         // Best-effort: status must succeed even when `.git/` is read-only (t7508).
         let _ = repo.write_index_at(&index_path, &mut index);
     }
@@ -2464,6 +2468,185 @@ pub(crate) fn parse_submodule_summary_limit(config: &ConfigSet) -> Option<i32> {
     (n > 0).then_some(n)
 }
 
+/// How `git status` should treat a submodule's dirtiness, mirroring Git's `--ignore-submodules`
+/// argument and `submodule.<name>.ignore` / `diff.ignoreSubmodules` config values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SubmoduleIgnore {
+    /// Report new commits, modified content and untracked content.
+    #[default]
+    None,
+    /// Hide only untracked content; still report new commits and modified content.
+    Untracked,
+    /// Hide modified and untracked content; still report new commits.
+    Dirty,
+    /// Hide the submodule entirely (also from "Changes to be committed").
+    All,
+}
+
+impl SubmoduleIgnore {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "none" => Some(SubmoduleIgnore::None),
+            "untracked" => Some(SubmoduleIgnore::Untracked),
+            "dirty" => Some(SubmoduleIgnore::Dirty),
+            "all" => Some(SubmoduleIgnore::All),
+            _ => None,
+        }
+    }
+}
+
+/// Map submodule paths to the `name` declared in `.gitmodules`, plus the per-name `ignore` values
+/// from `.gitmodules`. The map is keyed by submodule path (the value Git uses for the gitlink).
+#[derive(Default)]
+struct GitmodulesIgnore {
+    /// `submodule.<name>.ignore` from `.gitmodules`, keyed by submodule path.
+    by_path: HashMap<String, String>,
+    /// submodule path -> declared name (for resolving `.git/config submodule.<name>.ignore`).
+    name_by_path: HashMap<String, String>,
+}
+
+/// Read `submodule.<name>.path` / `submodule.<name>.ignore` from the work-tree `.gitmodules`.
+fn load_gitmodules_ignore(work_tree: &Path) -> GitmodulesIgnore {
+    use grit_lib::config::{ConfigFile, ConfigScope};
+    let path = work_tree.join(".gitmodules");
+    let Ok(content) = fs::read_to_string(&path) else {
+        return GitmodulesIgnore::default();
+    };
+    let (entries, _) =
+        ConfigFile::parse_gitmodules_best_effort(&path, &content, ConfigScope::Local);
+    let mut path_by_name: HashMap<String, String> = HashMap::new();
+    let mut ignore_by_name: HashMap<String, String> = HashMap::new();
+    for e in &entries {
+        let Some(rest) = e.key.strip_prefix("submodule.") else {
+            continue;
+        };
+        let Some(dot) = rest.rfind('.') else { continue };
+        let name = &rest[..dot];
+        let var = &rest[dot + 1..];
+        match var {
+            "path" => {
+                if let Some(v) = e.value.as_deref() {
+                    path_by_name.insert(name.to_owned(), v.to_owned());
+                }
+            }
+            "ignore" => {
+                if let Some(v) = e.value.as_deref() {
+                    ignore_by_name.insert(name.to_owned(), v.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut result = GitmodulesIgnore::default();
+    for (name, sm_path) in path_by_name {
+        if let Some(ig) = ignore_by_name.get(&name) {
+            result.by_path.insert(sm_path.clone(), ig.clone());
+        }
+        result.name_by_path.insert(sm_path, name);
+    }
+    result
+}
+
+/// Resolve the effective submodule-ignore setting for `sm_path`, following Git's precedence:
+/// `--ignore-submodules` CLI > `submodule.<name>.ignore` in `.git/config` > the same in
+/// `.gitmodules` > `diff.ignoreSubmodules`. Unrecognized values default to [`SubmoduleIgnore::None`].
+fn effective_submodule_ignore(
+    config: &ConfigSet,
+    cli_ignore: Option<&str>,
+    gitmodules: &GitmodulesIgnore,
+    sm_path: &str,
+) -> SubmoduleIgnore {
+    if let Some(v) = cli_ignore.and_then(SubmoduleIgnore::parse) {
+        return v;
+    }
+    let name = gitmodules.name_by_path.get(sm_path).map(String::as_str);
+    if let Some(name) = name {
+        let key = format!("submodule.{name}.ignore");
+        if let Some(v) = config.get(&key).as_deref().and_then(SubmoduleIgnore::parse) {
+            return v;
+        }
+    }
+    if let Some(v) = gitmodules
+        .by_path
+        .get(sm_path)
+        .and_then(|v| SubmoduleIgnore::parse(v))
+    {
+        return v;
+    }
+    config
+        .get("diff.ignoreSubmodules")
+        .as_deref()
+        .and_then(SubmoduleIgnore::parse)
+        .unwrap_or_default()
+}
+
+/// How a submodule gitlink should appear in long-format status / `commit --dry-run`.
+pub(crate) struct SubmoduleDisplay {
+    /// Annotation suffix for the "Changes not staged" entry (e.g. ` (new commits)`).
+    pub annotation: String,
+    /// When true, the gitlink is fully suppressed from the unstaged section.
+    pub suppress_unstaged: bool,
+    /// When true (CLI `--ignore-submodules=all`), the gitlink is also hidden from the staged
+    /// "Changes to be committed" section.
+    pub suppress_staged: bool,
+    /// When true, the submodule has displayable modified/untracked content (drives the
+    /// "commit or discard ... content in submodules" hint).
+    pub has_dirty_content: bool,
+}
+
+/// Compute the long-format display decision for a submodule gitlink, applying the effective
+/// `--ignore-submodules` / `submodule.<name>.ignore` setting (Git `wt_status` + submodule config).
+pub(crate) fn submodule_display_decision(
+    config: &ConfigSet,
+    work_tree: &Path,
+    cli_ignore: Option<&str>,
+    sm_path: &str,
+    recorded_oid: ObjectId,
+) -> SubmoduleDisplay {
+    let gitmodules = load_gitmodules_ignore(work_tree);
+    let ignore = effective_submodule_ignore(config, cli_ignore, &gitmodules, sm_path);
+    let cli_all = cli_ignore
+        .and_then(SubmoduleIgnore::parse)
+        .is_some_and(|v| v == SubmoduleIgnore::All);
+    if ignore == SubmoduleIgnore::All {
+        return SubmoduleDisplay {
+            annotation: String::new(),
+            suppress_unstaged: true,
+            suppress_staged: cli_all,
+            has_dirty_content: false,
+        };
+    }
+    let flags = submodule_porcelain_flags(work_tree, sm_path, recorded_oid);
+    let new_commits = flags.new_commits;
+    let modified = flags.modified && ignore != SubmoduleIgnore::Dirty;
+    let untracked =
+        flags.untracked && ignore != SubmoduleIgnore::Dirty && ignore != SubmoduleIgnore::Untracked;
+    if !new_commits && !modified && !untracked {
+        return SubmoduleDisplay {
+            annotation: String::new(),
+            suppress_unstaged: true,
+            suppress_staged: false,
+            has_dirty_content: false,
+        };
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    if new_commits {
+        parts.push("new commits");
+    }
+    if modified {
+        parts.push("modified content");
+    }
+    if untracked {
+        parts.push("untracked content");
+    }
+    SubmoduleDisplay {
+        annotation: format!(" ({})", parts.join(", ")),
+        suppress_unstaged: false,
+        suppress_staged: false,
+        has_dirty_content: modified || untracked,
+    }
+}
+
 fn count_stash_reflog_entries(git_dir: &Path) -> usize {
     if let Ok(n) = reflog::read_reflog(git_dir, "refs/stash").map(|e| e.len()) {
         if n > 0 {
@@ -2484,13 +2667,14 @@ fn count_stash_reflog_entries(git_dir: &Path) -> usize {
 }
 
 fn long_format_comment_leader(config: &ConfigSet) -> String {
+    // Git accepts a multi-character `core.commentChar` (a comment *string*); the whole value is
+    // used as the prefix, not just the first byte (t7508 two-char commentchar).
     let raw = config
         .get("core.commentChar")
         .or_else(|| config.get("core.commentchar"))
         .filter(|s| !s.is_empty() && !s.contains('\n'))
         .unwrap_or_else(|| "#".to_owned());
-    let c = raw.chars().next().unwrap_or('#');
-    format!("{c} ")
+    format!("{raw} ")
 }
 
 fn comment_prefixed_block(body: &str, leader: &str) -> String {
@@ -2835,13 +3019,54 @@ fn format_long(
     let mut unmerged_paths: Vec<(String, u8)> =
         unmerged_map.iter().map(|(p, m)| (p.clone(), *m)).collect();
 
+    // Resolve `--ignore-submodules` / `submodule.<name>.ignore` for submodule entries and compute
+    // the per-submodule annotation (`(new commits, modified content, ...)`) shown in the
+    // "Changes not staged for commit" section (Git `wt_longstatus_print_change_data`).
+    let cli_ignore = args
+        .ignore_submodules
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase());
+    let gitlink_oid_by_path: HashMap<String, ObjectId> = expanded_index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+        .map(|e| (String::from_utf8_lossy(&e.path).into_owned(), e.oid))
+        .collect();
+    // path -> (annotation, suppress_unstaged, suppress_staged)
+    let mut submodule_decisions: HashMap<String, (String, bool, bool)> = HashMap::new();
+    let mut any_dirty_submodule_shown = false;
+    if let Some(wt) = repo.work_tree.as_deref() {
+        for (path, recorded) in &gitlink_oid_by_path {
+            let d = submodule_display_decision(config, wt, cli_ignore.as_deref(), path, *recorded);
+            if d.has_dirty_content {
+                any_dirty_submodule_shown = true;
+            }
+            submodule_decisions.insert(
+                path.clone(),
+                (d.annotation, d.suppress_unstaged, d.suppress_staged),
+            );
+        }
+    }
+
     let staged_normal: Vec<&DiffEntry> = staged
         .iter()
         .filter(|e| e.status != DiffStatus::Unmerged)
+        .filter(|e| {
+            submodule_decisions
+                .get(e.path())
+                .map(|(_, _, suppress_staged)| !suppress_staged)
+                .unwrap_or(true)
+        })
         .collect();
     let unstaged_normal: Vec<&DiffEntry> = unstaged
         .iter()
         .filter(|e| e.status != DiffStatus::Unmerged && !unmerged_map.contains_key(e.path()))
+        .filter(|e| {
+            submodule_decisions
+                .get(e.path())
+                .map(|(_, suppress_unstaged, _)| !suppress_unstaged)
+                .unwrap_or(true)
+        })
         .collect();
 
     let has_unmerged = !unmerged_paths.is_empty();
@@ -2933,6 +3158,13 @@ fn format_long(
                 cp,
                 "  (use \"git restore <file>...\" to discard changes in working directory)",
             )?;
+            if any_dirty_submodule_shown {
+                cpw(
+                    out,
+                    cp,
+                    "  (commit or discard the untracked or modified content in submodules)",
+                )?;
+            }
         }
         for entry in &unstaged_normal {
             let label = match entry.status {
@@ -2944,7 +3176,15 @@ fn format_long(
                 DiffStatus::TypeChanged => "typechange",
                 _ => "changed",
             };
-            cpw(out, cp, &format!("\t{label}:   {}", entry.display_path()))?;
+            let suffix = submodule_decisions
+                .get(entry.path())
+                .map(|(annotation, _, _)| annotation.as_str())
+                .unwrap_or("");
+            cpw(
+                out,
+                cp,
+                &format!("\t{label}:   {}{suffix}", entry.display_path()),
+            )?;
         }
         cpw(out, cp, "")?;
     }
@@ -2988,11 +3228,14 @@ fn format_long(
             )?;
         }
         let comment_line = if use_comment_prefix {
-            comment_leader_string
-                .chars()
-                .next()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "#".to_string())
+            // Column indent uses the bare comment string (no trailing space) + tab; a multi-char
+            // `core.commentChar` keeps all its characters (t7508 two-char commentchar).
+            let bare = comment_leader_string.trim_end_matches(' ');
+            if bare.is_empty() {
+                "#".to_string()
+            } else {
+                bare.to_string()
+            }
         } else {
             String::new()
         };
@@ -3021,11 +3264,14 @@ fn format_long(
             )?;
         }
         let comment_line = if use_comment_prefix {
-            comment_leader_string
-                .chars()
-                .next()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "#".to_string())
+            // Column indent uses the bare comment string (no trailing space) + tab; a multi-char
+            // `core.commentChar` keeps all its characters (t7508 two-char commentchar).
+            let bare = comment_leader_string.trim_end_matches(' ');
+            if bare.is_empty() {
+                "#".to_string()
+            } else {
+                bare.to_string()
+            }
         } else {
             String::new()
         };

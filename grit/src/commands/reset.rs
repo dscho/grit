@@ -1307,28 +1307,11 @@ fn mixed_reset_should_refresh_index(no_refresh: bool, refresh: bool, repo: &Repo
 }
 
 fn refresh_stage0_index_stats_from_worktree(index: &mut Index, work_tree: &Path) {
-    for ie in &mut index.entries {
-        if ie.stage() != 0 {
-            continue;
-        }
-        if ie.mode == MODE_GITLINK || ie.mode == 0o040000 {
-            continue;
-        }
-        let path_str = String::from_utf8_lossy(&ie.path);
-        let abs = work_tree.join(path_str.as_ref());
-        if let Ok(meta) = std::fs::symlink_metadata(&abs) {
-            use std::os::unix::fs::MetadataExt as _;
-            ie.ctime_sec = meta.ctime() as u32;
-            ie.ctime_nsec = meta.ctime_nsec() as u32;
-            ie.mtime_sec = meta.mtime() as u32;
-            ie.mtime_nsec = meta.mtime_nsec() as u32;
-            ie.dev = meta.dev() as u32;
-            ie.ino = meta.ino() as u32;
-            ie.uid = meta.uid();
-            ie.gid = meta.gid();
-            ie.size = meta.len() as u32;
-        }
-    }
+    // Git's `refresh_index` (used by `reset --mixed`) only updates the cached stat for entries
+    // whose worktree content still matches the recorded OID; a genuinely modified file must keep
+    // its stale stat so `status`/`diff-files` keep reporting it (t7508 108). Adopting the worktree
+    // stat unconditionally would mark a modified file falsely clean.
+    grit_lib::diff::refresh_index_stat_content_verified(index, work_tree);
 }
 
 /// Reset HEAD (and optionally index + working tree) to the given commit.
