@@ -2421,14 +2421,15 @@ Aborting"
         if args.squash {
             // For squash + conflict: write SQUASH_MSG with conflict info, no MERGE_HEAD.
             // `build_squash_msg` ends with the last commit body (no trailing blank line, to
-            // match `git log`); git's `squash_message` then adds a blank line before the
-            // `# Conflicts:` block (builtin/merge.c append_conflicts_hint).
+            // match `git log`); git's `squash_message` then appends the conflict hint (with the
+            // scissors block under cleanup=scissors) — builtin/merge.c append_conflicts_hint.
             let mut msg = build_squash_msg(repo, head_oid, &[merge_oid])?;
-            msg.push('\n');
-            msg.push_str("# Conflicts:\n");
-            for desc in &merge_result.conflict_descriptions {
-                msg.push_str(&format!("#\t{}\n", desc.subject_path));
-            }
+            let paths: Vec<String> = merge_result
+                .conflict_descriptions
+                .iter()
+                .map(|d| d.subject_path.clone())
+                .collect();
+            append_merge_conflicts_hint(&mut msg, &paths, merge_cleanup_is_scissors(args, repo));
             fs::write(repo.git_dir.join("SQUASH_MSG"), &msg)?;
         } else {
             // Write MERGE_HEAD and MERGE_MSG for conflict resolution
@@ -2436,7 +2437,17 @@ Aborting"
                 repo.git_dir.join("MERGE_HEAD"),
                 format!("{}\n", merge_oid.to_hex()),
             )?;
-            let msg = build_merge_message(head, &args.commits[0], args.message.as_deref(), repo);
+            let mut msg =
+                build_merge_message(head, &args.commits[0], args.message.as_deref(), repo);
+            // Git appends the conflict hint (with the scissors block under cleanup=scissors)
+            // to MERGE_MSG so a follow-up `git commit` carries it (builtin/merge.c
+            // suggest_conflicts -> append_conflicts_hint).
+            let paths: Vec<String> = merge_result
+                .conflict_descriptions
+                .iter()
+                .map(|d| d.subject_path.clone())
+                .collect();
+            append_merge_conflicts_hint(&mut msg, &paths, merge_cleanup_is_scissors(args, repo));
             fs::write(repo.git_dir.join("MERGE_MSG"), &msg)?;
             fs::write(repo.git_dir.join("MERGE_MODE"), "")?;
         }
@@ -8894,6 +8905,40 @@ fn apply_merge_autostash(repo: &Repository) -> Result<()> {
 /// `save_autostash_ref`), used when an in-progress autostash merge is aborted/quit/reset.
 fn save_merge_autostash(repo: &Repository) -> Result<()> {
     crate::commands::stash::save_autostash_ref(repo, MERGE_AUTOSTASH_REF)
+}
+
+/// Whether the effective merge message cleanup mode is `scissors`.
+///
+/// Mirrors git's `get_cleanup_mode(cleanup_arg, 1)` evaluated *as if editing* (the conflict
+/// hint always uses the editor cleanup mode even with `--no-edit`, so a follow-up `git commit`
+/// sees the scissors block — see builtin/merge.c:suggest_conflicts comment).
+fn merge_cleanup_is_scissors(args: &Args, repo: &Repository) -> bool {
+    if let Some(c) = args.cleanup.as_deref() {
+        return c == "scissors";
+    }
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    config
+        .get("commit.cleanup")
+        .map(|v| v.trim() == "scissors")
+        .unwrap_or(false)
+}
+
+/// Append git's conflict hint to a MERGE_MSG/SQUASH_MSG body, matching
+/// `append_conflicts_hint` (sequencer.c). With scissors cleanup the cut line and its
+/// explanation precede the `# Conflicts:` list; the comment prefix is `#`.
+fn append_merge_conflicts_hint(msg: &mut String, paths: &[String], scissors: bool) {
+    if scissors {
+        msg.push('\n');
+        msg.push_str("# ------------------------ >8 ------------------------\n");
+        msg.push_str("# Do not modify or remove the line above.\n");
+        msg.push_str("# Everything below it will be ignored.\n");
+        msg.push('#');
+    }
+    msg.push('\n');
+    msg.push_str("# Conflicts:\n");
+    for path in paths {
+        msg.push_str(&format!("#\t{path}\n"));
+    }
 }
 
 /// Build the default merge commit message.
