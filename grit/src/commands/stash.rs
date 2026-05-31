@@ -4603,7 +4603,7 @@ fn show_tree_diff(
                         new_text.as_ref(),
                         path,
                         path,
-                        0,
+                        3,
                         0,
                         "a/",
                         "b/",
