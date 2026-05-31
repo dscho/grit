@@ -306,7 +306,7 @@ fn parse_conflict_style_name(raw: &str) -> Result<ConflictStyle> {
     match raw.to_ascii_lowercase().as_str() {
         "merge" => Ok(ConflictStyle::Merge),
         "diff3" | "zdiff3" => Ok(ConflictStyle::Diff3),
-        _ => bail!("error: unknown conflict style '{}'", raw),
+        _ => bail!("unknown conflict style '{}'", raw),
     }
 }
 
@@ -599,6 +599,32 @@ pub fn run(mut args: Args) -> Result<()> {
                 continue;
             }
             filtered.push(s);
+        }
+        args.rest = filtered;
+    }
+
+    // The merge tri-state flags (`-m`/`--merge`/`--no-merge`/`--conflict[=<style>]`/`--no-conflict`)
+    // are interpreted from the raw argv via `merge_cli`. `--no-merge` and `--no-conflict` are not
+    // clap options, so clap's `allow_hyphen_values` trailing_var_arg captures them into `rest`,
+    // where they would otherwise be mistaken for a revision or pathspec (t7201 38-41). Peel every
+    // merge-control token (and a following `--conflict <style>` argument) out of `rest`.
+    {
+        let original = std::mem::take(&mut args.rest);
+        let mut filtered: Vec<String> = Vec::with_capacity(original.len());
+        let mut iter = original.into_iter().peekable();
+        while let Some(s) = iter.next() {
+            match s.as_str() {
+                "-m" | "--merge" | "--no-merge" | "--no-conflict" => continue,
+                "--conflict" => {
+                    // Consume the following style argument (`--conflict diff3`).
+                    if iter.peek().is_some() {
+                        iter.next();
+                    }
+                    continue;
+                }
+                other if other.starts_with("--conflict=") => continue,
+                _ => filtered.push(s),
+            }
         }
         args.rest = filtered;
     }
@@ -3529,15 +3555,38 @@ fn reject_ambiguous_short_ref(repo: &Repository, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Mirror Git's `unmerge_index`/`unmerge_index_entry` (git/resolve-undo.c:124,155): for `checkout -m`
+/// restore conflict stages from the resolve-undo extension for paths matching `rel`.
+///
+/// For each resolve-undo record whose path matches the pathspec:
+/// - if the path is ALREADY unmerged (live stages 1/2/3 present), the record is dropped and the
+///   live stages are left untouched (Git returns early in `unmerge_index_entry`);
+/// - otherwise the stage-0 (or removed) entry is replaced with stages 1/2/3 from resolve-undo.
+///
+/// Paths that are unmerged but have no resolve-undo record are left untouched (Git's `unmerge_index`
+/// only iterates resolve-undo entries), so a still-conflicted path keeps its live stages and the
+/// subsequent merge runs against them.
 fn unmerge_paths_in_index(index: &mut Index, rel: &str) {
-    let paths: HashSet<Vec<u8>> = index
-        .entries
-        .iter()
-        .filter(|e| e.stage() != 0 && index_path_matches_spec(rel, &e.path))
-        .map(|e| e.path.clone())
-        .collect();
-    for p in paths {
-        index.entries.retain(|e| e.path != p);
+    let matching: Vec<Vec<u8>> = match index.resolve_undo.as_ref() {
+        Some(map) => map
+            .keys()
+            .filter(|p| index_path_matches_spec(rel, p))
+            .cloned()
+            .collect(),
+        None => return,
+    };
+    for path in matching {
+        let already_unmerged = index
+            .entries
+            .iter()
+            .any(|e| e.path == path && e.stage() != 0);
+        if already_unmerged {
+            // Already unmerged: leave the live stages in place, just consume the record.
+            index.take_resolve_undo_record(&path);
+        } else {
+            // Resolved to stage 0 or removed: restore the unmerged stages from resolve-undo.
+            index.unmerge_path_from_resolve_undo(&path);
+        }
     }
 }
 
@@ -3598,6 +3647,26 @@ checking out of the index."
                 }
             }
 
+            // Mirror Git's `checkout_paths` (git/builtin/checkout.c:599): before checking out any
+            // path, scan every matched pathspec for unmerged entries. When none of `-f`/`--ours`/
+            // `--theirs`/`--merge` is given, an unmerged path is a hard error and NO file is written
+            // (t7201 'checkout an unmerged path should fail' expects `fild` to be left untouched).
+            if !force_paths && !ours && !theirs && !merge_mode {
+                for path_str in paths {
+                    let rel = resolve_pathspec(path_str, work_tree, &cwd);
+                    if is_glob_pattern(&rel) {
+                        continue;
+                    }
+                    let is_root = rel.is_empty() || rel == "." || rel == "./";
+                    if is_root {
+                        continue;
+                    }
+                    if index_has_unmerged_matching(&index, &rel) {
+                        bail!("path '{}' is unmerged", rel);
+                    }
+                }
+            }
+
             for path_str in paths {
                 let rel = resolve_pathspec(path_str, work_tree, &cwd);
                 let path_bytes = rel.as_bytes();
@@ -3607,12 +3676,12 @@ checking out of the index."
                         let s2 = index.get(path_bytes, 2);
                         let s3 = index.get(path_bytes, 3);
                         if s2.is_none() || s3.is_none() {
-                            bail!("error: path '{}' does not have all necessary versions", rel);
+                            bail!("path '{}' does not have all necessary versions", rel);
                         }
                     } else if ours || theirs {
                         // Resolved below via stage 2/3 checkout.
                     } else if !force_paths {
-                        bail!("error: path '{}' is unmerged", rel);
+                        bail!("path '{}' is unmerged", rel);
                     } else {
                         // `checkout -f`: only paths with stage 0 are refreshed; unmerged-only paths
                         // are left as-is on disk (t7201).
@@ -3673,10 +3742,7 @@ checking out of the index."
                                     let s2 = index.get(pb.as_slice(), 2);
                                     let s3 = index.get(pb.as_slice(), 3);
                                     if s2.is_none() || s3.is_none() {
-                                        bail!(
-                                            "error: path '{}' does not have all necessary versions",
-                                            p
-                                        );
+                                        bail!("path '{}' does not have all necessary versions", p);
                                     }
                                 } else if force_paths && !ours && !theirs {
                                     // `checkout -f`: only refresh paths that have stage 0; leave
@@ -3695,7 +3761,7 @@ checking out of the index."
                                     }
                                     continue;
                                 } else if !ours && !theirs && !merge_mode {
-                                    bail!("error: path '{}' is unmerged", p);
+                                    bail!("path '{}' is unmerged", p);
                                 }
                             }
                             if ours || theirs {
