@@ -8865,7 +8865,109 @@ fn resolve_merge_target(repo: &Repository, spec: &str) -> Result<ObjectId> {
             return Ok(oid);
         }
     }
+    // Git resolves the merge argument with `get_merge_parent` (rev-parse / `dwim_ref`), which for
+    // a *bare* name only follows `ref_rev_parse_rules` — it never expands `<name>` to
+    // `refs/remotes/<remote>/<name>`. A bare name that does not resolve dies with a suggestion
+    // (`<name> - not something we can merge` + `Did you mean ...`), so do NOT fall through to the
+    // looser `resolve_revision_as_commit` DWIM for plain names (t7600 #82/#83).
+    let is_plain_name = !spec.contains(['~', '^', ':', '@'])
+        && !is_hex_like(spec)
+        && spec != "HEAD"
+        && spec != "FETCH_HEAD";
+    if is_plain_name {
+        let (count, dwim) = grit_lib::refs::resolve_ref_dwim(&repo.git_dir, spec);
+        let _ = count;
+        if let Some(oid) = dwim {
+            return peel_to_commit_oid(repo, oid);
+        }
+        return Err(merge_unknown_ref_error(repo, spec));
+    }
     resolve_revision_as_commit(repo, spec).map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Whether `spec` looks like an (abbreviated) object id rather than a ref name.
+fn is_hex_like(spec: &str) -> bool {
+    spec.len() >= 4 && spec.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Peel `oid` to a commit (following tag objects), as `get_merge_parent` does.
+fn peel_to_commit_oid(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
+    let mut cur = oid;
+    for _ in 0..10 {
+        let obj = repo.odb.read(&cur)?;
+        match obj.kind {
+            ObjectKind::Commit => return Ok(cur),
+            ObjectKind::Tag => {
+                let tag = grit_lib::objects::parse_tag(&obj.data)?;
+                cur = tag.object;
+            }
+            _ => break,
+        }
+    }
+    Ok(cur)
+}
+
+/// Build git's `help_unknown_ref`-style error for an unmergeable bare ref name: the headline plus
+/// `Did you mean ...` suggestions drawn from `refs/remotes/*` whose last component matches.
+fn merge_unknown_ref_error(repo: &Repository, spec: &str) -> anyhow::Error {
+    let suggestions = guess_merge_refs(repo, spec);
+    let mut msg = format!("merge: {spec} - not something we can merge\n");
+    if !suggestions.is_empty() {
+        if suggestions.len() == 1 {
+            msg.push_str("\nDid you mean this?\n");
+        } else {
+            msg.push_str("\nDid you mean one of these?\n");
+        }
+        for s in &suggestions {
+            msg.push_str(&format!("\t{s}\n"));
+        }
+    }
+    anyhow::Error::new(ExplicitExit {
+        code: 1,
+        message: msg.trim_end_matches('\n').to_string(),
+    })
+}
+
+/// Suggest remote-tracking refs whose final path component equals `base` (git `guess_refs` /
+/// `append_similar_ref`), returning each as a shortened-unambiguous ref name.
+fn guess_merge_refs(repo: &Repository, base: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(remotes) = grit_lib::refs::list_refs(&repo.git_dir, "refs/remotes/") else {
+        return out;
+    };
+    for (name, _oid) in remotes {
+        let last = name.rsplit('/').next().unwrap_or("");
+        if last == base {
+            out.push(shorten_unambiguous_merge_ref(repo, &name));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Shorten a full ref to the most concise `ref_rev_parse_rules` form that still resolves back to
+/// it unambiguously (git `refs_shorten_unambiguous_ref` with `strict`). Falls back to stripping
+/// `refs/`.
+fn shorten_unambiguous_merge_ref(repo: &Repository, full: &str) -> String {
+    // Candidate short names in the same order git's rules prefer, shortest first.
+    let candidates: Vec<&str> = if let Some(rest) = full.strip_prefix("refs/remotes/") {
+        // `refs/remotes/origin/x` -> try `origin/x` then `remotes/origin/x`.
+        vec![rest, full.strip_prefix("refs/").unwrap_or(full)]
+    } else if let Some(rest) = full.strip_prefix("refs/heads/") {
+        vec![rest]
+    } else if let Some(rest) = full.strip_prefix("refs/tags/") {
+        vec![rest]
+    } else {
+        vec![full.strip_prefix("refs/").unwrap_or(full)]
+    };
+    for cand in candidates {
+        let (count, _) = grit_lib::refs::resolve_ref_dwim(&repo.git_dir, cand);
+        if count == 1 {
+            return cand.to_string();
+        }
+    }
+    full.strip_prefix("refs/").unwrap_or(full).to_string()
 }
 
 pub(crate) fn read_fetch_head_merge_oids(repo: &Repository) -> Result<Vec<String>> {
