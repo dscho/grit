@@ -43,6 +43,21 @@ pub fn reflog_path(git_dir: &Path, refname: &str) -> PathBuf {
     reflog_file_path(git_dir, refname)
 }
 
+/// Apply `core.sharedRepository` permissions to a rewritten reflog file, matching Git's
+/// `adjust_shared_perm` call in `files_reflog_expire`. Best-effort: ignores config and FS errors.
+fn adjust_reflog_shared_perm(git_dir: &Path, path: &Path) {
+    let Ok(config) = ConfigSet::load(Some(git_dir), true) else {
+        return;
+    };
+    let raw = config.get("core.sharedRepository");
+    let Ok(perm) = crate::shared_repo::shared_repository_from_config_value(raw.as_deref()) else {
+        return;
+    };
+    if perm != 0 {
+        let _ = crate::shared_repo::adjust_shared_perm_path(perm, path);
+    }
+}
+
 /// Check whether a reflog exists for the given ref.
 pub fn reflog_exists(git_dir: &Path, refname: &str) -> bool {
     if crate::reftable::is_reftable_repo(git_dir) {
@@ -761,12 +776,15 @@ pub fn expire_reflog_git(
     if !params.dry_run && pruned > 0 {
         if is_reftable {
             crate::reftable::reftable_replace_reflog(git_dir, refname, &kept_entries)?;
-        } else if kept.is_empty() {
-            let path = reflog_path(git_dir, refname);
-            let _ = fs::remove_file(&path);
         } else {
+            // Git rewrites the reflog in place via the lockfile machinery and keeps the file even
+            // when all entries are pruned (it does not unlink it — only an explicit reflog/ref
+            // delete removes the file). Writing an empty file mirrors that and preserves the
+            // file's existence. Git then runs `adjust_shared_perm` on the rewritten log, so honor
+            // `core.sharedRepository` here too (t0600 "reflog expire honors core.sharedRepository").
             let path = reflog_path(git_dir, refname);
             fs::write(&path, kept.join(""))?;
+            adjust_reflog_shared_perm(git_dir, &path);
         }
     }
     Ok(pruned)

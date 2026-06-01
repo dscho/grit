@@ -259,7 +259,14 @@ pub fn run(args: Args) -> Result<()> {
             .trim_end_matches('/')
             .trim_end_matches('\\')
             .to_owned();
-        let key = precompose_utf8_path(&src_rel).into_owned();
+        // Only fold the source path to NFC when `core.precomposeunicode` is on. With it off the
+        // index stores the bytes the shell passed (often NFD on macOS), so the exact-byte
+        // `index.get` lookup below must use the unmodified spelling (git/builtin/mv.c).
+        let key = if precompose_unicode {
+            precompose_utf8_path(&src_rel).into_owned()
+        } else {
+            src_rel.clone()
+        };
         let mut src_abs = work_tree.join(&src_rel);
         if precompose_unicode && !src_abs.exists() {
             let nfc_path = work_tree.join(&key);

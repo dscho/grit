@@ -664,6 +664,13 @@ pub fn write_ref(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
     }
     let stor = crate::ref_namespace::storage_ref_name(refname);
     let path = storage_dir.join(stor);
+    // An empty directory left over from a previously deleted nested ref can sit exactly where
+    // this ref file must go (e.g. `refs/e-create/foo` after `refs/e-create/foo/bar` was pruned).
+    // Git removes such empty directory trees before locking the ref (see t0600 "empty directory
+    // should not fool create/update"); mirror that so the rename below does not hit "Is a
+    // directory". Non-empty directories (containing files or `*.lock`) are left in place so the
+    // subsequent write surfaces the conflict, matching Git's behaviour.
+    remove_empty_ref_directory(&path);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -673,6 +680,55 @@ pub fn write_ref(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
     fs::write(&lock, &content)?;
     fs::rename(&lock, &path)?;
     Ok(())
+}
+
+/// Remove the directory at `path` if it is an empty directory tree (contains only empty
+/// directories, no regular files or lock files). Best-effort: returns silently on any error or
+/// if `path` is not a directory. Mirrors Git's `remove_empty_directories`
+/// (`remove_dir_recursively(REMOVE_DIR_EMPTY_ONLY)`), used to clear stale directories that sit
+/// where a ref file must be created or deleted.
+fn remove_empty_ref_directory(path: &Path) {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_dir() => {}
+        _ => return,
+    }
+    // `remove_dir_all` would also delete files; we only want to remove trees that are entirely
+    // empty of files. `fs::remove_dir` fails (non-empty) unless we recurse, so walk first.
+    if dir_tree_has_files(path) {
+        return;
+    }
+    let _ = remove_dir_tree(path);
+}
+
+/// Return true if the directory tree rooted at `dir` contains any non-directory entry.
+fn dir_tree_has_files(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // Unreadable: treat conservatively as "has files" so we do not delete it.
+        return true;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {
+                if dir_tree_has_files(&entry.path()) {
+                    return true;
+                }
+            }
+            Ok(_) => return true, // a file, symlink, or `*.lock`
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Recursively remove an empty directory tree (assumes [`dir_tree_has_files`] returned false).
+fn remove_dir_tree(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_dir_tree(&entry.path())?;
+        }
+    }
+    fs::remove_dir(dir)
 }
 
 /// Delete a ref.
@@ -688,38 +744,51 @@ pub fn delete_ref(git_dir: &Path, refname: &str) -> Result<()> {
     }
     let storage_dir = ref_storage_dir(git_dir, refname);
     let stor = crate::ref_namespace::storage_ref_name(refname);
-    // Remove the loose ref file
     let path = storage_dir.join(&stor);
+
+    // Remove the packed-refs entry *first* (acquiring the packed-refs lock). Git deletes the
+    // packed version while holding the lock before unlinking the loose ref, so that a failure to
+    // rewrite packed-refs (lock held, stale `packed-refs.new`, ...) leaves the reference fully
+    // intact rather than dropping the loose file and exposing a stale packed value. See t0600
+    // "delete fails cleanly if packed-refs file is locked / .new write fails".
+    remove_packed_ref(&storage_dir, &stor)?;
+
+    // Remove the loose ref file. An empty directory tree may occupy the ref path (a leftover
+    // from a previously deleted nested ref); clear it so the delete succeeds rather than failing
+    // with "Is a directory" (see t0600 "empty directory should not fool 0/1-arg delete").
+    remove_empty_ref_directory(&path);
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e)
+            if e.kind() == io::ErrorKind::NotADirectory
+                || e.raw_os_error() == Some(libc::ENOTDIR) => {}
+        // The path is (still) a directory — e.g. a non-empty tree we declined to remove.
+        // Treat as "loose ref not present"; the packed-refs entry was already removed above.
+        Err(e)
+            if e.raw_os_error() == Some(libc::EISDIR) || e.raw_os_error() == Some(libc::EPERM) => {}
         Err(e) => return Err(Error::Io(e)),
     }
 
-    // Also remove the entry from packed-refs if present
-    remove_packed_ref(&storage_dir, &stor)?;
-
     let log_path = storage_dir.join("logs").join(&stor);
 
-    // Keep `logs/refs/heads/<name>` when deleting a branch so `branch -D` + later recreate can
-    // retain history (matches upstream expectations in t1507 `log -g` with `@{now}`).
-    if !refname.starts_with("refs/heads/") {
-        let _ = fs::remove_file(&log_path);
+    // Remove the ref's reflog and clean up empty parent directories, matching Git's
+    // `files_transaction_finish` (which deletes the reflog of any deleted ref and then calls
+    // `try_remove_empty_parents`). Leaving the reflog behind would block a later nested ref
+    // (e.g. deleting `k/l` then creating `k/l/m`, which needs `logs/refs/heads/k/l` to be a
+    // directory) — see t0601 and t1410 "stale dirs do not cause d/f conflicts".
+    let _ = fs::remove_file(&log_path);
 
-        // Remove empty parent directories under `logs/refs/heads/` so a deleted nested ref
-        // does not leave `logs/refs/heads/d` as a directory (which would block reflogs for
-        // a later branch named `d`).
-        let logs_heads = storage_dir.join("logs/refs/heads");
-        let mut parent = log_path.parent();
-        while let Some(p) = parent {
-            if p == logs_heads.as_path() || !p.starts_with(&logs_heads) {
-                break;
-            }
-            if fs::remove_dir(p).is_err() {
-                break;
-            }
-            parent = p.parent();
+    let logs_root = storage_dir.join("logs");
+    let mut parent = log_path.parent();
+    while let Some(p) = parent {
+        if p == logs_root.as_path() || !p.starts_with(&logs_root) {
+            break;
         }
+        if fs::remove_dir(p).is_err() {
+            break; // not empty or other error
+        }
+        parent = p.parent();
     }
 
     Ok(())
@@ -787,18 +856,71 @@ fn remove_packed_ref(git_dir: &Path, refname: &str) -> Result<()> {
     }
 
     if changed {
-        // Match Git's packed-refs rewrite lock path (`packed-refs.new`).
-        // Tests expect prune/delete to fail when this lock already exists.
-        let lock = packed_path.with_extension("new");
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-            .map_err(Error::Io)?;
-        use std::io::Write as _;
-        file.write_all(out.as_bytes()).map_err(Error::Io)?;
-        drop(file);
-        fs::rename(&lock, &packed_path).map_err(Error::Io)?;
+        // Git rewrites packed-refs under two files: it first takes the `packed-refs.lock`
+        // lockfile (failing if another process holds it), then writes the new content to the
+        // `packed-refs.new` tempfile and renames it over `packed-refs`. Mirror both so that
+        // `update-ref -d` fails cleanly — leaving the reference intact — when either file is
+        // already present (t0600 "delete fails cleanly if packed-refs file is locked / .new
+        // write fails").
+        let lock = lock_path_for_ref(&packed_path); // packed-refs.lock
+        let abs_lock = fs::canonicalize(git_dir)
+            .map(|d| d.join("packed-refs.lock"))
+            .unwrap_or_else(|_| lock.clone());
+        // Honor `core.packedrefstimeout`: git retries acquiring the packed-refs lock for up to
+        // this many milliseconds before giving up (t0600 "no bogus intermediate values during
+        // delete" holds the lock and expects update-ref to block, not fail immediately).
+        let timeout_ms = ConfigSet::load(Some(git_dir), true)
+            .ok()
+            .and_then(|cfg| cfg.get("core.packedrefstimeout"))
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => break,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    if timeout_ms > 0 && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
+                    return Err(Error::Message(format!(
+                        "Unable to create '{}': File exists.",
+                        abs_lock.display()
+                    )));
+                }
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
+
+        let tmp = packed_path.with_extension("new");
+        let mut created_tmp = false;
+        let write_result = (|| -> Result<()> {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(Error::Io)?;
+            created_tmp = true;
+            use std::io::Write as _;
+            file.write_all(out.as_bytes()).map_err(Error::Io)?;
+            drop(file);
+            fs::rename(&tmp, &packed_path).map_err(Error::Io)?;
+            created_tmp = false; // consumed by rename
+            Ok(())
+        })();
+
+        // Always release the lock; on failure clean up only a tempfile that we created (never a
+        // pre-existing `packed-refs.new` placed by the caller/test).
+        let _ = fs::remove_file(&lock);
+        if write_result.is_err() && created_tmp {
+            let _ = fs::remove_file(&tmp);
+        }
+        write_result?;
     }
 
     Ok(())
@@ -987,6 +1109,33 @@ pub fn should_autocreate_reflog(git_dir: &Path, refname: &str) -> bool {
 /// # Errors
 ///
 /// Returns [`Error::Io`] on filesystem errors.
+/// Remove stale reflog *files* that occupy path components which must become directories.
+///
+/// When a branch is deleted we keep its reflog file (so `branch -D` + later recreate can
+/// retain history). If a later nested branch (e.g. `k/l/m`) needs `logs/refs/heads/k/l` to be
+/// a directory, the leftover file at that path blocks `create_dir_all`. Walk from `logs_root`
+/// down toward `target` and remove any regular file sitting where a directory is required, so
+/// the directory can be created. Best-effort: filesystem errors are ignored (the subsequent
+/// `create_dir_all` surfaces any real problem).
+fn clear_conflicting_reflog_files(logs_root: &Path, target: &Path) {
+    let Ok(rel) = target.strip_prefix(logs_root) else {
+        return;
+    };
+    let mut cur = logs_root.to_path_buf();
+    for component in rel.components() {
+        cur.push(component);
+        match fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_dir() => {}
+            Ok(_) => {
+                // A non-directory (stale reflog file or symlink) is in the way of a needed
+                // directory. Remove it so the directory hierarchy can be created.
+                let _ = fs::remove_file(&cur);
+            }
+            Err(_) => break, // does not exist yet (or unreadable); nothing more to clear
+        }
+    }
+}
+
 pub fn append_reflog(
     git_dir: &Path,
     refname: &str,
@@ -1015,6 +1164,12 @@ pub fn append_reflog(
         return Ok(());
     }
     if let Some(parent) = log_path.parent() {
+        // A stale reflog *file* left behind by a deleted branch (e.g. `logs/refs/heads/k/l`)
+        // can occupy a path component that must now become a directory (for `k/l/m`). Git
+        // removes such leftovers while creating the reflog; mirror that so `create_dir_all`
+        // does not fail with "File exists" / "Not a directory".
+        let logs_root = storage_dir.join("logs");
+        clear_conflicting_reflog_files(&logs_root, parent);
         fs::create_dir_all(parent)?;
     }
     let line = if message.is_empty() {

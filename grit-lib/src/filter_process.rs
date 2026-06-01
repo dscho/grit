@@ -324,22 +324,21 @@ fn handshake(stdout: &mut ChildStdout, stdin: &mut ChildStdin) -> std::io::Resul
     write_packet_line(stdin, "version=2")?;
     write_flush(stdin)?;
 
-    let Some(server) = read_packet_line(stdout)? else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "expected git-filter-server",
-        ));
-    };
-    if server != "git-filter-server" {
+    // Match Git `sub-process.c` `handshake_version` error format
+    // (`error("Unexpected line '%s', expected %s-server", ...)`), so callers can recognize a
+    // non-filter subprocess (t0021 "invalid process filter must fail").
+    let server = read_packet_line(stdout)?;
+    let server_line = server.as_deref().unwrap_or("<flush packet>");
+    if server_line != "git-filter-server" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            format!("unexpected filter server line: {server}"),
+            format!("Unexpected line '{server_line}', expected git-filter-server"),
         ));
     }
     let Some(ver_line) = read_packet_line(stdout)? else {
         return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "expected version line",
+            std::io::ErrorKind::InvalidData,
+            "Unexpected line '<flush packet>', expected version",
         ));
     };
     let ver = ver_line

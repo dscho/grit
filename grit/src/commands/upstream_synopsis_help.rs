@@ -67,31 +67,16 @@ fn print_upstream_synopsis_to(subcmd: &str, syn: &str, out: &mut dyn Write) -> i
     Ok(())
 }
 
-/// `git rev-parse -h` — brief synopsis (t0012 expects stdout; stderr must stay empty).
-fn print_rev_parse_brief_help_stdout() -> io::Result<()> {
-    let mut out = std::io::stdout();
-    writeln!(
-        out,
-        "usage: git rev-parse --parseopt [<options>] -- [<args>...]"
-    )?;
-    writeln!(out, "   or: git rev-parse --sq-quote [<arg>...]")?;
-    writeln!(out, "   or: git rev-parse [<options>] [<arg>...]")?;
-    writeln!(out)?;
-    writeln!(
-        out,
-        "Run \"git rev-parse --parseopt -h\" for more information on the first usage."
-    )?;
-    Ok(())
-}
-
 /// If `rest` is exactly `-h`, `--help`, or `--help-all`, print the upstream synopsis and exit.
 /// Otherwise no-op.
 ///
 /// `--help-all` matches the short synopsis (`-h`) and exit **129** (t1517). Long `--help` alone
 /// exits **0** so POSIX `&&` chains keep working (t0450).
 ///
-/// Matches Git's streams: most commands use **stdout**; `git rev-parse -h` uses **stderr** with an
-/// extra trailer line.
+/// The synopsis text is the vendored `Documentation/*.adoc` SYNOPSIS, printed to **stdout** so the
+/// `-h` output and the `*.adoc` SYNOPSIS agree byte-for-byte (t0450). `git rev-parse -h` therefore
+/// prints `usage: git rev-parse [<options>] <arg>...` (the adoc synopsis), not the historical
+/// `--parseopt`/`--sq-quote` three-line form.
 pub(crate) fn try_print_upstream_help_and_exit(subcmd: &str, rest: &[String]) {
     if rest.len() != 1 {
         return;
@@ -108,15 +93,11 @@ pub(crate) fn try_print_upstream_help_and_exit(subcmd: &str, rest: &[String]) {
         129
     };
 
-    let result = if subcmd == "rev-parse" && !long_help {
-        print_rev_parse_brief_help_stdout()
-    } else {
-        let Some(syn) = synopsis_for_builtin(subcmd) else {
-            return;
-        };
-        let mut out = std::io::stdout();
-        print_upstream_synopsis_to(subcmd, syn, &mut out)
+    let Some(syn) = synopsis_for_builtin(subcmd) else {
+        return;
     };
+    let mut out = std::io::stdout();
+    let result = print_upstream_synopsis_to(subcmd, syn, &mut out);
 
     if let Err(e) = result {
         eprintln!("failed to write help: {e}");

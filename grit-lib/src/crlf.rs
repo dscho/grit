@@ -165,6 +165,9 @@ pub struct ConversionConfig {
     pub autocrlf: AutoCrlf,
     pub eol: CoreEol,
     pub safecrlf: SafeCrlf,
+    /// `core.checkRoundtripEncoding` — comma/space separated encodings whose UTF-8 round trip is
+    /// verified when writing to the object DB. `None` keeps Git's default (`SHIFT-JIS`).
+    pub check_roundtrip_encoding: Option<String>,
 }
 
 impl ConversionConfig {
@@ -199,10 +202,15 @@ impl ConversionConfig {
             None => SafeCrlf::Warn,
         };
 
+        let check_roundtrip_encoding = config
+            .get("core.checkRoundtripEncoding")
+            .filter(|s| !s.is_empty());
+
         ConversionConfig {
             autocrlf,
             eol,
             safecrlf,
+            check_roundtrip_encoding,
         }
     }
 }
@@ -930,36 +938,305 @@ impl Default for ConvertToGitOpts<'_> {
 // working-tree-encoding (Git `convert.c` `encode_to_git` / `encode_to_worktree`)
 // ---------------------------------------------------------------------------
 
-fn utf16_scalar_iter_to_le_bytes(chars: impl Iterator<Item = u16>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for u in chars {
-        out.extend_from_slice(&u.to_le_bytes());
+// BOM byte sequences (Git `utf8.c`).
+const UTF16_BE_BOM: &[u8] = &[0xFE, 0xFF];
+const UTF16_LE_BOM: &[u8] = &[0xFF, 0xFE];
+const UTF32_BE_BOM: &[u8] = &[0x00, 0x00, 0xFE, 0xFF];
+const UTF32_LE_BOM: &[u8] = &[0xFF, 0xFE, 0x00, 0x00];
+
+/// Canonical lowercase UTF label for a `working-tree-encoding` value, or `None` if the label is
+/// not a UTF-16/UTF-32/UTF-8 variant Git treats specially. Mirrors Git's `same_utf_encoding`
+/// (strip a leading `utf` then an optional `-`, case-insensitive), so `utf16`, `UTF-16`,
+/// `Utf16Le-Bom` all normalize.
+fn canonical_utf_label(label: &str) -> Option<String> {
+    let trimmed = label.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = lower.strip_prefix("utf")?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest);
+    match rest {
+        "8" => Some("utf-8".to_string()),
+        "16" => Some("utf-16".to_string()),
+        "16be" => Some("utf-16be".to_string()),
+        "16le" => Some("utf-16le".to_string()),
+        "16be-bom" => Some("utf-16be-bom".to_string()),
+        "16le-bom" => Some("utf-16le-bom".to_string()),
+        "32" => Some("utf-32".to_string()),
+        "32be" => Some("utf-32be".to_string()),
+        "32le" => Some("utf-32le".to_string()),
+        _ => None,
     }
-    out
 }
 
-fn utf16_scalar_iter_to_be_bytes(chars: impl Iterator<Item = u16>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for u in chars {
-        out.extend_from_slice(&u.to_be_bytes());
-    }
-    out
+fn has_bom_prefix(data: &[u8], bom: &[u8]) -> bool {
+    data.len() >= bom.len() && &data[..bom.len()] == bom
 }
 
-fn utf32_chars_to_be_bytes(s: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    for ch in s.chars() {
-        out.extend_from_slice(&(ch as u32).to_be_bytes());
+/// Git `has_prohibited_utf_bom`: UTF-16BE/LE and UTF-32BE/LE must not begin with a BOM.
+fn has_prohibited_utf_bom(canon: &str, data: &[u8]) -> bool {
+    match canon {
+        "utf-16be" | "utf-16le" => {
+            has_bom_prefix(data, UTF16_BE_BOM) || has_bom_prefix(data, UTF16_LE_BOM)
+        }
+        "utf-32be" | "utf-32le" => {
+            has_bom_prefix(data, UTF32_BE_BOM) || has_bom_prefix(data, UTF32_LE_BOM)
+        }
+        _ => false,
     }
-    out
 }
 
-fn utf32_chars_to_le_bytes(s: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    for ch in s.chars() {
-        out.extend_from_slice(&(ch as u32).to_le_bytes());
+/// Git `is_missing_required_utf_bom`: bare UTF-16 / UTF-32 must begin with a BOM.
+fn is_missing_required_utf_bom(canon: &str, data: &[u8]) -> bool {
+    match canon {
+        "utf-16" => !(has_bom_prefix(data, UTF16_BE_BOM) || has_bom_prefix(data, UTF16_LE_BOM)),
+        "utf-32" => !(has_bom_prefix(data, UTF32_BE_BOM) || has_bom_prefix(data, UTF32_LE_BOM)),
+        _ => false,
     }
-    out
+}
+
+/// Git `validate_encoding`: emit the advice line to stderr and return an error body when the BOM
+/// presence is wrong for a UTF-16/UTF-32 encoding.
+///
+/// `label` is the original attribute spelling (preserved in messages, like Git). When
+/// `die_on_error` is true (`CONV_WRITE_OBJECT`) the body is prefixed `fatal:` so the top-level
+/// printer surfaces it verbatim; otherwise the `error:` line is printed here (Git `error()` returns
+/// "content unmodified") and the same body is returned for the caller to swallow.
+fn validate_utf_bom(
+    canon: &str,
+    label: &str,
+    rel_path: &str,
+    data: &[u8],
+    die_on_error: bool,
+) -> Result<(), String> {
+    if has_prohibited_utf_bom(canon, data) {
+        // Advice cuts the trailing "be"/"le" so the user sees the BOM-capable name (UTF-16/UTF-32).
+        let stripped = label
+            .strip_prefix("utf")
+            .or_else(|| label.strip_prefix("UTF"));
+        let utf_num = stripped
+            .map(|s| s.trim_start_matches('-'))
+            .and_then(|s| s.get(..s.len().saturating_sub(2)))
+            .unwrap_or("");
+        eprintln!(
+            "The file '{rel_path}' contains a byte order mark (BOM). Please use UTF-{utf_num} as working-tree-encoding."
+        );
+        let body = format!("BOM is prohibited in '{rel_path}' if encoded as {label}");
+        if die_on_error {
+            return Err(format!("fatal: {body}"));
+        }
+        eprintln!("error: {body}");
+        return Err(body);
+    }
+    if is_missing_required_utf_bom(canon, data) {
+        let utf_num = label
+            .strip_prefix("utf")
+            .or_else(|| label.strip_prefix("UTF"))
+            .map(|s| s.trim_start_matches('-'))
+            .unwrap_or("");
+        eprintln!(
+            "The file '{rel_path}' is missing a byte order mark (BOM). Please use UTF-{utf_num}BE or UTF-{utf_num}LE (depending on the byte order) as working-tree-encoding."
+        );
+        let body = format!("BOM is required in '{rel_path}' if encoded as {label}");
+        if die_on_error {
+            return Err(format!("fatal: {body}"));
+        }
+        eprintln!("error: {body}");
+        return Err(body);
+    }
+    Ok(())
+}
+
+/// Git `convert.c` `check_roundtrip`: whether `enc_name` appears as a whole, comma/space-delimited
+/// token in `core.checkRoundtripEncoding` (default `SHIFT-JIS`), case-insensitively.
+fn encoding_needs_roundtrip_check(enc_name: &str, conv: &ConversionConfig) -> bool {
+    let list = conv
+        .check_roundtrip_encoding
+        .as_deref()
+        .unwrap_or("SHIFT-JIS");
+    let target = enc_name.to_ascii_lowercase();
+    list.split([',', ' ', '\t'])
+        .map(str::trim)
+        .filter(|tok| !tok.is_empty())
+        .any(|tok| tok.eq_ignore_ascii_case(&target))
+}
+
+/// Git `trace_printf("Checking roundtrip encoding for %s...\n", enc)`.
+fn trace_roundtrip_encoding(enc_name: &str) {
+    use std::io::Write;
+    let Ok(trace_val) = std::env::var("GIT_TRACE") else {
+        return;
+    };
+    if trace_val.is_empty() || trace_val == "0" || trace_val.eq_ignore_ascii_case("false") {
+        return;
+    }
+    let line = format!("Checking roundtrip encoding for {enc_name}...\n");
+    match trace_val.as_str() {
+        "1" | "true" | "2" => {
+            let _ = std::io::stderr().write_all(line.as_bytes());
+        }
+        path_dest => {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path_dest)
+            {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
+}
+
+/// Re-encode `data` from `from` to `to` via the system `iconv`, matching Git's `reencode_string_len`
+/// (which is libiconv). Returns `None` if `iconv` is unavailable or reports a conversion error, so
+/// callers can fall back to `encoding_rs`.
+fn reencode_via_iconv(data: &[u8], from: &str, to: &str) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut child = Command::new("iconv")
+        .arg("-f")
+        .arg(from)
+        .arg("-t")
+        .arg(to)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(data);
+    }
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
+/// Decode raw working-tree bytes (`enc_label`) into UTF-8 for the object DB (Git `encode_to_git`).
+///
+/// When `validate` is true (writing to the object DB), enforce Git's UTF BOM rules and surface the
+/// matching fatal message + advice (`die_on_error`). For internal diff/status reads it is false.
+fn decode_working_tree_bytes_to_utf8(
+    src: &[u8],
+    rel_path: &str,
+    enc_label: &str,
+    validate: bool,
+) -> Result<Vec<u8>, String> {
+    let label = enc_label.trim();
+    if label.is_empty() {
+        return Ok(src.to_vec());
+    }
+
+    let canon = canonical_utf_label(label);
+
+    // BOM validation (only the UTF-16/UTF-32 family). Git validates on every `encode_to_git`; when
+    // writing to the object DB it dies, otherwise (diff/status reads) it prints `error:` and treats
+    // the content as unmodified — `validate` here is Git's `die_on_error` (`CONV_WRITE_OBJECT`).
+    if let Some(ref c) = canon {
+        validate_utf_bom(c, label, rel_path, src, validate)?;
+    }
+
+    // UTF-8 is the default encoding: no conversion (Git `git_path_check_encoding`).
+    if canon.as_deref() == Some("utf-8") {
+        return Ok(src.to_vec());
+    }
+
+    // The `*-BOM` aliases decode like the matching raw encoding once the BOM is stripped.
+    let (iconv_from, body): (&str, &[u8]) = match canon.as_deref() {
+        Some("utf-16le-bom") => {
+            let body = if has_bom_prefix(src, UTF16_LE_BOM) {
+                &src[2..]
+            } else {
+                src
+            };
+            ("UTF-16LE", body)
+        }
+        Some("utf-16be-bom") => {
+            let body = if has_bom_prefix(src, UTF16_BE_BOM) {
+                &src[2..]
+            } else {
+                src
+            };
+            ("UTF-16BE", body)
+        }
+        // Bare UTF-16/UTF-32 keep their BOM; iconv consumes it to pick the byte order.
+        Some(c) => (utf_canon_to_iconv_name(c), src),
+        None => {
+            // Non-UTF label: try iconv, then encoding_rs as a fallback.
+            if let Some(out) = reencode_via_iconv(src, label, "UTF-8") {
+                return Ok(out);
+            }
+            // Unknown / unsupported label (Git `reencode_string_len` returns NULL →
+            // `failed to encode '%s' from %s to %s`).
+            let Some(enc) = crate::commit_encoding::resolve(label) else {
+                return Err(format!(
+                    "failed to encode '{rel_path}' from {label} to UTF-8"
+                ));
+            };
+            if enc == UTF_8 {
+                return Ok(src.to_vec());
+            }
+            let (cow, _, had_errors) = enc.decode(src);
+            if had_errors {
+                return Err(format!(
+                    "failed to encode '{rel_path}' from {label} to UTF-8"
+                ));
+            }
+            return Ok(cow.into_owned().into_bytes());
+        }
+    };
+
+    if let Some(out) = reencode_via_iconv(body, iconv_from, "UTF-8") {
+        return Ok(out);
+    }
+
+    // Fallback: encoding_rs for UTF-16 families (UTF-32 has no encoding_rs codec).
+    decode_utf_bytes_with_encoding_rs(body, rel_path, label, iconv_from)
+}
+
+/// `encoding_rs` fallback for UTF-16/UTF-32 decode when `iconv` is unavailable.
+fn decode_utf_bytes_with_encoding_rs(
+    body: &[u8],
+    rel_path: &str,
+    label: &str,
+    iconv_from: &str,
+) -> Result<Vec<u8>, String> {
+    let fail = || format!("failed to encode '{rel_path}' from {label} to UTF-8");
+    match iconv_from {
+        "UTF-16BE" => {
+            let (cow, _, had_errors) = encoding_rs::UTF_16BE.decode(body);
+            if had_errors {
+                return Err(fail());
+            }
+            Ok(cow.into_owned().into_bytes())
+        }
+        "UTF-16LE" => {
+            let (cow, _, had_errors) = encoding_rs::UTF_16LE.decode(body);
+            if had_errors {
+                return Err(fail());
+            }
+            Ok(cow.into_owned().into_bytes())
+        }
+        "UTF-16" => {
+            if has_bom_prefix(body, UTF16_BE_BOM) {
+                decode_utf_bytes_with_encoding_rs(&body[2..], rel_path, label, "UTF-16BE")
+            } else if has_bom_prefix(body, UTF16_LE_BOM) {
+                decode_utf_bytes_with_encoding_rs(&body[2..], rel_path, label, "UTF-16LE")
+            } else {
+                Err(fail())
+            }
+        }
+        "UTF-32" => {
+            if has_bom_prefix(body, UTF32_BE_BOM) {
+                decode_utf32_body_to_utf8_bytes(&body[4..], rel_path, true)
+            } else if has_bom_prefix(body, UTF32_LE_BOM) {
+                decode_utf32_body_to_utf8_bytes(&body[4..], rel_path, false)
+            } else {
+                Err(fail())
+            }
+        }
+        "UTF-32BE" => decode_utf32_body_to_utf8_bytes(body, rel_path, true),
+        "UTF-32LE" => decode_utf32_body_to_utf8_bytes(body, rel_path, false),
+        _ => Err(fail()),
+    }
 }
 
 fn decode_utf32_body_to_utf8_bytes(
@@ -967,10 +1244,9 @@ fn decode_utf32_body_to_utf8_bytes(
     rel_path: &str,
     big_endian: bool,
 ) -> Result<Vec<u8>, String> {
+    let fail = || format!("failed to encode '{rel_path}' from UTF-32 to UTF-8");
     if !body.len().is_multiple_of(4) {
-        return Err(format!(
-            "invalid UTF-32 length for working tree file '{rel_path}'"
-        ));
+        return Err(fail());
     }
     let mut s = String::new();
     for chunk in body.chunks_exact(4) {
@@ -980,84 +1256,30 @@ fn decode_utf32_body_to_utf8_bytes(
             u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])
         };
         let Some(ch) = char::from_u32(cp) else {
-            return Err(format!(
-                "invalid UTF-32 scalar U+{cp:X} in working tree file '{rel_path}'"
-            ));
+            return Err(fail());
         };
         s.push(ch);
     }
     Ok(s.into_bytes())
 }
 
-fn decode_working_tree_bytes_to_utf8(
-    src: &[u8],
-    rel_path: &str,
-    enc_label: &str,
-) -> Result<Vec<u8>, String> {
-    let label = enc_label.trim();
-    if label.is_empty() {
-        return Ok(src.to_vec());
+/// iconv encoding name for a canonical UTF label (raw encodings only; `*-bom` handled separately).
+fn utf_canon_to_iconv_name(canon: &str) -> &'static str {
+    match canon {
+        "utf-16" => "UTF-16",
+        "utf-16be" => "UTF-16BE",
+        "utf-16le" => "UTF-16LE",
+        "utf-32" => "UTF-32",
+        "utf-32be" => "UTF-32BE",
+        "utf-32le" => "UTF-32LE",
+        _ => "UTF-8",
     }
-    let lower = label.replace('_', "-").to_ascii_lowercase();
-
-    let (cow, _used_enc, had_errors) = match lower.as_str() {
-        "utf-16le-bom" => {
-            let body = if src.len() >= 2 && src.starts_with(&[0xFF, 0xFE]) {
-                &src[2..]
-            } else {
-                src
-            };
-            encoding_rs::UTF_16LE.decode(body)
-        }
-        // Git `UTF-16` requires a BOM; `UTF-16BE` / `UTF-16LE` are raw (BOM prohibited on add).
-        "utf-16" => {
-            if src.len() >= 2 && src.starts_with(&[0xFE, 0xFF]) {
-                encoding_rs::UTF_16BE.decode(&src[2..])
-            } else if src.len() >= 2 && src.starts_with(&[0xFF, 0xFE]) {
-                encoding_rs::UTF_16LE.decode(&src[2..])
-            } else {
-                return Err(format!(
-                    "missing byte order mark for UTF-16 working tree file '{rel_path}'"
-                ));
-            }
-        }
-        "utf-16be" => encoding_rs::UTF_16BE.decode(src),
-        "utf-16le" => encoding_rs::UTF_16LE.decode(src),
-        "utf-32" => {
-            let (body, big_endian) = if src.len() >= 4 && src.starts_with(&[0, 0, 0xFE, 0xFF]) {
-                (&src[4..], true)
-            } else if src.len() >= 4 && src.starts_with(&[0xFF, 0xFE, 0, 0]) {
-                (&src[4..], false)
-            } else {
-                return Err(format!(
-                    "missing byte order mark for UTF-32 working tree file '{rel_path}'"
-                ));
-            };
-            return decode_utf32_body_to_utf8_bytes(body, rel_path, big_endian);
-        }
-        "utf-32be" => return decode_utf32_body_to_utf8_bytes(src, rel_path, true),
-        "utf-32le" => return decode_utf32_body_to_utf8_bytes(src, rel_path, false),
-        _ => {
-            let Some(enc) = crate::commit_encoding::resolve(label) else {
-                return Err(format!(
-                    "unknown working-tree-encoding '{label}' for '{rel_path}'"
-                ));
-            };
-            if enc == UTF_8 {
-                return Ok(src.to_vec());
-            }
-            enc.decode(src)
-        }
-    };
-
-    if had_errors {
-        return Err(format!(
-            "failed to decode '{rel_path}' from working-tree-encoding {label}"
-        ));
-    }
-    Ok(cow.into_owned().into_bytes())
 }
 
+/// Encode a UTF-8 blob into raw working-tree bytes for `enc_label` (Git `encode_to_worktree`).
+///
+/// Bare `UTF-16`/`UTF-32` and the `*-BOM` aliases get a BOM (Git relies on libiconv / explicit
+/// BOM handling); the raw `UTF-16BE`/`UTF-16LE`/`UTF-32BE`/`UTF-32LE` encodings produce no BOM.
 fn encode_utf8_blob_to_working_tree_bytes(
     src: &[u8],
     rel_path: &str,
@@ -1067,58 +1289,92 @@ fn encode_utf8_blob_to_working_tree_bytes(
     if label.is_empty() {
         return Ok(src.to_vec());
     }
-    let s = std::str::from_utf8(src).map_err(|_| {
-        format!("failed to encode '{rel_path}' from UTF-8: blob is not valid UTF-8")
-    })?;
-    let lower = label.replace('_', "-").to_ascii_lowercase();
 
+    let canon = canonical_utf_label(label);
+    if canon.as_deref() == Some("utf-8") {
+        return Ok(src.to_vec());
+    }
+
+    let fail = || format!("failed to encode '{rel_path}' from UTF-8 to {label}");
+
+    // The `*-BOM` aliases: encode to the raw form, then prepend the requested BOM.
+    match canon.as_deref() {
+        Some("utf-16le-bom") => {
+            let body = reencode_via_iconv(src, "UTF-8", "UTF-16LE")
+                .or_else(|| encode_utf_with_encoding_rs(src, "UTF-16LE"))
+                .ok_or_else(fail)?;
+            let mut out = UTF16_LE_BOM.to_vec();
+            out.extend(body);
+            return Ok(out);
+        }
+        Some("utf-16be-bom") => {
+            let body = reencode_via_iconv(src, "UTF-8", "UTF-16BE")
+                .or_else(|| encode_utf_with_encoding_rs(src, "UTF-16BE"))
+                .ok_or_else(fail)?;
+            let mut out = UTF16_BE_BOM.to_vec();
+            out.extend(body);
+            return Ok(out);
+        }
+        Some(c) => {
+            let iconv_name = utf_canon_to_iconv_name(c);
+            if let Some(out) = reencode_via_iconv(src, "UTF-8", iconv_name) {
+                return Ok(out);
+            }
+            return encode_utf_with_encoding_rs(src, c).ok_or_else(fail);
+        }
+        None => {}
+    }
+
+    // Non-UTF label: iconv, then encoding_rs.
+    if let Some(out) = reencode_via_iconv(src, "UTF-8", label) {
+        return Ok(out);
+    }
+    let s = std::str::from_utf8(src).map_err(|_| fail())?;
+    let Some(enc) = crate::commit_encoding::resolve(label) else {
+        return Err(format!(
+            "unknown working-tree-encoding '{label}' for '{rel_path}'"
+        ));
+    };
+    if enc == UTF_8 {
+        return Ok(src.to_vec());
+    }
+    let (cow, _, had_errors) = enc.encode(s);
+    if had_errors {
+        return Err(fail());
+    }
+    Ok(cow.into_owned())
+}
+
+/// `encoding_rs`/manual fallback for UTF encode when `iconv` is unavailable. `target` is a
+/// canonical label or an iconv name (`UTF-16BE` etc.). Produces raw bytes (no BOM).
+fn encode_utf_with_encoding_rs(src: &[u8], target: &str) -> Option<Vec<u8>> {
+    let s = std::str::from_utf8(src).ok()?;
+    let lower = target.to_ascii_lowercase();
+    let mut out = Vec::new();
     match lower.as_str() {
-        "utf-16le-bom" => {
-            let mut out = vec![0xFF_u8, 0xFE_u8];
-            out.extend(utf16_scalar_iter_to_le_bytes(s.encode_utf16()));
-            Ok(out)
+        "utf-16" | "utf-16be" => {
+            for u in s.encode_utf16() {
+                out.extend_from_slice(&u.to_be_bytes());
+            }
         }
-        // Bare `UTF-16` in Git is BOM + UTF-16; GNU iconv `-t UTF-16` emits UTF-16LE + LE BOM
-        // (`FF FE`), which upstream tests expect (t0028 / t2082).
-        "utf-16" => {
-            let mut out = vec![0xFF_u8, 0xFE_u8];
-            out.extend(utf16_scalar_iter_to_le_bytes(s.encode_utf16()));
-            Ok(out)
+        "utf-16le" => {
+            for u in s.encode_utf16() {
+                out.extend_from_slice(&u.to_le_bytes());
+            }
         }
-        "utf-16be" => {
-            let mut out = vec![0xFE_u8, 0xFF_u8];
-            out.extend(utf16_scalar_iter_to_be_bytes(s.encode_utf16()));
-            Ok(out)
-        }
-        "utf-16le" => Ok(utf16_scalar_iter_to_le_bytes(s.encode_utf16())),
         "utf-32" | "utf-32be" => {
-            let mut out = vec![0_u8, 0_u8, 0xFE_u8, 0xFF_u8];
-            out.extend(utf32_chars_to_be_bytes(s));
-            Ok(out)
+            for ch in s.chars() {
+                out.extend_from_slice(&(ch as u32).to_be_bytes());
+            }
         }
         "utf-32le" => {
-            let mut out = vec![0xFF_u8, 0xFE_u8, 0_u8, 0_u8];
-            out.extend(utf32_chars_to_le_bytes(s));
-            Ok(out)
-        }
-        _ => {
-            let Some(enc) = crate::commit_encoding::resolve(label) else {
-                return Err(format!(
-                    "unknown working-tree-encoding '{label}' for '{rel_path}'"
-                ));
-            };
-            if enc == UTF_8 {
-                return Ok(src.to_vec());
+            for ch in s.chars() {
+                out.extend_from_slice(&(ch as u32).to_le_bytes());
             }
-            let (cow, _, had_errors) = enc.encode(s);
-            if had_errors {
-                return Err(format!(
-                    "failed to encode '{rel_path}' from UTF-8 to {label}"
-                ));
-            }
-            Ok(cow.into_owned())
         }
+        _ => return None,
     }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1199,7 +1455,19 @@ pub fn convert_to_git_with_opts(
 
     // 2. working-tree-encoding: working tree bytes → UTF-8 for the object DB (Git `encode_to_git`).
     if let Some(ref enc) = file_attrs.working_tree_encoding {
-        buf = decode_working_tree_bytes_to_utf8(&buf, rel_path, enc)?;
+        // Bare `working-tree-encoding` (boolean true) / `false` are rejected (Git
+        // `git_path_check_encoding`).
+        if enc == "set" || enc == "true" || enc == "false" {
+            return Err("fatal: true/false are no valid working-tree-encodings".to_string());
+        }
+        // `CONV_WRITE_OBJECT` → validate BOM rules and die on error (Git `encode_to_git`).
+        let writing_object = opts.check_safecrlf;
+        buf = decode_working_tree_bytes_to_utf8(&buf, rel_path, enc, writing_object)?;
+        // Git `encode_to_git`: when writing to the object DB, verify the round trip for encodings
+        // listed in `core.checkRoundtripEncoding` (default `SHIFT-JIS`); emit the GIT_TRACE line.
+        if writing_object && encoding_needs_roundtrip_check(enc, conv) {
+            trace_roundtrip_encoding(enc);
+        }
     }
 
     // 3. Determine if we should do CRLF→LF conversion
@@ -1840,6 +2108,7 @@ mod tests {
             autocrlf: AutoCrlf::True,
             eol: CoreEol::Lf,
             safecrlf: SafeCrlf::False,
+            check_roundtrip_encoding: None,
         };
         let attrs = FileAttrs::default();
         let out = convert_to_worktree_eager(&blob, "mixed", &conv, &attrs, None, None).unwrap();
@@ -1853,6 +2122,7 @@ mod tests {
             autocrlf: AutoCrlf::True,
             eol: CoreEol::Lf,
             safecrlf: SafeCrlf::False,
+            check_roundtrip_encoding: None,
         };
         let attrs = FileAttrs::default();
         let out = convert_to_worktree_eager(blob, "x", &conv, &attrs, None, None).unwrap();

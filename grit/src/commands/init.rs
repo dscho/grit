@@ -77,6 +77,186 @@ fn parse_gitfile_line(content: &str, base: &Path) -> Result<PathBuf> {
     bail!("invalid gitfile format")
 }
 
+/// The git directory for a work-tree rooted at `work_tree`: the gitfile target when
+/// `<work_tree>/.git` is an existing gitfile (so `git init` from inside a separate-git-dir
+/// repo reinitializes the real git dir instead of clobbering the gitfile; t0001 #40), otherwise
+/// `<work_tree>/.git` itself. When the gitfile points at a *linked-worktree* admin dir (it has a
+/// `commondir`), resolve to the shared common git dir so re-init operates on the main repo and
+/// does not corrupt the worktree admin dir (t0001 #51).
+fn git_dir_via_existing_link(work_tree: &Path) -> PathBuf {
+    let link = work_tree.join(".git");
+    if link.is_file() {
+        if let Ok(content) = fs::read_to_string(&link) {
+            let base = link.parent().unwrap_or(Path::new("."));
+            if let Ok(target) = parse_gitfile_line(&content, base) {
+                if let Some(common) = grit_lib::refs::common_dir(&target) {
+                    return common;
+                }
+                return target;
+            }
+        }
+    }
+    link
+}
+
+/// Resolve the git directory a work-tree's `.git` link points at, for `--separate-git-dir`
+/// reinit (git/setup.c `separate_git_dir`). Returns the source git dir to relocate:
+/// the gitfile target when `.git` is a regular file, the directory itself when `.git` is a
+/// directory, or `None` when `.git` does not exist.
+fn resolve_existing_gitdir_link(link_path: &Path) -> Option<PathBuf> {
+    let meta = fs::symlink_metadata(link_path).ok()?;
+    if meta.file_type().is_dir() {
+        return Some(link_path.to_path_buf());
+    }
+    // Regular file or symlink-to-file: read it as a gitfile.
+    let content = fs::read_to_string(link_path).ok()?;
+    let base = link_path.parent().unwrap_or(Path::new("."));
+    parse_gitfile_line(&content, base).ok()
+}
+
+/// After a git dir is moved (`old_dir` -> `new_dir`), repair the linking files of every linked
+/// worktree so their `.git` gitfiles point at the relocated admin directories
+/// (git/worktree.c `repair_worktrees_after_gitdir_move`). Failures are non-fatal: a worktree
+/// whose backing `.git` no longer exists is simply skipped.
+fn repair_worktrees_after_gitdir_move(old_dir: &Path, new_dir: &Path) {
+    let worktrees_dir = new_dir.join("worktrees");
+    let entries = match fs::read_dir(&worktrees_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let use_relative = worktree_uses_relative_paths(new_dir);
+    for entry in entries.flatten() {
+        let admin = entry.path();
+        if !admin.is_dir() {
+            continue;
+        }
+        let id = entry.file_name();
+        let gitdir_file = admin.join("gitdir");
+        let Ok(raw) = fs::read_to_string(&gitdir_file) else {
+            continue;
+        };
+        let stored = raw.trim();
+        if stored.is_empty() {
+            continue;
+        }
+        // The stored path is the work-tree's `.git`. A relative value was written relative to
+        // the *old* admin dir location, so resolve it against that, normalizing `..`/`.`
+        // lexically (the old admin dir no longer exists after the move).
+        let dotgit = {
+            let p = PathBuf::from(stored);
+            if p.is_absolute() {
+                p
+            } else {
+                lexically_normalize(&old_dir.join("worktrees").join(&id).join(&p))
+            }
+        };
+        if !dotgit.exists() {
+            continue;
+        }
+        // `dotgit` here points at `<wt>/.git`; its parent is the work-tree root.
+        let wt_path = dotgit.parent().unwrap_or(Path::new("."));
+        let _ = write_worktree_linking_files_local(wt_path, &admin, use_relative);
+    }
+}
+
+/// Resolve `.`/`..` components in a path lexically, without touching the filesystem (mirrors
+/// git's `strbuf_realpath_forgiving` for already-absolute inputs).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out: Vec<Component> = Vec::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(comp);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out.iter().collect()
+}
+
+/// Read `worktree.useRelativePaths` from a git dir's config (defaults to false).
+fn worktree_uses_relative_paths(git_dir: &Path) -> bool {
+    let config_path = git_dir.join("config");
+    let Ok(content) = fs::read_to_string(&config_path) else {
+        return false;
+    };
+    ConfigFile::parse(&config_path, &content, ConfigScope::Local)
+        .ok()
+        .and_then(|f| f.get("worktree.useRelativePaths"))
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+}
+
+/// Write the pair of worktree linking files (`<wt>/.git` gitfile and `<admin>/gitdir`),
+/// mirroring git/worktree.c `write_worktree_linking_files`.
+fn write_worktree_linking_files_local(
+    wt_path: &Path,
+    wt_admin: &Path,
+    use_relative: bool,
+) -> Result<()> {
+    let dot_git = wt_path.join(".git");
+    if use_relative {
+        let gitdir_rel = make_relative_path(wt_admin, &dot_git);
+        fs::write(
+            wt_admin.join("gitdir"),
+            format!("{}\n", gitdir_rel.display()),
+        )?;
+        let dotgit_rel = make_relative_path(wt_path, wt_admin);
+        fs::write(dot_git, format!("gitdir: {}\n", dotgit_rel.display()))?;
+    } else {
+        let dot_git_abs = path_for_git_storage(wt_path).join(".git");
+        let admin_abs = path_for_git_storage(wt_admin);
+        fs::write(
+            wt_admin.join("gitdir"),
+            format!("{}\n", dot_git_abs.display()),
+        )?;
+        fs::write(dot_git, format!("gitdir: {}\n", admin_abs.display()))?;
+    }
+    Ok(())
+}
+
+/// Compute the relative path from directory `from` to `to` (mirrors worktree.rs helper).
+fn make_relative_path(from: &Path, to: &Path) -> PathBuf {
+    let from_abs = from.canonicalize().unwrap_or_else(|_| from.to_path_buf());
+    let to_abs = to.canonicalize().unwrap_or_else(|_| to.to_path_buf());
+    let from_comps: Vec<_> = from_abs.components().collect();
+    let to_comps: Vec<_> = to_abs.components().collect();
+    let common_len = from_comps
+        .iter()
+        .zip(to_comps.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let up = from_comps.len() - common_len;
+    let mut result = PathBuf::new();
+    for _ in 0..up {
+        result.push("..");
+    }
+    for comp in &to_comps[common_len..] {
+        result.push(comp.as_os_str());
+    }
+    result
+}
+
+/// Canonicalize for storage in gitdir/gitfile paths (mirrors worktree.rs helper).
+fn path_for_git_storage(path: &Path) -> PathBuf {
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(stripped) = canon.strip_prefix("/private") {
+            let without_private = PathBuf::from("/").join(stripped);
+            if without_private.exists() {
+                return without_private;
+            }
+        }
+    }
+    canon
+}
+
 /// Arguments for `grit init`.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -155,7 +335,20 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
     let resolved_git_dir =
         resolve_git_dir_for_init(&cwd, &abs_path, explicit_directory, git_dir_env.as_deref())?;
 
-    let mut git_dir_for_guess = resolved_git_dir.clone();
+    // Mirror git/builtin/init-db.c: `guess_repository_type` is fed the *literal* git dir
+    // (`$GIT_DIR` or the default `.git`), not the gitfile-resolved target. A `.git` gitfile
+    // therefore still guesses non-bare (t0001 #41). Only when `--separate-git-dir` is used and
+    // the gitfile points at a *linked-worktree* admin dir (has a `commondir`) do we relocate to
+    // the main worktree's common dir for the guess.
+    let literal_git_dir: PathBuf = if let Some(g) = git_dir_env.as_deref().filter(|s| !s.is_empty())
+    {
+        PathBuf::from(g)
+    } else if explicit_directory {
+        abs_path.join(".git")
+    } else {
+        PathBuf::from(".git")
+    };
+    let mut git_dir_for_guess = literal_git_dir;
     if args.separate_git_dir.is_some() {
         if let Some(common) = grit_lib::refs::common_dir(&resolved_git_dir) {
             git_dir_for_guess = common;
@@ -192,7 +385,7 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
         if bare {
             abs_path.clone()
         } else {
-            abs_path.join(".git")
+            git_dir_via_existing_link(&abs_path)
         }
     } else if git_dir_env.is_some() {
         if let Some(parent) = resolved_git_dir.parent() {
@@ -202,8 +395,58 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
     } else if bare {
         abs_path.clone()
     } else {
-        abs_path.join(".git")
+        git_dir_via_existing_link(&abs_path)
     };
+
+    // `--separate-git-dir` on an existing repository: relocate the current git dir to the
+    // separate location (git/setup.c `separate_git_dir`), then below we replace the work-tree's
+    // `.git` with a gitfile (t0001 #41-47, #51). The "link" is normally the work-tree's `.git`
+    // (file or directory), but when `--separate-git-dir` is run from inside a *linked* worktree
+    // we relocate the shared common git dir and rewrite the *main* worktree's `.git`
+    // (git/builtin/init-db.c relocates the common `.git/`, not `.git/worktrees/<id>/`).
+    let mut sep_gitfile_link: Option<PathBuf> = None;
+    if args.separate_git_dir.is_some() && !bare {
+        let wt_link = abs_path.join(".git");
+        if let Some(resolved) = resolve_existing_gitdir_link(&wt_link) {
+            // If this work-tree's git dir is a linked-worktree admin dir, target the common dir
+            // and the main worktree's `.git` instead.
+            let (src, link_path) = match grit_lib::refs::common_dir(&resolved) {
+                Some(common) => {
+                    let link = common
+                        .parent()
+                        .map(|p| p.join(".git"))
+                        .unwrap_or(common.clone());
+                    (common, link)
+                }
+                None => (resolved, wt_link.clone()),
+            };
+            let src_canon = fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+            // Only relocate when the existing git dir actually lives somewhere else.
+            if src_canon != real_git_dir && src.join("HEAD").exists() {
+                if real_git_dir.exists() {
+                    bail!("{} already exists", real_git_dir.display());
+                }
+                if let Some(parent) = real_git_dir.parent() {
+                    fs::create_dir_all(parent).ok();
+                }
+                fs::rename(&src, &real_git_dir).with_context(|| {
+                    format!(
+                        "unable to move {} to {}",
+                        src.display(),
+                        real_git_dir.display()
+                    )
+                })?;
+                // Repair linked worktrees that pointed into the old git dir.
+                repair_worktrees_after_gitdir_move(&src_canon, &real_git_dir);
+                // If `.git` was a directory we just moved, drop the now-empty path so the
+                // gitfile can be written in its place.
+                if link_path.is_dir() {
+                    let _ = fs::remove_dir_all(&link_path);
+                }
+                sep_gitfile_link = Some(link_path);
+            }
+        }
+    }
 
     // Leftover `.git` from a failed/partial init (no HEAD): remove so `git init` matches Git
     // (t5332 `git init` into a directory that had an incomplete `.git`).
@@ -241,20 +484,20 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
     // 2. GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME env (test support)
     // 3. init.defaultBranch config
     // 4. "main" as fallback (matches modern Git default; see `git init` builtin)
+    // `branch_from_fallback` records when no explicit name was given so we can advise (t0001 #92).
+    let mut branch_from_fallback = false;
     let initial_branch = if !is_reinit {
         if let Some(ref b) = args.initial_branch {
             b.clone()
-        } else if let Ok(b) = std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME") {
-            if !b.is_empty() {
-                b
-            } else {
-                config
-                    .get("init.defaultBranch")
-                    .unwrap_or_else(|| "main".to_owned())
-            }
+        } else if let Some(b) = std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+            .ok()
+            .filter(|b| !b.is_empty())
+        {
+            b
         } else if let Some(b) = config.get("init.defaultBranch") {
             b
         } else {
+            branch_from_fallback = true;
             "main".to_owned()
         }
     } else {
@@ -262,21 +505,80 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
         String::new()
     };
 
-    // Determine object format:
-    // 1. --object-format flag
-    // 2. GIT_DEFAULT_HASH env
-    // 3. init.defaultObjectFormat config
-    // 4. "sha1" as fallback
+    // git/refs.c `repo_default_branch_name`: when the initial branch falls back to the built-in
+    // default (no -b, no GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME, no init.defaultBranch), advise the
+    // user how to configure it, unless `advice.defaultBranchName=false` (t0001 #92).
+    if branch_from_fallback && !args.quiet {
+        let advice_enabled = config
+            .get("advice.defaultBranchName")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "false" | "no" | "0"))
+            .unwrap_or(true);
+        if advice_enabled {
+            emit_default_branch_advice(&config, &initial_branch);
+        }
+    }
+
+    // The initial branch must form a valid `refs/heads/<name>` (git/refs.c
+    // `validate_new_branch_name`); e.g. a name with a space is rejected (t0001 #96).
+    if !initial_branch.is_empty() {
+        let full = format!("refs/heads/{initial_branch}");
+        if grit_lib::check_ref_format::check_refname_format(
+            &full,
+            &grit_lib::check_ref_format::RefNameOptions::default(),
+        )
+        .is_err()
+        {
+            bail!("fatal: invalid branch name: {initial_branch}");
+        }
+    }
+
+    // git/setup.c `read_default_format_config` warns about a garbage `init.defaultObjectFormat`
+    // whenever the key is present, independent of whether env/CLI ultimately overrides it.
+    if let Some(v) = config
+        .get("init.defaultObjectFormat")
+        .filter(|v| !v.trim().is_empty())
+    {
+        if !is_known_object_format(&v) {
+            eprintln!("warning: unknown hash algorithm '{}'", v.trim());
+        }
+    }
+
+    // Determine object format, mirroring git/setup.c `repository_format_configure`:
+    //   --object-format (CLI) → GIT_DEFAULT_HASH (env) → init.defaultObjectFormat (config) → sha1.
+    // Reinit preserves the existing hash; an explicit CLI/env hash differing from it is fatal.
+    // An unknown CLI/env hash is fatal, but an unknown init.defaultObjectFormat only warns.
+    let existing_object_format = is_reinit.then(|| detect_object_format(&real_git_dir));
+    let env_hash = std::env::var("GIT_DEFAULT_HASH")
+        .ok()
+        .filter(|h| !h.is_empty());
     let object_format = if let Some(ref fmt) = args.object_format {
+        if !is_known_object_format(fmt) {
+            bail!("fatal: unknown hash algorithm '{fmt}'");
+        }
+        if let Some(existing) = existing_object_format.as_deref() {
+            if existing != fmt {
+                bail!("fatal: attempt to reinitialize repository with different hash");
+            }
+        }
         fmt.clone()
-    } else if let Ok(hash) = std::env::var("GIT_DEFAULT_HASH") {
-        if !hash.is_empty() {
-            hash
+    } else if let Some(existing) = existing_object_format {
+        // Reinit without an explicit format keeps the current hash (env/config do not override).
+        existing.to_owned()
+    } else if let Some(hash) = env_hash {
+        if !is_known_object_format(&hash) {
+            bail!("fatal: unknown hash algorithm '{hash}'");
+        }
+        hash
+    } else if let Some(fmt) = config
+        .get("init.defaultObjectFormat")
+        .filter(|v| !v.trim().is_empty())
+    {
+        if is_known_object_format(&fmt) {
+            fmt
         } else {
+            // Already warned above; ignore the bad value and fall back to the default.
             "sha1".to_owned()
         }
-    } else if let Some(fmt) = config.get("init.defaultObjectFormat") {
-        fmt
     } else {
         "sha1".to_owned()
     };
@@ -311,8 +613,20 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
     let skip_default_templates = matches!(&args.template, Some(t) if t.is_empty())
         || (args.template.is_none() && std::env::var_os("TEST_CREATE_REPO_NO_TEMPLATE").is_some());
 
-    // Determine ref format. On reinit, an omitted format preserves the existing backend even if
-    // default-format environment/config would choose a different one.
+    // git/setup.c `read_default_format_config` warns about a garbage `init.defaultRefFormat`
+    // whenever the key is present, independent of whether env/CLI ultimately overrides it.
+    if let Some(v) = config
+        .get("init.defaultRefFormat")
+        .filter(|v| !v.trim().is_empty())
+    {
+        if !is_known_ref_format(&v) {
+            eprintln!("warning: unknown ref storage format '{}'", v.trim());
+        }
+    }
+
+    // Determine ref format, mirroring git/setup.c `repository_format_configure`. Validation is
+    // per-source: an explicit `--ref-format`/`GIT_DEFAULT_REF_FORMAT` value that is unknown is a
+    // fatal error, but a bad `init.defaultRefFormat` only warns and is ignored.
     let existing_ref_format = is_reinit.then(|| detect_ref_format(&real_git_dir));
     let env_ref_format = std::env::var("GIT_DEFAULT_REF_FORMAT")
         .ok()
@@ -322,37 +636,46 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
                 .ok()
                 .filter(|value| !value.is_empty())
         });
-    let configured_ref_format = config.get("init.defaultRefFormat");
-    let ref_format_owned;
-    let ref_format = if let Some(format) = args.ref_format.as_deref() {
-        format
-    } else if let Some(format) = existing_ref_format {
-        format
-    } else if let Some(format) = env_ref_format.as_deref() {
-        format
-    } else if let Some(format) = configured_ref_format.as_deref() {
-        ref_format_owned = format.to_owned();
-        &ref_format_owned
-    } else {
-        "files"
-    };
-    match ref_format {
-        "files" | "reftable" => {}
-        other => bail!("unknown ref storage format: {other}"),
-    }
 
-    // On reinit, check for format mismatch
-    if is_reinit {
-        let existing_format = detect_ref_format(&real_git_dir);
-        if existing_format != ref_format {
-            bail!(
-                "attempt to reinitialize repository with mismatched ref format: \
-                 existing '{}', requested '{}'",
-                existing_format,
-                ref_format
-            );
+    let ref_format_owned: String = if let Some(format) = args.ref_format.as_deref() {
+        // CLI `--ref-format`: must be a known backend.
+        if !is_known_ref_format(format) {
+            bail!("fatal: unknown ref storage format '{format}'");
         }
-    }
+        // Reinit with an explicit format different from the existing backend is fatal.
+        if let Some(existing) = existing_ref_format {
+            if existing != format {
+                bail!(
+                    "fatal: attempt to reinitialize repository with different reference storage format"
+                );
+            }
+        }
+        format.to_owned()
+    } else if let Some(existing) = existing_ref_format {
+        // Reinit without an explicit format preserves the existing backend; env/config that would
+        // choose a different default does not change it (and does not error on mismatch).
+        existing.to_owned()
+    } else if let Some(env) = env_ref_format.as_deref() {
+        // `GIT_DEFAULT_REF_FORMAT`: an unknown value is fatal.
+        if !is_known_ref_format(env) {
+            bail!("fatal: unknown ref storage format '{env}'");
+        }
+        env.to_owned()
+    } else if let Some(configured) = config
+        .get("init.defaultRefFormat")
+        .filter(|value| !value.trim().is_empty())
+    {
+        // `init.defaultRefFormat`: an unknown value is ignored (already warned above), falling
+        // through to the feature.experimental / default backend.
+        if is_known_ref_format(&configured) {
+            configured
+        } else {
+            default_ref_format(&config)
+        }
+    } else {
+        default_ref_format(&config)
+    };
+    let ref_format = ref_format_owned.as_str();
 
     let work_tree_abs = work_tree_env.as_ref().map(|wt| {
         let p = PathBuf::from(wt);
@@ -375,8 +698,20 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
         },
     )?;
 
-    let shared_perm =
-        apply_shared_repository_settings(&real_git_dir, args.shared.as_deref(), is_reinit, bare)?;
+    // Fresh init honors `core.sharedRepository` from global/system config (t0001 #21); the
+    // just-written local `config` (which may carry a template-supplied value) wins over it.
+    let global_shared = if is_reinit {
+        None
+    } else {
+        config.get("core.sharedRepository")
+    };
+    let shared_perm = apply_shared_repository_settings(
+        &real_git_dir,
+        args.shared.as_deref(),
+        global_shared.as_deref(),
+        is_reinit,
+        bare,
+    )?;
 
     // Git's probe_utf8_pathname_composition: if the FS aliases NFC/NFD spellings under .git,
     // set core.precomposeunicode (unless already set in higher-priority config).
@@ -412,10 +747,13 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
         cfg.write()?;
     }
 
-    // Handle --separate-git-dir: write gitfile at path/.git
+    // Handle --separate-git-dir: write gitfile at the work-tree's `.git` (or the main worktree's
+    // `.git` when relocating from a linked worktree). Store the realpath of the separate git dir
+    // (git/setup.c writes `gitdir: <real_pathdup>`); the dir now exists so canonicalize.
     if args.separate_git_dir.is_some() && !bare {
-        let gitfile_path = abs_path.join(".git");
-        let gitfile_content = format!("gitdir: {}\n", real_git_dir.display());
+        let gitfile_path = sep_gitfile_link.unwrap_or_else(|| abs_path.join(".git"));
+        let stored = path_for_git_storage(&real_git_dir);
+        let gitfile_content = format!("gitdir: {}\n", stored.display());
         fs::write(&gitfile_path, gitfile_content).with_context(|| "cannot write gitfile")?;
     }
 
@@ -444,6 +782,96 @@ pub fn run(args: Args, global_bare: bool) -> Result<()> {
 }
 
 /// Create or update the git directory structure.
+/// Emit the "Using '<name>' as the name for the initial branch" advice (git/refs.c
+/// `default_branch_name_advice`), colorizing the `hint:` prefix per `color.advice` like
+/// git's `vadvise` / `advise_get_color(ADVICE_COLOR_HINT)`.
+fn emit_default_branch_advice(config: &ConfigSet, branch: &str) {
+    // Determine whether to color: `color.advice` (or `color.ui`) of `always` always colors;
+    // `auto`/unset colors only on a terminal (false under the test harness). `never`/`false`
+    // disables. With color.advice=always the test greps for `<YELLOW>hint: ` (t0001 #92).
+    let color_setting = config
+        .get("color.advice")
+        .or_else(|| config.get("color.ui"));
+    let use_color = match color_setting.as_deref().map(str::trim) {
+        Some("always") => true,
+        Some("never") | Some("false") | Some("no") | Some("0") => false,
+        _ => std::io::IsTerminal::is_terminal(&std::io::stderr()),
+    };
+    let (yellow, reset) = if use_color {
+        ("\x1b[33m", "\x1b[m")
+    } else {
+        ("", "")
+    };
+
+    let advice = format!(
+        "Using '{branch}' as the name for the initial branch. This default branch name\n\
+         will change to \"main\" in Git 3.0. To configure the initial branch name\n\
+         to use in all of your new repositories, which will suppress this warning,\n\
+         call:\n\
+         \n\
+         \tgit config --global init.defaultBranch <name>\n\
+         \n\
+         Names commonly chosen instead of 'master' are 'main', 'trunk' and\n\
+         'development'. The just-created branch can be renamed via this command:\n\
+         \n\
+         \tgit branch -m <name>"
+    );
+    for line in advice.split('\n') {
+        let sep = if line.is_empty() { "" } else { " " };
+        eprintln!("{yellow}hint:{sep}{line}{reset}");
+    }
+}
+
+/// Whether `name` is a known ref storage backend.
+fn is_known_ref_format(name: &str) -> bool {
+    matches!(name, "files" | "reftable")
+}
+
+/// Whether `name` is a known object format (hash algorithm).
+fn is_known_object_format(name: &str) -> bool {
+    matches!(name, "sha1" | "sha256")
+}
+
+/// Detect the object format (hash algorithm) of an existing repository from its
+/// `extensions.objectformat` config; defaults to `sha1`.
+fn detect_object_format(git_dir: &Path) -> &'static str {
+    let config_path = git_dir.join("config");
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        let mut in_extensions = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                in_extensions = trimmed.eq_ignore_ascii_case("[extensions]");
+                continue;
+            }
+            if in_extensions {
+                if let Some((key, value)) = trimmed.split_once('=') {
+                    if key.trim().eq_ignore_ascii_case("objectformat")
+                        && value.trim().eq_ignore_ascii_case("sha256")
+                    {
+                        return "sha256";
+                    }
+                }
+            }
+        }
+    }
+    "sha1"
+}
+
+/// The default ref format for a fresh repository when no explicit format/env/config applies.
+/// `feature.experimental=true` selects `reftable` (git/setup.c read_default_format_config),
+/// otherwise the built-in default `files`.
+fn default_ref_format(config: &ConfigSet) -> String {
+    if config
+        .get("feature.experimental")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+    {
+        "reftable".to_owned()
+    } else {
+        "files".to_owned()
+    }
+}
+
 /// Detect the ref storage format of an existing repository.
 fn detect_ref_format(git_dir: &Path) -> &'static str {
     // Check config for extensions.refStorage
@@ -625,6 +1053,7 @@ fn create_git_dir(git_dir: &Path, opts: CreateGitDirOptions<'_>) -> Result<()> {
 fn apply_shared_repository_settings(
     git_dir: &Path,
     shared_arg: Option<&str>,
+    global_shared: Option<&str>,
     is_reinit: bool,
     bare: bool,
 ) -> Result<i32> {
@@ -632,7 +1061,9 @@ fn apply_shared_repository_settings(
     let from_cfg = fs::read_to_string(&config_path)
         .ok()
         .and_then(|c| ConfigFile::parse(&config_path, &c, ConfigScope::Local).ok())
-        .and_then(|f| f.get("core.sharedRepository"));
+        .and_then(|f| f.get("core.sharedRepository"))
+        // Fall back to global/system config (fresh init only); local template value wins.
+        .or_else(|| global_shared.map(str::to_owned));
     let (shared_perm, stored) =
         resolve_shared_repository_mode(shared_arg, from_cfg.as_deref(), is_reinit, bare)?;
 
