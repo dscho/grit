@@ -1,5 +1,10 @@
 # PLAN.md — Get the `t0*` (plumbing) test family fully passing
 
+## Active t8 loop — 2026-06-01
+
+- [x] `t8002-blame` 135/135 — fixed `blame -c`, show-email config/negation, boundary abbreviations, `-b`, untracked-file rejection, and no-op editor amend setup.
+- [ ] `t8012-blame-colors` 50/120 — next highest-failure t8 file after `t8002`.
+
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
 
 The t0 family has **85 files: 47 fully green, 25 in-scope-not-full (~247 failing subtests),

@@ -1,6 +1,10 @@
 # Test Results
 
-Updated: 2026-05-22
+Updated: 2026-06-01
+
+- t8 blame focus: `cargo build --release -p grit-cli` passes with existing warnings.
+- t8 blame focus: `./scripts/run-tests.sh t8002-blame.sh` passes 135/135 after blame compatibility fixes.
+- t8 blame focus: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
