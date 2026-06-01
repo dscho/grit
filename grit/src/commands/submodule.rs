@@ -3155,8 +3155,22 @@ fn submodule_up_path(path: &str) -> String {
     s
 }
 
+/// Port of git's `url_is_local_not_ssh` (connect.c): a URL is a local path (not scp-style SSH)
+/// when it has no colon, a slash precedes the first colon, or it has a DOS drive prefix.
 fn url_is_local_not_ssh(url: &str) -> bool {
-    !url.contains("://") || url.starts_with("file://")
+    let colon = url.find(':');
+    let slash = url.find('/');
+    match colon {
+        None => true,
+        Some(c) => match slash {
+            Some(s) if s < c => true,
+            _ => {
+                // DOS drive prefix like `C:\path` (single letter then colon).
+                let b = url.as_bytes();
+                b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+            }
+        },
+    }
 }
 
 fn is_absolute_path_url(url: &str) -> bool {
