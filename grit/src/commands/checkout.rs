@@ -1862,6 +1862,8 @@ fn merge_branch_working_tree(
             entry.mtime_nsec = meta.mtime_nsec() as u32;
             entry.dev = meta.dev() as u32;
             entry.ino = meta.ino() as u32;
+            entry.uid = meta.uid();
+            entry.gid = meta.gid();
             entry.size = meta.size() as u32;
         }
     }
@@ -2984,6 +2986,8 @@ fn switch_to_tree(
             entry.mtime_nsec = meta.mtime_nsec() as u32;
             entry.dev = meta.dev() as u32;
             entry.ino = meta.ino() as u32;
+            entry.uid = meta.uid();
+            entry.gid = meta.gid();
             entry.size = meta.size() as u32;
         }
     }
@@ -5990,6 +5994,13 @@ pub(crate) fn checkout_index_to_worktree(
                     Some(old) => old.mode != MODE_GITLINK || old.oid != entry.oid,
                 };
                 checkout_gitlink_worktree_entry(repo, work_tree, &rel, &entry.oid, force_populate)?;
+                // `checkout_gitlink_worktree_entry` returns early (no dir) for uninitialized
+                // submodules; mirror Git's `write_entry`/`S_IFGITLINK` which always `mkdir`s the
+                // (empty) placeholder directory (lib-submodule-update "added submodule creates
+                // empty directory", t2013).
+                if !abs_path.exists() {
+                    std::fs::create_dir_all(&abs_path)?;
+                }
             } else {
                 // Rebase/revert: empty placeholder only; preserve populated submodule dirs (t3426).
                 if abs_path.join(".git").exists() {
