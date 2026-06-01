@@ -45,6 +45,7 @@
   - Completed: `t9230-diff-index-modes.sh` (38/38).
   - Completed: `t9420-update-ref-delete.sh` (24/24).
   - Completed: `t9860-log-max-count-skip.sh` (38/38).
+  - Completed: `t9890-init-object-format.sh` (31/31).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
