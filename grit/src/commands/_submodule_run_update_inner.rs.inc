@@ -101,7 +101,13 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
 
         let url_key = format!("submodule.{}.url", m.name);
         let has_url = local_cfg.entries.iter().any(|e| e.key == url_key);
-        if !has_url {
+
+        // Git operates on a submodule when it is "active": `submodule.<name>.active`,
+        // `submodule.active` pathspec, or a `submodule.<name>.url` in config. An inactive
+        // submodule is reported as not initialized and skipped (warn only with explicit paths).
+        let active = grit_lib::submodule_active::is_submodule_active(&repo, &m.path)
+            .unwrap_or(has_url);
+        if !active {
             if !args.paths.is_empty() {
                 eprintln!("Submodule path '{msg_path}' not initialized");
             } else {
@@ -110,6 +116,14 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                     m.path
                 );
             }
+            continue;
+        }
+
+        // An active submodule with no resolvable URL (neither config nor `.gitmodules`) cannot
+        // be cloned (git: "cannot clone submodule '<name>' without a URL").
+        if !has_url && m.url.trim().is_empty() {
+            eprintln!("fatal: cannot clone submodule '{}' without a URL", m.name);
+            any_failure = true;
             continue;
         }
 

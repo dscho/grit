@@ -1391,6 +1391,52 @@ fn validate_submodule_pathspecs(
     Ok(normalized)
 }
 
+/// Select gitlink paths matching the given raw pathspecs (which may include `:(exclude)` magic),
+/// mirroring git's `module_list_compute` pathspec matching. With no specs, all gitlinks match.
+fn pathspec_select_gitlinks(gitlinks: &[String], specs: &[String]) -> Vec<String> {
+    use grit_lib::pathspec::{matches_pathspec_with_context, PathspecMatchContext};
+    if specs.is_empty() {
+        return gitlinks.to_vec();
+    }
+    let ctx = PathspecMatchContext {
+        is_directory: false,
+        is_git_submodule: true,
+    };
+    let positives: Vec<&String> = specs
+        .iter()
+        .filter(|s| {
+            !s.starts_with(":!") && !s.starts_with(":^") && !s.starts_with(":(exclude")
+        })
+        .collect();
+    let excludes: Vec<String> = specs
+        .iter()
+        .filter_map(|s| {
+            s.strip_prefix(":!")
+                .or_else(|| s.strip_prefix(":^"))
+                .or_else(|| s.strip_prefix(":(exclude)"))
+                .map(|x| x.to_string())
+        })
+        .collect();
+    let mut out = Vec::new();
+    for gl in gitlinks {
+        let included = positives.is_empty()
+            || positives
+                .iter()
+                .any(|p| matches_pathspec_with_context(p, gl, ctx));
+        if !included {
+            continue;
+        }
+        let excluded = excludes
+            .iter()
+            .any(|p| matches_pathspec_with_context(p, gl, ctx));
+        if excluded {
+            continue;
+        }
+        out.push(gl.clone());
+    }
+    out
+}
+
 fn filter_submodules<'a>(modules: &'a [SubmoduleInfo], paths: &[String]) -> Vec<&'a SubmoduleInfo> {
     if paths.is_empty() || paths.iter().any(|p| p == ".") {
         modules.iter().collect()
@@ -2059,24 +2105,30 @@ fn init_in_repo(repo: &Repository, args: &InitArgs, quiet: bool) -> Result<()> {
     let init_paths = validate_submodule_pathspecs(repo, work_tree, &args.paths)?;
     let modules = parse_gitmodules_with_repo(work_tree, Some(repo))?;
     let gitlinks = index_gitlink_paths(repo);
-    for gl in &gitlinks {
-        // Only consider gitlinks selected by the (normalized) path arguments.
-        let selected_by_args = init_paths.is_empty()
-            || init_paths.iter().any(|p| {
-                p == "." || p == gl || gl.starts_with(&format!("{p}/")) || p.starts_with(':')
+
+    // Select gitlinks by pathspec (supports `:(exclude)`); when no path args were given and
+    // `submodule.active` is configured, default to only the active submodules (git module_init).
+    let mut selected_paths = pathspec_select_gitlinks(&gitlinks, &init_paths);
+    if args.paths.is_empty() {
+        let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).ok();
+        let has_active = cfg
+            .as_ref()
+            .map(|c| c.has_key("submodule.active"))
+            .unwrap_or(false);
+        if has_active {
+            selected_paths.retain(|gl| {
+                grit_lib::submodule_active::is_submodule_active(repo, gl).unwrap_or(false)
             });
-        if !selected_by_args {
-            continue;
         }
+    }
+
+    for gl in &selected_paths {
         let matched = modules.iter().find(|m| &m.path == gl);
         // Die when the gitlink has no `.gitmodules` mapping, or its mapping has no url and the
         // local config has not already registered a url for that submodule name.
         let needs_url = match matched {
             None => true,
-            Some(m) => {
-                m.url.trim().is_empty()
-                    && config_submodule_url(repo, &m.name).is_none()
-            }
+            Some(m) => m.url.trim().is_empty() && config_submodule_url(repo, &m.name).is_none(),
         };
         if needs_url {
             let display = rev_parse::to_relative_path(
@@ -2086,7 +2138,6 @@ fn init_in_repo(repo: &Repository, args: &InitArgs, quiet: bool) -> Result<()> {
             bail!("No url found for submodule path '{display}' in .gitmodules");
         }
     }
-    let selected = filter_submodules(&modules, &init_paths);
 
     let config_path = repo.git_dir.join("config");
     let mut config = if config_path.exists() {
@@ -2096,9 +2147,18 @@ fn init_in_repo(repo: &Repository, args: &InitArgs, quiet: bool) -> Result<()> {
         ConfigFile::parse(&config_path, "", ConfigScope::Local)?
     };
 
-    for m in selected {
+    for gl in &selected_paths {
+        let Some(m) = modules.iter().find(|m| &m.path == gl) else {
+            continue;
+        };
         let url_key = format!("submodule.{}.url", m.name);
         let already = config.entries.iter().any(|e| e.key == url_key);
+
+        // Set the active flag (git: init_submodule sets submodule.<name>.active=true unless it
+        // is already active, e.g. matched by an existing submodule.active pathspec).
+        if !grit_lib::submodule_active::is_submodule_active(repo, &m.path).unwrap_or(false) {
+            config.set(&format!("submodule.{}.active", m.name), "true")?;
+        }
 
         if !already {
             if let Some(ref u) = m.update {
