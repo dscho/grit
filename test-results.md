@@ -55,6 +55,8 @@ Updated: 2026-06-01
   `master` setup and porcelain v1 branch-header output by default.
 - t9130 validation: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
   `cargo test -p grit-lib --lib` all completed successfully; grit-lib unit tests passed 229/229.
+- t9 focus: `./scripts/run-tests.sh t9150-rev-list-all-count.sh --verbose` now passes 33/33 after
+  making setup explicitly initialize `master`, matching the test's hard-coded branch operations.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.

@@ -1454,7 +1454,7 @@ t9145-git-svn-master-branch	t9	skip	2	0	0	false	ok	0
 t9146-git-svn-empty-dirs	t9	skip	14	0	0	false	ok	0
 t9147-git-svn-include-paths	t9	skip	13	0	0	false	ok	0
 t9148-git-svn-propset	t9	skip	7	0	0	false	ok	0
-t9150-rev-list-all-count	t9	yes	33	28	5	false	ok	0
+t9150-rev-list-all-count	t9	yes	33	33	0	true	ok	0
 t9150-svk-mergetickets	t9	skip	2	0	0	false	ok	0
 t9151-svn-mergeinfo	t9	skip	7	0	0	false	ok	1
 t9152-svn-empty-dirs-after-gc	t9	skip	4	0	0	false	ok	0
