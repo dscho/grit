@@ -24,6 +24,15 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
 
     trace_submodule_job_tasks_if_needed(args.jobs);
 
+    // Validate explicit path arguments against the index gitlink set (git's
+    // module_list_compute): a pathspec matching no gitlink is an error. Replace the raw paths
+    // with worktree-relative normalized ones so filtering works from a subdirectory.
+    let normalized_paths = validate_submodule_pathspecs(&repo, work_tree, &args.paths)?;
+    let args = &UpdateArgs {
+        paths: normalized_paths,
+        ..args.clone()
+    };
+
     if args.init {
         init_in_repo(
             &repo,
@@ -37,6 +46,23 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
 
     let modules = parse_gitmodules_with_repo(work_tree, Some(&repo))?;
     let selected = filter_submodules(&modules, &args.paths);
+
+    // Git iterates the index gitlink set; any gitlink without a matching `.gitmodules` entry is
+    // simply "not initialized" (rather than silently ignored). When explicit paths are given,
+    // emit that message so callers see it (t7400 "aborts on missing .gitmodules file").
+    if !args.paths.is_empty() {
+        let gitlinks = index_gitlink_paths(&repo);
+        for gl in &gitlinks {
+            let selected_by_args = args.paths.iter().any(|p| {
+                p == "." || p == gl || gl.starts_with(&format!("{p}/")) || p.starts_with(':')
+            });
+            if selected_by_args && !modules.iter().any(|m| &m.path == gl) {
+                let msg_path = submodule_display_path_from_cwd(&work_tree.join(gl));
+                eprintln!("Submodule path '{msg_path}' not initialized");
+                eprintln!("Maybe you want to use 'update --init'?");
+            }
+        }
+    }
 
     let grit_bin = grit_exe::grit_executable();
     let super_index = repo.load_index().ok();

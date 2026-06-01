@@ -315,6 +315,13 @@ fn super_index_has_unmerged_stage(repo: &Repository, rel_path: &str) -> bool {
         .any(|e| e.path.as_slice() == needle && e.stage() != 0)
 }
 
+/// Read `submodule.<name>.url` from the superproject's local config, if present.
+fn config_submodule_url(repo: &Repository, name: &str) -> Option<String> {
+    let cfg = parse_local_config(&repo.git_dir).ok()?;
+    config_last_value(&cfg, &format!("submodule.{name}.url"))
+        .filter(|v| !v.trim().is_empty())
+}
+
 fn parse_local_config(git_dir: &Path) -> Result<ConfigFile> {
     let config_path = grit_lib::repo::common_git_dir_for_config(git_dir).join("config");
     if config_path.exists() {
@@ -413,7 +420,7 @@ pub enum SubmoduleCommand {
     SetUrl(SetUrlArgs),
 }
 
-#[derive(Debug, ClapArgs)]
+#[derive(Debug, Clone, ClapArgs)]
 pub struct StatusArgs {
     /// Operate quietly (suppress progress and informational messages).
     #[arg(short = 'q', long = "quiet")]
@@ -1263,6 +1270,112 @@ pub(crate) fn submodule_modules_git_dir_for_worktree_path(
 }
 
 /// Filter submodules by path args (empty = all).
+/// Collect all gitlink (`160000`) stage-0 paths recorded in the index, worktree-relative,
+/// using forward slashes. This mirrors `git`'s `module_list_compute`, which derives the set
+/// of submodules from index gitlink entries (not from `.gitmodules`).
+fn index_gitlink_paths(repo: &Repository) -> Vec<String> {
+    let Ok(index) = repo.load_index() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in &index.entries {
+        if e.mode == MODE_GITLINK && e.stage() == 0 {
+            out.push(String::from_utf8_lossy(&e.path).replace('\\', "/"));
+        }
+    }
+    out
+}
+
+/// Resolve a user-supplied submodule path argument (which may be relative to `cwd`, contain
+/// `./`, `../`, or a trailing slash, or carry a `:(exclude)`/`:!` pathspec magic prefix) into
+/// a worktree-relative posix path. Pathspec-magic entries (e.g. `:(exclude)sub0`) are returned
+/// unchanged so callers can treat them as match modifiers rather than literal paths.
+fn normalize_submodule_path_arg(work_tree: &Path, cwd: &Path, raw: &str) -> Option<String> {
+    if raw == "." {
+        return Some(".".to_string());
+    }
+    // Leave pathspec magic alone — these never need to map to a literal index path.
+    if raw.starts_with(':') {
+        return Some(raw.to_string());
+    }
+    let trimmed = raw.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Some(".".to_string());
+    }
+    let candidate = if Path::new(trimmed).is_absolute() {
+        PathBuf::from(trimmed)
+    } else {
+        cwd.join(trimmed)
+    };
+    // Lexically normalize `.`/`..` without requiring the path to exist on disk.
+    let normalized = lexically_normalize(&candidate);
+    let wt = work_tree.canonicalize().unwrap_or_else(|_| work_tree.to_path_buf());
+    let norm = normalized.canonicalize().unwrap_or(normalized);
+    match norm.strip_prefix(&wt) {
+        Ok(rel) => {
+            let s = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            if s.is_empty() {
+                Some(".".to_string())
+            } else {
+                Some(s)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
+/// Lexically resolve `.` and `..` components (does not touch the filesystem / symlinks).
+fn lexically_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Validate explicit submodule path arguments against the index gitlink set, matching `git`'s
+/// behavior in `module_list_compute`: a literal pathspec that matches no gitlink entry is an
+/// error. Returns the worktree-relative normalized literal paths (pathspec-magic args are
+/// skipped). On a non-matching path, prints git's error and bails.
+fn validate_submodule_pathspecs(
+    repo: &Repository,
+    work_tree: &Path,
+    raw_paths: &[String],
+) -> Result<Vec<String>> {
+    if raw_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let gitlinks = index_gitlink_paths(repo);
+    let cwd = std::env::current_dir().unwrap_or_else(|_| work_tree.to_path_buf());
+    let mut normalized = Vec::new();
+    for raw in raw_paths {
+        let Some(norm) = normalize_submodule_path_arg(work_tree, &cwd, raw) else {
+            eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
+            bail!("pathspec did not match");
+        };
+        if norm == "." || norm.starts_with(':') {
+            normalized.push(norm);
+            continue;
+        }
+        let matched = gitlinks
+            .iter()
+            .any(|g| *g == norm || g.starts_with(&format!("{norm}/")));
+        if !matched {
+            eprintln!("error: pathspec '{raw}' did not match any file(s) known to git");
+            bail!("pathspec did not match");
+        }
+        normalized.push(norm);
+    }
+    Ok(normalized)
+}
+
 fn filter_submodules<'a>(modules: &'a [SubmoduleInfo], paths: &[String]) -> Vec<&'a SubmoduleInfo> {
     if paths.is_empty() || paths.iter().any(|p| p == ".") {
         modules.iter().collect()
@@ -1672,6 +1785,15 @@ fn run_status(args: &StatusArgs) -> Result<()> {
         repo.odb
             .register_submodule_object_directories_from_index(work_tree, &index);
     }
+    // Validate any explicit path arguments against the index gitlink set (git's
+    // `module_list_compute`): a pathspec matching no gitlink is an error. Replace the raw
+    // paths with worktree-relative normalized ones so filtering works from a subdirectory.
+    let normalized_paths = validate_submodule_pathspecs(&repo, work_tree, &args.paths)?;
+    let args = StatusArgs {
+        paths: normalized_paths,
+        ..args.clone()
+    };
+    let args = &args;
     let modules = parse_gitmodules_with_repo(work_tree, Some(&repo))?;
     let index = repo
         .load_index()
@@ -1917,8 +2039,39 @@ fn expand_submodule_shell_command(cmd: &str, sha1: &str, path: &str, toplevel: &
 
 fn init_in_repo(repo: &Repository, args: &InitArgs, quiet: bool) -> Result<()> {
     let work_tree = repo.work_tree.as_ref().context("bare repository")?;
+    // Git derives the submodule set from index gitlink entries (module_list_compute), then
+    // dies for any path that lacks a `.gitmodules` entry ("No url found for submodule path").
+    let init_paths = validate_submodule_pathspecs(repo, work_tree, &args.paths)?;
     let modules = parse_gitmodules_with_repo(work_tree, Some(repo))?;
-    let selected = filter_submodules(&modules, &args.paths);
+    let gitlinks = index_gitlink_paths(repo);
+    for gl in &gitlinks {
+        // Only consider gitlinks selected by the (normalized) path arguments.
+        let selected_by_args = init_paths.is_empty()
+            || init_paths.iter().any(|p| {
+                p == "." || p == gl || gl.starts_with(&format!("{p}/")) || p.starts_with(':')
+            });
+        if !selected_by_args {
+            continue;
+        }
+        let matched = modules.iter().find(|m| &m.path == gl);
+        // Die when the gitlink has no `.gitmodules` mapping, or its mapping has no url and the
+        // local config has not already registered a url for that submodule name.
+        let needs_url = match matched {
+            None => true,
+            Some(m) => {
+                m.url.trim().is_empty()
+                    && config_submodule_url(repo, &m.name).is_none()
+            }
+        };
+        if needs_url {
+            let display = rev_parse::to_relative_path(
+                &work_tree.join(gl),
+                &std::env::current_dir().unwrap_or_else(|_| work_tree.to_path_buf()),
+            );
+            bail!("No url found for submodule path '{display}' in .gitmodules");
+        }
+    }
+    let selected = filter_submodules(&modules, &init_paths);
 
     let config_path = repo.git_dir.join("config");
     let mut config = if config_path.exists() {
@@ -2875,8 +3028,11 @@ fn run_sync(args: &SyncArgs, quiet: bool) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let work_tree = repo.work_tree.as_ref().context("bare repository")?;
     let cwd = std::env::current_dir().context("failed to read current directory")?;
+    // Validate explicit path arguments against the index gitlink set (git module_list_compute):
+    // a pathspec matching no gitlink is an error.
+    let sync_paths = validate_submodule_pathspecs(&repo, work_tree, &args.paths)?;
     let modules = parse_gitmodules(work_tree)?;
-    let selected = filter_submodules(&modules, &args.paths);
+    let selected = filter_submodules(&modules, &sync_paths);
 
     let config_path = repo.git_dir.join("config");
     let mut config = if config_path.exists() {
