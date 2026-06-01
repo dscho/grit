@@ -70,6 +70,8 @@ Updated: 2026-06-01
   `cargo test -p grit-lib --lib` all completed successfully; grit-lib unit tests passed 229/229.
 - t9 focus: `./scripts/run-tests.sh t9170-read-tree-prefix.sh --verbose` now passes 25/25 after
   aligning prefix/no-duplicate expectations with real Git behavior.
+- t9 focus: `./scripts/run-tests.sh t9260-log-oneline-format.sh --verbose` now passes 33/33 after
+  explicit `master` setup and aligning `--graph --reverse` with real Git rejection behavior.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
