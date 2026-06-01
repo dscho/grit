@@ -2531,16 +2531,20 @@ pub fn run(mut args: Args) -> Result<()> {
                     blob_side_for_blob_diff_spec(&repo, &revs[1])?,
                 ) {
                     (Some(a), Some(b)) => {
-                        vec![DiffEntry {
-                            status: DiffStatus::Modified,
-                            old_path: Some(a.path),
-                            new_path: Some(b.path),
-                            old_mode: a.mode,
-                            new_mode: b.mode,
-                            old_oid: a.oid,
-                            new_oid: b.oid,
-                            score: None,
-                        }]
+                        if a.oid == b.oid && a.mode == b.mode {
+                            Vec::new()
+                        } else {
+                            vec![DiffEntry {
+                                status: DiffStatus::Modified,
+                                old_path: Some(a.path),
+                                new_path: Some(b.path),
+                                old_mode: a.mode,
+                                new_mode: b.mode,
+                                old_oid: a.oid,
+                                new_oid: b.oid,
+                                score: None,
+                            }]
+                        }
                     }
                     _ => {
                         let tree1 = commit_or_tree_oid(&repo, &revs[0])?;

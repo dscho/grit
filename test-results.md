@@ -2,6 +2,14 @@
 
 Updated: 2026-06-01
 
+- t0 focus: `./scripts/run-tests.sh t0023-crlf-am.sh t0020-crlf.sh t0000-basic.sh t0081-find-pack.sh` passes: `t0023` 2/2, `t0020` 36/36, `t0000` 92/92, `t0081` 4/4.
+- t0 focus build: `cargo build --release -p grit-cli` passes with the existing warning backlog (`ignore.rs`, `refs.rs`, `sparse_checkout.rs`, `worktree.rs`).
+- t0 conversion follow-up: `./scripts/run-tests.sh t0021-conversion.sh t0023-crlf-am.sh t0020-crlf.sh` improves `t0021-conversion` from 27/42 to 28/42, and keeps `t0023` 2/2 plus `t0020` 36/36.
+- `cargo test -p grit-lib --lib`: pass, 229/229, with existing warnings.
+- `cargo clippy --fix --allow-dirty`: completed after sandbox escalation; still reports the existing clippy warning backlog and failed auto-fixes in unrelated files (`bundle_uri_test_tool.rs`, `mergetool.rs`).
+- `cargo test --workspace`: not run for this focused t0 iteration.
+- `./tests/harness/run.sh`: skipped; project uses `./scripts/run-tests.sh` for CSV/dashboard updates.
+
 - t1 setup-cwd sweep: wrapped setup blocks in 41 one-pass t1 tests that entered `repo` before later `(cd repo && ...)` assertions. Verification via `./scripts/run-tests.sh` across those 41 files: 23 now fully pass; the remaining 18 improved beyond the setup failure and expose real command-specific gaps.
 - Focus harness: `./scripts/run-tests.sh t13190-log-format-body.sh` passes 36/36 after isolating the setup `cd repo` in a subshell so the log format assertions run from the expected trash root.
 - `cargo test --workspace`: skipped for this test-only harness correction; no Rust code changed.

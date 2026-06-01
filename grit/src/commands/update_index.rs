@@ -1281,7 +1281,6 @@ fn refresh_index(
         let abs = work_tree.join(path);
         match std::fs::symlink_metadata(&abs) {
             Ok(meta) => {
-                use std::os::unix::fs::MetadataExt;
                 // Symlinks: compare link target to the blob Git stores (matches
                 // readlink + hash, not `read()` which follows the link).
                 if meta.file_type().is_symlink() {
@@ -1291,31 +1290,18 @@ fn refresh_index(
                         grit_lib::objects::ObjectKind::Blob,
                         data,
                     );
-                    let stat_changed =
-                        entry.mtime_sec != meta.mtime() as u32 || entry.size != meta.size() as u32;
+                    let stat_changed = !grit_lib::diff::stat_matches(entry, &meta);
                     if actual_oid != entry.oid {
                         eprintln!("{path_str}: needs update");
                         all_uptodate = false;
                     } else if stat_changed {
-                        entry.ctime_sec = meta.ctime() as u32;
-                        entry.ctime_nsec = meta.ctime_nsec() as u32;
-                        entry.mtime_sec = meta.mtime() as u32;
-                        entry.mtime_nsec = meta.mtime_nsec() as u32;
-                        entry.size = meta.size() as u32;
+                        refresh_entry_stat(entry, &meta);
                         index_modified = true;
-                    } else {
-                        let new_ctime = meta.ctime() as u32;
-                        if entry.ctime_sec != new_ctime {
-                            entry.ctime_sec = new_ctime;
-                            entry.ctime_nsec = meta.ctime_nsec() as u32;
-                            index_modified = true;
-                        }
                     }
                     continue;
                 }
                 // Check if stat data differs from index
-                let stat_changed =
-                    entry.mtime_sec != meta.mtime() as u32 || entry.size != meta.size() as u32;
+                let stat_changed = !grit_lib::diff::stat_matches(entry, &meta);
                 if stat_changed {
                     // Check if content actually changed
                     let content_changed = if let Ok(data) = std::fs::read(&abs) {
@@ -1329,19 +1315,7 @@ fn refresh_index(
                         all_uptodate = false;
                     } else {
                         // Update stat info
-                        entry.ctime_sec = meta.ctime() as u32;
-                        entry.ctime_nsec = meta.ctime_nsec() as u32;
-                        entry.mtime_sec = meta.mtime() as u32;
-                        entry.mtime_nsec = meta.mtime_nsec() as u32;
-                        entry.size = meta.size() as u32;
-                        index_modified = true;
-                    }
-                } else {
-                    // Stat matches, update ctime if it changed
-                    let new_ctime = meta.ctime() as u32;
-                    if entry.ctime_sec != new_ctime {
-                        entry.ctime_sec = new_ctime;
-                        entry.ctime_nsec = meta.ctime_nsec() as u32;
+                        refresh_entry_stat(entry, &meta);
                         index_modified = true;
                     }
                 }
@@ -1356,6 +1330,19 @@ fn refresh_index(
         }
     }
     Ok((all_uptodate, index_modified))
+}
+
+fn refresh_entry_stat(entry: &mut IndexEntry, meta: &std::fs::Metadata) {
+    let refreshed = grit_lib::index::entry_from_metadata(meta, &entry.path, entry.oid, entry.mode);
+    entry.ctime_sec = refreshed.ctime_sec;
+    entry.ctime_nsec = refreshed.ctime_nsec;
+    entry.mtime_sec = refreshed.mtime_sec;
+    entry.mtime_nsec = refreshed.mtime_nsec;
+    entry.dev = refreshed.dev;
+    entry.ino = refreshed.ino;
+    entry.uid = refreshed.uid;
+    entry.gid = refreshed.gid;
+    entry.size = refreshed.size;
 }
 
 /// CWD-relative prefix for pathspec matching (Git `PATHSPEC_PREFER_CWD` / `prefix_path`).

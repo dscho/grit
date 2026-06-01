@@ -5,6 +5,10 @@
 ## Current claimed item
 - [x] `t13190-log-format-body` — make the log format body/subject placeholder test pass.
 - [x] t1 one-pass setup-cwd sweep — wrap affected setup blocks so assertions run from the trash root.
+- [x] `t0081-find-pack` — print pack paths like upstream `test-tool find-pack`.
+- [x] `t0000-basic` — clear the final diff-files/update-index failure.
+- [x] `t0020-crlf` — fix checkout with existing `.gitattributes`.
+- [x] `t0023-crlf-am` — refresh staged metadata and clean-convert files applied by `git am`.
 
 The t0 family has **85 files: 47 fully green, 25 in-scope-not-full (~247 failing subtests),
 13 skipped**. This plan splits the 25 remaining in-scope files into **work lanes grouped by the
@@ -19,9 +23,9 @@ single agent should own the whole lane.
 
 ## Lane 1 — Conversion: CRLF / clean-smudge filters / working-tree-encoding
 **Owns:** `grit-lib/src/crlf.rs`, `grit-lib/src/filter_process.rs`, `grit-lib/src/attributes.rs`, `grit-lib/src/ws.rs`
-- `t0021-conversion` 27/42 — clean/smudge filter + `filter.<driver>.process` protocol
+- [~] `t0021-conversion` 28/42 — clean/smudge filter + `filter.<driver>.process` protocol
 - `t0028-working-tree-encoding` 8/22 — `working-tree-encoding` attr (iconv reencode on checkout/checkin)
-- `t0020-crlf` 35/36, `t0023-crlf-am` 1/2 — autocrlf / eol normalization
+- [x] `t0020-crlf` 36/36, [x] `t0023-crlf-am` 2/2 — autocrlf / eol normalization
 - `t0027-auto-crlf` 0/0 — **runs 0 tests; investigate** (errors out or all-prereq-skip before summary)
 **Subtotal: ~31 failing.**
 
@@ -59,7 +63,7 @@ Consider giving this lane a longer iteration budget.
 - `t0130-sha1-validation` 1/30 — object-id parse/validate, `GIT_TEST_BUILTIN_HASH`, fsck-ish id checks (big gap)
 - `t0080-tree-hash` 3/30 — `mktree` / tree object hashing (big gap)
 - [ ] `t0090-cache-tree` 16/22 — cache-tree index extension build/invalidate/write; remaining failures are partial/interactive commit patch semantics and checkout cache-tree shape edge cases
-- `t0081-find-pack` 3/4 — `cat-file --find-pack` (1 failing)
+- [x] `t0081-find-pack` 4/4 — `test-tool find-pack` path display
 **Subtotal: ~77 failing.** Grouped because they all touch `objects.rs`/`write_tree.rs`/`index.rs`.
 
 ## Lane 7 — Path utilities
@@ -74,8 +78,7 @@ Consider giving this lane a longer iteration budget.
 
 ## Lane 9 — Basics (single failure)
 **Owns:** TBD — the failing subtest decides
-- `t0000-basic` 91/92 — one failing subtest; agent first identifies which subsystem it is, then fixes
-  it there. Likely object/index/`test_must_fail` plumbing. Keep small.
+- [x] `t0000-basic` 92/92 — fixed `update-index --refresh` to refresh complete stat tuples.
 **Subtotal: 1 failing.**
 
 ---

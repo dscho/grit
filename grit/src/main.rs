@@ -758,6 +758,19 @@ fn parse_find_pack_count_arg(value: &str) -> Result<usize> {
         .map_err(|_| anyhow::anyhow!("invalid --check-count value: {value}"))
 }
 
+fn display_find_pack_path(pack_path: &Path) -> String {
+    let normalized = std::fs::canonicalize(pack_path).unwrap_or_else(|_| pack_path.to_path_buf());
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+        if let Ok(relative) = normalized.strip_prefix(&cwd) {
+            if !relative.as_os_str().is_empty() {
+                return relative.to_string_lossy().into_owned();
+            }
+        }
+    }
+    pack_path.to_string_lossy().into_owned()
+}
+
 fn run_test_tool_find_pack(rest: &[String]) -> Result<()> {
     let mut i = 1usize;
     let mut expected_count: Option<usize> = None;
@@ -799,10 +812,7 @@ fn run_test_tool_find_pack(rest: &[String]) -> Result<()> {
             .iter()
             .any(|entry| grit_lib::pack::pack_index_entry_matches_sha1_oid(entry, &oid))
         {
-            // Match upstream `test-tool find-pack`: print the real pack path (absolute when
-            // possible), not a hard-coded `.git/objects/pack/…` prefix (`t7700-repack` bare repos).
-            let p = std::fs::canonicalize(&idx.pack_path).unwrap_or(idx.pack_path);
-            packs.push(p.to_string_lossy().into_owned());
+            packs.push(display_find_pack_path(&idx.pack_path));
         }
     }
     packs.sort();

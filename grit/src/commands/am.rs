@@ -16,8 +16,9 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use grit_lib::config::{parse_bool, ConfigSet};
+use grit_lib::crlf::{self, ConversionConfig};
 use grit_lib::hooks::{run_hook as grit_run_hook, HookResult};
-use grit_lib::index::{Index, IndexEntry, MODE_REGULAR};
+use grit_lib::index::{entry_from_metadata, Index, IndexEntry, MODE_REGULAR};
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::refs::{delete_ref, write_ref};
 use grit_lib::repo::Repository;
@@ -2032,6 +2033,9 @@ fn stage_affected_files(repo: &Repository, affected_paths: &[String]) -> Result<
         .ok_or_else(|| anyhow::anyhow!("no work tree"))?;
 
     let mut index = load_index(repo)?;
+    let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+    let conv = ConversionConfig::from_config(&config);
+    let attrs = crlf::load_gitattributes(work_tree);
 
     for rel_path in affected_paths {
         let abs = work_tree.join(rel_path);
@@ -2046,7 +2050,21 @@ fn stage_affected_files(repo: &Repository, affected_paths: &[String]) -> Result<
             continue;
         }
 
-        let content = fs::read(&abs)?;
+        let raw_content = fs::read(&abs)?;
+        let file_attrs = crlf::get_file_attrs(&attrs, rel_path, false, &config);
+        let prior_blob = index
+            .get(rel_path.as_bytes(), 0)
+            .filter(|e| e.oid != ObjectId::zero())
+            .and_then(|e| repo.odb.read(&e.oid).ok())
+            .map(|o| o.data);
+        let opts = crlf::ConvertToGitOpts {
+            index_blob: prior_blob.as_deref(),
+            renormalize: false,
+            check_safecrlf: true,
+        };
+        let content =
+            crlf::convert_to_git_with_opts(&raw_content, rel_path, &conv, &file_attrs, opts)
+                .map_err(|msg| anyhow::anyhow!(msg))?;
         let oid = repo.odb.write(ObjectKind::Blob, &content)?;
         let metadata = fs::metadata(&abs)?;
 
@@ -2068,25 +2086,7 @@ fn stage_affected_files(repo: &Repository, affected_paths: &[String]) -> Result<
         };
 
         let path_bytes = rel_path.as_bytes().to_vec();
-        let size = content.len() as u32;
-
-        let entry = grit_lib::index::IndexEntry {
-            ctime_sec: 0,
-            ctime_nsec: 0,
-            mtime_sec: 0,
-            mtime_nsec: 0,
-            dev: 0,
-            ino: 0,
-            mode,
-            uid: 0,
-            gid: 0,
-            size,
-            oid,
-            flags: (path_bytes.len().min(0xFFF)) as u16,
-            flags_extended: None,
-            path: path_bytes,
-            base_index_pos: 0,
-        };
+        let entry = entry_from_metadata(&metadata, &path_bytes, oid, mode);
         index.add_or_replace(entry);
     }
 

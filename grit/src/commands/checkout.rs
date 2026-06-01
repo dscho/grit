@@ -2958,24 +2958,45 @@ fn switch_to_tree(
 
     warn_sparse_paths_already_present(repo, &old_index, &new_index, &work_tree);
 
-    // Update cached stat in the new index to match the freshly checked-out files. Only do so when
-    // the work-tree content actually hashes to the index blob: a locally-modified file whose blob
-    // is unchanged across the branch switch is carried over WITHOUT being rewritten, so refreshing
-    // its stat would make `diff_index_to_worktree`'s stat fast-path treat it as clean and drop the
-    // `M <path>` report. Leaving the stale stat forces a re-hash that correctly reports the change
-    // (Git only lstats files it actually wrote; t7201 4).
+    // Update cached stat in the new index. Entries that checkout skipped because the same path
+    // already existed keep their old stat tuple; entries that checkout wrote adopt the new
+    // worktree metadata, even when CRLF smudge means raw worktree bytes do not hash to the index
+    // blob (t0020). Preserving old stats for skipped paths keeps local modifications visible.
     for entry in &mut new_index.entries {
         if entry.stage() != 0 {
             continue;
         }
         let path_str = String::from_utf8_lossy(&entry.path);
         let abs = work_tree.join(path_str.as_ref());
-        if entry.mode != MODE_SYMLINK && entry.mode != MODE_GITLINK {
-            let clean = matches!(std::fs::read(&abs), Ok(data)
-                if Odb::hash_object_data(ObjectKind::Blob, &data) == entry.oid);
-            if !clean {
-                continue;
+        let skipped_existing = !force
+            && old_index
+                .entries
+                .iter()
+                .find(|old| {
+                    old.stage() == 0
+                        && old.path == entry.path
+                        && old.oid == entry.oid
+                        && old.mode == entry.mode
+                })
+                .is_some()
+            && (abs.exists() || abs.is_symlink());
+        if skipped_existing {
+            if let Some(old) = old_index
+                .entries
+                .iter()
+                .find(|old| old.stage() == 0 && old.path == entry.path)
+            {
+                entry.ctime_sec = old.ctime_sec;
+                entry.ctime_nsec = old.ctime_nsec;
+                entry.mtime_sec = old.mtime_sec;
+                entry.mtime_nsec = old.mtime_nsec;
+                entry.dev = old.dev;
+                entry.ino = old.ino;
+                entry.uid = old.uid;
+                entry.gid = old.gid;
+                entry.size = old.size;
             }
+            continue;
         }
         if let Ok(meta) = std::fs::symlink_metadata(&abs) {
             use std::os::unix::fs::MetadataExt as _;

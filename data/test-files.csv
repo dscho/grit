@@ -1,6 +1,6 @@
 file	group	in_scope	tests_total	passed_last	failing	fully_passing	status	expect_failure
 t0-version	t0	yes	1	1	0	true	ok	0
-t0000-basic	t0	yes	92	91	1	false	ok	8
+t0000-basic	t0	yes	92	92	0	true	ok	8
 t0001-init	t0	yes	102	74	28	false	ok	0
 t0002-gitfile	t0	yes	14	12	2	false	ok	0
 t0003-attributes	t0	yes	55	55	0	true	ok	0
@@ -17,10 +17,10 @@ t0014-alias	t0	yes	21	21	0	true	ok	1
 t0017-env-helper	t0	yes	5	5	0	true	ok	0
 t0018-advice	t0	yes	6	6	0	true	ok	0
 t0019-json-writer	t0	yes	16	16	0	true	ok	0
-t0020-crlf	t0	yes	36	35	1	false	ok	0
-t0021-conversion	t0	yes	42	27	15	false	ok	0
+t0020-crlf	t0	yes	36	36	0	true	ok	0
+t0021-conversion	t0	yes	42	28	14	false	ok	0
 t0022-crlf-rename	t0	yes	2	2	0	true	ok	0
-t0023-crlf-am	t0	yes	2	1	1	false	ok	0
+t0023-crlf-am	t0	yes	2	2	0	true	ok	0
 t0024-crlf-archive	t0	yes	3	3	0	true	ok	0
 t0025-crlf-renormalize	t0	yes	3	3	0	true	ok	0
 t0026-eol-config	t0	yes	6	6	0	true	ok	0
@@ -49,7 +49,7 @@ t0070-fundamental	t0	yes	11	11	0	true	ok	0
 t0071-sort	t0	yes	1	1	0	true	ok	0
 t0080-tree-hash	t0	yes	30	30	0	true	ok	0
 t0080-unit-test-output	t0	yes	1	1	0	true	ok	0
-t0081-find-pack	t0	yes	4	3	1	false	ok	0
+t0081-find-pack	t0	yes	4	4	0	true	ok	0
 t0090-cache-tree	t0	yes	22	16	6	false	ok	0
 t0091-bugreport	t0	yes	13	13	0	true	ok	0
 t0092-diagnose	t0	yes	4	4	0	true	ok	0
