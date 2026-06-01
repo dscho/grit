@@ -22,6 +22,8 @@ Updated: 2026-06-01
 - t8 for-each-ref sort: `./scripts/run-tests.sh t8070-for-each-ref-sort.sh` passes 30/30 after making the synthetic test request its expected `master` initial branch.
 - t8 init templates: `./scripts/run-tests.sh t8090-init-templates.sh` passes 28/28 after fixture fixes and `.git/hooks` creation.
 - init neighbor: `./scripts/run-tests.sh t0001-init.sh` remains 74/102.
+- t8 log author search: `./scripts/run-tests.sh t8270-log-author-search.sh` passes 29/29 after raw option hydration and author matching fixes.
+- t8 log committer search: `./scripts/run-tests.sh t8280-log-committer-search.sh t8290-log-grep-message.sh` passes 29/29 for `t8280`; `t8290` is now 28/30.
 - t8 switch checks: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 - t8 blame focus: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 
