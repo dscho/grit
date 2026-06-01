@@ -32,6 +32,7 @@
   - Completed: `t9170-read-tree-prefix.sh` (25/25).
   - Completed: `t9260-log-oneline-format.sh` (33/33).
   - Completed: `t9430-symbolic-ref-delete.sh` (28/28).
+  - Completed: `t9850-status-ignored-patterns.sh` (36/36).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.

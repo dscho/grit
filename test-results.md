@@ -74,6 +74,8 @@ Updated: 2026-06-01
   explicit `master` setup and aligning `--graph --reverse` with real Git rejection behavior.
 - t9 focus: `./scripts/run-tests.sh t9430-symbolic-ref-delete.sh --verbose` now passes 28/28 after
   making real-Git setup explicitly initialize `master`, matching the test's hard-coded HEAD refs.
+- t9 focus: `./scripts/run-tests.sh t9850-status-ignored-patterns.sh --verbose` now passes 36/36 after
+  making real-Git setup explicitly initialize `master`, matching the test's hard-coded status checks.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
