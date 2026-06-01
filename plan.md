@@ -46,7 +46,8 @@
   - Completed: `t9420-update-ref-delete.sh` (24/24).
   - Completed: `t9860-log-max-count-skip.sh` (38/38).
   - Completed: `t9890-init-object-format.sh` (31/31).
-  - Next expected target: choose by refreshed CSV after commit.
+  - Completed: `t9903-bash-prompt.sh` (67/67).
+  - Next expected target: final t9 verification.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
   - Execution log: `logs/2026-06-01_0000-t9-family.md`.

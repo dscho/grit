@@ -88,6 +88,11 @@ Updated: 2026-06-01
   after making setup explicitly initialize `master`, matching hard-coded refs.
 - t9 focus: `./scripts/run-tests.sh t9890-init-object-format.sh --verbose` now passes 31/31 after
   documented subshell wrapping for cd-using test bodies.
+- t9 focus: `cargo build --release -p grit-cli` passed, then
+  `./scripts/run-tests.sh t9903-bash-prompt.sh --verbose` passed 67/67 after interactive rebase
+  prompt progress files were fixed for edit stops.
+- t9903 validation: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` all completed successfully; grit-lib unit tests passed 229/229.
 - t9 focus: `./scripts/run-tests.sh t9860-log-max-count-skip.sh --verbose` now passes 38/38 after
   making real-Git setup explicitly initialize `master`, matching hard-coded branch operations.
 - t9 focus: `./scripts/run-tests.sh t9870-rev-list-reverse-count.sh --verbose` now passes 34/34 after
