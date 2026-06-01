@@ -394,6 +394,26 @@ pub fn run(mut args: Args) -> Result<()> {
         grit_lib::precompose_config::effective_core_precomposeunicode(Some(&repo.git_dir));
 
     let index_path = resolved_env_index_path(&repo);
+    // Git holds the index lock at the start of `cmd_add` (LOCK_REPORT_ON_ERROR), even with
+    // --dry-run, so a pre-existing `index.lock` is fatal. grit only checks the lock when it
+    // writes the index, which dry-run skips — replicate the early check here so
+    // `git submodule add` relays the lock error (t7400 "relays add --dry-run stderr").
+    {
+        let lock_path = index_path.with_extension("lock");
+        if lock_path.exists() {
+            let mut msg = format!("Unable to create '{}': File exists.", lock_path.display());
+            if let Some(pid_msg) = lockfile_pid_diagnostic(&index_path) {
+                msg.push_str("\n\n");
+                msg.push_str(&pid_msg);
+            } else {
+                msg.push_str("\n\n");
+                msg.push_str(
+                    "Another git process seems to be running in this repository, or the lock file may be stale",
+                );
+            }
+            bail!("fatal: {msg}");
+        }
+    }
     let idx_exists = index_path.exists();
     let mut index = if idx_exists {
         repo.load_index_at(&index_path)?

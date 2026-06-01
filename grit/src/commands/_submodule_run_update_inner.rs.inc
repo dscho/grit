@@ -24,6 +24,15 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
 
     trace_submodule_job_tasks_if_needed(args.jobs);
 
+    // Validate explicit path arguments against the index gitlink set (git's
+    // module_list_compute): a pathspec matching no gitlink is an error. Replace the raw paths
+    // with worktree-relative normalized ones so filtering works from a subdirectory.
+    let normalized_paths = validate_submodule_pathspecs(&repo, work_tree, &args.paths)?;
+    let args = &UpdateArgs {
+        paths: normalized_paths,
+        ..args.clone()
+    };
+
     if args.init {
         init_in_repo(
             &repo,
@@ -37,6 +46,23 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
 
     let modules = parse_gitmodules_with_repo(work_tree, Some(&repo))?;
     let selected = filter_submodules(&modules, &args.paths);
+
+    // Git iterates the index gitlink set; any gitlink without a matching `.gitmodules` entry is
+    // simply "not initialized" (rather than silently ignored). When explicit paths are given,
+    // emit that message so callers see it (t7400 "aborts on missing .gitmodules file").
+    if !args.paths.is_empty() {
+        let gitlinks = index_gitlink_paths(&repo);
+        for gl in &gitlinks {
+            let selected_by_args = args.paths.iter().any(|p| {
+                p == "." || p == gl || gl.starts_with(&format!("{p}/")) || p.starts_with(':')
+            });
+            if selected_by_args && !modules.iter().any(|m| &m.path == gl) {
+                let msg_path = submodule_display_path_from_cwd(&work_tree.join(gl));
+                eprintln!("Submodule path '{msg_path}' not initialized");
+                eprintln!("Maybe you want to use 'update --init'?");
+            }
+        }
+    }
 
     let grit_bin = grit_exe::grit_executable();
     let super_index = repo.load_index().ok();
@@ -75,7 +101,13 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
 
         let url_key = format!("submodule.{}.url", m.name);
         let has_url = local_cfg.entries.iter().any(|e| e.key == url_key);
-        if !has_url {
+
+        // Git operates on a submodule when it is "active": `submodule.<name>.active`,
+        // `submodule.active` pathspec, or a `submodule.<name>.url` in config. An inactive
+        // submodule is reported as not initialized and skipped (warn only with explicit paths).
+        let active = grit_lib::submodule_active::is_submodule_active(&repo, &m.path)
+            .unwrap_or(has_url);
+        if !active {
             if !args.paths.is_empty() {
                 eprintln!("Submodule path '{msg_path}' not initialized");
             } else {
@@ -84,6 +116,14 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                     m.path
                 );
             }
+            continue;
+        }
+
+        // An active submodule with no resolvable URL (neither config nor `.gitmodules`) cannot
+        // be cloned (git: "cannot clone submodule '<name>' without a URL").
+        if !has_url && m.url.trim().is_empty() {
+            eprintln!("fatal: cannot clone submodule '{}' without a URL", m.name);
+            any_failure = true;
             continue;
         }
 
@@ -161,6 +201,27 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                     &config_last_value(&local_cfg, &url_key).unwrap_or_else(|| m.url.clone()),
                     &m.url,
                 );
+
+                // git refuses to clone over an occupied path: a regular file, or a non-empty
+                // directory that is not itself the submodule checkout (t7400.52/53).
+                if let Ok(meta) = fs::symlink_metadata(&sub_path) {
+                    if !meta.is_dir() {
+                        eprintln!(
+                            "fatal: could not create directory '{}'",
+                            sub_path.display()
+                        );
+                        any_failure = true;
+                        continue;
+                    }
+                    let non_empty = fs::read_dir(&sub_path)
+                        .map(|mut it| it.next().is_some())
+                        .unwrap_or(false);
+                    if non_empty {
+                        eprintln!("fatal: directory not empty: '{}'", sub_path.display());
+                        any_failure = true;
+                        continue;
+                    }
+                }
 
                 if let Ok(meta) = fs::symlink_metadata(&sub_path) {
                     if meta.is_dir() {
