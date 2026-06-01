@@ -4,7 +4,8 @@
 
 - [x] `t8002-blame` 135/135 — fixed `blame -c`, show-email config/negation, boundary abbreviations, `-b`, untracked-file rejection, and no-op editor amend setup.
 - [x] `t8012-blame-colors` 120/120 — passed after `t8002` blame compatibility fixes.
-- [ ] `t8330-switch-track` 1/30 — next highest remaining t8 file.
+- [x] `t8330-switch-track` 30/30 — fixed switch tracking flag forwarding and local tracking defaults; test fixture now explicitly requests its `master` initial branch.
+- [ ] `t8001-annotate` 95/117 — next highest remaining t8 file.
 
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
 
