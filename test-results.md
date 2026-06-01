@@ -68,6 +68,8 @@ Updated: 2026-06-01
   excluded) after rev-parse gitfile, clone completion-helper, and ls-tree directory pathspec fixes.
 - t9902 validation: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
   `cargo test -p grit-lib --lib` all completed successfully; grit-lib unit tests passed 229/229.
+- t9 focus: `./scripts/run-tests.sh t9170-read-tree-prefix.sh --verbose` now passes 25/25 after
+  aligning prefix/no-duplicate expectations with real Git behavior.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
