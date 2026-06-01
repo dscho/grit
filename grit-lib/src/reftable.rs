@@ -673,8 +673,16 @@ impl ReftableReader {
             )));
         }
         let _block_size = ((data[5] as u32) << 16) | ((data[6] as u32) << 8) | (data[7] as u32);
-        let _min_update_index = u64::from_be_bytes(data[8..16].try_into().unwrap());
-        let _max_update_index = u64::from_be_bytes(data[16..24].try_into().unwrap());
+        let _min_update_index = u64::from_be_bytes(
+            data[8..16]
+                .try_into()
+                .map_err(|_| Error::InvalidRef("reftable: truncated header".into()))?,
+        );
+        let _max_update_index = u64::from_be_bytes(
+            data[16..24]
+                .try_into()
+                .map_err(|_| Error::InvalidRef("reftable: truncated header".into()))?,
+        );
 
         // Parse footer
         let footer_size = if version == 2 { 72 } else { FOOTER_V1_SIZE };
@@ -1005,7 +1013,11 @@ fn decode_log_record(data: &[u8], pos: usize, prev_key: &[u8]) -> Result<(LogRec
     if null_pos + 9 > key.len() {
         return Err(Error::InvalidRef("reftable: log key too short".into()));
     }
-    let reversed_idx = u64::from_be_bytes(key[null_pos + 1..null_pos + 9].try_into().unwrap());
+    let reversed_idx = u64::from_be_bytes(
+        key[null_pos + 1..null_pos + 9]
+            .try_into()
+            .map_err(|_| Error::InvalidRef("reftable: log key too short".into()))?,
+    );
     let update_index = 0xffffffffffffffffu64 - reversed_idx;
 
     if log_type == 0 {
@@ -1339,11 +1351,10 @@ impl ReftableStack {
         if self.table_names.len() <= 2 {
             return Ok(());
         }
-        let newest = self
-            .table_names
-            .last()
-            .cloned()
-            .expect("length checked above");
+        let newest =
+            self.table_names.last().cloned().ok_or_else(|| {
+                Error::InvalidRef("reftable: table stack unexpectedly empty".into())
+            })?;
         let old_names: Vec<String> = self.table_names[..self.table_names.len() - 1].to_vec();
         let prefix_stack = Self {
             reftable_dir: self.reftable_dir.clone(),
@@ -1720,14 +1731,16 @@ pub fn reftable_write_ref(
 ) -> Result<()> {
     let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, refname);
     let mut stack = ReftableStack::open(&store_git_dir)?;
-    let old_oid = stack
+    let old_oid = match stack
         .lookup_ref(&storage_refname)?
         .and_then(|r| match r.value {
             RefValue::Val1(oid) => Some(oid),
             RefValue::Val2(oid, _) => Some(oid),
             _ => None,
-        })
-        .unwrap_or_else(|| ObjectId::from_bytes(&[0u8; 20]).unwrap());
+        }) {
+        Some(oid) => oid,
+        None => ObjectId::from_bytes(&[0u8; 20])?,
+    };
 
     let log = if let Some(identity) = log_identity {
         let (name, email, time_secs, tz) = parse_identity_string(identity);
@@ -2170,19 +2183,31 @@ fn parse_footer(data: &[u8], version: u8) -> Result<Footer> {
         )));
     }
 
+    // Footer-size validated above, so every fixed-width slice below is in
+    // bounds; convert via `?` to surface any unexpected truncation as an error.
+    let read_u64 = |slice: &[u8]| -> Result<u64> {
+        let bytes: [u8; 8] = slice
+            .try_into()
+            .map_err(|_| Error::InvalidRef("reftable: truncated footer field".into()))?;
+        Ok(u64::from_be_bytes(bytes))
+    };
+
     let block_size = ((data[5] as u32) << 16) | ((data[6] as u32) << 8) | (data[7] as u32);
-    let min_update_index = u64::from_be_bytes(data[8..16].try_into().unwrap());
-    let max_update_index = u64::from_be_bytes(data[16..24].try_into().unwrap());
+    let min_update_index = read_u64(&data[8..16])?;
+    let max_update_index = read_u64(&data[16..24])?;
 
     let off = 24;
-    let ref_index_position = u64::from_be_bytes(data[off..off + 8].try_into().unwrap());
-    let obj_position_and_id_len = u64::from_be_bytes(data[off + 8..off + 16].try_into().unwrap());
-    let obj_index_position = u64::from_be_bytes(data[off + 16..off + 24].try_into().unwrap());
-    let log_position = u64::from_be_bytes(data[off + 24..off + 32].try_into().unwrap());
-    let log_index_position = u64::from_be_bytes(data[off + 32..off + 40].try_into().unwrap());
+    let ref_index_position = read_u64(&data[off..off + 8])?;
+    let obj_position_and_id_len = read_u64(&data[off + 8..off + 16])?;
+    let obj_index_position = read_u64(&data[off + 16..off + 24])?;
+    let log_position = read_u64(&data[off + 24..off + 32])?;
+    let log_index_position = read_u64(&data[off + 32..off + 40])?;
 
     // CRC-32 check
-    let crc_stored = u32::from_be_bytes(data[footer_size - 4..footer_size].try_into().unwrap());
+    let crc_bytes: [u8; 4] = data[footer_size - 4..footer_size]
+        .try_into()
+        .map_err(|_| Error::InvalidRef("reftable: truncated footer CRC".into()))?;
+    let crc_stored = u32::from_be_bytes(crc_bytes);
     let crc_computed = crc32(&data[..footer_size - 4]);
     if crc_stored != crc_computed {
         return Err(Error::InvalidRef(format!(
