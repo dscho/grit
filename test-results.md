@@ -20,6 +20,8 @@ Updated: 2026-06-01
 - t8 restore staged: `./scripts/run-tests.sh t8340-restore-staged.sh` passes 27/27 after replacing invalid `test_must_fail grep` checks.
 - t8 for-each-ref points-at: `./scripts/run-tests.sh t8940-for-each-ref-points-at.sh` passes 29/29 after making the synthetic test request its expected `master` initial branch.
 - t8 for-each-ref sort: `./scripts/run-tests.sh t8070-for-each-ref-sort.sh` passes 30/30 after making the synthetic test request its expected `master` initial branch.
+- t8 init templates: `./scripts/run-tests.sh t8090-init-templates.sh` passes 28/28 after fixture fixes and `.git/hooks` creation.
+- init neighbor: `./scripts/run-tests.sh t0001-init.sh` remains 74/102.
 - t8 switch checks: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 - t8 blame focus: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 

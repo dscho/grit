@@ -17,7 +17,8 @@
 - [x] `t8340-restore-staged` 27/27 — fixed invalid `test_must_fail grep` checks.
 - [x] `t8940-for-each-ref-points-at` 29/29 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8070-for-each-ref-sort` 30/30 — fixed the synthetic test's expected `master` initial branch.
-- [ ] `t8090-init-templates` 20/28 — tied next highest remaining t8 file.
+- [x] `t8090-init-templates` 28/28 — fixed initial branch/cwd fixture issues and ensured init creates `.git/hooks`.
+- [ ] `t8270-log-author-search` 21/29 — tied next highest remaining t8 file.
 
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
 
