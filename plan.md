@@ -5,9 +5,9 @@
 - [~] Make current in-scope `t9` family tests fully pass. Work one file at a time, always choosing
   the non-green in-scope `t9` row with the largest `failing` count in `data/test-files.csv`, then
   re-running that file until it has `failing=0` before moving on.
-  - First target: `t9040-hash-object-types.sh` (currently 1/28, 27 failing; tie-break before
-    `t9060-mktag-verify.sh`).
-  - Next expected target after that: `t9060-mktag-verify.sh` (currently 1/28, 27 failing).
+  - Completed: `t9040-hash-object-types.sh` (28/28).
+  - Completed: `t9060-mktag-verify.sh` (28/28).
+  - Next expected target: `t9300-branch-delete-force.sh` (currently 4/25, 21 failing).
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
   - Execution log: `logs/2026-06-01_0000-t9-family.md`.

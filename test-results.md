@@ -7,7 +7,9 @@ Updated: 2026-06-01
   `grit/src/commands/worktree.rs`.
 - t9 focus: `./scripts/run-tests.sh t9040-hash-object-types.sh --verbose` now passes 28/28 after
   containing the setup test's `cd repo` in a subshell.
-- Workspace cargo/unit tests: not re-run for the `t9040` harness-only cwd fix.
+- t9 focus: `./scripts/run-tests.sh t9060-mktag-verify.sh --verbose` now passes 28/28 after
+  containing the setup test's `cd repo` in a subshell.
+- Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
 - `cargo check`: pass with existing warnings.
