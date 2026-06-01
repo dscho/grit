@@ -25,6 +25,7 @@
   - Completed: `t9710-show-ref-hash-abbrev.sh` (38/38).
   - Completed: `t9130-status-porcelain-v2.sh` (26/26).
   - Completed: `t9150-rev-list-all-count.sh` (33/33).
+  - Completed: `t9450-merge-base-ancestor.sh` (32/32).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
