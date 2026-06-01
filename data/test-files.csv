@@ -1488,7 +1488,7 @@ t9220-diff-tree-pathspec	t9	yes	30	30	0	true	ok	0
 t9230-diff-index-modes	t9	yes	38	37	1	false	ok	0
 t9231-diff-index-patch	t9	yes	11	11	0	true	ok	0
 t9240-diff-files-deleted	t9	yes	34	32	2	false	ok	0
-t9250-status-short-branch	t9	yes	33	27	6	false	ok	0
+t9250-status-short-branch	t9	yes	33	33	0	true	ok	0
 t9260-log-oneline-format	t9	yes	33	30	3	false	ok	0
 t9270-rev-list-topo-date	t9	yes	31	25	6	false	ok	0
 t9280-config-bool-int	t9	yes	27	27	0	true	ok	0

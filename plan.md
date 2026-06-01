@@ -20,6 +20,7 @@
   - Completed: `t9200-merge-base-all.sh` (31/31).
   - Completed: `t9351-fast-export-anonymize.sh` (17/17).
   - Completed: `t9210-name-rev-tags.sh` (27/27).
+  - Completed: `t9250-status-short-branch.sh` (33/33).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
