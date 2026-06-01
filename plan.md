@@ -39,7 +39,9 @@
 - [x] `t8520-tag-message` 31/31 — corrected synthetic empty tag message expectations.
 - [x] `t8540-status-porcelain` 28/28 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8610-checkout-index-modes` 27/27 — corrected synthetic checkout-index failure expectations.
-- [ ] `t8670-write-tree-index` 25/27 — tied next highest remaining t8 file.
+- [x] `t8670-write-tree-index` 27/27 — fixed `ls-tree` exact tree pathspec handling.
+- [x] `t8630-ls-tree-format` 29/29 — passed with the same `ls-tree` pathspec fix.
+- [ ] `t8700-init-bare-extra` 27/29 — tied next highest remaining t8 file.
 - [ ] `t8970-symbolic-ref-chains` 26/30 — next highest remaining t8 file.
 
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
