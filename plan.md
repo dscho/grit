@@ -27,7 +27,7 @@
 - [x] `t8820-branch-tracking-display` 27/27 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8860-add-intent-to-add` 30/30 — corrected synthetic intent-to-add expectations for empty blob/status/cached diff behavior.
 - [x] `t8930-rev-list-first-parent` 32/32 — fixed the synthetic test's expected `master` initial branch.
-- [ ] `t8005-blame-i18n` 0/5 — next highest remaining t8 file.
+- [x] `t8005-blame-i18n` 5/5 — fixed raw non-UTF-8 commit argv hydration for author/message encoding.
 
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
 

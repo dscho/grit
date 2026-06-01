@@ -33,6 +33,7 @@ Updated: 2026-06-01
 - t8 rev-list first-parent: `./scripts/run-tests.sh t8930-rev-list-first-parent.sh` passes 32/32 after making the synthetic test request its expected `master` initial branch.
 - t8 switch checks: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 - t8 blame focus: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
+- t8 blame i18n: `./scripts/run-tests.sh t8005-blame-i18n.sh` passes 5/5 after preserving raw non-UTF-8 commit `--author` and `-m` argv bytes for `i18n.commitencoding` decoding.
 
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
