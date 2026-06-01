@@ -533,7 +533,8 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.revision.is_some() && args.mirror {
         bail!("--revision and --mirror are mutually exclusive");
     }
-    if !args.reference.is_empty() && !args.reference_if_able.is_empty() && args.recurse_submodules() {
+    if !args.reference.is_empty() && !args.reference_if_able.is_empty() && args.recurse_submodules()
+    {
         bail!("clone --recursive is not compatible with both --reference and --reference-if-able");
     }
     if args.separate_git_dir.is_some() && args.bare {
@@ -3655,9 +3656,7 @@ fn clone_submodules(work_tree: &Path, repo: &Repository, clone_args: &Args) -> R
             continue;
         }
         // With explicit `--recurse-submodules=<pathspec>`, only clone active submodules.
-        if active_filter
-            && !crate::commands::submodule::submodule_path_is_active(repo, &sm.path)
-        {
+        if active_filter && !crate::commands::submodule::submodule_path_is_active(repo, &sm.path) {
             continue;
         }
 

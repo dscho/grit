@@ -317,8 +317,7 @@ fn super_index_has_unmerged_stage(repo: &Repository, rel_path: &str) -> bool {
 /// Read `submodule.<name>.url` from the superproject's local config, if present.
 fn config_submodule_url(repo: &Repository, name: &str) -> Option<String> {
     let cfg = parse_local_config(&repo.git_dir).ok()?;
-    config_last_value(&cfg, &format!("submodule.{name}.url"))
-        .filter(|v| !v.trim().is_empty())
+    config_last_value(&cfg, &format!("submodule.{name}.url")).filter(|v| !v.trim().is_empty())
 }
 
 fn parse_local_config(git_dir: &Path) -> Result<ConfigFile> {
@@ -1333,11 +1332,15 @@ fn normalize_submodule_path_arg(work_tree: &Path, cwd: &Path, raw: &str) -> Opti
     };
     // Lexically normalize `.`/`..` without requiring the path to exist on disk.
     let normalized = lexically_normalize(&candidate);
-    let wt = work_tree.canonicalize().unwrap_or_else(|_| work_tree.to_path_buf());
+    let wt = work_tree
+        .canonicalize()
+        .unwrap_or_else(|_| work_tree.to_path_buf());
     let norm = normalized.canonicalize().unwrap_or(normalized);
     match norm.strip_prefix(&wt) {
         Ok(rel) => {
-            let s = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+            let s = rel
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
             if s.is_empty() {
                 Some(".".to_string())
             } else {
@@ -1413,9 +1416,7 @@ fn pathspec_select_gitlinks(gitlinks: &[String], specs: &[String]) -> Vec<String
     };
     let positives: Vec<&String> = specs
         .iter()
-        .filter(|s| {
-            !s.starts_with(":!") && !s.starts_with(":^") && !s.starts_with(":(exclude")
-        })
+        .filter(|s| !s.starts_with(":!") && !s.starts_with(":^") && !s.starts_with(":(exclude"))
         .collect();
     let excludes: Vec<String> = specs
         .iter()
@@ -2564,8 +2565,8 @@ fn run_add(args: &AddArgs) -> Result<()> {
             let name = String::from_utf8_lossy(&e.path);
             name == path || name.starts_with(&path_prefix)
         }) {
-            let exact_gitlink = String::from_utf8_lossy(&entry.path) == path
-                && entry.mode == MODE_GITLINK;
+            let exact_gitlink =
+                String::from_utf8_lossy(&entry.path) == path && entry.mode == MODE_GITLINK;
             if !args.force {
                 bail!("fatal: '{path}' already exists in the index");
             }
@@ -2620,10 +2621,7 @@ fn run_add(args: &AddArgs) -> Result<()> {
         let existing = parse_gitmodules_with_repo(work_tree, Some(&repo)).unwrap_or_default();
         if let Some(m) = existing.iter().find(|m| m.name == name) {
             if m.path != path && !args.force {
-                bail!(
-                    "submodule name '{name}' already used for path '{}'",
-                    m.path
-                );
+                bail!("submodule name '{name}' already used for path '{}'", m.path);
             }
         }
     }
@@ -2633,12 +2631,11 @@ fn run_add(args: &AddArgs) -> Result<()> {
     // Git only rejects a path that is *strictly nested* under an existing registered submodule
     // (die_path_inside_submodule: item->len > ce_len). Re-adding the same path (reconfigure with
     // --force) and adding a path that merely shares a `.gitmodules` section name are allowed.
-    let registered_paths: Vec<String> =
-        parse_gitmodules_with_repo(work_tree, Some(&repo))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| m.path.replace('\\', "/"))
-            .collect();
+    let registered_paths: Vec<String> = parse_gitmodules_with_repo(work_tree, Some(&repo))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|m| m.path.replace('\\', "/"))
+        .collect();
     let path_norm = path.replace('\\', "/");
     let is_registered_path = registered_paths.iter().any(|p| *p == path_norm);
     let nested_under_registered = registered_paths
@@ -2822,12 +2819,17 @@ fn run_add(args: &AddArgs) -> Result<()> {
     }
     local_config.write()?;
 
-    // Add the submodule path to the index.
-    // Use --no-warn-embedded-repo so the add doesn't warn about the
-    // embedded git repository we just cloned on purpose.
-    let status = Command::new(&grit_bin)
-        .arg("add")
-        .arg("--no-warn-embedded-repo")
+    // Add the submodule path (and `.gitmodules`) to the index. Use --no-warn-embedded-repo so
+    // the add doesn't warn about the embedded git repository we just cloned on purpose. With
+    // --force, pass `add --force` so an "ignore everything" .gitignore does not block staging
+    // the submodule / `.gitmodules` (git's configure_added_submodule forces the gitlink add).
+    let mut add_cmd = Command::new(&grit_bin);
+    add_cmd.arg("add").arg("--no-warn-embedded-repo");
+    if args.force {
+        add_cmd.arg("--force");
+    }
+    let status = add_cmd
+        .arg("--")
         .arg(".gitmodules")
         .arg(&path)
         .current_dir(work_tree)
@@ -3486,7 +3488,9 @@ fn run_deinit(args: &DeinitArgs, quiet: bool) -> Result<()> {
     // `--all` and explicit pathspecs are mutually exclusive.
     if args.all && !args.paths.is_empty() {
         eprintln!("error: pathspec and --all are incompatible");
-        eprintln!("usage: git submodule deinit [--quiet] [-f | --force] [--all | [--] [<path>...]]");
+        eprintln!(
+            "usage: git submodule deinit [--quiet] [-f | --force] [--all | [--] [<path>...]]"
+        );
         return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
     }
     // Without either, refuse to act (git: die "Use '--all'...").
