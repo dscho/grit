@@ -864,7 +864,9 @@ fn parse_options(argv: &[String]) -> Result<Options> {
                     }
                 }
                 _ if arg.starts_with("-U") && arg[2..].parse::<usize>().is_ok() => {
-                    context_lines = arg[2..].parse::<usize>().unwrap();
+                    if let Ok(n) = arg[2..].parse::<usize>() {
+                        context_lines = n;
+                    }
                 }
                 "-b" | "--ignore-space-change" => {
                     ignore_space_change = true;
@@ -2312,8 +2314,7 @@ pub(crate) fn write_submodule_diff_recursive(
         // Modified working tree vs same recorded commit: show inner diff only (no `Submodule a..b:` line).
         let use_worktree_for_right =
             !ignore_dirty_for_inner && new_commit != z && sub_repo.is_some();
-        if use_worktree_for_right {
-            let sr = sub_repo.as_ref().unwrap();
+        if let Some(sr) = sub_repo.as_ref().filter(|_| use_worktree_for_right) {
             let idx = sr.load_index().unwrap_or_else(|_| Index::new());
             let inner =
                 grit_lib::diff::diff_tree_to_worktree(&sr.odb, old_tree.as_ref(), &sub_path, &idx)?;
@@ -2424,8 +2425,7 @@ pub(crate) fn write_submodule_diff_recursive(
         return Ok(());
     }
 
-    if use_worktree_for_right {
-        let sr = sub_repo.as_ref().unwrap();
+    if let Some(sr) = sub_repo.as_ref().filter(|_| use_worktree_for_right) {
         let idx = sr.load_index().unwrap_or_else(|_| Index::new());
         let inner =
             grit_lib::diff::diff_tree_to_worktree(&sr.odb, old_tree.as_ref(), &sub_path, &idx)?;

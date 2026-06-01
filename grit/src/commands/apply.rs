@@ -13,7 +13,7 @@
 //! - Reads from stdin if no file argument given
 
 use crate::explicit_exit::ExplicitExit;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::crlf::{self, FileAttrs, MergeAttr};
@@ -1124,8 +1124,10 @@ fn guess_p_value_from_nameline(line: &[u8], setup_prefix: Option<&str>) -> Optio
 fn epoch_stamp_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // Provably infallible: the pattern is a fixed string literal that is a valid regex.
+        #[allow(clippy::expect_used)]
         Regex::new(r"^([0-2][0-9]):([0-5][0-9]):00(?:\.0+)? ([-+][0-2][0-9]:?[0-5][0-9])")
-            .expect("epoch stamp regex")
+            .expect("epoch stamp regex is a valid constant pattern")
     })
 }
 
@@ -4058,8 +4060,7 @@ fn show_summary(patches: &[FilePatch], directory: Option<&str>) {
             let pct = fp.similarity_index.unwrap_or(100);
             let compact = compact_rename_path(&old, &path);
             let _ = writeln!(out, " {kind} {compact} ({pct}%)");
-        } else if fp.dissimilarity_index.is_some() {
-            let pct = fp.dissimilarity_index.unwrap();
+        } else if let Some(pct) = fp.dissimilarity_index {
             let _ = writeln!(out, " rewrite {path} ({pct}%)");
         } else if fp.old_mode.is_some() && fp.new_mode.is_some() && fp.old_mode != fp.new_mode {
             let _ = writeln!(
@@ -5134,7 +5135,10 @@ fn apply_to_worktree(
             } else {
                 None
             };
-            let binary_patch = fp.binary_patch.as_ref().expect("checked");
+            let binary_patch = fp
+                .binary_patch
+                .as_ref()
+                .ok_or_else(|| anyhow!("internal error: missing binary patch payload"))?;
             let new_bytes = inflate_binary_payload(&binary_patch.forward_compressed)?;
             if let Some(expected_new) = fp.new_oid.as_deref() {
                 let actual = grit_lib::odb::Odb::hash_object_data(ObjectKind::Blob, &new_bytes);

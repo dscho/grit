@@ -6,7 +6,7 @@
 //! - One commit argument: compare the commit's tree against its parent(s).
 //! - `--stdin`: read commit or tree-pair OIDs from standard input.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Args as ClapArgs;
 use encoding_rs::Encoding;
 use grit_lib::combined_diff_patch::CombinedDiffWsOptions;
@@ -667,7 +667,11 @@ fn run_multi_tree_combined(
 
 fn run_two_trees(repo: &Repository, opts: &Options, out: &mut impl Write) -> Result<bool> {
     if opts.combined_patch && opts.objects.len() >= 3 {
-        let merge = resolve_to_tree(repo, opts.objects.last().unwrap())?;
+        let last_obj = opts
+            .objects
+            .last()
+            .ok_or_else(|| anyhow!("combined patch requires at least one object"))?;
+        let merge = resolve_to_tree(repo, last_obj)?;
         let mut parents = Vec::with_capacity(opts.objects.len() - 1);
         for s in &opts.objects[..opts.objects.len() - 1] {
             parents.push(resolve_to_tree(repo, s)?);
