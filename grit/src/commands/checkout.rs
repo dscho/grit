@@ -19,8 +19,8 @@ use std::process::{Command, Stdio};
 use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::crlf::{self, MergeAttr};
-use grit_lib::diff::read_submodule_head_oid;
 use grit_lib::diff::{diff_index_to_worktree, zero_oid};
+use grit_lib::diff::{read_submodule_head_oid, stat_matches};
 use grit_lib::error::Error as LibError;
 use grit_lib::filter_process::{self, DelayedProcessCheckout};
 use grit_lib::hooks::{run_hook, run_reference_transaction_committed_for_head_update, HookResult};
@@ -264,6 +264,10 @@ pub struct Args {
     #[arg(long = "progress")]
     pub progress: bool,
 
+    /// Suppress progress.
+    #[arg(long = "no-progress")]
+    pub no_progress: bool,
+
     /// Guess branch name from remote tracking branches (default).
     #[arg(long = "guess")]
     pub guess: bool,
@@ -290,7 +294,7 @@ pub struct Args {
 }
 
 /// Run `grit checkout`.
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 /// Parsed `-m` / `--merge` / `--no-merge` / `--conflict` / `--no-conflict` (matches Git tri-state `merge`).
 #[derive(Clone, Debug, Default)]
@@ -399,6 +403,32 @@ thread_local! {
     /// When set, untracked paths that are wholly covered by ignore rules may be clobbered
     /// (matches Git's `o->internal.dir` populated from `setup_standard_excludes`).
     static OVERWRITE_IGNORE: Cell<bool> = const { Cell::new(false) };
+    static CHECKOUT_SMUDGE_CONTEXT: RefCell<Option<(Option<String>, String)>> = const { RefCell::new(None) };
+}
+
+fn with_checkout_smudge_context<T>(
+    ref_name: Option<String>,
+    treeish_hex: String,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let previous = CHECKOUT_SMUDGE_CONTEXT.with(|ctx| ctx.replace(Some((ref_name, treeish_hex))));
+    let result = f();
+    CHECKOUT_SMUDGE_CONTEXT.with(|ctx| {
+        ctx.replace(previous);
+    });
+    result
+}
+
+fn checkout_smudge_meta(repo: &Repository, blob_hex: &str) -> filter_process::FilterSmudgeMeta {
+    if let Some((ref_name, treeish_hex)) = CHECKOUT_SMUDGE_CONTEXT.with(|ctx| ctx.borrow().clone())
+    {
+        return filter_process::FilterSmudgeMeta {
+            ref_name,
+            treeish_hex: Some(treeish_hex),
+            blob_hex: Some(blob_hex.to_string()),
+        };
+    }
+    filter_process::smudge_meta_for_checkout(repo, blob_hex)
 }
 
 /// Set whether the current `checkout` invocation should recurse into submodules after updating
@@ -2074,10 +2104,27 @@ fn switch_branch(
         };
 
         if branch_merge && !already_at_target {
-            merge_branch_working_tree(repo, &head, &target_oid, force, presentation, recurse)?;
+            with_checkout_smudge_context(
+                Some(branch_ref.to_string()),
+                target_oid.to_string(),
+                || {
+                    merge_branch_working_tree(
+                        repo,
+                        &head,
+                        &target_oid,
+                        force,
+                        presentation,
+                        recurse,
+                    )
+                },
+            )?;
         } else {
             let target_tree = commit_to_tree(repo, &target_oid)?;
-            switch_to_tree(repo, &head, &target_tree, force, recurse)?;
+            with_checkout_smudge_context(
+                Some(branch_ref.to_string()),
+                target_oid.to_string(),
+                || switch_to_tree(repo, &head, &target_tree, force, recurse),
+            )?;
         }
     }
 
@@ -3672,6 +3719,11 @@ fn is_worktree_dirty(
             Err(_) => Ok(true),
         }
     } else {
+        if let Ok(meta) = std::fs::symlink_metadata(abs_path) {
+            if stat_matches(entry, &meta) {
+                return Ok(false);
+            }
+        }
         let raw = match std::fs::read(abs_path) {
             Ok(data) => data,
             Err(_) => return Ok(true),
@@ -3704,6 +3756,52 @@ fn checkout_record_path_result(
         Ok(false) => {}
         Err(e) => path_errors.push(e),
     }
+}
+
+fn checkout_record_index_result(
+    result: Result<bool>,
+    rel_path: &str,
+    updated_paths: &mut usize,
+    path_errors: &mut Vec<anyhow::Error>,
+    checkout_written_paths: &mut HashSet<Vec<u8>>,
+) {
+    match result {
+        Ok(true) => {
+            *updated_paths += 1;
+            checkout_written_paths.insert(rel_path.as_bytes().to_vec());
+        }
+        Ok(false) => {}
+        Err(e) => path_errors.push(e),
+    }
+}
+
+fn refresh_written_index_entries(
+    index: &mut Index,
+    work_tree: &Path,
+    written_paths: &HashSet<Vec<u8>>,
+) -> bool {
+    let mut changed = false;
+    for path in written_paths {
+        let Some(entry) = index.get_mut(path, 0) else {
+            continue;
+        };
+        let rel_path = String::from_utf8_lossy(path);
+        let abs = work_tree.join(rel_path.as_ref());
+        let Ok(refreshed) = entry_from_stat(&abs, path, entry.oid, entry.mode) else {
+            continue;
+        };
+        entry.ctime_sec = refreshed.ctime_sec;
+        entry.ctime_nsec = refreshed.ctime_nsec;
+        entry.mtime_sec = refreshed.mtime_sec;
+        entry.mtime_nsec = refreshed.mtime_nsec;
+        entry.dev = refreshed.dev;
+        entry.ino = refreshed.ino;
+        entry.uid = refreshed.uid;
+        entry.gid = refreshed.gid;
+        entry.size = refreshed.size;
+        changed = true;
+    }
+    changed
 }
 
 /// Populate a submodule worktree for a single gitlink index entry (path + commit OID).
@@ -3916,6 +4014,7 @@ checking out of the index."
             let index_path = repo.index_path();
             let mut index = repo.load_index_at(&index_path).context("loading index")?;
             let mut index_modified = false;
+            let mut checkout_written_paths: HashSet<Vec<u8>> = HashSet::new();
 
             if merge_mode {
                 for path_str in paths {
@@ -3966,13 +4065,15 @@ checking out of the index."
                         // `checkout -f`: only paths with stage 0 are refreshed; unmerged-only paths
                         // are left as-is on disk (t7201).
                         if let Some(entry) = index.get(path_bytes, 0) {
-                            checkout_record_path_result(
+                            checkout_record_index_result(
                                 write_blob_to_worktree(
                                     repo, work_tree, &rel, &entry.oid, entry.mode, &index, false,
                                     None,
                                 ),
+                                &rel,
                                 &mut updated_paths,
                                 &mut path_errors,
+                                &mut checkout_written_paths,
                             );
                         }
                         continue;
@@ -3997,7 +4098,13 @@ checking out of the index."
                             if w.is_ok() {
                                 matched = true;
                             }
-                            checkout_record_path_result(w, &mut updated_paths, &mut path_errors);
+                            checkout_record_index_result(
+                                w,
+                                &p,
+                                &mut updated_paths,
+                                &mut path_errors,
+                                &mut checkout_written_paths,
+                            );
                         }
                     }
                     if !matched {
@@ -4029,13 +4136,15 @@ checking out of the index."
                                     // purely unmerged paths untouched (t7201).
                                     if let Some(entry) = index.get(pb.as_slice(), 0) {
                                         if !skip_for_sparse(entry) {
-                                            checkout_record_path_result(
+                                            checkout_record_index_result(
                                                 write_blob_to_worktree(
                                                     repo, work_tree, &p, &entry.oid, entry.mode,
                                                     &index, false, None,
                                                 ),
+                                                &p,
                                                 &mut updated_paths,
                                                 &mut path_errors,
+                                                &mut checkout_written_paths,
                                             );
                                         }
                                     }
@@ -4053,7 +4162,7 @@ checking out of the index."
                                     stage2.or(stage3)
                                 };
                                 if let Some(entry_src) = chosen {
-                                    checkout_record_path_result(
+                                    checkout_record_index_result(
                                         write_blob_to_worktree(
                                             repo,
                                             work_tree,
@@ -4064,18 +4173,22 @@ checking out of the index."
                                             false,
                                             None,
                                         ),
+                                        &p,
                                         &mut updated_paths,
                                         &mut path_errors,
+                                        &mut checkout_written_paths,
                                     );
                                 } else if let Some(entry) = index.get(pb.as_slice(), 0) {
                                     if !skip_for_sparse(entry) {
-                                        checkout_record_path_result(
+                                        checkout_record_index_result(
                                             write_blob_to_worktree(
                                                 repo, work_tree, &p, &entry.oid, entry.mode,
                                                 &index, false, None,
                                             ),
+                                            &p,
                                             &mut updated_paths,
                                             &mut path_errors,
+                                            &mut checkout_written_paths,
                                         );
                                     }
                                 }
@@ -4101,13 +4214,15 @@ checking out of the index."
                                     }
                                 } else if let Some(entry) = index.get(pb.as_slice(), 0) {
                                     if !skip_for_sparse(entry) {
-                                        checkout_record_path_result(
+                                        checkout_record_index_result(
                                             write_blob_to_worktree(
                                                 repo, work_tree, &p, &entry.oid, entry.mode,
                                                 &index, false, None,
                                             ),
+                                            &p,
                                             &mut updated_paths,
                                             &mut path_errors,
+                                            &mut checkout_written_paths,
                                         );
                                     }
                                 }
@@ -4141,24 +4256,28 @@ checking out of the index."
                                 continue;
                             }
                             let p = String::from_utf8_lossy(&ie.path).to_string();
-                            checkout_record_path_result(
+                            checkout_record_index_result(
                                 write_blob_to_worktree(
                                     repo, work_tree, &p, &ie.oid, ie.mode, &index, false, None,
                                 ),
+                                &p,
                                 &mut updated_paths,
                                 &mut path_errors,
+                                &mut checkout_written_paths,
                             );
                         }
                     }
                 } else if let Some(entry) = index.get(path_bytes, 0).cloned() {
                     // Exact file match
                     if !skip_for_sparse(&entry) {
-                        checkout_record_path_result(
+                        checkout_record_index_result(
                             write_blob_to_worktree(
                                 repo, work_tree, &rel, &entry.oid, entry.mode, &index, false, None,
                             ),
+                            &rel,
                             &mut updated_paths,
                             &mut path_errors,
+                            &mut checkout_written_paths,
                         );
                     }
                 } else if ours || theirs {
@@ -4175,7 +4294,7 @@ checking out of the index."
                             path_str
                         );
                     };
-                    checkout_record_path_result(
+                    checkout_record_index_result(
                         write_blob_to_worktree(
                             repo,
                             work_tree,
@@ -4186,8 +4305,10 @@ checking out of the index."
                             false,
                             None,
                         ),
+                        &rel,
                         &mut updated_paths,
                         &mut path_errors,
+                        &mut checkout_written_paths,
                     );
                 } else if merge_mode {
                     let stage1 = index.get(path_bytes, 1).cloned();
@@ -4234,7 +4355,13 @@ checking out of the index."
                             if w.is_ok() {
                                 matched = true;
                             }
-                            checkout_record_path_result(w, &mut updated_paths, &mut path_errors);
+                            checkout_record_index_result(
+                                w,
+                                &p,
+                                &mut updated_paths,
+                                &mut path_errors,
+                                &mut checkout_written_paths,
+                            );
                         }
                     }
                     if !matched {
@@ -4244,6 +4371,9 @@ checking out of the index."
                         );
                     }
                 }
+            }
+            if refresh_written_index_entries(&mut index, work_tree, &checkout_written_paths) {
+                index_modified = true;
             }
             if index_modified {
                 repo.write_index(&mut index).context("writing index")?;
@@ -6147,6 +6277,18 @@ fn write_blob_to_worktree(
         return Ok(true);
     }
 
+    if !full_smudge_meta && mode != MODE_SYMLINK {
+        let abs_path = work_tree.join(rel_path);
+        if let (Some(entry), Ok(meta)) = (
+            index.get(rel_path.as_bytes(), 0),
+            std::fs::symlink_metadata(&abs_path),
+        ) {
+            if entry.oid == *oid && entry.mode == mode && stat_matches(entry, &meta) {
+                return Ok(false);
+            }
+        }
+    }
+
     let obj = read_object_for_checkout(repo, oid).context("reading object for checkout")?;
     if obj.kind != ObjectKind::Blob {
         bail!("cannot checkout non-blob at '{rel_path}'");
@@ -6191,7 +6333,7 @@ fn write_blob_to_worktree(
         let file_attrs = crlf::get_file_attrs(&attrs, rel_path, false, &config);
         let oid_hex = format!("{oid}");
         let smudge_meta = if full_smudge_meta {
-            filter_process::smudge_meta_for_checkout(repo, &oid_hex)
+            checkout_smudge_meta(repo, &oid_hex)
         } else {
             filter_process::smudge_meta_blob_only(&oid_hex)
         };

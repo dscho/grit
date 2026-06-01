@@ -163,6 +163,39 @@ fn process_registry() -> &'static Mutex<HashMap<String, Arc<Mutex<RunningFilter>
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn disabled_process_filters() -> &'static Mutex<HashSet<String>> {
+    static DISABLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    DISABLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Stop using a process filter for the rest of this process.
+///
+/// Git treats `status=abort` from a long-running filter as a request to skip all later paths for
+/// that filter driver.
+pub fn disable_process_filter(cmd: &str) {
+    if let Ok(mut disabled) = disabled_process_filters().lock() {
+        disabled.insert(cmd.to_string());
+    }
+    remove_process_filter(cmd);
+}
+
+fn process_filter_is_disabled(cmd: &str) -> bool {
+    disabled_process_filters()
+        .lock()
+        .ok()
+        .is_some_and(|disabled| disabled.contains(cmd))
+}
+
+fn remove_process_filter(cmd: &str) {
+    if let Ok(mut reg) = process_registry().lock() {
+        reg.remove(cmd);
+    }
+}
+
+fn process_transport_error(err: &str) -> bool {
+    !err.starts_with("filter status:") && !err.starts_with("filter tail status:")
+}
+
 fn set_packet_header(len: usize, out: &mut [u8; 4]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     out[0] = HEX[(len >> 12) & 0xf];
@@ -218,9 +251,6 @@ fn read_packet_header(stdout: &mut ChildStdout) -> std::io::Result<Option<[u8; 4
     while off < 4 {
         let n = stdout.read(&mut hdr[off..])?;
         if n == 0 {
-            if off == 0 {
-                return Ok(None);
-            }
             return Err(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "unexpected EOF reading pkt-line",
@@ -416,6 +446,9 @@ fn write_packetized(stdin: &mut ChildStdin, data: &[u8]) -> std::io::Result<()> 
 
 /// Run clean via long-running filter `cmd` for `path` and `input`.
 pub fn apply_process_clean(cmd: &str, path: &str, input: &[u8]) -> Result<Vec<u8>, String> {
+    if process_filter_is_disabled(cmd) {
+        return Ok(input.to_vec());
+    }
     ensure_started(cmd)?;
     let arc = {
         let reg = process_registry()
@@ -539,6 +572,9 @@ pub fn process_filter_supports_delay(cmd: &str) -> bool {
     if cmd.is_empty() {
         return false;
     }
+    if process_filter_is_disabled(cmd) {
+        return false;
+    }
     if ensure_process_filter_started(cmd).is_err() {
         return false;
     }
@@ -616,6 +652,9 @@ pub fn apply_process_smudge(
     meta: Option<&FilterSmudgeMeta>,
     can_delay: bool,
 ) -> Result<Option<Vec<u8>>, String> {
+    if process_filter_is_disabled(cmd) {
+        return Ok(Some(input.to_vec()));
+    }
     ensure_started(cmd)?;
     let arc = {
         let reg = process_registry()
@@ -681,6 +720,18 @@ pub fn apply_process_smudge(
         }
         Ok(Some(out))
     })();
+
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(|e| process_transport_error(e))
+    {
+        drop(stdin);
+        drop(stdout);
+        drop(rf);
+        remove_process_filter(cmd);
+        return result;
+    }
 
     rf.stdin = Some(stdin);
     rf.stdout = Some(stdout);

@@ -347,7 +347,7 @@ pub(crate) fn archive_bytes_for_repo(
         .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"));
 
     let mtime_opt = token_mtime(p);
-    let (commit_oid, tree_data, mtime_secs) =
+    let (commit_oid, resolved_tip, tree_data, mtime_secs) =
         resolve_tree_for_archive(repo, tree_ish, mtime_opt, upload_context, allow_unreachable)?;
 
     validate_pathspecs(&p.pathspecs, cwd_prefix.as_deref(), &prefix)?;
@@ -360,6 +360,9 @@ pub(crate) fn archive_bytes_for_repo(
         &p.pathspecs,
         cwd_prefix.as_deref(),
         mtime_secs,
+        tree_ish,
+        &resolved_tip,
+        commit_oid.is_some(),
         commit_oid,
         &add_files,
         verbose_flag(p),
@@ -490,7 +493,7 @@ fn resolve_tree_for_archive(
     mtime_override: Option<&str>,
     remote: bool,
     allow_unreachable: bool,
-) -> Result<(Option<ObjectId>, Vec<u8>, u64)> {
+) -> Result<(Option<ObjectId>, ObjectId, Vec<u8>, u64)> {
     if remote && !allow_unreachable {
         dwim_ref_must_exist(repo, tree_ish)?;
     }
@@ -516,7 +519,7 @@ fn resolve_tree_for_archive(
         default_mtime
     };
 
-    Ok((commit_oid, tree_data, mtime_secs))
+    Ok((commit_oid, oid, tree_data, mtime_secs))
 }
 
 fn dwim_ref_must_exist(repo: &Repository, name: &str) -> Result<()> {
@@ -608,6 +611,9 @@ fn build_archive(
     pathspecs: &[String],
     cwd_prefix: Option<&str>,
     mtime_secs: u64,
+    tree_ish: &str,
+    resolved_tip: &ObjectId,
+    tip_is_commit: bool,
     commit_oid: Option<ObjectId>,
     add_files: &[PathBuf],
     verbose: bool,
@@ -648,6 +654,9 @@ fn build_archive(
         &conv,
         &attr_rules,
         config,
+        tree_ish,
+        resolved_tip,
+        tip_is_commit,
         commit_oid.as_ref(),
         &mut entries,
         verbose,
@@ -918,6 +927,9 @@ fn collect_entries(
     conv: &ConversionConfig,
     attr_rules: &[grit_lib::crlf::AttrRule],
     config: &ConfigSet,
+    tree_ish: &str,
+    resolved_tip: &ObjectId,
+    tip_is_commit: bool,
     commit_oid: Option<&ObjectId>,
     entries: &mut Vec<ArchiveEntry>,
     verbose: bool,
@@ -1002,6 +1014,9 @@ fn collect_entries(
                 conv,
                 attr_rules,
                 config,
+                tree_ish,
+                resolved_tip,
+                tip_is_commit,
                 commit_oid,
                 entries,
                 verbose,
@@ -1013,8 +1028,22 @@ fn collect_entries(
             let mut data = if is_symlink {
                 blob.data.clone()
             } else {
-                convert_to_worktree_eager(&blob.data, &attr_path, conv, &fa, Some(&oid_hex), None)
-                    .map_err(|e| anyhow::anyhow!("smudge filter failed for {attr_path}: {e}"))?
+                let smudge_meta = grit_lib::filter_process::smudge_meta_for_archive(
+                    repo,
+                    tree_ish,
+                    resolved_tip,
+                    tip_is_commit,
+                    &oid_hex,
+                );
+                convert_to_worktree_eager(
+                    &blob.data,
+                    &attr_path,
+                    conv,
+                    &fa,
+                    Some(&oid_hex),
+                    Some(&smudge_meta),
+                )
+                .map_err(|e| anyhow::anyhow!("smudge filter failed for {attr_path}: {e}"))?
             };
             if fa.export_subst {
                 if let Some(oid) = commit_oid {

@@ -18,7 +18,7 @@ t0017-env-helper	t0	yes	5	5	0	true	ok	0
 t0018-advice	t0	yes	6	6	0	true	ok	0
 t0019-json-writer	t0	yes	16	16	0	true	ok	0
 t0020-crlf	t0	yes	36	36	0	true	ok	0
-t0021-conversion	t0	yes	42	28	14	false	ok	0
+t0021-conversion	t0	yes	42	32	10	false	ok	0
 t0022-crlf-rename	t0	yes	2	2	0	true	ok	0
 t0023-crlf-am	t0	yes	2	2	0	true	ok	0
 t0024-crlf-archive	t0	yes	3	3	0	true	ok	0

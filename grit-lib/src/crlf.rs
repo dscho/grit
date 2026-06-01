@@ -1161,13 +1161,21 @@ pub fn convert_to_git_with_opts(
     // 1. Run clean filter if configured (long-running `process` overrides clean command)
     if let Some(ref proc_cmd) = file_attrs.filter_process {
         let name = file_attrs.filter_driver_name.as_deref().unwrap_or_default();
-        buf = apply_process_clean(proc_cmd, rel_path, &buf).map_err(|_e| {
-            if file_attrs.filter_clean_required {
-                format!("fatal: {rel_path}: clean filter '{name}' failed")
-            } else {
-                format!("clean filter failed: {_e}")
+        match apply_process_clean(proc_cmd, rel_path, &buf) {
+            Ok(filtered) => buf = filtered,
+            Err(e) => {
+                if file_attrs.filter_clean_required {
+                    if e.contains("expected git-filter-server") {
+                        return Err(e);
+                    }
+                    return Err(format!("fatal: {rel_path}: clean filter '{name}' failed"));
+                }
+                if e.starts_with("filter status: abort") {
+                    crate::filter_process::disable_process_filter(proc_cmd);
+                }
+                eprintln!("error: external filter '{name}' failed");
             }
-        })?;
+        }
     } else {
         match file_attrs.filter_clean.as_ref() {
             Some(clean_cmd) => {
@@ -1428,15 +1436,19 @@ pub fn convert_to_worktree(
     let driver = file_attrs.filter_driver_name.as_deref().unwrap_or("");
     if let Some(ref proc_cmd) = file_attrs.filter_process {
         let smudge_out =
-            apply_process_smudge(proc_cmd, rel_path, &buf, smudge_meta, can_delay_smudge).map_err(
-                |_e| {
+            match apply_process_smudge(proc_cmd, rel_path, &buf, smudge_meta, can_delay_smudge) {
+                Ok(out) => out,
+                Err(e) => {
                     if file_attrs.filter_smudge_required {
-                        format!("fatal: {rel_path}: smudge filter {driver} failed")
-                    } else {
-                        _e
+                        return Err(format!("fatal: {rel_path}: smudge filter {driver} failed"));
                     }
-                },
-            )?;
+                    if e.starts_with("filter status: abort") {
+                        crate::filter_process::disable_process_filter(proc_cmd);
+                    }
+                    eprintln!("error: external filter '{driver}' failed");
+                    return Ok(Some(buf));
+                }
+            };
         let Some(out) = smudge_out else {
             let Some(q) = delayed_checkout else {
                 return Err(format!(

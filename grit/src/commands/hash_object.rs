@@ -6,6 +6,8 @@ use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use grit_lib::config::ConfigSet;
+use grit_lib::crlf::{self, ConversionConfig};
 use grit_lib::fsck_standalone::fsck_object;
 use grit_lib::objects::ObjectKind;
 use grit_lib::odb::Odb;
@@ -54,10 +56,21 @@ pub fn run(args: Args) -> Result<()> {
     let kind = ObjectKind::from_str(&args.object_type)
         .with_context(|| format!("unknown object type '{}'", args.object_type))?;
 
+    let use_filters = kind == ObjectKind::Blob && !args.no_filters;
+    let repo = if args.write {
+        Some(Repository::discover(None).context("not a git repository")?)
+    } else if use_filters {
+        Repository::discover(None).ok()
+    } else {
+        None
+    };
+    let filter_context = repo.as_ref().and_then(HashObjectFilterContext::load);
+
     // We only need the odb if -w is given
     let odb = if args.write {
-        let repo = Repository::discover(None).context("not a git repository")?;
-        Some(odb_for_write(&repo)?)
+        Some(odb_for_write(
+            repo.as_ref().expect("repository loaded for -w"),
+        )?)
     } else {
         None
     };
@@ -72,7 +85,7 @@ pub fn run(args: Args) -> Result<()> {
         println!("{oid}");
         for path in &args.files {
             let file_data =
-                std::fs::read(path).with_context(|| format!("cannot read '{}'", path.display()))?;
+                read_file_for_hash(path, kind, args.no_filters, filter_context.as_ref())?;
             validate_object_data(kind, &file_data, args.literally)?;
             let file_oid = hash_and_maybe_write(kind, &file_data, odb.as_ref())?;
             println!("{file_oid}");
@@ -87,16 +100,14 @@ pub fn run(args: Args) -> Result<()> {
                 continue;
             }
             let path = PathBuf::from(line);
-            let data = std::fs::read(&path)
-                .with_context(|| format!("cannot read '{}'", path.display()))?;
+            let data = read_file_for_hash(&path, kind, args.no_filters, filter_context.as_ref())?;
             validate_object_data(kind, &data, args.literally)?;
             let oid = hash_and_maybe_write(kind, &data, odb.as_ref())?;
             println!("{oid}");
         }
     } else {
         for path in &args.files {
-            let data =
-                std::fs::read(path).with_context(|| format!("cannot read '{}'", path.display()))?;
+            let data = read_file_for_hash(path, kind, args.no_filters, filter_context.as_ref())?;
             validate_object_data(kind, &data, args.literally)?;
             let oid = hash_and_maybe_write(kind, &data, odb.as_ref())?;
             println!("{oid}");
@@ -104,6 +115,60 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+struct HashObjectFilterContext<'a> {
+    repo: &'a Repository,
+    config: ConfigSet,
+    conv: ConversionConfig,
+    attrs: Vec<crlf::AttrRule>,
+}
+
+impl<'a> HashObjectFilterContext<'a> {
+    fn load(repo: &'a Repository) -> Option<Self> {
+        let work_tree = repo.work_tree.as_deref()?;
+        let config = ConfigSet::load(Some(&repo.git_dir), true).ok()?;
+        let conv = ConversionConfig::from_config(&config);
+        let attrs = crlf::load_gitattributes(work_tree);
+        Some(Self {
+            repo,
+            config,
+            conv,
+            attrs,
+        })
+    }
+}
+
+fn read_file_for_hash(
+    path: &Path,
+    kind: ObjectKind,
+    no_filters: bool,
+    filter_context: Option<&HashObjectFilterContext<'_>>,
+) -> Result<Vec<u8>> {
+    let raw = std::fs::read(path).with_context(|| format!("cannot read '{}'", path.display()))?;
+    if kind != ObjectKind::Blob || no_filters {
+        return Ok(raw);
+    }
+    let Some(ctx) = filter_context else {
+        return Ok(raw);
+    };
+    let Some(rel_path) = filter_relative_path(path, ctx.repo.work_tree.as_deref()) else {
+        return Ok(raw);
+    };
+    let file_attrs = crlf::get_file_attrs(&ctx.attrs, &rel_path, false, &ctx.config);
+    crlf::convert_to_git(&raw, &rel_path, &ctx.conv, &file_attrs)
+        .map_err(|msg| anyhow::anyhow!(msg))
+}
+
+fn filter_relative_path(path: &Path, work_tree: Option<&Path>) -> Option<String> {
+    let work_tree = work_tree?;
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let rel = abs.strip_prefix(work_tree).ok()?;
+    Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
 fn validate_object_data(kind: ObjectKind, data: &[u8], literally: bool) -> Result<()> {

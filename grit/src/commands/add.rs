@@ -1813,6 +1813,7 @@ fn add_all(
         args.force,
         add_cfg.precompose_unicode,
     )?;
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut chmod_err: Option<anyhow::Error> = None;
     if !args.dry_run {

@@ -1439,12 +1439,13 @@ Aborting"
         // were filtered out (blob:none); lazily fetch any that the checkout will
         // need before writing the working tree (t5616 partial-clone pull).
         lazy_fetch_missing_index_blobs(repo, &new_index);
-        checkout_entries(
+        checkout_entries_with_treeish(
             repo,
             wt,
             &new_index,
             None,
             sparse_checkout_enabled(&repo.git_dir),
+            Some(&merge_oid),
         )?;
     }
     refresh_index_stat_cache_from_worktree(repo, &mut new_index)?;
@@ -9711,6 +9712,18 @@ fn checkout_entries(
     old_entries: Option<&HashMap<Vec<u8>, IndexEntry>>,
     sparse_checkout: bool,
 ) -> Result<()> {
+    checkout_entries_with_treeish(repo, work_tree, index, old_entries, sparse_checkout, None)
+}
+
+/// Checkout index entries to working tree with optional process-smudge treeish metadata.
+fn checkout_entries_with_treeish(
+    repo: &Repository,
+    work_tree: &Path,
+    index: &Index,
+    old_entries: Option<&HashMap<Vec<u8>, IndexEntry>>,
+    sparse_checkout: bool,
+    smudge_treeish: Option<&ObjectId>,
+) -> Result<()> {
     // Load gitattributes and config for CRLF conversion
     let mut attr_rules = grit_lib::crlf::load_gitattributes(work_tree);
     if index.get(b".gitattributes", 0).is_some() {
@@ -9806,13 +9819,17 @@ fn checkout_entries(
             let data = if let (Some(ref config), Some(ref conv)) = (&config, &conv) {
                 let file_attrs =
                     grit_lib::crlf::get_file_attrs(&attr_rules, &path_str, false, config);
+                let oid_hex = entry.oid.to_hex();
+                let smudge_meta = smudge_treeish.map(|treeish| {
+                    grit_lib::filter_process::smudge_meta_treeish_only(&treeish.to_hex(), &oid_hex)
+                });
                 grit_lib::crlf::convert_to_worktree_eager(
                     &obj.data,
                     &path_str,
                     conv,
                     &file_attrs,
-                    None,
-                    None,
+                    Some(&oid_hex),
+                    smudge_meta.as_ref(),
                 )
                 .map_err(|e| anyhow::anyhow!("smudge filter failed for {path_str}: {e}"))?
             } else {
