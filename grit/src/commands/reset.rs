@@ -32,6 +32,7 @@ use grit_lib::rev_parse::{
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::submodule_gitdir::submodule_modules_git_dir;
 use grit_lib::unicode_normalization::precompose_utf8_path;
+use grit_lib::write_tree::build_cache_tree_from_index;
 use similar::{Algorithm, TextDiff};
 
 use crate::commands::update_ref;
@@ -1660,6 +1661,8 @@ fn reset_commit(
     }
 
     new_index.clear_resolve_undo();
+    let cache_tree = build_cache_tree_from_index(&repo.odb, &new_index)?;
+    new_index.set_cache_tree(cache_tree);
     repo.write_index_at(&index_path, &mut new_index)
         .context("writing index")?;
     // For MIXED (and SOFT) resets, do NOT re-apply sparse-checkout. Git's `reset`

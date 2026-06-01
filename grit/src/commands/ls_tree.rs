@@ -331,6 +331,20 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    let mut normalized_paths = Vec::with_capacity(args.paths.len());
+    for path in &args.paths {
+        let had_trailing_slash = path.ends_with('/');
+        let normalized = git_normalize_pathspec_no_prefix(path)?;
+        if normalized.is_empty() {
+            normalized_paths.push(normalized);
+        } else if had_trailing_slash {
+            normalized_paths.push(format!("{normalized}/"));
+        } else {
+            normalized_paths.push(normalized);
+        }
+    }
+    args.paths = normalized_paths;
+
     // `dir/../` from a subdirectory normalizes to `""`, which Git treats as "match everything".
     if args.paths.iter().any(|p| p.is_empty()) {
         args.paths.clear();
@@ -502,7 +516,14 @@ fn list_tree(
                 &full_name,
                 entry.mode,
                 attr_rules,
-            );
+            ) || args.paths.iter().any(|path| {
+                let base = path.trim_end_matches('/');
+                !base.is_empty()
+                    && (full_name == base
+                        || full_name
+                            .strip_prefix(base)
+                            .is_some_and(|rest| rest.starts_with('/')))
+            });
             if !matches {
                 continue;
             }

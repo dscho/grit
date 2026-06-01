@@ -36,7 +36,7 @@ use grit_lib::rev_list::{rev_list, OrderingMode, OutputMode, RevListOptions};
 use grit_lib::rev_parse::{resolve_upstream_symbolic_name, upstream_suffix_info};
 use grit_lib::sparse_checkout::apply_sparse_checkout_skip_worktree;
 use grit_lib::state::{resolve_head, HeadState};
-use grit_lib::write_tree::write_tree_from_index;
+use grit_lib::write_tree::{build_cache_tree_from_index, write_tree_from_index};
 use time::OffsetDateTime;
 
 use crate::commands::commit::author_env_for_commit_hooks;
@@ -1448,6 +1448,7 @@ Aborting"
         )?;
     }
     refresh_index_stat_cache_from_worktree(repo, &mut new_index)?;
+    set_merge_cache_tree(repo, &mut new_index)?;
     repo.write_index(&mut new_index)?;
 
     if !args.quiet {
@@ -2587,6 +2588,7 @@ Aborting"
     }
 
     refresh_index_stat_cache_from_worktree(repo, &mut merge_result.index)?;
+    set_merge_cache_tree(repo, &mut merge_result.index)?;
     repo.write_index(&mut merge_result.index)?;
 
     if merge_result.has_conflicts {
@@ -2698,6 +2700,7 @@ Aborting"
     }
 
     run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut merge_result.index)?;
+    set_merge_cache_tree(repo, &mut merge_result.index)?;
     repo.write_index(&mut merge_result.index)?;
 
     // Create merge commit. The tree is (re)computed after prepare-commit-msg below, since the
@@ -2765,6 +2768,9 @@ Aborting"
         bail!("Empty commit message.");
     }
     let tree_oid = write_tree_from_index(&repo.odb, &merge_result.index, "")?;
+    let cache_tree = build_cache_tree_from_index(&repo.odb, &merge_result.index)?;
+    merge_result.index.set_cache_tree(cache_tree);
+    repo.write_index(&mut merge_result.index)?;
 
     let finalized = finalize_merge_commit_message(msg, &config);
     let commit_data = CommitData {
@@ -2821,6 +2827,12 @@ Aborting"
     }
 
     run_post_merge_hook(repo, false);
+    Ok(())
+}
+
+fn set_merge_cache_tree(repo: &Repository, index: &mut Index) -> Result<()> {
+    let cache_tree = build_cache_tree_from_index(&repo.odb, index)?;
+    index.set_cache_tree(cache_tree);
     Ok(())
 }
 

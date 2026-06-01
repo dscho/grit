@@ -43,7 +43,7 @@ single agent should own the whole lane.
 **Owns:** `grit-lib/src/repo.rs`, `grit/src/commands/init.rs`, `grit-lib/src/dotfile.rs`, `grit/src/commands/var.rs`, and the `safe.directory`/`GIT_*`-env read paths in `grit-lib/src/config.rs`
 - `t0110-environment` 3/31 — `GIT_*` env var precedence/handling (big gap)
 - `t0001-init` 74/102 — `git init` (`--bare`, `--separate-git-dir`, templates, reinit, `--shared`)
-- `t0120-dot-git-dir` 8/32 — `.git` dir/file discovery edge cases
+- [x] `t0120-dot-git-dir` 32/32 — `.git` dir/file discovery edge cases
 - `t0033-safe-directory` 20/22, `t0034-root-safe-directory` 0/0 (**sudo-gated**: runs only with `GIT_TEST_ALLOW_SUDO`)
 - `t0002-gitfile` 12/14 — `.git` gitfile indirection
 - `t0007-git-var` 26/27 — `git var` (1 failing)
@@ -54,7 +54,7 @@ Consider giving this lane a longer iteration budget.
 **Owns:** `grit-lib/src/objects.rs`, `grit-lib/src/odb.rs`, `grit-lib/src/write_tree.rs`, `grit-lib/src/index.rs` (cache-tree extension), `grit-lib/src/pack.rs`, `grit/src/commands/{mktree,hash_object}.rs`
 - `t0130-sha1-validation` 1/30 — object-id parse/validate, `GIT_TEST_BUILTIN_HASH`, fsck-ish id checks (big gap)
 - `t0080-tree-hash` 3/30 — `mktree` / tree object hashing (big gap)
-- `t0090-cache-tree` 2/22 — cache-tree index extension build/invalidate/write (big gap)
+- [ ] `t0090-cache-tree` 16/22 — cache-tree index extension build/invalidate/write; remaining failures are partial/interactive commit patch semantics and checkout cache-tree shape edge cases
 - `t0081-find-pack` 3/4 — `cat-file --find-pack` (1 failing)
 **Subtotal: ~77 failing.** Grouped because they all touch `objects.rs`/`write_tree.rs`/`index.rs`.
 

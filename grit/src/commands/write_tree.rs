@@ -10,6 +10,7 @@ use grit_lib::index::{
 use grit_lib::objects::{serialize_tree, tree_entry_cmp, ObjectId, ObjectKind, TreeEntry};
 use grit_lib::odb::Odb;
 use grit_lib::repo::Repository;
+use grit_lib::write_tree as lib_write_tree;
 
 fn resolved_env_index_path(repo: &Repository) -> PathBuf {
     if let Ok(raw) = std::env::var("GIT_INDEX_FILE") {
@@ -42,7 +43,7 @@ pub struct Args {
 pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let index_path = resolved_env_index_path(&repo);
-    let index = repo
+    let mut index = repo
         .load_index_at(&index_path)
         .with_context(|| format!("loading index {}", index_path.display()))?;
 
@@ -58,6 +59,14 @@ pub fn run(args: Args) -> Result<()> {
         }
         Err(err) => return Err(err),
     };
+
+    if prefix.is_empty() {
+        let cache_tree = lib_write_tree::build_cache_tree_from_index(&repo.odb, &index)
+            .context("building cache-tree from index")?;
+        index.set_cache_tree(cache_tree);
+        repo.write_index_at(&index_path, &mut index)
+            .with_context(|| format!("writing index {}", index_path.display()))?;
+    }
 
     println!("{oid}");
     Ok(())

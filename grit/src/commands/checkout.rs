@@ -44,7 +44,7 @@ use grit_lib::rev_parse::{
 use grit_lib::sparse_checkout::apply_sparse_checkout_skip_worktree;
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::submodule_gitdir::submodule_modules_git_dir;
-use grit_lib::write_tree::write_tree_from_index;
+use grit_lib::write_tree::{build_cache_tree_from_index, write_tree_from_index};
 
 use crate::branch_tracking::{format_tracking_info, AheadBehindMode};
 use crate::commands::merge::execute_custom_merge_driver;
@@ -1868,6 +1868,7 @@ fn merge_branch_working_tree(
         }
     }
     let mut final_index = final_index;
+    set_checkout_cache_tree(repo, &mut final_index)?;
     repo.write_index_at(&index_path, &mut final_index)
         .context("writing index after merge checkout")?;
 
@@ -2696,6 +2697,7 @@ fn force_reset_to_head(repo: &Repository) -> Result<()> {
     let index_path = repo
         .index_path_for_env()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    set_checkout_cache_tree(repo, &mut new_index)?;
     repo.write_index_at(&index_path, &mut new_index)
         .context("writing index")?;
 
@@ -2990,6 +2992,7 @@ fn switch_to_tree(
     }
 
     // Write the new index
+    set_checkout_cache_tree(repo, &mut new_index)?;
     repo.write_index_at(&index_path, &mut new_index)
         .context("writing index")?;
 
@@ -2998,6 +3001,12 @@ fn switch_to_tree(
         recurse_submodules_after_checkout(repo)?;
     }
 
+    Ok(())
+}
+
+fn set_checkout_cache_tree(repo: &Repository, index: &mut Index) -> Result<()> {
+    let cache_tree = build_cache_tree_from_index(&repo.odb, index)?;
+    index.set_cache_tree(cache_tree);
     Ok(())
 }
 

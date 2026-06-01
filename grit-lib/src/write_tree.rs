@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 
 use crate::error::Result;
 use crate::index::{
-    Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK, MODE_TREE,
+    CacheTreeNode, Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK,
+    MODE_TREE,
 };
 use crate::objects::{parse_tree, serialize_tree, tree_entry_cmp, ObjectId, ObjectKind, TreeEntry};
 use crate::odb::Odb;
@@ -63,6 +64,22 @@ pub fn write_tree_from_index(odb: &Odb, index: &Index, prefix: &str) -> Result<O
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stage().cmp(&b.stage())));
     build_tree(odb, &entries, prefix_bytes)
+}
+
+/// Build a valid cache-tree extension from the index and write any missing tree objects.
+///
+/// # Errors
+///
+/// Returns an error if tree object creation fails.
+pub fn build_cache_tree_from_index(odb: &Odb, index: &Index) -> Result<CacheTreeNode> {
+    ensure_empty_blob_for_intent_to_add(odb, index)?;
+    let mut entries: Vec<&IndexEntry> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && !entry.intent_to_add() && entry.mode != MODE_TREE)
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.stage().cmp(&b.stage())));
+    build_cache_tree_node(odb, b"", Vec::new(), &entries)
 }
 
 fn build_tree(odb: &Odb, entries: &[&IndexEntry], dir_prefix: &[u8]) -> Result<ObjectId> {
@@ -125,6 +142,90 @@ fn build_tree(odb: &Odb, entries: &[&IndexEntry], dir_prefix: &[u8]) -> Result<O
 
     let data = serialize_tree(&tree_entries);
     odb.write(ObjectKind::Tree, &data)
+}
+
+fn build_cache_tree_node(
+    odb: &Odb,
+    dir_prefix: &[u8],
+    name: Vec<u8>,
+    entries: &[&IndexEntry],
+) -> Result<CacheTreeNode> {
+    let mut children: BTreeMap<Vec<u8>, ChildKind> = BTreeMap::new();
+
+    for entry in entries {
+        let path = &entry.path;
+        let rel = if dir_prefix.is_empty() {
+            path.as_slice()
+        } else {
+            path.strip_prefix(dir_prefix)
+                .and_then(|suffix| suffix.strip_prefix(b"/"))
+                .unwrap_or(path.as_slice())
+        };
+
+        if let Some(slash_pos) = rel.iter().position(|&byte| byte == b'/') {
+            let child_name = rel[..slash_pos].to_vec();
+            let sub_prefix = if dir_prefix.is_empty() {
+                child_name.clone()
+            } else {
+                let mut sub_prefix = dir_prefix.to_vec();
+                sub_prefix.push(b'/');
+                sub_prefix.extend_from_slice(&child_name);
+                sub_prefix
+            };
+            children
+                .entry(child_name)
+                .or_insert_with(|| ChildKind::Tree(sub_prefix, Vec::new()))
+                .push_entry(entry);
+        } else {
+            children
+                .entry(rel.to_vec())
+                .or_insert_with(|| ChildKind::Blob {
+                    mode: canonicalize_blob_mode(entry.mode),
+                    oid: entry.oid,
+                });
+        }
+    }
+
+    let mut tree_entries = Vec::with_capacity(children.len());
+    let mut cache_children = Vec::new();
+    for (child_name, child) in children {
+        match child {
+            ChildKind::Blob { mode, oid } => tree_entries.push(TreeEntry {
+                mode,
+                name: child_name,
+                oid,
+            }),
+            ChildKind::Tree(sub_prefix, sub_entries) => {
+                let child_node =
+                    build_cache_tree_node(odb, &sub_prefix, child_name.clone(), &sub_entries)?;
+                let oid = child_node.oid.ok_or_else(|| {
+                    crate::error::Error::IndexError("cache-tree child missing oid".to_owned())
+                })?;
+                tree_entries.push(TreeEntry {
+                    mode: MODE_TREE,
+                    name: child_name,
+                    oid,
+                });
+                cache_children.push(child_node);
+            }
+        }
+    }
+
+    tree_entries.sort_by(|a, b| {
+        let a_tree = a.mode == MODE_TREE;
+        let b_tree = b.mode == MODE_TREE;
+        tree_entry_cmp(&a.name, a_tree, &b.name, b_tree)
+    });
+    cache_children.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let data = serialize_tree(&tree_entries);
+    let oid = odb.write(ObjectKind::Tree, &data)?;
+    Ok(CacheTreeNode::valid(
+        name,
+        entries.len() as i32,
+        oid,
+        cache_children,
+    ))
 }
 
 /// Build a tree for a **partial** commit: paths listed in `paths_from_index` (repository-relative,

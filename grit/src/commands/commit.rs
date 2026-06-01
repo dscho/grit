@@ -30,7 +30,8 @@ use regex::RegexBuilder;
 
 use crate::branch_tracking::{format_tracking_info, AheadBehindMode};
 use grit_lib::write_tree::{
-    write_tree_from_index, write_tree_from_index_subset, write_tree_partial_from_index,
+    build_cache_tree_from_index, write_tree_from_index, write_tree_from_index_subset,
+    write_tree_partial_from_index,
 };
 
 use crate::ident::{resolve_email, resolve_name, IdentRole};
@@ -1451,6 +1452,8 @@ pub fn run(mut args: Args) -> Result<()> {
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
         Err(e) => return Err(e.into()),
     };
+    let cache_tree = build_cache_tree_from_index(&repo.odb, &index_refresh)?;
+    index_refresh.set_cache_tree(cache_tree);
     repo.write_index_at(&index_path, &mut index_refresh)?;
 
     // Run post-commit hook (informational, don't abort on failure)

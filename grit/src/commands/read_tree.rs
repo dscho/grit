@@ -19,7 +19,7 @@ use grit_lib::sparse_checkout::apply_sparse_checkout_skip_worktree;
 use grit_lib::submodule_gitdir::{
     set_submodule_repo_worktree, submodule_modules_git_dir, write_submodule_gitfile,
 };
-use grit_lib::write_tree::write_tree_from_index;
+use grit_lib::write_tree::{build_cache_tree_from_index, write_tree_from_index};
 
 /// Arguments for `grit read-tree`.
 #[derive(Debug, ClapArgs)]
@@ -328,7 +328,7 @@ pub fn run(args: Args) -> Result<()> {
             )?;
         }
         if !dry_run {
-            repo.write_index_at(&index_path, &mut new_index)
+            write_index_with_cache_tree(&repo, &index_path, &mut new_index)
                 .context("writing index")?;
         }
         if args.update && recurse_submodules_effective && !dry_run {
@@ -451,14 +451,24 @@ pub fn run(args: Args) -> Result<()> {
         )?;
     }
     if !dry_run {
-        repo.write_index_at(&index_path, &mut new_index)
-            .context("writing index")?;
+        write_index_with_cache_tree(&repo, &index_path, &mut new_index).context("writing index")?;
     }
 
     if args.update && recurse_submodules_effective && !dry_run {
         submodule_update_after_read_tree(&repo, &old_index, &new_index, prot)?;
     }
 
+    Ok(())
+}
+
+fn write_index_with_cache_tree(
+    repo: &Repository,
+    index_path: &Path,
+    index: &mut Index,
+) -> Result<()> {
+    let cache_tree = build_cache_tree_from_index(&repo.odb, index)?;
+    index.set_cache_tree(cache_tree);
+    repo.write_index_at(index_path, index)?;
     Ok(())
 }
 

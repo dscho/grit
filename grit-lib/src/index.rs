@@ -225,6 +225,51 @@ pub struct Index {
     pub(crate) split_link: Option<crate::split_index::SplitIndexLink>,
     /// Root tree OID from a valid `TREE` index extension (`cache_tree`), when present.
     pub cache_tree_root: Option<ObjectId>,
+    /// Parsed `TREE` index extension (`cache-tree`) preserving invalid and subtree nodes.
+    pub cache_tree: Option<CacheTreeNode>,
+}
+
+/// One node from Git's `TREE` index extension.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTreeNode {
+    /// Path component for this node. The root node stores an empty name.
+    pub name: Vec<u8>,
+    /// Number of index entries covered by this node, or `-1` when invalid.
+    pub entry_count: i32,
+    /// Tree object ID for valid nodes. Invalid nodes do not store an object ID.
+    pub oid: Option<ObjectId>,
+    /// Immediate child cache-tree nodes.
+    pub children: Vec<CacheTreeNode>,
+}
+
+impl CacheTreeNode {
+    /// Create a valid cache-tree node.
+    #[must_use]
+    pub fn valid(
+        name: Vec<u8>,
+        entry_count: i32,
+        oid: ObjectId,
+        children: Vec<CacheTreeNode>,
+    ) -> Self {
+        Self {
+            name,
+            entry_count,
+            oid: Some(oid),
+            children,
+        }
+    }
+
+    /// Mark this node as invalid while preserving its children.
+    pub fn invalidate(&mut self) {
+        self.entry_count = -1;
+        self.oid = None;
+    }
+
+    /// Returns whether this node has a valid cached tree object ID.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.entry_count >= 0 && self.oid.is_some()
+    }
 }
 
 /// Options for loading an index from disk.
@@ -254,33 +299,64 @@ const INDEX_FORMAT_UB: u32 = 4;
 /// Index extension signature `TREE` (cache-tree).
 const INDEX_EXT_CACHE_TREE: u32 = 0x5452_4545;
 
-/// Best-effort read of the root OID from Git's `TREE` index extension (`cache_tree_read`).
-fn parse_cache_tree_root_oid(data: &[u8]) -> Option<ObjectId> {
-    // Root node: leading NUL name (`read_one` skips NUL-terminated name; empty name is one byte).
-    if data.first().copied()? != 0 {
+/// Best-effort read of Git's `TREE` index extension (`cache_tree_read`).
+fn parse_cache_tree(data: &[u8]) -> Option<CacheTreeNode> {
+    let (node, pos) = parse_cache_tree_node(data, 0)?;
+    if pos == data.len() {
+        Some(node)
+    } else {
+        None
+    }
+}
+
+fn parse_cache_tree_node(data: &[u8], mut pos: usize) -> Option<(CacheTreeNode, usize)> {
+    let name_end = data.get(pos..)?.iter().position(|&b| b == 0)? + pos;
+    let name = data[pos..name_end].to_vec();
+    pos = name_end + 1;
+
+    let (entry_count, consumed) = parse_signed_int_prefix(&data[pos..])?;
+    pos += consumed;
+    if data.get(pos) != Some(&b' ') {
         return None;
     }
-    let mut i = 1usize;
-    let (entry_count, ni) = parse_signed_int_prefix(&data[i..])?;
-    i += ni;
-    if data.get(i) != Some(&b' ') {
+    pos += 1;
+    let (subtree_count, consumed) = parse_signed_int_prefix(&data[pos..])?;
+    if subtree_count < 0 {
         return None;
     }
-    i += 1;
-    let (_subtree_nr, ni2) = parse_signed_int_prefix(&data[i..])?;
-    i += ni2;
-    if data.get(i) != Some(&b'\n') {
+    pos += consumed;
+    if data.get(pos) != Some(&b'\n') {
         return None;
     }
-    i += 1;
-    if entry_count < 0 {
-        return None;
+    pos += 1;
+
+    let oid = if entry_count >= 0 {
+        if data.len().saturating_sub(pos) < 20 {
+            return None;
+        }
+        let oid = ObjectId::from_bytes(&data[pos..pos + 20]).ok()?;
+        pos += 20;
+        Some(oid)
+    } else {
+        None
+    };
+
+    let mut children = Vec::with_capacity(subtree_count as usize);
+    for _ in 0..subtree_count {
+        let (child, next) = parse_cache_tree_node(data, pos)?;
+        children.push(child);
+        pos = next;
     }
-    if data.len().saturating_sub(i) < 20 {
-        return None;
-    }
-    let raw: [u8; 20] = data[i..i + 20].try_into().ok()?;
-    ObjectId::from_bytes(&raw).ok()
+
+    Some((
+        CacheTreeNode {
+            name,
+            entry_count,
+            oid,
+            children,
+        },
+        pos,
+    ))
 }
 
 fn parse_signed_int_prefix(data: &[u8]) -> Option<(i32, usize)> {
@@ -302,6 +378,53 @@ fn parse_signed_int_prefix(data: &[u8]) -> Option<(i32, usize)> {
     let s = std::str::from_utf8(&data[start..j]).ok()?;
     let v: i32 = s.parse().ok()?;
     Some((v, j))
+}
+
+fn serialize_cache_tree_node(node: &CacheTreeNode, out: &mut Vec<u8>) {
+    out.extend_from_slice(&node.name);
+    out.push(0);
+    out.extend_from_slice(node.entry_count.to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(node.children.len().to_string().as_bytes());
+    out.push(b'\n');
+    if node.entry_count >= 0 {
+        if let Some(oid) = node.oid {
+            out.extend_from_slice(oid.as_bytes());
+        }
+    }
+    for child in &node.children {
+        serialize_cache_tree_node(child, out);
+    }
+}
+
+fn format_cache_tree_node(node: &CacheTreeNode, parent_path: &str, out: &mut String) {
+    let path = if node.name.is_empty() {
+        String::new()
+    } else {
+        let name = String::from_utf8_lossy(&node.name);
+        format!("{parent_path}{name}/")
+    };
+    if node.is_valid() {
+        if let Some(oid) = node.oid {
+            out.push_str(&format!(
+                "{} {} ({} entries, {} subtrees)\n",
+                oid,
+                path,
+                node.entry_count,
+                node.children.len()
+            ));
+        }
+    } else {
+        out.push_str(&format!(
+            "{:<40} {} ({} subtrees)\n",
+            "invalid",
+            path,
+            node.children.len()
+        ));
+    }
+    for child in &node.children {
+        format_cache_tree_node(child, &path, out);
+    }
 }
 
 /// Read `GIT_INDEX_VERSION` and return the requested version.
@@ -342,6 +465,7 @@ impl Index {
             resolve_undo: None,
             split_link: None,
             cache_tree_root: None,
+            cache_tree: None,
         }
     }
 
@@ -363,6 +487,7 @@ impl Index {
                 resolve_undo: None,
                 split_link: None,
                 cache_tree_root: None,
+                cache_tree: None,
             };
         }
 
@@ -396,6 +521,7 @@ impl Index {
             resolve_undo: None,
             split_link: None,
             cache_tree_root: None,
+            cache_tree: None,
         }
     }
 
@@ -415,6 +541,7 @@ impl Index {
                 resolve_undo: None,
                 split_link: None,
                 cache_tree_root: None,
+                cache_tree: None,
             };
         }
 
@@ -451,6 +578,7 @@ impl Index {
             resolve_undo: None,
             split_link: None,
             cache_tree_root: None,
+            cache_tree: None,
         }
     }
 
@@ -710,6 +838,7 @@ impl Index {
         let mut resolve_undo = None;
         let mut split_link = None;
         let mut cache_tree_root = None;
+        let mut cache_tree = None;
         while pos + 8 <= body.len() {
             let sig = u32::from_be_bytes(
                 body[pos..pos + 4]
@@ -748,7 +877,10 @@ impl Index {
                 split_link = Some(crate::split_index::parse_link_extension(ext_data)?);
             } else if sig == INDEX_EXT_CACHE_TREE {
                 let ext_data = &body[pos..pos + ext_sz];
-                cache_tree_root = parse_cache_tree_root_oid(ext_data);
+                cache_tree = parse_cache_tree(ext_data);
+                cache_tree_root = cache_tree
+                    .as_ref()
+                    .and_then(|node| node.oid.filter(|_| node.entry_count >= 0));
             }
             pos += ext_sz;
         }
@@ -765,6 +897,7 @@ impl Index {
             resolve_undo,
             split_link,
             cache_tree_root,
+            cache_tree,
         })
     }
 
@@ -927,6 +1060,13 @@ impl Index {
             out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
             out.extend_from_slice(&payload);
         }
+        if let Some(cache_tree) = &self.cache_tree {
+            let mut payload = Vec::new();
+            serialize_cache_tree_node(cache_tree, &mut payload);
+            out.extend_from_slice(&INDEX_EXT_CACHE_TREE.to_be_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            out.extend_from_slice(&payload);
+        }
         Ok(())
     }
 
@@ -959,6 +1099,9 @@ impl Index {
             if let Ok(p) = std::str::from_utf8(&path) {
                 self.invalidate_untracked_cache_for_path(p);
             }
+        }
+        if stage == 0 {
+            self.invalidate_cache_tree_for_path(&path);
         }
     }
 
@@ -1054,6 +1197,7 @@ impl Index {
         if let Ok(p) = std::str::from_utf8(path) {
             self.invalidate_untracked_cache_for_path(p);
         }
+        self.invalidate_cache_tree_for_path(path);
         true
     }
 
@@ -1105,7 +1249,57 @@ impl Index {
         });
         if had_descendant {
             self.invalidate_untracked_cache_for_path(path);
+            self.invalidate_cache_tree_for_path(path.as_bytes());
         }
+    }
+
+    /// Replace the cache-tree extension with a valid tree.
+    pub fn set_cache_tree(&mut self, cache_tree: CacheTreeNode) {
+        self.cache_tree_root = cache_tree.oid.filter(|_| cache_tree.entry_count >= 0);
+        self.cache_tree = Some(cache_tree);
+    }
+
+    /// Remove the cache-tree extension.
+    pub fn clear_cache_tree(&mut self) {
+        self.cache_tree_root = None;
+        self.cache_tree = None;
+    }
+
+    /// Mark cache-tree nodes affected by an index path change as invalid.
+    pub fn invalidate_cache_tree_for_path(&mut self, path: &[u8]) {
+        let Some(root) = self.cache_tree.as_mut() else {
+            self.cache_tree_root = None;
+            return;
+        };
+        root.invalidate();
+        self.cache_tree_root = None;
+
+        let mut current = root;
+        for component in path.split(|&b| b == b'/') {
+            if component.is_empty() {
+                break;
+            }
+            let Some(child) = current
+                .children
+                .iter_mut()
+                .find(|child| child.name == component)
+            else {
+                break;
+            };
+            child.invalidate();
+            current = child;
+        }
+    }
+
+    /// Format the parsed cache-tree extension like Git's `test-tool dump-cache-tree`.
+    #[must_use]
+    pub fn format_cache_tree_dump(&self) -> String {
+        let Some(root) = self.cache_tree.as_ref() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        format_cache_tree_node(root, "", &mut out);
+        out
     }
 
     /// Sort entries in Git's canonical order: by path, then by stage.
