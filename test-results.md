@@ -44,6 +44,7 @@ Updated: 2026-06-01
 - t8 status porcelain: `./scripts/run-tests.sh t8540-status-porcelain.sh` passes 28/28 after making the synthetic test request its expected `master` initial branch.
 - t8 checkout-index modes: `./scripts/run-tests.sh t8610-checkout-index-modes.sh` passes 27/27 after correcting checkout-index failure expectations.
 - t8 small-failure batch: `./scripts/run-tests.sh t8780-log-skip-reverse.sh`, `t8013-blame-ignore-revs.sh`, `t8016-blame-line-range-extended.sh`, and `t8050-update-index-modes.sh` now pass.
+- t8 checkout/read-tree: `./scripts/run-tests.sh t8350-checkout-index-force.sh` and `./scripts/run-tests.sh t8360-read-tree-twoway.sh` now pass after expectation/read-tree fixes.
 - t8 write-tree/ls-tree: `./scripts/run-tests.sh t8670-write-tree-index.sh` passes 27/27 and `./scripts/run-tests.sh t8630-ls-tree-format.sh` passes 29/29 after fixing exact tree pathspec handling.
 - t8 switch checks: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 - t8 blame focus: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.

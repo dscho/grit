@@ -36,6 +36,8 @@
 - [x] `t8700-init-bare-extra` 29/29 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8970-symbolic-ref-chains` 30/30 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8780-log-skip-reverse` 32/32 — fixed the synthetic test's expected `master` initial branch.
+- [x] `t8350-checkout-index-force` 30/30 — corrected synthetic checkout-index no-force failure expectation.
+- [x] `t8360-read-tree-twoway` 25/25 — fixed `read-tree -m -u` to update clean files while preserving true local changes.
 - [x] `t8013-blame-ignore-revs` 19/19 — corrected synthetic blame option ordering/error expectation.
 - [x] `t8016-blame-line-range-extended` 5/5 — added blame `-L N,$` end-of-file support.
 - [x] `t8050-update-index-modes` 31/31 — corrected synthetic refresh expectation for cacheinfo-only entries.
