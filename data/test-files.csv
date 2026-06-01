@@ -1230,7 +1230,7 @@ t7505-prepare-commit-msg	t7	yes	30	12	18	false	ok	0
 t7505-prepare-commit-msg-hook	t7	yes	23	22	1	false	ok	0
 t7506-status-submodule	t7	yes	40	28	12	false	ok	0
 t7507-commit-verbose	t7	yes	45	35	10	false	ok	0
-t7508-status	t7	yes	126	121	5	false	ok	0
+t7508-status	t7	yes	126	123	3	false	ok	0
 t7509-commit-authorship	t7	yes	12	3	9	false	ok	0
 t7510-signed-commit	t7	yes	28	28	0	true	ok	0
 t7511-status-index	t7	yes	24	24	0	true	ok	0
@@ -1487,7 +1487,7 @@ t9211-scalar-clone	t9	skip	14	10	4	false	ok	0
 t9220-diff-tree-pathspec	t9	yes	30	30	0	true	ok	0
 t9230-diff-index-modes	t9	yes	38	37	1	false	ok	0
 t9231-diff-index-patch	t9	yes	11	11	0	true	ok	0
-t9240-diff-files-deleted	t9	yes	34	32	2	false	ok	0
+t9240-diff-files-deleted	t9	yes	34	34	0	true	ok	0
 t9250-status-short-branch	t9	yes	33	33	0	true	ok	0
 t9260-log-oneline-format	t9	yes	33	33	0	true	ok	0
 t9270-rev-list-topo-date	t9	yes	31	31	0	true	ok	0

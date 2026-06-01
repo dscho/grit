@@ -76,6 +76,12 @@ Updated: 2026-06-01
   making real-Git setup explicitly initialize `master`, matching the test's hard-coded HEAD refs.
 - t9 focus: `./scripts/run-tests.sh t9850-status-ignored-patterns.sh --verbose` now passes 36/36 after
   making real-Git setup explicitly initialize `master`, matching the test's hard-coded status checks.
+- t9 focus: `cargo build --release -p grit-cli` passed, then
+  `./scripts/run-tests.sh t9240-diff-files-deleted.sh --verbose` passed 34/34 after diff-files
+  learned to suppress content/mode-identical stat-dirty entries when index refresh is possible.
+- Regression focus: `./scripts/run-tests.sh t7508-status.sh --verbose` improved to 123/126.
+- t9240 validation: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` all completed successfully; grit-lib unit tests passed 229/229.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
