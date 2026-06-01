@@ -808,7 +808,7 @@ pub fn run_reference_transaction_committed_for_head_update(
     old_head_commit: Option<ObjectId>,
     new_oid: ObjectId,
 ) -> HookResult {
-    let zero = ObjectId::from_bytes(&[0u8; 20]).unwrap();
+    let zero = ObjectId::zero();
     let old_oid = old_head_commit.unwrap_or(zero);
     let old_hex = if old_oid == zero {
         "0000000000000000000000000000000000000000".to_owned()

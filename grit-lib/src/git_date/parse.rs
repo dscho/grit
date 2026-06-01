@@ -454,7 +454,7 @@ fn set_date(year: i32, month: i32, day: i32, now_tm: Option<&tm>, now: i64, tm: 
     if !(month > 0 && month < 13 && day > 0 && day < 32) {
         return -1;
     }
-    if now_tm.is_none() {
+    let Some(nt) = now_tm else {
         tm.tm_mon = month - 1;
         tm.tm_mday = day;
         if year == -1 {
@@ -470,8 +470,7 @@ fn set_date(year: i32, month: i32, day: i32, now_tm: Option<&tm>, now: i64, tm: 
             return -1;
         }
         return 0;
-    }
-    let nt = now_tm.unwrap();
+    };
     let mut check = *tm;
     check.tm_mon = month - 1;
     check.tm_mday = day;

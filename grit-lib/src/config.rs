@@ -196,8 +196,7 @@ pub fn canonical_key(raw: &str) -> Result<String> {
     }
 
     // Validate variable name: must start with alpha, rest alphanumeric or hyphen
-    if name.is_empty()
-        || !name.chars().next().unwrap().is_ascii_alphabetic()
+    if !name.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
         || !name.chars().all(|c| c.is_alphanumeric() || c == '-')
     {
         return Err(Error::ConfigError(format!(
@@ -1338,8 +1337,13 @@ fatal: bad config variable 'fetch.negotiationalgorithm' in file '{file_disp}' at
     /// Write the (possibly modified) config back to disk.
     /// Remove section headers that have no remaining entries or comments.
     fn remove_empty_section_headers(&mut self) {
-        let section_re = regex::Regex::new(r"^\s*\[").unwrap();
-        let comment_re = regex::Regex::new(r"^\s*(#|;)").unwrap();
+        let (Ok(section_re), Ok(comment_re)) = (
+            regex::Regex::new(r"^\s*\["),
+            regex::Regex::new(r"^\s*(#|;)"),
+        ) else {
+            // Static patterns: compilation cannot fail in practice; bail out safely.
+            return;
+        };
 
         let mut to_remove: Vec<usize> = Vec::new();
         let len = self.raw_lines.len();
@@ -2881,7 +2885,7 @@ fn is_dir_sep(b: u8) -> bool {
 
 fn add_trailing_starstar_for_dir(pat: &mut String) {
     let bytes = pat.as_bytes();
-    if !bytes.is_empty() && is_dir_sep(*bytes.last().unwrap()) {
+    if bytes.last().is_some_and(|&b| is_dir_sep(b)) {
         pat.push_str("**");
     }
 }

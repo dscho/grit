@@ -353,7 +353,11 @@ fn strftime_c(fmt: &str, tm: &tm) -> String {
     let mut buf = vec![0u8; 4096];
     let cfmt = match CString::new(fmt) {
         Ok(c) => c,
-        Err(_) => CString::new("%Y").unwrap(),
+        // Fall back to a fixed format when `fmt` contains an interior NUL.
+        Err(_) => match CString::new("%Y") {
+            Ok(c) => c,
+            Err(_) => return String::new(),
+        },
     };
     unsafe {
         let n = compat::strftime(
@@ -365,15 +369,16 @@ fn strftime_c(fmt: &str, tm: &tm) -> String {
         if n == 0 && !fmt.is_empty() {
             let mut munged = fmt.to_string();
             munged.push(' ');
-            let c2 = CString::new(munged.as_str()).unwrap();
-            let n2 = compat::strftime(
-                buf.as_mut_ptr() as *mut std::ffi::c_char,
-                buf.len(),
-                c2.as_ptr(),
-                tm,
-            );
-            if n2 > 0 {
-                return String::from_utf8_lossy(&buf[..n2 - 1]).into_owned();
+            if let Ok(c2) = CString::new(munged.as_str()) {
+                let n2 = compat::strftime(
+                    buf.as_mut_ptr() as *mut std::ffi::c_char,
+                    buf.len(),
+                    c2.as_ptr(),
+                    tm,
+                );
+                if n2 > 0 {
+                    return String::from_utf8_lossy(&buf[..n2 - 1]).into_owned();
+                }
             }
         }
         String::from_utf8_lossy(&buf[..n]).into_owned()

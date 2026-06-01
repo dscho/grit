@@ -565,7 +565,9 @@ fn load_commit_cached<'c>(
         let commit = parse_commit(&obj.data)?;
         e.insert(commit);
     }
-    Ok(cache.get(&oid).unwrap())
+    cache
+        .get(&oid)
+        .ok_or_else(|| Error::CorruptObject(format!("commit {oid} missing from cache")))
 }
 
 /// Load and parse a commit object from the object database.

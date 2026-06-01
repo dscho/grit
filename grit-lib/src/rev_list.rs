@@ -4656,7 +4656,11 @@ fn filter_object_bits_tree_begin(
             }
         }
         ObjectFilter::Combine(parts) => {
-            let states = sub_states.expect("combine sub-states");
+            // `sub_states` is always `Some` for a `Combine` filter; fall back to the
+            // neutral merge if the invariant is ever violated rather than panicking.
+            let Some(states) = sub_states else {
+                return ListFilterBits::merge_combine(&[], &[]);
+            };
             debug_assert_eq!(states.len(), parts.len());
             let mut bits = Vec::with_capacity(parts.len());
             let mut skipping = Vec::with_capacity(parts.len());
@@ -4725,7 +4729,11 @@ fn filter_object_bits_blob(
             }
         }
         ObjectFilter::Combine(parts) => {
-            let states = sub_states.expect("combine sub-states");
+            // `sub_states` is always `Some` for a `Combine` filter; fall back to the
+            // neutral merge if the invariant is ever violated rather than panicking.
+            let Some(states) = sub_states else {
+                return ListFilterBits::merge_combine(&[], &[]);
+            };
             let mut bits = Vec::with_capacity(parts.len());
             let mut skipping = Vec::with_capacity(parts.len());
             for (i, p) in parts.iter().enumerate() {
@@ -4842,18 +4850,15 @@ fn collect_tree_objects_filtered(
                 }
             } else {
                 match f {
-                    ObjectFilter::Combine(_) => {
-                        let states = combine_states.as_mut().expect("combine states");
-                        filter_object_bits_tree_begin(
-                            f,
-                            tree_oid,
-                            depth,
-                            tree_state,
-                            tree_omit_set,
-                            collect_tree_omits,
-                            Some(states.as_mut_slice()),
-                        )
-                    }
+                    ObjectFilter::Combine(_) => filter_object_bits_tree_begin(
+                        f,
+                        tree_oid,
+                        depth,
+                        tree_state,
+                        tree_omit_set,
+                        collect_tree_omits,
+                        combine_states.as_mut().map(Vec::as_mut_slice),
+                    ),
                     _ => filter_object_bits_tree_begin(
                         f,
                         tree_oid,
@@ -4977,18 +4982,15 @@ fn collect_tree_objects_filtered(
                             }
                         } else {
                             match f {
-                                ObjectFilter::Combine(_) => {
-                                    let states = combine_states.as_mut().unwrap();
-                                    filter_object_bits_blob(
-                                        f,
-                                        entry.oid,
-                                        child_obj.data.len() as u64,
-                                        depth,
-                                        tree_omit_set,
-                                        collect_tree_omits,
-                                        Some(states.as_mut_slice()),
-                                    )
-                                }
+                                ObjectFilter::Combine(_) => filter_object_bits_blob(
+                                    f,
+                                    entry.oid,
+                                    child_obj.data.len() as u64,
+                                    depth,
+                                    tree_omit_set,
+                                    collect_tree_omits,
+                                    combine_states.as_mut().map(Vec::as_mut_slice),
+                                ),
                                 _ => filter_object_bits_blob(
                                     f,
                                     entry.oid,
@@ -5176,18 +5178,15 @@ fn collect_root_object(
                         }
                     } else {
                         match f {
-                            ObjectFilter::Combine(_) => {
-                                let states = combine_states.as_mut().expect("combine states");
-                                filter_object_bits_blob(
-                                    f,
-                                    root.oid,
-                                    object.data.len() as u64,
-                                    0,
-                                    tree_omit_set,
-                                    collect_tree_omits,
-                                    Some(states.as_mut_slice()),
-                                )
-                            }
+                            ObjectFilter::Combine(_) => filter_object_bits_blob(
+                                f,
+                                root.oid,
+                                object.data.len() as u64,
+                                0,
+                                tree_omit_set,
+                                collect_tree_omits,
+                                combine_states.as_mut().map(Vec::as_mut_slice),
+                            ),
                             _ => filter_object_bits_blob(
                                 f,
                                 root.oid,

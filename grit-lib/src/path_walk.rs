@@ -499,7 +499,10 @@ impl<'a> PathWalkContext<'a> {
 
     fn append_root_tree(&mut self, oid: ObjectId) -> Result<()> {
         self.ensure_root_list();
-        let list = self.paths.get_mut(ROOT_PATH).expect("root list");
+        let list = self
+            .paths
+            .get_mut(ROOT_PATH)
+            .ok_or_else(|| Error::CorruptObject("root path list missing".to_owned()))?;
         list.oids.push(oid);
         self.push_heap(ROOT_PATH);
         Ok(())
@@ -989,7 +992,11 @@ fn setup_pending_objects(
                     ctx.add_path_pending(path, ObjectKind::Tree, oid, true)?;
                 } else {
                     ctx.ensure_root_list();
-                    ctx.paths.get_mut(ROOT_PATH).expect("root").oids.push(oid);
+                    ctx.paths
+                        .get_mut(ROOT_PATH)
+                        .ok_or_else(|| Error::CorruptObject("root path list missing".to_owned()))?
+                        .oids
+                        .push(oid);
                     ctx.push_heap(ROOT_PATH);
                 }
             }

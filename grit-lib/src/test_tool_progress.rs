@@ -216,7 +216,9 @@ impl Progress {
             self.throughput = Some(Throughput::new(total, now_ns));
             return Ok(());
         }
-        let tp = self.throughput.as_mut().unwrap();
+        let Some(tp) = self.throughput.as_mut() else {
+            return Ok(());
+        };
         tp.curr_total = total;
 
         if now_ns.saturating_sub(tp.prev_ns) <= 500_000_000 {
@@ -392,7 +394,7 @@ pub fn run() -> io::Result<()> {
                 None | Some("") => "Working hard".to_string(),
                 Some(t) => {
                     title_storage.push(t.to_string());
-                    title_storage.last().unwrap().clone()
+                    t.to_string()
                 }
             };
             if let Some(path) = trace_path.as_deref() {

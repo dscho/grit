@@ -335,7 +335,7 @@ pub(crate) fn hash_index_body(body: &[u8]) -> ObjectId {
     let mut hasher = Sha1::new();
     hasher.update(body);
     let digest = hasher.finalize();
-    ObjectId::from_bytes(&digest).expect("sha1 is 20 bytes")
+    ObjectId::from_bytes(digest.as_slice()).unwrap_or_else(|_| unreachable!("SHA-1 is 20 bytes"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,11 +621,10 @@ pub(crate) fn write_index_file_split(
         }
         v
     } else {
-        load_shared_entries(
-            git_dir,
-            path,
-            &index.split_link.as_ref().expect("split_link").base_oid,
-        )?
+        let link = index.split_link.as_ref().ok_or_else(|| {
+            Error::IndexError("split index missing base link during reuse".to_owned())
+        })?;
+        load_shared_entries(git_dir, path, &link.base_oid)?
     };
 
     // After a shared-index rebuild, `base_snapshot` matches the merged index exactly; align indices
@@ -696,7 +695,13 @@ pub(crate) fn write_index_file_split(
         clean_stale_shared_index_files(git_dir, &oid.to_hex(), cfg);
         oid
     } else {
-        let oid = index.split_link.as_ref().unwrap().base_oid;
+        let oid = index
+            .split_link
+            .as_ref()
+            .ok_or_else(|| {
+                Error::IndexError("split index missing base link during reuse".to_owned())
+            })?
+            .base_oid;
         freshen_shared_index(&resolve_shared_index_file(git_dir, path, &oid));
         oid
     };
