@@ -7,7 +7,8 @@
 - [x] `t8330-switch-track` 30/30 — fixed switch tracking flag forwarding and local tracking defaults; test fixture now explicitly requests its `master` initial branch.
 - [x] `t8001-annotate` 117/117 — passed after the shared blame/annotate compatibility fixes.
 - [x] `t8150-config-multivar` 29/29 — fixed the documented cwd-leak test wrapper issue.
-- [ ] `t8730-cherry-advanced` 10/28 — next highest remaining t8 file.
+- [x] `t8730-cherry-advanced` 28/28 — fixed the synthetic test's expected `master` initial branch.
+- [ ] `t8160-config-section` 12/27 — next highest remaining t8 file.
 
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
 

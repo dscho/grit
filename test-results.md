@@ -9,6 +9,7 @@ Updated: 2026-06-01
 - t8 switch focus: `./scripts/run-tests.sh t8330-switch-track.sh` passes 30/30 after switch tracking fixes.
 - t8 switch regressions: `./scripts/run-tests.sh t7201-co.sh t1507-rev-parse-upstream.sh` passes 46/46 and 29/29.
 - t8 config multivar: `./scripts/run-tests.sh t8150-config-multivar.sh` passes 29/29 after applying the documented cwd-leak wrapper.
+- t8 cherry advanced: `./scripts/run-tests.sh t8730-cherry-advanced.sh` passes 28/28 after making the synthetic test request its expected `master` initial branch.
 - t8 switch checks: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 - t8 blame focus: `cargo check` and `cargo test -p grit-lib --lib` pass; `cargo clippy --fix --allow-dirty` completes with the existing workspace clippy warning backlog.
 
