@@ -1009,7 +1009,9 @@ fn format_cover_letter(
     let mut out = String::new();
 
     // Use the last commit's info for From/Date
-    let (last_oid, last_commit) = commits.last().expect("non-empty commits");
+    let (last_oid, last_commit) = commits
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("cannot format cover letter for empty commit series"))?;
 
     out.push_str(&format!(
         "From {} Mon Sep 17 00:00:00 2001\n",

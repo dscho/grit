@@ -4,7 +4,7 @@
 //! matched with a Hungarian assignment, then printed in RHS order with optional
 //! inner diffs.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 
 use crate::commands::upstream_synopsis_help;
@@ -787,7 +787,7 @@ fn write_pair_header(
     let oid_for_subject = left
         .map(|(_, p)| p.oid)
         .or_else(|| right.map(|(_, p)| p.oid))
-        .unwrap();
+        .ok_or_else(|| anyhow!("range-diff pair header requires at least one side"))?;
 
     match (left, right) {
         (None, Some((rj, rp))) => {

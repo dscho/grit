@@ -300,7 +300,9 @@ pub fn run(args: Args) -> Result<()> {
 
     // One side missing (e.g. directory/file conflicts after `merge-index`): take the other blob.
     if ours_oid.is_none() ^ theirs_oid.is_none() {
-        let chosen = ours_oid.or(theirs_oid).expect("one side present");
+        let chosen = ours_oid
+            .or(theirs_oid)
+            .ok_or_else(|| anyhow::anyhow!("internal error: expected one merge side present"))?;
         let data = read_blob(&repo, Some(chosen))?;
         let preferred_mode = parse_mode(&args.ours_mode)
             .or_else(|| parse_mode(&args.theirs_mode))

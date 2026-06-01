@@ -14,7 +14,7 @@
 
 use crate::explicit_exit::ExplicitExit;
 use crate::pathspec::resolve_pathspec;
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::attributes::{
     collect_attrs_for_path, load_gitattributes_for_diff, AttrValue, ParsedGitAttributes,
@@ -602,8 +602,7 @@ fn write_submodule_log_lines(
         writeln!(out, "Submodule {} {}..{}:", entry.path(), old_a, new_a)?;
         return Ok(());
     };
-    let sub_repo = open_submodule_repo_for_log(&repo.git_dir, Some(wt), entry.path());
-    if sub_repo.is_none() {
+    let Some(sub_repo) = open_submodule_repo_for_log(&repo.git_dir, Some(wt), entry.path()) else {
         writeln!(
             out,
             "Submodule {} {}...{} (commits not present)",
@@ -612,8 +611,7 @@ fn write_submodule_log_lines(
             new_a
         )?;
         return Ok(());
-    }
-    let sub_repo = sub_repo.expect("checked above");
+    };
     writeln!(out, "Submodule {} {}..{}:", entry.path(), old_a, new_a)?;
     let mut opts = RevListOptions::default();
     opts.first_parent = true;
@@ -995,21 +993,27 @@ fn no_index_unified_patch_body(
         for change in hunk.iter_changes() {
             match change.tag() {
                 ChangeTag::Equal => {
-                    let idx = change.new_index().expect("equal change has new_index");
+                    let Some(idx) = change.new_index() else {
+                        continue;
+                    };
                     let raw = &new_slots[idx].display;
                     output.push(' ');
                     output.push_str(&line_body_for_patch(raw));
                     output.push('\n');
                 }
                 ChangeTag::Delete => {
-                    let idx = change.old_index().expect("delete has old_index");
+                    let Some(idx) = change.old_index() else {
+                        continue;
+                    };
                     let raw = &old_slots[idx].display;
                     output.push('-');
                     output.push_str(&line_body_for_patch(raw));
                     output.push('\n');
                 }
                 ChangeTag::Insert => {
-                    let idx = change.new_index().expect("insert has new_index");
+                    let Some(idx) = change.new_index() else {
+                        continue;
+                    };
                     let raw = &new_slots[idx].display;
                     output.push('+');
                     output.push_str(&line_body_for_patch(raw));
@@ -2354,7 +2358,10 @@ pub fn run(mut args: Args) -> Result<()> {
         fn tree_oid_for_diff_spec(repo: &Repository, spec: &str) -> Result<ObjectId> {
             commit_or_tree_oid(repo, spec)
         }
-        let merge_tree = tree_oid_for_diff_spec(&repo, revs.last().unwrap())?;
+        let last_rev = revs
+            .last()
+            .ok_or_else(|| anyhow!("combined diff requires at least one revision"))?;
+        let merge_tree = tree_oid_for_diff_spec(&repo, last_rev)?;
         let mut parent_trees = Vec::with_capacity(revs.len() - 1);
         for s in &revs[..revs.len() - 1] {
             parent_trees.push(tree_oid_for_diff_spec(&repo, s)?);
@@ -4424,7 +4431,9 @@ fn apply_rotate_skip_ordered_paths(
         return Ok(out);
     }
 
-    let needle = rotate.expect("rotate set when reaching this branch");
+    let Some(needle) = rotate else {
+        return Ok(by_path.into_values().collect());
+    };
     let idx = tree_paths.iter().position(|p| p == needle).ok_or_else(|| {
         anyhow::Error::new(ExplicitExit {
             code: 128,

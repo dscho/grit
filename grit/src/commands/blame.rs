@@ -215,11 +215,13 @@ fn format_time(timestamp: i64, tz: &str) -> String {
     let offset_secs = parse_tz_offset_seconds(tz);
     let dt = OffsetDateTime::from_unix_timestamp(timestamp + offset_secs as i64)
         .unwrap_or(OffsetDateTime::UNIX_EPOCH);
-    let fmt = time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
-        .expect("valid blame timestamp format");
-    let rendered = dt
-        .format(&fmt)
-        .unwrap_or_else(|_| "1970-01-01 00:00:00".to_owned());
+    let rendered =
+        match time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]") {
+            Ok(fmt) => dt
+                .format(&fmt)
+                .unwrap_or_else(|_| "1970-01-01 00:00:00".to_owned()),
+            Err(_) => "1970-01-01 00:00:00".to_owned(),
+        };
     format!("{rendered} {tz}")
 }
 
@@ -2589,7 +2591,7 @@ fn read_from_index_conflict(repo: &Repository, odb: &Odb, file_path: &str) -> Re
     for entry in &index.entries {
         if entry.path == path_bytes
             && entry.stage() > 0
-            && (best.is_none() || entry.stage() > best.unwrap().stage())
+            && best.map_or(true, |b| entry.stage() > b.stage())
         {
             best = Some(entry);
         }
