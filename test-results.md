@@ -74,6 +74,8 @@ Updated: 2026-06-01
   explicit `master` setup and aligning `--graph --reverse` with real Git rejection behavior.
 - t9 focus: `./scripts/run-tests.sh t9430-symbolic-ref-delete.sh --verbose` now passes 28/28 after
   making real-Git setup explicitly initialize `master`, matching the test's hard-coded HEAD refs.
+- t9 focus: `./scripts/run-tests.sh t9420-update-ref-delete.sh --verbose` now passes 24/24 after
+  making real-Git setup explicitly initialize `master`, matching the test's hard-coded refs.
 - t9 focus: `./scripts/run-tests.sh t9850-status-ignored-patterns.sh --verbose` now passes 36/36 after
   making real-Git setup explicitly initialize `master`, matching the test's hard-coded status checks.
 - t9 focus: `./scripts/run-tests.sh t9330-add-update-all.sh --verbose` now passes 26/26 after

@@ -43,6 +43,7 @@
   - Completed: `t9080-ls-tree-recursive.sh` (26/26).
   - Completed: `t9160-update-index-cacheinfo.sh` (25/25).
   - Completed: `t9230-diff-index-modes.sh` (38/38).
+  - Completed: `t9420-update-ref-delete.sh` (24/24).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
