@@ -135,7 +135,7 @@ pub fn get_tree_entry_follow_symlinks(
                 }));
             }
             stack.push(entry_oid);
-            path_buf = rest.unwrap();
+            path_buf = rest.unwrap_or_default();
             continue;
         }
 
