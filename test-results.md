@@ -84,6 +84,8 @@ Updated: 2026-06-01
   making setup explicitly initialize `master`, matching hard-coded output/comparison assumptions.
 - t9 focus: `./scripts/run-tests.sh t9700-for-each-ref-sort-combined.sh --verbose` now passes 37/37
   after making setup explicitly initialize `master`, matching hard-coded refs.
+- t9 focus: `./scripts/run-tests.sh t9870-rev-list-reverse-count.sh --verbose` now passes 34/34 after
+  making real-Git setup explicitly initialize `master`, matching hard-coded range checks.
 - t9 focus: `cargo build --release -p grit-cli` passed, then
   `./scripts/run-tests.sh t9790-write-tree-nested.sh --verbose` passed 29/29 after exact tree
   pathspec handling in `ls-tree`; `t9902-completion.sh` remains passing with failing=0.

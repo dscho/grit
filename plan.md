@@ -39,6 +39,7 @@
   - Completed: `t9560-commit-message-variants.sh` (33/33).
   - Completed: `t9700-for-each-ref-sort-combined.sh` (37/37).
   - Completed: `t9790-write-tree-nested.sh` (29/29).
+  - Completed: `t9870-rev-list-reverse-count.sh` (34/34).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
