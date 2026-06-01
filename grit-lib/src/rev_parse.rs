@@ -2795,13 +2795,15 @@ fn approxidate(s: &str) -> Option<i64> {
     let relative = lower.replace('.', " ");
     let parts: Vec<&str> = relative.split_whitespace().collect();
     if parts.len() >= 2 {
-        // Try to parse "N unit ago" or just "N unit"
-        let (n_str, unit, is_ago) = if parts.len() >= 3 && parts[2] == "ago" {
-            (parts[0], parts[1], true)
+        // Try to parse "N unit ago" or just "N unit". Both are past-relative: git's
+        // approxidate treats a bare "N unit" the same as "N unit ago" (it parses times for
+        // --since/--until), so the result is always `now - N*unit`.
+        let (n_str, unit) = if parts.len() >= 3 && parts[2] == "ago" {
+            (parts[0], parts[1])
         } else if parts.len() == 2 {
-            (parts[0], parts[1], false)
+            (parts[0], parts[1])
         } else {
-            ("", "", false)
+            ("", "")
         };
         if !n_str.is_empty() {
             if let Ok(n) = n_str.parse::<i64>() {
@@ -2816,11 +2818,7 @@ fn approxidate(s: &str) -> Option<i64> {
                     _ => None,
                 };
                 if let Some(s) = secs {
-                    return Some(if is_ago || true {
-                        now_ts - s
-                    } else {
-                        now_ts + s
-                    });
+                    return Some(now_ts - s);
                 }
             }
         }

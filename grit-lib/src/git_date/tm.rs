@@ -40,7 +40,7 @@ pub fn tm_to_time_t(tm: &tm) -> time_t {
 }
 
 pub fn date_overflows(t: u64) -> bool {
-    if t >= u64::MAX {
+    if t == u64::MAX {
         return true;
     }
     let sys: time_t = t as time_t;
