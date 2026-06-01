@@ -17,6 +17,7 @@
   - Completed: `t9900-branch-verbose-all.sh` (33/33).
   - Completed: `t9030-commit-tree-parents.sh` (25/25).
   - Completed: `t9190-for-each-ref-atoms.sh` (27/27).
+  - Completed: `t9200-merge-base-all.sh` (31/31).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.

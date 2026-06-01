@@ -35,6 +35,8 @@ Updated: 2026-06-01
   making real-Git setup explicitly initialize `master`, matching the test's hard-coded branch names.
 - t9 focus: `./scripts/run-tests.sh t9190-for-each-ref-atoms.sh --verbose` now passes 27/27 after
   making setup explicitly initialize `master`, matching the test's hard-coded refs.
+- t9 focus: `./scripts/run-tests.sh t9200-merge-base-all.sh --verbose` now passes 31/31 after
+  making setup explicitly initialize `master`, matching the test's hard-coded refs.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.
