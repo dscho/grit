@@ -191,7 +191,6 @@ use grit_lib::rev_parse::{self, resolve_revision};
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::submodule_gitdir::{
     die_path_inside_submodule_when_disabled, ensure_submodule_gitdir_config,
-    path_inside_registered_submodule, path_inside_registered_submodule_name,
     submodule_gitdir_filesystem_path, submodule_gitdir_outer_conflict, submodule_modules_git_dir,
     submodule_path_config_enabled, validate_submodule_path, write_submodule_gitfile,
 };
@@ -2471,20 +2470,25 @@ fn run_add(args: &AddArgs) -> Result<()> {
     // Reject paths that traverse a symlink (git: validate_submodule_path).
     validate_submodule_path(work_tree, &path).map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Fail if the path is already tracked in the index (git: die_on_index_match). When forced,
-    // a non-gitlink match is still fatal.
-    if let Some(idx) = repo.load_index().ok() {
-        let path_bytes = path.as_bytes();
-        if let Some(entry) = idx
-            .entries
-            .iter()
-            .find(|e| e.path.as_slice() == path_bytes && e.stage() == 0)
-        {
-            if !args.force {
-                bail!("'{path}' already exists in the index");
+    // Fail if the path is already tracked in the index (git: die_on_index_match). Pathspec
+    // semantics: a directory pathspec matches entries beneath it (e.g. `dir-tracked` matches
+    // `dir-tracked/bar`). When forced, a non-gitlink match is still fatal.
+    if let Ok(idx) = repo.load_index() {
+        let path_prefix = format!("{path}/");
+        if let Some(entry) = idx.entries.iter().find(|e| {
+            if e.stage() != 0 {
+                return false;
             }
-            if entry.mode != MODE_GITLINK {
-                bail!("'{path}' already exists in the index and is not a submodule");
+            let name = String::from_utf8_lossy(&e.path);
+            name == path || name.starts_with(&path_prefix)
+        }) {
+            let exact_gitlink = String::from_utf8_lossy(&entry.path) == path
+                && entry.mode == MODE_GITLINK;
+            if !args.force {
+                bail!("fatal: '{path}' already exists in the index");
+            }
+            if !exact_gitlink {
+                bail!("fatal: '{path}' already exists in the index and is not a submodule");
             }
         }
     }
@@ -2493,7 +2497,7 @@ fn run_add(args: &AddArgs) -> Result<()> {
     // (git: die_on_repo_without_commits).
     let sub_abs = work_tree.join(&path);
     if is_nonbare_repository_dir(&sub_abs) && submodule_resolve_gitlink_head(&sub_abs).is_none() {
-        bail!("'{path}' does not have a commit checked out");
+        bail!("fatal: '{path}' does not have a commit checked out");
     }
 
     // Without --force, mirror git's `add --dry-run --ignore-missing --no-warn-embedded-repo`
@@ -2517,7 +2521,12 @@ fn run_add(args: &AddArgs) -> Result<()> {
                 stderr.push('\n');
             }
             eprint!("{stderr}");
-            bail!("submodule add probe failed");
+            // Relay only the probe's own stderr (matches git's behavior of fputs(sb.buf,
+            // stderr) followed by a clean non-zero exit) — do not add a grit "error:" line.
+            return Err(crate::explicit_exit::SilentNonZeroExit {
+                code: out.status.code().unwrap_or(1),
+            }
+            .into());
         }
     }
 
@@ -2539,16 +2548,27 @@ fn run_add(args: &AddArgs) -> Result<()> {
 
     let index_for_die = repo.load_index().ok();
     let store = refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
-    if path_inside_registered_submodule(work_tree, &path) {
+    // Git only rejects a path that is *strictly nested* under an existing registered submodule
+    // (die_path_inside_submodule: item->len > ce_len). Re-adding the same path (reconfigure with
+    // --force) and adding a path that merely shares a `.gitmodules` section name are allowed.
+    let registered_paths: Vec<String> =
+        parse_gitmodules_with_repo(work_tree, Some(&repo))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.path.replace('\\', "/"))
+            .collect();
+    let path_norm = path.replace('\\', "/");
+    let is_registered_path = registered_paths.iter().any(|p| *p == path_norm);
+    let nested_under_registered = registered_paths
+        .iter()
+        .any(|p| path_norm.starts_with(&format!("{p}/")));
+    if nested_under_registered {
         bail!("cannot add submodule: path inside existing submodule");
     }
-    if !submodule_path_config_enabled(&store)
-        && path_inside_registered_submodule_name(work_tree, &path)
-    {
-        bail!("cannot add submodule: path inside existing submodule");
+    if !is_registered_path {
+        die_path_inside_submodule_when_disabled(&store, work_tree, &path, index_for_die.as_ref())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    die_path_inside_submodule_when_disabled(&store, work_tree, &path, index_for_die.as_ref())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let sub_path = work_tree.join(&path);
     // Submodule git dir is keyed by `--name` when given (Git: `.git/modules/<name>`), not by
@@ -2742,11 +2762,42 @@ fn run_add(args: &AddArgs) -> Result<()> {
         checkout_submodule_worktree(
             &grit_bin, &repo, work_tree, &name, &path, &name, &oid, args.quiet,
         )?;
+        // With `-b <branch>`, git checks out `origin/<branch>` and leaves the submodule on a
+        // local branch of that name (not detached / default branch). Attach HEAD accordingly.
+        if let Some(ref branch) = args.branch {
+            let modules_dir = submodule_separate_git_dir(&repo, work_tree, &name, &path)?;
+            let _ = attach_submodule_head_to_named_branch(&modules_dir, branch);
+        }
     }
 
-    if !args.quiet {
-        eprintln!("Cloning into '{}'...", path);
-    }
+    Ok(())
+}
+
+/// Attach a freshly added submodule's HEAD to a local branch tracking `origin/<branch>` (git's
+/// `submodule add -b <branch>` performs `checkout -B <branch> origin/<branch>`).
+fn attach_submodule_head_to_named_branch(sub_git_dir: &Path, branch: &str) -> Result<()> {
+    let remote_branch = format!("refs/remotes/origin/{branch}");
+    let remote_tip = match refs::resolve_ref(sub_git_dir, &remote_branch) {
+        Ok(oid) => oid,
+        Err(_) => return Ok(()),
+    };
+    let local_branch = format!("refs/heads/{branch}");
+    refs::write_ref(sub_git_dir, &local_branch, &remote_tip)?;
+    refs::write_symbolic_ref(sub_git_dir, "HEAD", &local_branch)?;
+
+    let config_path = sub_git_dir.join("config");
+    let mut config = if config_path.exists() {
+        let content = fs::read_to_string(&config_path)?;
+        ConfigFile::parse(&config_path, &content, ConfigScope::Local)?
+    } else {
+        ConfigFile::parse(&config_path, "", ConfigScope::Local)?
+    };
+    config.set(&format!("branch.{branch}.remote"), "origin")?;
+    config.set(
+        &format!("branch.{branch}.merge"),
+        &format!("refs/heads/{branch}"),
+    )?;
+    config.write()?;
     Ok(())
 }
 
