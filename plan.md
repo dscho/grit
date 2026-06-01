@@ -18,6 +18,7 @@
   - Completed: `t9030-commit-tree-parents.sh` (25/25).
   - Completed: `t9190-for-each-ref-atoms.sh` (27/27).
   - Completed: `t9200-merge-base-all.sh` (31/31).
+  - Completed: `t9351-fast-export-anonymize.sh` (17/17).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
