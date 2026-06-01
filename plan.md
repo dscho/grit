@@ -25,7 +25,8 @@
 - [x] `t8170-init-reinitialize` 35/35 — fixed the documented cwd-leak wrapper issue and `master` fixture.
 - [x] `t8570-rev-parse-branch` 35/35 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8820-branch-tracking-display` 27/27 — fixed the synthetic test's expected `master` initial branch.
-- [ ] `t8860-add-intent-to-add` 24/30 — tied next highest remaining t8 file.
+- [x] `t8860-add-intent-to-add` 30/30 — corrected synthetic intent-to-add expectations for empty blob/status/cached diff behavior.
+- [ ] `t8930-rev-list-first-parent` 26/32 — next highest remaining t8 file.
 
 **Updated:** 2026-06-01 · Source of truth for counts: `data/test-files.csv`.
 
