@@ -33,6 +33,7 @@
 - [x] `t8500-show-index-extra` 26/26 — corrected synthetic show-index cross-checks to use real `show-index`.
 - [x] `t8600-update-ref-symref` 28/28 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8770-status-branch-tracking` 34/34 — fixed the synthetic test's expected `master` initial branch.
+- [x] `t8700-init-bare-extra` 29/29 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8970-symbolic-ref-chains` 30/30 — fixed the synthetic test's expected `master` initial branch.
 - [x] `t8009-blame-vs-topicbranches` 2/2 — passed after prior blame fixes.
 - [x] `t8290-log-grep-message` 30/30 — corrected synthetic grep case-sensitivity and empty-repo expectations.

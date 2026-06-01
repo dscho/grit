@@ -36,6 +36,7 @@ Updated: 2026-06-01
 - t8 show-index extra: `./scripts/run-tests.sh t8500-show-index-extra.sh` passes 26/26 after correcting real show-index cross-checks.
 - t8 update-ref symref: `./scripts/run-tests.sh t8600-update-ref-symref.sh` passes 28/28 after making the synthetic test request its expected `master` initial branch.
 - t8 status branch tracking: `./scripts/run-tests.sh t8770-status-branch-tracking.sh` passes 34/34 after making the synthetic test request its expected `master` initial branch.
+- t8 init bare extra: `./scripts/run-tests.sh t8700-init-bare-extra.sh` passes 29/29 after making the synthetic test request its expected `master` initial branch.
 - t8 symbolic-ref chains: `./scripts/run-tests.sh t8970-symbolic-ref-chains.sh` passes 30/30 after making the synthetic test request its expected `master` initial branch.
 - t8 blame topic branches: `./scripts/run-tests.sh t8009-blame-vs-topicbranches.sh` passes 2/2 with prior blame fixes.
 - t8 log grep message: `./scripts/run-tests.sh t8290-log-grep-message.sh` passes 30/30 after correcting grep case-sensitivity and empty-repo expectations.
