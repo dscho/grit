@@ -34,6 +34,7 @@
   - Completed: `t9430-symbolic-ref-delete.sh` (28/28).
   - Completed: `t9850-status-ignored-patterns.sh` (36/36).
   - Completed: `t9240-diff-files-deleted.sh` (34/34).
+  - Completed: `t9330-add-update-all.sh` (26/26).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
