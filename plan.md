@@ -14,6 +14,7 @@
   - Completed: `t9540-branch-rename-copy.sh` (38/38).
   - Completed: `t9410-show-ref-verify.sh` (31/31).
   - Completed: `t9120-diff-tree-merge.sh` (29/29).
+  - Completed: `t9900-branch-verbose-all.sh` (33/33).
   - Next expected target: choose by refreshed CSV after commit.
   - Scope: current `in_scope=yes` t9 rows; skipped external-helper files remain excluded unless
     explicitly unskipped later.
