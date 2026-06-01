@@ -9,6 +9,8 @@ Updated: 2026-06-01
   containing the setup test's `cd repo` in a subshell.
 - t9 focus: `./scripts/run-tests.sh t9060-mktag-verify.sh --verbose` now passes 28/28 after
   containing the setup test's `cd repo` in a subshell.
+- t9 focus: `./scripts/run-tests.sh t9300-branch-delete-force.sh --verbose` now passes 25/25 after
+  making real-Git setup explicitly initialize `master`, matching the test's hard-coded branch names.
 - Workspace cargo/unit tests: not re-run for the `t9040`/`t9060` harness-only cwd fixes.
 - `cargo build --release -p grit-cli`: pass.
 - `cargo fmt`: run. `cargo fmt --check` still reports pre-existing formatting drift in unrelated files; those mechanical edits were not included in this scoped commit.

@@ -1493,7 +1493,7 @@ t9260-log-oneline-format	t9	yes	33	30	3	false	ok	0
 t9270-rev-list-topo-date	t9	yes	31	25	6	false	ok	0
 t9280-config-bool-int	t9	yes	27	27	0	true	ok	0
 t9290-init-template-hooks	t9	yes	31	31	0	true	ok	0
-t9300-branch-delete-force	t9	yes	25	4	21	false	ok	0
+t9300-branch-delete-force	t9	yes	25	25	0	true	ok	0
 t9300-fast-import	t9	skip	204	0	0	false	ok	0
 t9301-fast-import-notes	t9	skip	17	14	3	false	ok	0
 t9302-fast-import-unpack-limit	t9	skip	3	3	0	true	ok	0
