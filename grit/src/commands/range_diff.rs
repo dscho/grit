@@ -36,6 +36,10 @@ pub struct Args {
     #[arg(long = "no-dual-color")]
     pub no_dual_color: bool,
 
+    /// Explicit `--dual-color` (Git forces color output on when given).
+    #[arg(long = "dual-color")]
+    pub dual_color: bool,
+
     #[arg(long = "left-only")]
     pub left_only: bool,
 
@@ -93,10 +97,56 @@ struct Patch {
 /// Parse argv after `range-diff` and run (used from `main` so `--` / pathspecs work).
 pub fn run_with_rest(rest: &[String]) -> Result<()> {
     upstream_synopsis_help::try_print_upstream_help_and_exit("range-diff", rest);
-    let mut argv = vec!["grit range-diff".to_string()];
-    argv.extend(rest.iter().cloned());
+    // Git's `parse_options` accepts options interspersed with the commit-range
+    // operands (e.g. `range-diff A...B --color --dual-color`). Clap's
+    // `trailing_var_arg` would swallow any option after the first operand, so
+    // move options ahead of operands (preserving everything after a literal `--`).
+    let argv = reorder_options_first(rest);
     let args = Args::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("{e}"))?;
     run(args)
+}
+
+/// Reorder `range-diff` argv so options precede operands (stopping at `--`),
+/// returning a fresh argv with the program name prepended.
+fn reorder_options_first(rest: &[String]) -> Vec<String> {
+    let mut opts: Vec<String> = Vec::new();
+    let mut operands: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let mut seen_dashdash = false;
+    while i < rest.len() {
+        let tok = &rest[i];
+        if seen_dashdash {
+            tail.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        if tok == "--" {
+            seen_dashdash = true;
+            tail.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            opts.push(tok.clone());
+            // `--creation-factor N` / `-s` etc.: only `--creation-factor` (and its
+            // alias forms) consumes a following separate value token.
+            if (tok == "--creation-factor") && i + 1 < rest.len() {
+                opts.push(rest[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        operands.push(tok.clone());
+        i += 1;
+    }
+    let mut argv = vec!["grit range-diff".to_string()];
+    argv.extend(opts);
+    argv.extend(operands);
+    argv.extend(tail);
+    argv
 }
 
 fn run(args: Args) -> Result<()> {
@@ -118,15 +168,26 @@ fn run(args: Args) -> Result<()> {
     find_exact_matches(&mut branch1, &mut branch2);
     get_correspondences(&mut branch1, &mut branch2, creation);
 
+    // Git uses one `--[no-]dual-color` toggle (`simple_color`, default -1). `--dual-color`
+    // sets it to 0 and forces color on; `--no-dual-color` sets it to 1 (simple colors).
+    let dual_color = !args.no_dual_color;
+    let force_color = args.dual_color && !args.no_dual_color;
+
     let use_color = !args.no_color
-        && args
-            .color
-            .as_deref()
-            .map(|c| c == "always" || c.is_empty())
-            .unwrap_or_else(|| {
-                std::io::stdout().is_terminal() || std::env::var_os("GIT_PAGER_IN_USE").is_some()
-            })
-        && !args.no_dual_color;
+        && (force_color
+            || args
+                .color
+                .as_deref()
+                .map(|c| c == "always" || c.is_empty())
+                .unwrap_or_else(|| {
+                    std::io::stdout().is_terminal()
+                        || std::env::var_os("GIT_PAGER_IN_USE").is_some()
+                }));
+    let use_color = use_color
+        && !matches!(
+            args.color.as_deref(),
+            Some("never") | Some("false") | Some("no")
+        );
 
     let abbrev_len = args
         .abbrev
@@ -144,6 +205,7 @@ fn run(args: Args) -> Result<()> {
         args.no_patch,
         args.stat,
         use_color,
+        dual_color,
         abbrev_len,
     )?;
 
@@ -730,10 +792,12 @@ fn output(
     no_patch: bool,
     stat_mode: bool,
     use_color: bool,
+    dual_color: bool,
     abbrev_len: usize,
 ) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let dual = use_color && dual_color;
     let max_n = 1 + a.len().max(b.len());
     let w = decimal_width(max_n);
     let reset = if use_color { "\x1b[m" } else { "" };
@@ -807,6 +871,10 @@ fn output(
                 let inner = diff_patches(&ai.full, &bj.full);
                 if stat_mode {
                     write_stat_summary(&mut out, &inner)?;
+                } else if dual {
+                    for line in inner.lines() {
+                        writeln!(out, "    {}", render_inner_dual_color(line))?;
+                    }
                 } else {
                     for line in inner.lines() {
                         writeln!(out, "    {line}")?;
@@ -889,6 +957,117 @@ fn diff_patches(x: &str, y: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+// Git diff color codes (defaults), used for `--dual-color` inner-diff rendering.
+const C_RESET: &str = "\x1b[m";
+const C_REVERSE: &str = "\x1b[7m";
+const C_OLD: &str = "\x1b[31m"; // red
+const C_NEW: &str = "\x1b[32m"; // green
+const C_FRAG: &str = "\x1b[36m"; // cyan
+const C_CONTEXT: &str = ""; // no color
+const C_FUNC: &str = ""; // no color
+const C_OLD_BOLD: &str = "\x1b[1;31m";
+const C_NEW_BOLD: &str = "\x1b[1;32m";
+const C_CONTEXT_BOLD: &str = "\x1b[1m";
+const C_OLD_DIM: &str = "\x1b[2;31m";
+const C_NEW_DIM: &str = "\x1b[2;32m";
+const C_CONTEXT_DIM: &str = "\x1b[2m";
+
+/// Render one inner-diff line in Git `--dual-color` style (mirrors `emit_diff_symbol`
+/// with `dual_color_diffed_diffs`). `line` carries the outer diff prefix
+/// (` `/`+`/`-`) or is a rebuilt hunk header beginning with `@@`.
+fn render_inner_dual_color(line: &str) -> String {
+    // Rebuilt inner hunk header: "@@" or "@@ <funcname>".
+    if let Some(rest) = line.strip_prefix("@@") {
+        let mut s = String::new();
+        s.push_str(C_REVERSE);
+        s.push_str(C_FRAG);
+        s.push_str("@@");
+        s.push_str(C_RESET);
+        // Anything after "@@" is " <funcname>": a context-colored leading blank,
+        // then the function name in funcinfo color.
+        let trimmed = rest.trim_start_matches(' ');
+        let blanks = &rest[..rest.len() - trimmed.len()];
+        if !blanks.is_empty() {
+            s.push_str(C_CONTEXT);
+            s.push_str(blanks);
+            s.push_str(C_RESET);
+        }
+        if !trimmed.is_empty() {
+            s.push_str(C_FUNC);
+            s.push_str(trimmed);
+            s.push_str(C_RESET);
+        }
+        return s;
+    }
+
+    let (outer, content) = line.split_at(line.len().min(1));
+    let inner_first = content.as_bytes().first().copied();
+    match outer {
+        "+" => {
+            // set_sign = NEW; content color depends on the inner first char.
+            let set = match inner_first {
+                Some(b'-') => C_OLD_BOLD,
+                Some(b'@') => C_FRAG,
+                Some(b'+') => C_NEW_BOLD,
+                _ => C_CONTEXT_BOLD,
+            };
+            emit_line0(C_REVERSE, C_NEW, Some(set), '+', content)
+        }
+        "-" => {
+            let set = match inner_first {
+                Some(b'+') => C_NEW_DIM,
+                Some(b'@') => C_FRAG,
+                Some(b'-') => C_OLD_DIM,
+                _ => C_CONTEXT_DIM,
+            };
+            emit_line0(C_REVERSE, C_OLD, Some(set), '-', content)
+        }
+        _ => {
+            // Context line: emit_line_0(set_sign=set, set=NULL, reverse=0).
+            // Git's set_sign is a non-NULL (possibly empty) string, so a trailing
+            // RESET is always emitted once the sign char is written.
+            let set = match inner_first {
+                Some(b'+') => C_NEW,
+                Some(b'@') => C_FRAG,
+                Some(b'-') => C_OLD,
+                _ => C_CONTEXT,
+            };
+            let mut s = String::new();
+            s.push_str(set); // possibly ""
+            s.push(' ');
+            s.push_str(content);
+            s.push_str(C_RESET);
+            s
+        }
+    }
+}
+
+/// Mirror of Git's `emit_line_0` for the `+`/`-` (set_sign present, reverse) cases.
+/// When `content` is empty, Git jumps to end-of-line before emitting `set`.
+fn emit_line0(
+    reverse: &str,
+    set_sign: &str,
+    set: Option<&str>,
+    sign: char,
+    content: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str(reverse);
+    s.push_str(set_sign);
+    s.push(sign);
+    if !content.is_empty() {
+        if let Some(set) = set {
+            if set != set_sign {
+                s.push_str(C_RESET);
+            }
+            s.push_str(set);
+        }
+        s.push_str(content);
+    }
+    s.push_str(C_RESET);
+    s
 }
 
 /// Parse the 1-based old-file start line from a unified-diff hunk header
@@ -1050,13 +1229,13 @@ fn write_pair_header(
         _ => {}
     }
 
+    // Git always appends " <subject>" for the commit; for `!` it first re-emits
+    // `reset` + the header color (DIFF_COMMIT = color_commit).
     let subj = lookup_commit_subject(repo, oid_for_subject)?;
-    if !subj.is_empty() {
-        if status == '!' {
-            write!(out, "{reset}")?;
-        }
-        write!(out, " {subj}")?;
+    if status == '!' {
+        write!(out, "{reset}{color_commit}")?;
     }
+    write!(out, " {subj}")?;
     writeln!(out, "{reset}")?;
     Ok(())
 }
