@@ -453,6 +453,13 @@ pub fn run(mut args: Args) -> Result<()> {
     RECURSE_SUBMODULES.with(|r| r.set(args.recurse_submodules));
     OVERWRITE_IGNORE.with(|o| o.set(args.overwrite_ignore));
     let repo = Repository::discover(None).context("not a git repository")?;
+    if !args.recurse_submodules {
+        let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        if config.get_bool("submodule.recurse") == Some(Ok(true)) {
+            args.recurse_submodules = true;
+            RECURSE_SUBMODULES.with(|r| r.set(true));
+        }
+    }
     let raw_args: Vec<String> = std::env::args().collect();
     let merge_cli = parse_checkout_merge_flags_from_raw(&raw_args);
     validate_checkout_conflict_arg(&raw_args)?;
@@ -6249,12 +6256,24 @@ pub(crate) fn checkout_index_to_worktree(
             let rel = String::from_utf8_lossy(&entry.path).into_owned();
             let abs_path = work_tree.join(&rel);
             if populate_gitlinks {
-                let force_populate = force_write_all
-                    || match old_map.get(entry.path.as_slice()) {
+                let old_entry = old_map.get(entry.path.as_slice()).copied();
+                let recurse_requested = RECURSE_SUBMODULES.with(|r| r.get());
+                let existing_gitlink = old_entry.is_some_and(|old| old.mode == MODE_GITLINK);
+                if !existing_gitlink || recurse_requested {
+                    let force_populate = match old_entry {
                         None => true,
-                        Some(old) => old.mode != MODE_GITLINK || old.oid != entry.oid,
+                        Some(old) => {
+                            old.mode != MODE_GITLINK || old.oid != entry.oid || force_write_all
+                        }
                     };
-                checkout_gitlink_worktree_entry(repo, work_tree, &rel, &entry.oid, force_populate)?;
+                    checkout_gitlink_worktree_entry(
+                        repo,
+                        work_tree,
+                        &rel,
+                        &entry.oid,
+                        force_populate,
+                    )?;
+                }
                 // `checkout_gitlink_worktree_entry` returns early (no dir) for uninitialized
                 // submodules; mirror Git's `write_entry`/`S_IFGITLINK` which always `mkdir`s the
                 // (empty) placeholder directory (lib-submodule-update "added submodule creates

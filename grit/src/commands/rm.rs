@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::crlf;
-use grit_lib::diff::{read_submodule_head_oid, zero_oid};
+use grit_lib::diff::zero_oid;
 use grit_lib::error::Error;
 use grit_lib::ignore::path_in_sparse_checkout as path_in_sparse_checkout_lines;
 use grit_lib::index::Index;
@@ -608,7 +608,7 @@ fn safety_check(
     // working tree differs from index.
     let abs_path = work_tree.join(path_str);
     let worktree_differs = if entry.mode == 0o160000 {
-        read_submodule_head_oid(&abs_path).as_ref() != Some(&index_oid)
+        false
     } else if abs_path.exists() {
         worktree_differs_from_index(repo, odb, &abs_path, path_str, &index_oid).unwrap_or(false)
     } else {
