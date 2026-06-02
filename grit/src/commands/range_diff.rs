@@ -414,8 +414,10 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
                 buf.push_str("\n\n");
                 let name = line.trim_end_matches(':');
                 buf.push_str(&format!(" ## {name} ##\n"));
-            } else if let Some(body) = line.strip_prefix("    ") {
-                let trimmed = body.trim_end();
+            } else if line.starts_with("    ") {
+                // Keep the full message line (including its 4-space indent), like
+                // Git's range-diff; only trailing whitespace is stripped.
+                let trimmed = line.trim_end_matches(char::is_whitespace);
                 buf.push_str(trimmed);
                 buf.push('\n');
             }
