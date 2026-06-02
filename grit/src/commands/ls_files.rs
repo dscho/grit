@@ -866,13 +866,22 @@ pub fn run(args: Args) -> Result<()> {
         let indexed_paths: BTreeSet<Vec<u8>> =
             index.entries.iter().map(|e| e.path.clone()).collect();
         let mut untracked = Vec::new();
+        // With `--ignored --directory`, Git collapses a directory to `dir/` only when the
+        // directory itself is ignored; directories that merely *contain* ignored files are
+        // recursed into so the individual ignored files are listed (t3001 "** patterns and
+        // --directory"). We still emit a `dir/` marker for genuinely empty directories (t3001
+        // "show empty ignored directory"), so we keep empty-directory emission on but force the
+        // walk to recurse into every non-empty directory, then decide the ignored-directory
+        // collapse afterwards from the ignore matcher.
+        let walk_emit_empty = args.directory;
+        let recurse_nonempty_dirs = args.directory && args.ignored;
         walk_worktree(
             work_tree,
             work_tree,
             &indexed_paths,
             &mut untracked,
             true,
-            args.directory,
+            walk_emit_empty,
             args.no_empty_directory,
             precompose_walk,
             if pathspec_filter.is_empty() {
@@ -882,6 +891,7 @@ pub fn run(args: Args) -> Result<()> {
             },
             &own_git_dir,
             args.directory && !args.ignored,
+            recurse_nonempty_dirs,
         )?;
         untracked.sort();
 
@@ -906,6 +916,11 @@ pub fn run(args: Args) -> Result<()> {
                 }
             }
 
+            // When `--ignored --directory` collapses an ignored file to the `dir/` of its
+            // shallowest ignored ancestor directory, this holds the repo-relative directory
+            // path (with trailing `/`) to emit instead of the file itself.
+            let mut ignored_dir_collapse: Option<Vec<u8>> = None;
+
             // Apply exclude filtering (always when matcher is loaded)
             if has_excludes || args.ignored || matcher.is_some() {
                 let path_str = String::from_utf8_lossy(path_bytes);
@@ -924,6 +939,51 @@ pub fn run(args: Args) -> Result<()> {
                 if !args.ignored && is_excluded {
                     continue; // --others with excludes: hide excluded files
                 }
+
+                // `--ignored --directory`: Git shows a directory as `dir/` only when the
+                // directory itself is ignored *and* has no tracked content under it (Git's
+                // `treat_directory` only collapses untracked-as-a-whole directories). Find the
+                // shallowest such ancestor directory and collapse the entry onto it. A directory
+                // that holds a tracked file (t3001 "empty ignored sub-directory") is not
+                // collapsed, so a deeper empty ignored subdirectory below it is shown instead;
+                // entries with no qualifying ignored ancestor are listed individually.
+                if args.ignored && args.directory {
+                    if let Some(ref mut m) = matcher {
+                        let trimmed = path_str.trim_end_matches('/');
+                        let segments: Vec<&str> = trimmed.split('/').collect();
+                        // For a file the last segment is the file name; for a `dir/` marker the
+                        // directory itself is a collapse candidate, so include all segments.
+                        let dir_segments = if is_dir {
+                            segments.len()
+                        } else {
+                            segments.len().saturating_sub(1)
+                        };
+                        let mut acc = String::new();
+                        for seg in segments.iter().take(dir_segments) {
+                            if !acc.is_empty() {
+                                acc.push('/');
+                            }
+                            acc.push_str(seg);
+                            let prefix_slash = format!("{acc}/");
+                            let has_tracked_under = indexed_paths
+                                .iter()
+                                .any(|t| t.starts_with(prefix_slash.as_bytes()));
+                            if has_tracked_under {
+                                continue;
+                            }
+                            let dir_ignored = m
+                                .check_path(&repo, Some(&index), &acc, true)
+                                .map(|(ig, _)| ig)
+                                .unwrap_or(false);
+                            if dir_ignored {
+                                let mut dir_bytes = acc.clone().into_bytes();
+                                dir_bytes.push(b'/');
+                                ignored_dir_collapse = Some(dir_bytes);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
 
             if !pathspec_filter.is_empty() {
@@ -937,23 +997,33 @@ pub fn run(args: Args) -> Result<()> {
                 }
             }
 
+            let emit_bytes: &[u8] = ignored_dir_collapse.as_deref().unwrap_or(path_bytes);
             let display = format_ls_display_path(
                 args.full_name,
                 &cwd,
                 work_tree,
-                path_bytes,
+                emit_bytes,
                 &cwd_prefix,
                 &config,
             )?;
             let mut display = display.into_owned();
-            if path_bytes.ends_with(b"/") && !display.ends_with(b"/") {
+            if emit_bytes.ends_with(b"/") && !display.ends_with(b"/") {
                 display.push(b'/');
             }
             filtered_untracked.push(display);
         }
+        // The ignored-directory collapse above can emit the same `dir/` for many files; keep the
+        // first occurrence of each path so the directory is listed once (the list is already
+        // sorted by repo-relative path, so duplicates are adjacent).
+        if args.ignored && args.directory {
+            filtered_untracked.dedup();
+        }
 
-        // Collapse to directories if --directory (after making paths cwd-relative)
-        let output_paths = if args.directory {
+        // Collapse to directories if --directory (after making paths cwd-relative).
+        // In `--ignored` mode the per-file ignored-ancestor collapse above has already produced
+        // the final `dir/` vs individual-file shape, so the generic untracked-directory collapse
+        // is skipped (it would wrongly fold the individually-listed ignored files together).
+        let output_paths = if args.directory && !args.ignored {
             let mut collapsed = collapse_to_directories(&filtered_untracked);
             if args.no_empty_directory {
                 // Remove directory entries that have no file children
@@ -1087,6 +1157,7 @@ pub fn run(args: Args) -> Result<()> {
                 Some(pathspec_filter.as_slice())
             },
             &own_git_dir,
+            false,
             false,
         )?;
         untracked.sort();
@@ -1660,6 +1731,7 @@ fn walk_worktree(
     pathspecs: Option<&[Pathspec]>,
     own_git_dir: &std::path::Path,
     opaque_own_git_dir: bool,
+    recurse_nonempty_dirs: bool,
 ) -> Result<bool> {
     let mut rel_bytes = path_to_bytes(dir.strip_prefix(root).unwrap_or(dir));
     if precompose_unicode {
@@ -1748,6 +1820,7 @@ fn walk_worktree(
                 || hide_empty_directories
                 || has_tracked_under
                 || is_own_git_dir
+                || recurse_nonempty_dirs
                 || pathspecs.is_some_and(|ps| pathspec_requires_recurse_into_dir(&rel_bytes, ps));
             if emit_empty_directories && !must_recurse {
                 let mut dir_entry = rel_bytes.clone();
@@ -1768,6 +1841,7 @@ fn walk_worktree(
                 pathspecs,
                 own_git_dir,
                 opaque_own_git_dir,
+                recurse_nonempty_dirs,
             )? {
                 added = true;
             }
