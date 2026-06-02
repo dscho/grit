@@ -188,7 +188,7 @@ test_expect_success 'diff -q suppresses diff output' '
 	(
 	cd repo &&
 	git diff -q >actual 2>&1 || true &&
-	test_must_fail test -s actual
+	! test -s actual
 	)
 '
 
