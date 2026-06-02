@@ -487,6 +487,40 @@ pub fn run(mut args: Args) -> Result<()> {
         std::process::exit(1);
     }
 
+    // Determine which paths slated for removal are gitlinks (submodules); used
+    // for the `.gitmodules` pre-check below and the post-removal cleanup.
+    let to_remove_gitlinks: BTreeSet<String> = to_remove
+        .iter()
+        .filter(|p| {
+            index
+                .get(p.as_bytes(), 0)
+                .map(|e| e.mode == 0o160000)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    // When removing a submodule, Git refuses to proceed if `.gitmodules` is
+    // tracked but has unstaged worktree modifications (`is_staging_gitmodules_ok`),
+    // since `git rm` is about to rewrite and re-stage it (t3600 "rm will error
+    // out on a modified .gitmodules file unless staged").
+    if !to_remove_gitlinks.is_empty() && !args.dry_run {
+        let gm_path = work_tree.join(".gitmodules");
+        let staged = index.get(b".gitmodules", 0).is_some();
+        if staged && gm_path.exists() {
+            let differs = index
+                .get(b".gitmodules", 0)
+                .map(|e| {
+                    worktree_differs_from_index(&repo, &repo.odb, &gm_path, ".gitmodules", &e.oid)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if differs {
+                bail!("please stage your changes to .gitmodules or stash them to proceed");
+            }
+        }
+    }
+
     // Phase 2: perform all removals (only reached when all checks passed).
     // Lock stdout once: the SIGPIPE "choke" tests print thousands of lines into
     // a pipe that closes, and `print_rm_line` surfaces the resulting EPIPE so the
@@ -544,7 +578,46 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
-    if !args.dry_run && !to_remove.is_empty() {
+    // For each removed submodule, drop its `[submodule "<name>"]` section from
+    // `.gitmodules` and re-stage the file (Git's `remove_path_from_gitmodules`
+    // + `stage_updated_gitmodules`). A missing `.gitmodules` is silently
+    // ignored; a missing section produces a warning but is not fatal.
+    // Like Git, this only runs for full removal: `git rm --cached` leaves the
+    // work tree and `.gitmodules` untouched (it lives in the `!index_only` path).
+    if !args.dry_run && !args.cached && !to_remove_gitlinks.is_empty() {
+        let gm_path = work_tree.join(".gitmodules");
+        if gm_path.exists() {
+            let mut content = fs::read_to_string(&gm_path).unwrap_or_default();
+            let mut modified = false;
+            for path_str in &to_remove_gitlinks {
+                match gitmodules_name_for_path(&content, path_str) {
+                    Some(name) => match remove_submodule_section(&content, &name) {
+                        Some(new_content) => {
+                            content = new_content;
+                            modified = true;
+                        }
+                        None => {
+                            eprintln!("warning: Could not remove .gitmodules entry for {path_str}");
+                        }
+                    },
+                    None => {
+                        eprintln!(
+                            "warning: Could not find section in .gitmodules where path={path_str}"
+                        );
+                    }
+                }
+            }
+            if modified {
+                fs::write(&gm_path, &content)
+                    .with_context(|| format!("writing {}", gm_path.display()))?;
+                // Stage the rewritten `.gitmodules` so the change is recorded in
+                // the index alongside the submodule removal.
+                stage_gitmodules(&repo, &mut index, &gm_path)?;
+            }
+        }
+    }
+
+    if !args.dry_run && (!to_remove.is_empty() || !to_remove_gitlinks.is_empty()) {
         repo.write_index(&mut index)?;
     }
     // Git keeps `submodule.<name>.*` entries in `.git/config` after `git rm` on a gitlink;
@@ -653,7 +726,7 @@ fn safety_check(
     // working tree differs from index.
     let abs_path = work_tree.join(path_str);
     let worktree_differs = if entry.mode == 0o160000 {
-        read_submodule_head_oid(&abs_path).as_ref() != Some(&index_oid)
+        gitlink_worktree_differs(&abs_path, &index_oid)
     } else if abs_path.exists() {
         worktree_differs_from_index(repo, odb, &abs_path, path_str, &index_oid).unwrap_or(false)
     } else {
@@ -727,6 +800,176 @@ fn worktree_differs_from_index(
 
     let wt_oid = Odb::hash_object_data(ObjectKind::Blob, &data);
     Ok(wt_oid != *index_oid)
+}
+
+/// Whether a directory exists and contains no entries (ignoring nothing — an
+/// empty `mkdir`ed submodule dir counts).  Mirrors Git's `is_empty_dir`.
+fn is_empty_dir(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(mut it) => it.next().is_none(),
+        Err(_) => false,
+    }
+}
+
+/// Whether the submodule at `sub_dir` is wired up via a `.git` *file* (gitlink)
+/// rather than an embedded `.git` *directory*.  Git refuses to remove a
+/// submodule whose git dir is still embedded (it would lose history) unless
+/// `--force` is given.
+fn submodule_uses_gitfile(sub_dir: &Path) -> bool {
+    fs::symlink_metadata(sub_dir.join(".git"))
+        .map(|m| m.file_type().is_file())
+        .unwrap_or(false)
+}
+
+/// Whether a populated submodule has local modifications or untracked content
+/// (Git's `bad_to_remove_submodule` runs `git status --porcelain` inside it).
+fn submodule_status_dirty(sub_dir: &Path) -> bool {
+    let out = std::process::Command::new("git")
+        .args(["status", "--porcelain", "--ignore-submodules=none", "-uall"])
+        .current_dir(sub_dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output();
+    match out {
+        Ok(o) => o.status.success() && o.stdout.len() > 2,
+        // If status cannot be run, be conservative and treat as not-dirty so
+        // an unpopulated/empty submodule is still removable (matches the
+        // `is_empty_dir`/unpopulated fast paths above).
+        Err(_) => false,
+    }
+}
+
+/// Whether a gitlink (submodule) entry should be treated as "modified" for the
+/// purposes of `git rm` safety, mirroring Git's `ce_compare_gitlink` plus
+/// `bad_to_remove_submodule`:
+///   * a missing or empty submodule directory is never modified;
+///   * a populated submodule whose resolvable `HEAD` differs from the recorded
+///     gitlink OID is modified;
+///   * a populated submodule with local modifications / untracked files (per
+///     `git status`) is modified;
+///   * a submodule whose git dir is still embedded (no `.git` gitfile) is
+///     treated as modified, since removing it would discard history.
+fn gitlink_worktree_differs(sub_dir: &Path, index_oid: &grit_lib::objects::ObjectId) -> bool {
+    if !sub_dir.exists() || is_empty_dir(sub_dir) {
+        return false;
+    }
+    // HEAD differs from the recorded gitlink commit?
+    if let Some(head) = read_submodule_head_oid(sub_dir) {
+        if &head != index_oid {
+            return true;
+        }
+    }
+    // Embedded git dir (not a gitfile) → unsafe to remove without --force.
+    if !submodule_uses_gitfile(sub_dir) {
+        return true;
+    }
+    submodule_status_dirty(sub_dir)
+}
+
+/// Hash the (rewritten) `.gitmodules` file as a blob and stage it in the index,
+/// preserving the existing entry's mode when present.  Mirrors Git's
+/// `stage_updated_gitmodules`.
+fn stage_gitmodules(repo: &Repository, index: &mut Index, gm_path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let data = fs::read(gm_path).with_context(|| format!("reading {}", gm_path.display()))?;
+    let oid = repo
+        .odb
+        .write(ObjectKind::Blob, &data)
+        .context("writing .gitmodules blob")?;
+    let prior_mode = index.get(b".gitmodules", 0).map(|e| e.mode);
+    let meta = fs::metadata(gm_path).ok();
+    let entry = grit_lib::index::IndexEntry {
+        ctime_sec: meta.as_ref().map(|m| m.ctime() as u32).unwrap_or(0),
+        ctime_nsec: meta.as_ref().map(|m| m.ctime_nsec() as u32).unwrap_or(0),
+        mtime_sec: meta.as_ref().map(|m| m.mtime() as u32).unwrap_or(0),
+        mtime_nsec: meta.as_ref().map(|m| m.mtime_nsec() as u32).unwrap_or(0),
+        dev: meta.as_ref().map(|m| m.dev() as u32).unwrap_or(0),
+        ino: meta.as_ref().map(|m| m.ino() as u32).unwrap_or(0),
+        mode: prior_mode.unwrap_or(0o100644),
+        uid: meta.as_ref().map(|m| m.uid()).unwrap_or(0),
+        gid: meta.as_ref().map(|m| m.gid()).unwrap_or(0),
+        size: data.len() as u32,
+        oid,
+        flags: ".gitmodules".len().min(0xFFF) as u16,
+        flags_extended: None,
+        path: b".gitmodules".to_vec(),
+        base_index_pos: 0,
+    };
+    index.add_or_replace(entry);
+    Ok(())
+}
+
+/// Find the submodule *name* whose `path` entry equals `path` in `.gitmodules`.
+///
+/// Returns `None` if no matching `submodule.<name>.path = <path>` entry exists.
+fn gitmodules_name_for_path(content: &str, path: &str) -> Option<String> {
+    let mut current_section: Option<String> = None;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('#') || line.starts_with(';') || line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            // Section header: [submodule "name"]
+            let header = rest.split(']').next().unwrap_or("").trim();
+            if let Some(after) = header.strip_prefix("submodule") {
+                let name = after.trim().trim_matches('"').to_string();
+                current_section = Some(name);
+            } else {
+                current_section = None;
+            }
+            continue;
+        }
+        if let Some(name) = &current_section {
+            if let Some((key, value)) = line.split_once('=') {
+                if key.trim().eq_ignore_ascii_case("path") {
+                    let v = value.trim().trim_matches('"');
+                    if v == path {
+                        return Some(name.clone());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Remove the `[submodule "<name>"]` section (and its body) from `.gitmodules`
+/// content, returning the rewritten text, or `None` when no such section
+/// exists.  Mirrors `git config --file .gitmodules --remove-section
+/// submodule.<name>`.
+fn remove_submodule_section(content: &str, name: &str) -> Option<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut in_target = false;
+    let mut removed = false;
+    for raw in content.lines() {
+        let trimmed = raw.trim();
+        if let Some(rest) = trimmed.strip_prefix('[') {
+            let header = rest.split(']').next().unwrap_or("").trim();
+            let is_target = header
+                .strip_prefix("submodule")
+                .map(|after| after.trim().trim_matches('"') == name)
+                .unwrap_or(false);
+            if is_target {
+                in_target = true;
+                removed = true;
+                continue;
+            }
+            in_target = false;
+        }
+        if !in_target {
+            out.push(raw.to_string());
+        }
+    }
+    if !removed {
+        return None;
+    }
+    let mut text = out.join("\n");
+    if content.ends_with('\n') && !text.is_empty() {
+        text.push('\n');
+    }
+    Some(text)
 }
 
 /// Build a map from repo-relative path string to HEAD tree OID.
