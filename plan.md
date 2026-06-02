@@ -43,6 +43,7 @@
     `ignore=all` for unstaged gitlinks while explicit `git add --force` can stage the pointer.
   - Completed: `t2300-cd-to-toplevel.sh` (5/5). Added a test exec-path `git-sh-setup` helper
     exposing `cd_to_toplevel`.
+  - Completed: `t2016-checkout-patch.sh` (19/19). Passed after shared patch-mode fixes.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---

@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 focus: `./scripts/run-tests.sh t2016-checkout-patch.sh --verbose` passes 19/19 with the
+  shared patch-mode fixes.
 - t2 focus: `./scripts/run-tests.sh t2300-cd-to-toplevel.sh --verbose` passes 5/5 after adding
   the test exec-path `git-sh-setup` helper.
 - t2 focus: `./scripts/run-tests.sh t2206-add-submodule-ignored.sh --verbose` passes 8/8 after
