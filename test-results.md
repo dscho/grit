@@ -22,6 +22,9 @@ Updated: 2026-06-02
   `t7112` from 61/82 to 69/82 by preserving submodule worktrees during non-recursive hard reset,
   failing atomically on populated gitlink replacement, and relaxing keep/merge safety for
   gitlink-only superproject index updates.
+- t7 submodule focus: `./scripts/run-tests.sh t7112-reset-submodule.sh --verbose` improved
+  `t7112` from 69/82 to 76/82 by allowing `reset --merge` to introduce gitlinks over empty
+  directories and clean tracked directories without misclassifying them as untracked obstructions.
 - Verification: `cargo build --release -p grit-cli` passed with the existing warning backlog.
 
 Updated: 2026-06-01

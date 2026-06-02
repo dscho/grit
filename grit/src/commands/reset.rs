@@ -1856,7 +1856,7 @@ fn check_merge_reset_worktree(
         let abs_path = work_tree.join(path_str.as_ref());
 
         match (idx_e, tgt_e) {
-            (None, Some(_)) => {
+            (None, Some(te)) => {
                 // The path is present in the target tree but absent from the index
                 // (stage 0), i.e. it is untracked. If something exists on disk at
                 // this path it would be clobbered by the reset. Git's `verify_absent`
@@ -1867,6 +1867,18 @@ fn check_merge_reset_worktree(
                 match std::fs::symlink_metadata(&abs_path) {
                     Ok(meta) => {
                         if meta.is_dir() {
+                            if te.mode == MODE_GITLINK
+                                && worktree_dir_is_empty_for_new_gitlink(&abs_path)
+                            {
+                                continue;
+                            }
+                            if te.mode == MODE_GITLINK
+                                && gitlink_replaces_clean_tracked_directory(
+                                    repo, &work_tree, &path, &index_map, &index_map,
+                                )?
+                            {
+                                continue;
+                            }
                             bail!("Updating '{}' would lose untracked files in it", path_str);
                         } else {
                             bail!("Updating '{}' would lose untracked files.", path_str);
