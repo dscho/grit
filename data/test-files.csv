@@ -472,7 +472,7 @@ t2009-checkout-statinfo	t2	yes	3	3	0	true	ok	0
 t2010-checkout-ambiguous	t2	yes	10	10	0	true	ok	0
 t2011-checkout-invalid-head	t2	yes	10	10	0	true	ok	0
 t2012-checkout-last	t2	yes	22	21	1	false	ok	0
-t2013-checkout-submodule	t2	yes	74	70	0	true	ok	0
+t2013-checkout-submodule	t2	yes	70	70	0	true	ok	0
 t2014-checkout-switch	t2	yes	4	4	0	true	ok	0
 t2015-checkout-unborn	t2	yes	6	5	1	false	ok	0
 t2016-checkout-patch	t2	yes	19	15	4	false	ok	0
@@ -492,7 +492,7 @@ t2030-unresolve-info	t2	yes	14	8	6	false	ok	0
 t2031-checkout-index-symlink	t2	yes	25	24	1	false	ok	0
 t2032-checkout-index-parallel	t2	yes	28	25	3	false	ok	0
 t2040-checkout-file-modes	t2	yes	28	12	16	false	ok	0
-t2045-checkout-conflict	t2	yes	29	11	18	false	ok	0
+t2045-checkout-conflict	t2	yes	29	29	0	true	ok	0
 t2050-checkout	t2	yes	80	80	0	true	ok	0
 t2050-git-dir-relative	t2	yes	4	4	0	true	ok	0
 t2060-switch	t2	yes	16	8	8	false	ok	0
