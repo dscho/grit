@@ -53,6 +53,8 @@
   - Completed: `t2103-update-index-ignore-missing.sh` (5/5). `update-index --refresh` now reports
     refresh problems on stdout, detects same-size content changes, and reset preserves populated
     gitlink worktrees so submodule refresh checks see HEAD changes.
+  - Completed: `t2004-checkout-cache-temp.sh` (23/23). `checkout-index --stage=<n> --temp` now
+    recognizes unmerged stage entries when selecting requested paths.
   - Completed: `t2201-add-update-typechange.sh` (6/6) by treating index paths under symlinked
     parents as deleted in diff/add/commit flows and by reporting worktree gitlink typechanges in
     `diff-index`.
