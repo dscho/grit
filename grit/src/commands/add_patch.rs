@@ -170,6 +170,11 @@ pub(crate) fn run_add_patch(
     let conv = &add_cfg.conv;
     let attrs = &add_cfg.attrs;
 
+    // Track how many candidate files turned out to be binary; if every one did, Git prints
+    // "Only binary files changed." (add-patch.c) instead of silently doing nothing.
+    let total_entries = entries.len();
+    let mut binary_count = 0usize;
+
     for entry in entries {
         let path_str = entry.path().to_owned();
         let path_bytes = path_str.as_bytes();
@@ -244,6 +249,7 @@ pub(crate) fn run_add_patch(
         };
 
         if is_binary(&index_blob) || is_binary(&work_blob) {
+            binary_count += 1;
             continue;
         }
 
@@ -505,6 +511,11 @@ pub(crate) fn run_add_patch(
             }
             break 'rediff;
         }
+    }
+
+    // Mirror Git: if every candidate file was binary (and thus skipped), say so.
+    if total_entries > 0 && binary_count == total_entries {
+        println!("Only binary files changed.");
     }
 
     repo.write_index_at(&index_path, &mut index)
