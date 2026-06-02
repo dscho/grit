@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 focus: `./scripts/run-tests.sh t2060-switch.sh --verbose` passes 16/16 after switch
+  commit-ish/advice/remote-guess/merge-state fixes.
 - t2 focus: `./scripts/run-tests.sh t2071-restore-patch.sh --verbose` passes 15/15 after restore
   patch pathspec/source handling fixes.
 - t2 cwd-empty: `./scripts/run-tests.sh t2501-cwd-empty.sh --verbose` passes 24/24 after

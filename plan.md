@@ -30,6 +30,8 @@
     `--include-untracked` to clean from the worktree root while preserving cwd.
   - Completed: `t2071-restore-patch.sh` (15/15). Fixed `restore -p` with no pathspec and made
     restore patch mode with `--source` update only the worktree, not the index.
+  - Completed: `t2060-switch.sh` (16/16). Fixed switch's commit-ish rejection/advice, remote
+    branch guessing with `checkout.guess`, and refusal while a merge is in progress.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---
