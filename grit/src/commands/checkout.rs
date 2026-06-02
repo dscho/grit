@@ -1049,7 +1049,9 @@ pub fn run(mut args: Args) -> Result<()> {
             HeadState::Branch { oid: Some(oid), .. } | HeadState::Detached { oid } => {
                 commit_to_tree(&repo, oid)?
             }
-            HeadState::Branch { oid: None, .. } | HeadState::Invalid => return Ok(()),
+            HeadState::Branch { oid: None, .. } | HeadState::Invalid => {
+                bail!("you are on a branch yet to be born")
+            }
         };
         let sparse_on = sparse_checkout_config_enabled(&repo.git_dir);
         if sparse_on {

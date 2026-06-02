@@ -57,6 +57,8 @@
     recognizes unmerged stage entries when selecting requested paths.
   - Completed: `t2012-checkout-last.sh` (22/22). Interactive rebase now honors the harness
     no-op `EDITOR=:` fallback so checkout-last reflog tests can run without a terminal editor.
+  - Completed: `t2015-checkout-unborn.sh` (6/6). Bare `checkout` in a newly-created unborn repo
+    now fails instead of silently succeeding.
   - Completed: `t2201-add-update-typechange.sh` (6/6) by treating index paths under symlinked
     parents as deleted in diff/add/commit flows and by reporting worktree gitlink typechanges in
     `diff-index`.
