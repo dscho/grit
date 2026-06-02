@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 parallel checkout: `./scripts/run-tests.sh t2080-parallel-checkout-basics.sh --verbose`
+  improved from 7/11 to 9/11 after submodule update/clone and symlink diff fixes; still in progress.
 - t2 focus: `./scripts/run-tests.sh t2016-checkout-patch.sh --verbose` passes 19/19 with the
   shared patch-mode fixes.
 - t2 focus: `./scripts/run-tests.sh t2300-cd-to-toplevel.sh --verbose` passes 5/5 after adding

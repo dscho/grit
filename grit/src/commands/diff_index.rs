@@ -1403,6 +1403,9 @@ fn diff_tree_vs_worktree(
         match read_worktree_snapshot_from_meta(repo, &abs, &meta)? {
             Some(worktree_snapshot) => {
                 if worktree_snapshot == *index_snapshot {
+                    if worktree_snapshot.mode == MODE_SYMLINK {
+                        continue;
+                    }
                     // Index stat cache is stale (e.g. after `read-tree` zeroed stat fields) while
                     // tree, index OID, and work tree content still agree — Git reports `M` with a
                     // zero OID on the work-tree side (`t3700-add.sh` refresh tests).

@@ -1081,12 +1081,16 @@ fn collect_changes(
             let abs = work_tree.join(path);
             match read_worktree_info(repo, &abs)? {
                 Some((wt_mode, wt_oid)) => {
+                    let idx_mode = canonicalize_mode(*idx_mode);
+                    if idx_mode == wt_mode && *idx_oid == wt_oid {
+                        continue;
+                    }
                     changes.insert(
                         path.clone(),
                         Change {
                             path: path.clone(),
                             status: 'M',
-                            old_mode: canonicalize_mode(*idx_mode),
+                            old_mode: idx_mode,
                             new_mode: wt_mode,
                             old_oid: *idx_oid,
                             new_oid: wt_oid,
@@ -1816,6 +1820,9 @@ fn read_worktree_info_fast(
     if meta.file_type().is_symlink() {
         let target = fs::read_link(abs_path)?;
         let oid = Odb::hash_object_data(ObjectKind::Blob, target.as_os_str().as_bytes());
+        if oid == index_entry.oid && canonicalize_mode(index_entry.mode) == MODE_SYMLINK {
+            return Ok(WorktreeStatus::Unchanged);
+        }
         return Ok(WorktreeStatus::Modified(MODE_SYMLINK, oid));
     }
 

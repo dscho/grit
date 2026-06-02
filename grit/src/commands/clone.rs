@@ -3812,7 +3812,7 @@ fn clone_submodules(work_tree: &Path, repo: &Repository, clone_args: &Args) -> R
 
     let mut upd = std::process::Command::new(&grit_bin);
     crate::grit_exe::strip_trace2_env(&mut upd);
-    upd.args(["submodule", "update", "--init", "--recursive"])
+    upd.args(["submodule", "update", "--init", "--recursive", "--force"])
         .current_dir(work_tree);
     if let Some(n) = clone_args.jobs {
         upd.arg("--jobs").arg(n.to_string());

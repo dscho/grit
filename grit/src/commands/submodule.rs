@@ -1629,6 +1629,18 @@ fn checkout_submodule_worktree(
     Ok(())
 }
 
+fn submodule_worktree_clean_for_update(modules_dir: &Path, sub_path: &Path) -> bool {
+    let Ok(sub_repo) = Repository::open(modules_dir, Some(sub_path)) else {
+        return false;
+    };
+    let Ok(index) = sub_repo.load_index() else {
+        return false;
+    };
+    grit_lib::diff::diff_index_to_worktree(&sub_repo.odb, &index, sub_path, false, false)
+        .map(|diff| diff.is_empty())
+        .unwrap_or(false)
+}
+
 fn attach_submodule_head_to_default_branch(
     sub_git_dir: &Path,
     checked_out_oid: &str,

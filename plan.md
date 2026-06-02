@@ -44,6 +44,10 @@
   - Completed: `t2300-cd-to-toplevel.sh` (5/5). Added a test exec-path `git-sh-setup` helper
     exposing `cd_to_toplevel`.
   - Completed: `t2016-checkout-patch.sh` (19/19). Passed after shared patch-mode fixes.
+  - In progress: `t2080-parallel-checkout-basics.sh` improved from 7/11 to 9/11 by forcing
+    submodule checkout during clone/update and treating clean symlink worktree snapshots as clean
+    despite stale stat data. Remaining failure is clone-vs-checkout working tree comparison for
+    submodule paths that are no longer gitlinks on the target branch.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---
