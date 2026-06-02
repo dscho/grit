@@ -93,6 +93,7 @@ test_expect_failure CASE_INSENSITIVE_FS 'add (with different case)' '
 '
 
 test_expect_success "setup unicode normalization tests" '
+	(
 	test_create_repo unicode &&
 	cd unicode &&
 	git config core.precomposeunicode false &&
@@ -105,18 +106,23 @@ test_expect_success "setup unicode normalization tests" '
 	git mv tmp "$auml" &&
 	git commit -m rename &&
 	git checkout -f main
+	)
 '
 
 $test_unicode 'rename (silent unicode normalization)' '
+	(
 	cd unicode &&
 	git mv "$aumlcdiar" "$auml" &&
 	git commit -m rename
+	)
 '
 
 $test_unicode 'merge (silent unicode normalization)' '
+	(
 	cd unicode &&
 	git reset --hard initial &&
 	git merge topic
+	)
 '
 
 test_expect_success CASE_INSENSITIVE_FS 'checkout with no pathspec and a case insensitive fs' '

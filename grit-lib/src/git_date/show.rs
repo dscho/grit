@@ -340,6 +340,9 @@ pub fn strbuf_addftime(tm: &tm, tz_hhmm: TzHhmm, fmt: &str, suppress_tz_name: bo
         } else if rest.starts_with('z') {
             munged.push_str(&format!("{:+05}", tz_hhmm));
             rest = &rest[1..];
+        } else if !suppress_tz_name && rest.starts_with('Z') && tz_hhmm == 0 {
+            munged.push_str("UTC");
+            rest = &rest[1..];
         } else if suppress_tz_name && rest.starts_with('Z') {
             rest = &rest[1..];
         } else {

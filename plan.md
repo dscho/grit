@@ -1,10 +1,12 @@
 # PLAN.md — Current execution queue
 
-## Active task — t0 remaining in-scope failures 100% pass
+## Completed task — t0 remaining in-scope failures 100% pass
 
-Goal: make every current in-scope `t0` row fully pass. The current failure ledger is 32 subtests:
-31 direct `not ok` failures plus one `t0007-git-var` harness-summary mismatch that direct execution
-currently reports green.
+Goal: make every current in-scope `t0` row fully pass.
+
+**Status:** complete. A fresh `./scripts/run-tests.sh t0 --verbose` run passed all 70 in-scope t0
+files. The final sweep also refreshed the CSV/dashboard rows for opportunistic regressions found
+during the family run (`t0006`, `t0010`, `t0050`, and the reftable rows).
 
 ### Area A — init object/ref format and includeIf config
 **Owns:** `grit/src/commands/init.rs`, `grit-lib/src/repo.rs`, `grit-lib/src/config.rs`,
@@ -53,10 +55,16 @@ currently reports green.
 ### Area E — reftable transaction and serving behavior
 **Owns:** `grit-lib/src/reftable.rs`, `grit/src/commands/update_ref.rs`,
 `grit/src/commands/for_each_ref.rs`, HTTP test environment only if proven grit-controlled.
-- [ ] `t0610-reftable-basics` #45 — `ref transaction: fails gracefully when auto compaction fails`
-- [ ] `t0610-reftable-basics` #48 — `ref transaction: many concurrent writers`
-- [ ] `t0611-reftable-httpd` #1 — `serving ls-remote`
-- [ ] `t0613-reftable-write-options` #3 — `many refs results in multiple blocks`
+- [x] `t0610-reftable-basics` #45 — `ref transaction: fails gracefully when auto compaction fails`
+- [x] `t0610-reftable-basics` #48 — `ref transaction: many concurrent writers`
+- [x] `t0611-reftable-httpd` #1 — `serving ls-remote`
+- [x] `t0613-reftable-write-options` #3 — `many refs results in multiple blocks`
+- [x] `t0614-reftable-fsck` — reftable stack/table-name/symref verification
+
+### Final t0 verification follow-ups
+- [x] `t0006-date` — normalized local UTC `%Z` formatting to `UTC`.
+- [x] `t0010-racy-git` — taught `diff-files`/`update-index` about smudged racy entries.
+- [x] `t0050-filesystem` — fixed the documented cwd leak in unicode normalization test bodies.
 
 ### Execution order
 1. Fix small repo/discovery mismatches first: `t0007`, `t0002`, `t0050`, then `t0110`.
@@ -65,9 +73,9 @@ currently reports green.
 4. Fix files refs: `t0600`.
 5. Fix reftable transaction/sort/block/httpd items: `t0613`, `t0610`, `t0611`.
 6. After each file goes green, run `./scripts/run-tests.sh <file>.sh` to refresh CSV/dashboards.
-7. Final verification: `cargo fmt`, `cargo build --release -p grit-cli`,
-   `cargo clippy --fix --allow-dirty --allow-staged`, `cargo test -p grit-lib --lib`,
-   and `./scripts/run-tests.sh --family t0`.
+7. Final verification completed: `cargo fmt`, `cargo build --release -p grit-cli --bin grit --bin test-httpd`,
+   `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty --allow-staged`,
+   `cargo test -p grit-lib --lib`, and `./scripts/run-tests.sh t0 --verbose`.
 
 ---
 

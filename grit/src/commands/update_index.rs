@@ -104,6 +104,13 @@ fn has_racy_timestamp(index: &Index, index_mtime_sec: u32, index_mtime_nsec: u32
     })
 }
 
+fn current_unix_seconds_u32() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as u32)
+        .unwrap_or(0)
+}
+
 /// Arguments for `grit update-index`.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -1083,8 +1090,11 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
             }
         };
 
-        let entry = entry_from_stat(&abs_path, &rel_bytes, oid, mode)
+        let mut entry = entry_from_stat(&abs_path, &rel_bytes, oid, mode)
             .with_context(|| format!("stat failed for '{}'", abs_path.display()))?;
+        if entry.mtime_sec == current_unix_seconds_u32() {
+            entry.size = 0;
+        }
 
         index.stage_file(entry);
 

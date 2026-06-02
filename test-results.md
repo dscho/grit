@@ -1,6 +1,14 @@
 # Test Results
 
 Updated: 2026-06-02
+- t0 final: `./scripts/run-tests.sh t0 --verbose` passes all 70 in-scope t0 files after the
+  reftable transaction/fsck/httpd fixes plus racy `diff-files`, local UTC `%Z`, and t0050 cwd-leak
+  follow-ups.
+- t0 validation: `cargo build --release -p grit-cli --bin grit --bin test-httpd`, `cargo check -p
+  grit-cli`, `cargo clippy --fix --allow-dirty --allow-staged`, and `cargo test -p grit-lib --lib`
+  all completed; only the existing warning backlog remains (`ignore.rs`, `refs.rs`, `difftool.rs`,
+  `sparse_checkout.rs`, `worktree.rs`). Clippy's unrelated auto-fixes in `config.rs` and
+  `filter_process.rs` were backed out.
 - t4 workflow: dependency breakdown created for diff-family tests; started with `t4017-diff-retval.sh`.
 - t4 focus build: `cargo build --release -p grit-cli` passes with the existing warning backlog (`ignore.rs`, `refs.rs`, `difftool.rs`, `sparse_checkout.rs`, `worktree.rs`).
 - t4 focus harness: `./scripts/run-tests.sh t4017-diff-retval.sh --verbose` passes 38/38 after rejecting unknown long `git diff` options with usage instead of resolving them as revisions.

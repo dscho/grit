@@ -34,7 +34,7 @@ t0034-root-safe-directory	t0	skip	0	0	0	false	ok	0
 t0035-safe-bare-repository	t0	yes	12	12	0	true	ok	0
 t0040-parse-options	t0	yes	94	94	0	true	ok	0
 t0041-usage	t0	yes	16	16	0	true	ok	0
-t0050-filesystem	t0	yes	11	11	0	true	ok	2
+t0050-filesystem	t0	yes	13	13	0	true	ok	2
 t0051-windows-named-pipe	t0	skip	1	0	0	false	ok	0
 t0052-simple-ipc	t0	yes	9	9	0	true	ok	0
 t0055-beyond-symlinks	t0	yes	3	3	0	true	ok	0

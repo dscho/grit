@@ -2280,7 +2280,7 @@ impl ReftableStack {
         config
             .get("reftable.lockTimeout")
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0)
+            .unwrap_or(1000)
     }
 
     /// Atomically acquire `tables.list.lock` (O_CREAT|O_EXCL), retrying up to the

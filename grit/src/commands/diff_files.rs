@@ -61,8 +61,9 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let index_path = effective_index_path(&repo)?;
     let index = repo.load_index_at(&index_path).context("loading index")?;
+    let index_mtime = index_file_mtime_pair(&index_path);
 
-    let changes = collect_changes(&repo, &index, &work_tree, &options)?;
+    let changes = collect_changes(&repo, &index, &work_tree, &options, index_mtime)?;
 
     let mut diff_entries: Vec<DiffEntry> = changes.iter().map(change_to_diff_entry).collect();
 
@@ -923,6 +924,7 @@ fn collect_changes(
     index: &Index,
     work_tree: &Path,
     options: &Options,
+    index_mtime: Option<(u32, u32)>,
 ) -> Result<Vec<Change>> {
     // Collect index entries, grouped by path.  For stage==0 we use merged
     // entries (stage 0).  For stage 1–3 we use that specific unmerged stage.
@@ -961,11 +963,24 @@ fn collect_changes(
         // Use stat info to skip unchanged files (avoid hashing).
         for (path, (idx_mode, idx_oid, idx_entry)) in &stage0 {
             let abs = work_tree.join(path);
-            match read_worktree_info_fast(repo, work_tree, &abs, idx_entry)? {
+            match read_worktree_info_fast(repo, work_tree, &abs, idx_entry, index_mtime)? {
                 WorktreeStatus::Unchanged => { /* skip — stat says identical */ }
                 WorktreeStatus::Modified(wt_mode, wt_oid) => {
                     let idx_canonical = canonicalize_mode(*idx_mode);
-                    let content_matches = wt_oid == *idx_oid && wt_mode == idx_canonical;
+                    let mut effective_wt_oid = wt_oid;
+                    if effective_wt_oid != *idx_oid {
+                        let abs = work_tree.join(path);
+                        if let Ok(raw) = fs::read(&abs) {
+                            let raw_oid =
+                                grit_lib::odb::Odb::hash_object_data(ObjectKind::Blob, &raw);
+                            if raw_oid == *idx_oid {
+                                effective_wt_oid = *idx_oid;
+                            }
+                        }
+                    }
+                    let content_matches = effective_wt_oid == *idx_oid && wt_mode == idx_canonical;
+                    let racy_clean =
+                        idx_entry.size == 0 && index_entry_is_racy(idx_entry, index_mtime);
                     // Git's `run_diff_files` reports a file as modified whenever the worktree
                     // stat tuple disagrees with the index, even if re-hashing the content would
                     // yield the same OID (it never re-hashes to clear the change). Only suppress
@@ -977,6 +992,7 @@ fn collect_changes(
                     if content_matches
                         && index_stat_is_trusted(idx_entry)
                         && stat_agrees
+                        && !racy_clean
                         && !idx_entry.intent_to_add()
                     {
                         continue;
@@ -984,11 +1000,15 @@ fn collect_changes(
                     if content_matches
                         && index_stat_is_trusted(idx_entry)
                         && git_dir_allows_index_refresh(&repo.git_dir)
+                        && !racy_clean
                         && !idx_entry.intent_to_add()
                     {
                         continue;
                     }
-                    if wt_oid != *idx_oid || wt_mode != idx_canonical || idx_entry.intent_to_add() {
+                    if effective_wt_oid != *idx_oid
+                        || wt_mode != idx_canonical
+                        || idx_entry.intent_to_add()
+                    {
                         // Detect type changes (e.g., symlink ↔ regular, regular ↔ submodule)
                         let status = if mode_type(idx_canonical) != mode_type(wt_mode) {
                             'T'
@@ -1003,7 +1023,7 @@ fn collect_changes(
                                 old_mode: idx_canonical,
                                 new_mode: wt_mode,
                                 old_oid: *idx_oid,
-                                new_oid: wt_oid,
+                                new_oid: effective_wt_oid,
                                 intent_to_add: idx_entry.intent_to_add(),
                             },
                         );
@@ -1026,7 +1046,7 @@ fn collect_changes(
                                     old_mode: idx_canonical,
                                     new_mode: wt_mode,
                                     old_oid: *idx_oid,
-                                    new_oid: wt_oid,
+                                    new_oid: effective_wt_oid,
                                     intent_to_add: false,
                                 },
                             );
@@ -1731,11 +1751,41 @@ fn path_component_is_not_directory(err: &std::io::Error) -> bool {
     false
 }
 
+fn index_file_mtime_pair(index_path: &Path) -> Option<(u32, u32)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(index_path).ok()?;
+        return Some((meta.mtime() as u32, meta.mtime_nsec() as u32));
+    }
+    #[cfg(not(unix))]
+    {
+        let meta = fs::metadata(index_path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some((mtime.as_secs() as u32, mtime.subsec_nanos()))
+    }
+}
+
+fn index_entry_is_racy(index_entry: &IndexEntry, index_mtime: Option<(u32, u32)>) -> bool {
+    let Some((index_mtime_sec, _index_mtime_nsec)) = index_mtime else {
+        return false;
+    };
+    if index_mtime_sec == 0 {
+        return false;
+    }
+    index_mtime_sec <= index_entry.mtime_sec
+}
+
 fn read_worktree_info_fast(
     repo: &Repository,
     super_worktree: &Path,
     abs_path: &Path,
     index_entry: &IndexEntry,
+    index_mtime: Option<(u32, u32)>,
 ) -> Result<WorktreeStatus> {
     if index_entry.assume_unchanged() || index_entry.skip_worktree() {
         return Ok(WorktreeStatus::Unchanged);
@@ -1791,7 +1841,8 @@ fn read_worktree_info_fast(
     // Symlinks: when lstat matches the index, skip readlink+hash (matches Git `ce_match_stat`;
     // needed so `diff-files` agrees with `apply` after symlink-only updates — see t4115).
     if canonicalize_mode(index_entry.mode) == MODE_SYMLINK && meta.file_type().is_symlink() {
-        if stat_matches(index_entry, &meta) {
+        let smudged_racy = index_entry.size == 0 && index_entry_is_racy(index_entry, index_mtime);
+        if stat_matches(index_entry, &meta) && !smudged_racy {
             return Ok(WorktreeStatus::Unchanged);
         }
     }
@@ -1799,7 +1850,8 @@ fn read_worktree_info_fast(
     // Fast path: if stat info matches the index, file is unchanged.
     // But also check if the index mode differs from the worktree mode
     // (e.g., after git update-index --chmod=+x).
-    if meta.file_type().is_file() && stat_matches(index_entry, &meta) {
+    let smudged_racy = index_entry.size == 0 && index_entry_is_racy(index_entry, index_mtime);
+    if meta.file_type().is_file() && stat_matches(index_entry, &meta) && !smudged_racy {
         let wt_mode = if meta.permissions().mode() & 0o111 != 0 {
             MODE_EXECUTABLE
         } else {
