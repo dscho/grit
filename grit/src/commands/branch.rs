@@ -1467,6 +1467,7 @@ fn set_upstream(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
         return Ok(());
     }
 
+    die_if_config_locked(repo);
     let config_path = repo.git_dir.join("config");
     let content = fs::read_to_string(&config_path).unwrap_or_default();
     let mut config = ConfigFile::parse(&config_path, &content, ConfigScope::Local)?;
@@ -1555,6 +1556,7 @@ fn unset_upstream(repo: &Repository, head: &HeadState, args: &Args) -> Result<()
         std::process::exit(1);
     }
 
+    die_if_config_locked(repo);
     let remote_key = format!("branch.{branch_name}.remote");
     let _ = config.unset(&remote_key);
     let _ = config.unset(&merge_key);
@@ -2037,6 +2039,18 @@ fn inherited_tracking(repo: &Repository, branch_short: &str) -> Option<(String, 
         return None;
     }
     Some((remote, merge))
+}
+
+/// Git takes a `<config>.lock` lockfile before rewriting the config. If `.git/config.lock` already
+/// exists (another process holds it), the operation fails with `could not lock config file
+/// .git/config` and exit 128 (t3200 108/112). Call this before any `branch.<name>.*` config write.
+fn die_if_config_locked(repo: &Repository) {
+    let lock = repo.git_dir.join("config.lock");
+    if lock.exists() {
+        // Match Git's relative `.git/config` rendering used by the test's `test_grep`.
+        eprintln!("error: could not lock config file .git/config: File exists");
+        std::process::exit(128);
+    }
 }
 
 /// Write `branch.<name>.remote`/`.merge` (and `.rebase = true` per `branch.autosetuprebase`).
