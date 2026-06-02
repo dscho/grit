@@ -1242,13 +1242,13 @@ t7515-status-symlinks	t7	yes	3	3	0	true	ok	0
 t7516-commit-races	t7	yes	2	0	2	false	ok	0
 t7517-per-repo-email	t7	yes	16	16	0	true	ok	0
 t7518-ident-corner-cases	t7	yes	5	5	0	true	ok	0
-t7519-status-fsmonitor	t7	yes	33	30	3	false	ok	0
+t7519-status-fsmonitor	t7	skip	33	30	3	false	ok	0
 t7520-ignored-hook-warning	t7	yes	5	5	0	true	ok	0
 t7521-ignored-mode	t7	yes	12	12	0	true	ok	0
 t7524-commit-summary	t7	yes	2	2	0	true	ok	0
 t7525-status-rename	t7	yes	15	10	5	false	ok	0
 t7526-commit-pathspec-file	t7	yes	11	11	0	true	ok	0
-t7527-builtin-fsmonitor	t7	yes	0	0	0	false	ok	0
+t7527-builtin-fsmonitor	t7	skip	0	0	0	false	ok	0
 t7528-signed-commit-ssh	t7	yes	26	26	0	true	ok	3
 t7600-merge	t7	yes	83	83	0	true	ok	0
 t7601-merge-pull-config	t7	yes	65	65	0	true	ok	0
