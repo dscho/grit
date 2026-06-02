@@ -32,6 +32,8 @@
     restore patch mode with `--source` update only the worktree, not the index.
   - Completed: `t2060-switch.sh` (16/16). Fixed switch's commit-ish rejection/advice, remote
     branch guessing with `checkout.guess`, and refusal while a merge is in progress.
+  - Completed: `t2020-checkout-detach.sh` (26/26). Added detached HEAD orphan warnings,
+    previous-HEAD descriptions, tracking output parity, and `GIT_PRINT_SHA1_ELLIPSIS` formatting.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---

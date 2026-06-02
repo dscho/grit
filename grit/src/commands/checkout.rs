@@ -1389,7 +1389,7 @@ pub fn run(mut args: Args) -> Result<()> {
     // Try as a commit (detached HEAD)
     match resolve_to_commit(&repo, &target) {
         Ok(oid) => {
-            let result = detach_head(&repo, &oid, switch_force);
+            let result = detach_head_with_label(&repo, &oid, switch_force, &target);
             if result.is_ok() && RECURSE_SUBMODULES.with(|r| r.get()) && target == "first" {
                 let _ = crate::commands::submodule::unset_linked_worktree_submodule_core_worktrees(
                     &repo,
@@ -2060,7 +2060,7 @@ fn switch_branch(
                         format_tracking_info(repo, branch_name, AheadBehindMode::Full, true)
                     {
                         if !s.is_empty() {
-                            eprintln!("{}", s.trim_end_matches('\n'));
+                            println!("{}", s.trim_end_matches('\n'));
                         }
                     }
                 }
@@ -2185,6 +2185,10 @@ fn switch_branch(
         }
     }
 
+    if let HeadState::Detached { oid: old_detached } = head {
+        print_detached_checkout_leave_message(repo, old_detached, target_oid)?;
+    }
+
     // Update HEAD before appending the checkout reflog so `@{-1}` / `git switch -`
     // see the branch we are leaving as the previous checkout (matches Git).
     std::fs::write(repo.git_dir.join("HEAD"), format!("ref: {branch_ref}\n"))?;
@@ -2214,7 +2218,7 @@ fn switch_branch(
         if !q.get() {
             if let Ok(s) = format_tracking_info(repo, branch_name, AheadBehindMode::Full, true) {
                 if !s.is_empty() {
-                    eprintln!("{}", s.trim_end_matches('\n'));
+                    println!("{}", s.trim_end_matches('\n'));
                 }
             }
         }
@@ -2827,15 +2831,30 @@ fn force_reset_to_head(repo: &Repository) -> Result<()> {
 
 /// Detach HEAD at a specific commit.
 fn detach_head_explicit(repo: &Repository, oid: &ObjectId, force: bool) -> Result<()> {
-    detach_head_inner(repo, oid, force, true)
+    detach_head_inner(repo, oid, force, true, None)
 }
 
 /// Detach HEAD at `oid` (used by `bisect` and `checkout`).
 pub(crate) fn detach_head(repo: &Repository, oid: &ObjectId, force: bool) -> Result<()> {
-    detach_head_inner(repo, oid, force, false)
+    detach_head_inner(repo, oid, force, false, None)
 }
 
-fn detach_head_inner(repo: &Repository, oid: &ObjectId, force: bool, explicit: bool) -> Result<()> {
+fn detach_head_with_label(
+    repo: &Repository,
+    oid: &ObjectId,
+    force: bool,
+    label: &str,
+) -> Result<()> {
+    detach_head_inner(repo, oid, force, false, Some(label))
+}
+
+fn detach_head_inner(
+    repo: &Repository,
+    oid: &ObjectId,
+    force: bool,
+    explicit: bool,
+    label: Option<&str>,
+) -> Result<()> {
     let head = resolve_head(&repo.git_dir)?;
     let old_head_commit = head.oid().copied();
 
@@ -2857,6 +2876,10 @@ fn detach_head_inner(repo: &Repository, oid: &ObjectId, force: bool, explicit: b
         )?;
     } else {
         run_post_checkout_hook(repo, old_head_commit.as_ref(), oid, true)?;
+    }
+
+    if let HeadState::Detached { oid: old_detached } = head {
+        print_detached_checkout_leave_message(repo, old_detached, *oid)?;
     }
 
     // Write reflog entries
@@ -2884,7 +2907,12 @@ fn detach_head_inner(repo: &Repository, oid: &ObjectId, force: bool, explicit: b
     if explicit {
         print_detached_head_message_explicit(repo, oid)?;
     } else {
-        print_detached_head_message(repo, oid)?;
+        print_detached_head_message_inner(
+            repo,
+            oid,
+            matches!(head, HeadState::Detached { .. }),
+            label,
+        )?;
     }
     Ok(())
 }
@@ -5502,17 +5530,122 @@ pub(crate) fn apply_accepted_hunks(
 
 /// Print detached HEAD message.
 fn print_detached_head_message(repo: &Repository, oid: &ObjectId) -> Result<()> {
-    print_detached_head_message_inner(repo, oid, false)
+    print_detached_head_message_inner(repo, oid, false, None)
+}
+
+fn print_detached_checkout_leave_message(
+    repo: &Repository,
+    old_oid: ObjectId,
+    new_oid: ObjectId,
+) -> Result<()> {
+    if old_oid == new_oid {
+        return Ok(());
+    }
+    let count = count_first_parent_commits_not_reachable(repo, old_oid, new_oid)?;
+    let abbrev_len = ConfigSet::load(Some(&repo.git_dir), true)
+        .ok()
+        .and_then(|cfg| cfg.get("core.abbrev"))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(7);
+    let short = abbreviate_object_id(repo, old_oid, abbrev_len)
+        .unwrap_or_else(|_| old_oid.to_hex()[..abbrev_len.min(40)].to_string());
+    let short = maybe_add_sha1_ellipsis(short);
+    let subject = commit_subject(repo, old_oid).unwrap_or_default();
+    if count > 0 {
+        let noun = if count == 1 { "commit" } else { "commits" };
+        eprintln!("Warning: you are leaving {count} {noun} behind, not connected to");
+        eprintln!("any of your branches:");
+        eprintln!();
+        eprintln!("  {short} {subject}");
+        eprintln!();
+    } else {
+        eprintln!("Previous HEAD position was {short} {subject}");
+    }
+    Ok(())
+}
+
+fn count_first_parent_commits_not_reachable(
+    repo: &Repository,
+    start: ObjectId,
+    new_tip: ObjectId,
+) -> Result<usize> {
+    let mut protected: Vec<ObjectId> = vec![new_tip];
+    protected.extend(
+        refs::list_refs(&repo.git_dir, "refs/")
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(_, oid)| oid),
+    );
+
+    let mut count = 0usize;
+    let mut cur = start;
+    for _ in 0..1024 {
+        if protected
+            .iter()
+            .any(|tip| commit_reaches(repo, *tip, cur).unwrap_or(false))
+        {
+            break;
+        }
+        count += 1;
+        let obj = repo.odb.read(&cur)?;
+        let commit = parse_commit(&obj.data)?;
+        let Some(parent) = commit.parents.first().copied() else {
+            break;
+        };
+        cur = parent;
+    }
+    Ok(count)
+}
+
+fn commit_reaches(repo: &Repository, tip: ObjectId, needle: ObjectId) -> Result<bool> {
+    let mut stack = vec![tip];
+    let mut seen = HashSet::new();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if oid == needle {
+            return Ok(true);
+        }
+        let Ok(obj) = repo.odb.read(&oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        let commit = parse_commit(&obj.data)?;
+        stack.extend(commit.parents);
+    }
+    Ok(false)
+}
+
+fn commit_subject(repo: &Repository, oid: ObjectId) -> Result<String> {
+    let obj = repo.odb.read(&oid)?;
+    let commit = parse_commit(&obj.data)?;
+    Ok(commit
+        .message
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string())
+}
+
+fn maybe_add_sha1_ellipsis(s: String) -> String {
+    match std::env::var("GIT_PRINT_SHA1_ELLIPSIS") {
+        Ok(v) if v.eq_ignore_ascii_case("yes") => format!("{s}..."),
+        _ => s,
+    }
 }
 
 fn print_detached_head_message_explicit(repo: &Repository, oid: &ObjectId) -> Result<()> {
-    print_detached_head_message_inner(repo, oid, true)
+    print_detached_head_message_inner(repo, oid, true, None)
 }
 
 fn print_detached_head_message_inner(
     repo: &Repository,
     oid: &ObjectId,
     explicit_detach_flag: bool,
+    label: Option<&str>,
 ) -> Result<()> {
     let obj = repo.odb.read(oid)?;
     if obj.kind != ObjectKind::Commit {
@@ -5522,6 +5655,7 @@ fn print_detached_head_message_inner(
     let subject = commit.message.lines().next().unwrap_or("").trim();
     let abbrev =
         abbreviate_object_id(repo, *oid, 12).unwrap_or_else(|_| oid.to_hex()[..12].to_owned());
+    let abbrev = maybe_add_sha1_ellipsis(abbrev);
 
     // Print detached HEAD advice unless:
     // 1. advice.detachedHead is false
@@ -5535,25 +5669,20 @@ fn print_detached_head_message_inner(
             Err(_) => true,
         };
     if show_advice {
-        checkout_eprintln!(
-            "Note: switching to '{}'.\n\
-             \n\
-             You are in 'detached HEAD' state. You can look around, make experimental\n\
-             changes and commit them, and you can discard any commits you make in this\n\
-             state without impacting any branches by switching back to a branch.\n\
-             \n\
-             If you want to create a new branch to retain commits you create, you may\n\
-             do so (now or later) by using -c with the switch command. Example:\n\
-             \n\
-               git switch -c <new-branch-name>\n\
-             \n\
-             Or undo this operation with:\n\
-             \n\
-               git switch -\n\
-             \n\
-             Turn off this advice by setting config variable advice.detachedHead to false\n",
-            oid
+        let display = label.map_or_else(|| oid.to_string(), str::to_string);
+        let msg = format!(
+            "Note: switching to '{display}'.\n\n\
+You are in 'detached HEAD' state. You can look around, make experimental\n\
+changes and commit them, and you can discard any commits you make in this\n\
+state without impacting any branches by switching back to a branch.\n\n\
+If you want to create a new branch to retain commits you create, you may\n\
+do so (now or later) by using -c with the switch command. Example:\n\n  \
+git switch -c <new-branch-name>\n\n\
+Or undo this operation with:\n\n  \
+git switch -\n\n\
+Turn off this advice by setting config variable advice.detachedHead to false\n"
         );
+        checkout_eprintln!("{}", msg);
     }
 
     checkout_eprintln!("HEAD is now at {} {}", abbrev, subject);
