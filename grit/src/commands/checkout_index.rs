@@ -523,6 +523,9 @@ fn checkout_entry(
             if !args.quiet {
                 eprintln!("{rel_path} already exists, no checkout");
             }
+            if args.all {
+                return Err(anyhow::anyhow!("{rel_path} already exists, no checkout"));
+            }
             return Ok(outcome);
         }
     }

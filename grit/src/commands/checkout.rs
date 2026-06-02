@@ -1546,7 +1546,10 @@ fn run_post_checkout_hook(
     new_oid: &ObjectId,
     is_branch_checkout: bool,
 ) -> Result<()> {
-    let head = resolve_head(&repo.git_dir)?;
+    let mut head = resolve_head(&repo.git_dir)?;
+    if head.oid().is_some_and(|oid| *oid == ObjectId::zero()) {
+        head = HeadState::Invalid;
+    }
     let _ = run_reference_transaction_committed_for_head_update(
         repo,
         &head,
@@ -2021,11 +2024,9 @@ fn switch_branch(
         bail!("this operation must be run in a work tree");
     }
 
-    let head = resolve_head(&repo.git_dir)?;
-
-    // Fail gracefully when HEAD is corrupt (empty or garbage)
-    if matches!(head, HeadState::Invalid) {
-        bail!("fatal: invalid HEAD - your HEAD file may be corrupt");
+    let mut head = resolve_head(&repo.git_dir)?;
+    if head.oid().is_some_and(|oid| *oid == ObjectId::zero()) {
+        head = HeadState::Invalid;
     }
 
     // Check if already on this branch (must come BEFORE branch-in-use check)

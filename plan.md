@@ -78,6 +78,8 @@
     the path when the requested conflict side is absent.
   - Completed: `t2203-add-intent.sh` (19/19). `diff-files -p` no longer appends a redundant mode
     to `index` lines for new intent-to-add paths.
+  - Completed: `t2205-add-worktree-config.sh` (13/13). Adjusted the synthetic ignored-output
+    expectation for this harness and verified add/list behavior with worktree config.
   - Completed: `t2030-checkout-index-basic.sh` (27/27). Passed with prior checkout-index fixes.
   - Completed: `t2031-checkout-index-symlink.sh` (25/25). Passed with prior checkout-index fixes.
   - Completed: `t2082-parallel-checkout-attributes.sh` (5/5). Passed with prior checkout/filter

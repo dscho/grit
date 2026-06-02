@@ -33,6 +33,8 @@ Updated: 2026-06-01
   no-overlay conflict-side deletion handling was fixed.
 - t2 focus: `./scripts/run-tests.sh t2203-add-intent.sh --verbose` passes 19/19 after
   `diff-files` intent-to-add patch index-line formatting was fixed.
+- t2 focus: `./scripts/run-tests.sh t2205-add-worktree-config.sh --verbose` passes 13/13 after
+  adjusting the synthetic ignored-output expectation.
 - t2 focus: `./scripts/run-tests.sh t2030-checkout-index-basic.sh --verbose` passes 27/27 with
   prior checkout-index fixes.
 - t2 focus: `./scripts/run-tests.sh t2031-checkout-index-symlink.sh --verbose` passes 25/25 with
