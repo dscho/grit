@@ -3397,7 +3397,15 @@ fn preprocess_blame_h_rev(rest: &[String]) -> Vec<String> {
 fn strip_subcommand_leading_change_dir(subcmd: &str, rest: &mut Vec<String>) -> Result<()> {
     if matches!(
         subcmd,
-        "switch" | "checkout" | "commit" | "diff" | "diff-index" | "diff-tree" | "diff-files"
+        "switch"
+            | "checkout"
+            | "commit"
+            | "diff"
+            | "diff-index"
+            | "diff-tree"
+            | "diff-files"
+            // `git branch -C <old> <new>` is force-copy, not a leading change-dir.
+            | "branch"
     ) {
         return Ok(());
     }
