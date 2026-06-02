@@ -3001,7 +3001,15 @@ fn switch_to_tree(
 
     // Perform the actual working tree update.
     // When force, write all entries even if OID matches (to restore dirty files).
-    checkout_index_to_worktree(repo, &old_index, &new_index, &work_tree, force, true, true)?;
+    checkout_index_to_worktree(
+        repo,
+        &old_index,
+        &new_index,
+        &work_tree,
+        force,
+        true,
+        !recurse_submodules,
+    )?;
 
     warn_sparse_paths_already_present(repo, &old_index, &new_index, &work_tree);
 
@@ -3497,6 +3505,16 @@ pub(crate) fn check_untracked_overwrite(
                 continue;
             }
             if abs_path.exists() || abs_path.is_symlink() {
+                // A populated submodule working tree left behind from a previous checkout is not
+                // an ordinary untracked directory. Git allows a target gitlink to reuse it (and,
+                // with recursive checkout, update it) instead of rejecting it as an untracked
+                // path in the way.
+                if new_entry.mode == MODE_GITLINK
+                    && abs_path.is_dir()
+                    && read_submodule_head_oid(&abs_path).is_some()
+                {
+                    continue;
+                }
                 // Empty directory at a path that becomes a submodule: Git removes the directory
                 // during checkout (t3426 `mkdir sub1` before `rebase` onto `add_sub1`).
                 if new_entry.mode == MODE_GITLINK && abs_path.is_dir() {
@@ -6054,6 +6072,24 @@ pub(crate) fn checkout_index_to_worktree(
                     .is_some_and(|e| e.mode == MODE_GITLINK && abs.join(".git").exists());
             if skip_populated_submodule {
                 // keep populated submodule dirs when checkout preserves dropped gitlinks
+            } else if !preserve_dropped_gitlink_dirs
+                && old_map
+                    .get(old_path.as_slice())
+                    .is_some_and(|e| e.mode == MODE_GITLINK)
+            {
+                let _ =
+                    crate::commands::submodule::absorb_submodule_dot_git_dir_into_modules(
+                        repo, &rel,
+                    );
+                if let Ok(modules_git) =
+                    submodule_modules_git_dir_for_checkout(repo, work_tree, &rel)
+                {
+                    let _ =
+                        crate::commands::submodule::unset_submodule_core_worktree_config(
+                            &modules_git,
+                        );
+                }
+                let _ = std::fs::remove_dir_all(&abs);
             } else if old_map.get(old_path.as_slice()).is_some_and(|e| {
                 e.mode == MODE_GITLINK && !git_dir_is_nested_modules_repo(&repo.git_dir)
             }) {
