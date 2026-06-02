@@ -48,6 +48,11 @@ pub struct Args {
     #[arg(long = "stat")]
     pub stat: bool,
 
+    /// `--submodule[=<format>]` diff option (accepted for compatibility; the inner
+    /// patch text already renders submodule changes as ordinary file sections).
+    #[arg(long = "submodule", value_name = "FORMAT", num_args = 0..=1, default_missing_value = "log", require_equals = true)]
+    pub submodule: Option<String>,
+
     #[arg(long = "color", default_missing_value = "always", num_args = 0..=1, require_equals = true)]
     pub color: Option<String>,
 
@@ -346,10 +351,18 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
     let mut current: Option<Patch> = None;
     let mut in_header = true;
     let mut current_filename: Option<String> = None;
-    let mut skip_diff_header = false;
+    let mut pending: Option<DiffHeader> = None;
 
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("commit ") {
+            if let Some(h) = pending.take() {
+                let summary = h.summary();
+                if let Some(p) = current.as_mut() {
+                    p.diffsize += summary.lines().count() as i32;
+                }
+                buf.push_str(&summary);
+                current_filename = Some(h.context_filename());
+            }
             if let Some(p) = current.take() {
                 list.push(finish_patch(p, &buf)?);
                 buf.clear();
@@ -383,25 +396,77 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
         })?;
 
         if line.starts_with("diff --git ") {
+            // Flush any previous (hunk-less, e.g. pure mode change) diff header first.
+            if let Some(h) = pending.take() {
+                let summary = h.summary();
+                util.diffsize += summary.lines().count() as i32;
+                buf.push_str(&summary);
+                current_filename = Some(h.context_filename());
+            }
             in_header = false;
             buf.push('\n');
             if util.diff_offset == 0 {
                 util.diff_offset = buf.len();
             }
-            let (summary, fname) = parse_diff_git_header(line);
-            util.diffsize += summary.lines().count() as i32;
-            buf.push_str(&summary);
-            current_filename = Some(fname);
-            skip_diff_header = true;
+            pending = Some(DiffHeader::from_diff_git_line(line));
             continue;
         }
 
-        if skip_diff_header {
-            if line.starts_with("@@ ") {
-                skip_diff_header = false;
-            } else {
+        // While accumulating a `diff --git` header, capture mode/new/delete/rename
+        // metadata and consume the header lines until the first hunk or content.
+        if let Some(h) = pending.as_mut() {
+            if line.starts_with("old mode ") {
+                h.old_mode = line["old mode ".len()..].trim().to_string();
                 continue;
             }
+            if line.starts_with("new mode ") {
+                h.new_mode = line["new mode ".len()..].trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("new file mode ") {
+                h.is_new = true;
+                h.new_mode = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("deleted file mode ") {
+                h.is_delete = true;
+                h.old_mode = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("rename from ") {
+                h.is_rename = true;
+                h.old_name = rest.to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("rename to ") {
+                h.is_rename = true;
+                h.new_name = rest.to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("copy from ") {
+                h.old_name = rest.to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("copy to ") {
+                h.new_name = rest.to_string();
+                continue;
+            }
+            if line.starts_with("similarity index ")
+                || line.starts_with("dissimilarity index ")
+                || line.starts_with("index ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with("Binary files ")
+                || line.starts_with("GIT binary patch")
+            {
+                continue;
+            }
+            // First real content line (a hunk or otherwise): flush the summary now.
+            let summary = h.summary();
+            util.diffsize += summary.lines().count() as i32;
+            buf.push_str(&summary);
+            current_filename = Some(h.context_filename());
+            pending = None;
         }
 
         if in_header {
@@ -463,6 +528,14 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
         util.diffsize += 1;
     }
 
+    if let Some(h) = pending.take() {
+        let summary = h.summary();
+        if let Some(p) = current.as_mut() {
+            p.diffsize += summary.lines().count() as i32;
+        }
+        buf.push_str(&summary);
+    }
+
     if let Some(p) = current {
         list.push(finish_patch(p, &buf)?);
     }
@@ -478,22 +551,73 @@ fn finish_patch(mut p: Patch, buf: &str) -> Result<Patch> {
     Ok(p)
 }
 
-fn parse_diff_git_header(line: &str) -> (String, String) {
-    let rest = line.strip_prefix("diff --git ").unwrap_or("");
-    let mut parts = rest.split_whitespace();
-    let a_raw = parts.next().unwrap_or("");
-    let b_raw = parts.next().unwrap_or("");
-    let a = a_raw.strip_prefix("a/").unwrap_or(a_raw);
-    let b = b_raw.strip_prefix("b/").unwrap_or(b_raw);
-    let summary = format!(" ## {b} ##\n");
-    (
-        summary,
-        if b.is_empty() {
-            a.to_string()
+/// Accumulated state for one `diff --git` section, used to render the range-diff
+/// `## ... ##` file summary line (mirrors Git `range-diff.c`'s use of
+/// `parse_git_diff_header`).
+struct DiffHeader {
+    old_name: String,
+    new_name: String,
+    is_new: bool,
+    is_delete: bool,
+    is_rename: bool,
+    old_mode: String,
+    new_mode: String,
+}
+
+impl DiffHeader {
+    fn from_diff_git_line(line: &str) -> Self {
+        let rest = line.strip_prefix("diff --git ").unwrap_or("");
+        let mut parts = rest.split_whitespace();
+        let a_raw = parts.next().unwrap_or("");
+        let b_raw = parts.next().unwrap_or("");
+        let a = a_raw.strip_prefix("a/").unwrap_or(a_raw);
+        let b = b_raw.strip_prefix("b/").unwrap_or(b_raw);
+        DiffHeader {
+            old_name: a.to_string(),
+            new_name: b.to_string(),
+            is_new: false,
+            is_delete: false,
+            is_rename: false,
+            old_mode: String::new(),
+            new_mode: String::new(),
+        }
+    }
+
+    /// The `## ... ##` summary line (with trailing newline).
+    fn summary(&self) -> String {
+        let mut s = String::from(" ## ");
+        if self.is_new {
+            s.push_str(&format!("{} (new)", self.new_name));
+        } else if self.is_delete {
+            s.push_str(&format!("{} (deleted)", self.old_name));
+        } else if self.is_rename {
+            s.push_str(&format!("{} => {}", self.old_name, self.new_name));
         } else {
-            b.to_string()
-        },
-    )
+            s.push_str(&self.new_name);
+        }
+        if !self.old_mode.is_empty()
+            && !self.new_mode.is_empty()
+            && self.old_mode != self.new_mode
+            && !self.is_new
+            && !self.is_delete
+        {
+            s.push_str(&format!(
+                " (mode change {} => {})",
+                self.old_mode, self.new_mode
+            ));
+        }
+        s.push_str(" ##\n");
+        s
+    }
+
+    /// File name used for `@@ <file>: <func>` inner-hunk headers.
+    fn context_filename(&self) -> String {
+        if self.is_delete {
+            self.old_name.clone()
+        } else {
+            self.new_name.clone()
+        }
+    }
 }
 
 fn find_exact_matches(a: &mut [Patch], b: &mut [Patch]) {
@@ -516,11 +640,26 @@ fn find_exact_matches(a: &mut [Patch], b: &mut [Patch]) {
     }
 }
 
+/// Cost of pairing two patch texts: the number of lines a real unified diff
+/// (Myers, 3 context lines) of them would emit, mirroring Git `range-diff.c`'s
+/// `diffsize()` (each hunk header + each emitted body line counts once).
 fn diffsize_lines(x: &str, y: &str) -> i32 {
+    use grit_lib::diff::unified_diff_with_prefix_and_funcname;
     if x == y {
         return 0;
     }
-    line_diff_inner(x, y).lines().count() as i32
+    let raw = unified_diff_with_prefix_and_funcname(
+        x, y, "a", "b", 3, 0, "", "", None, /* indent_heuristic */ true,
+        /* quote_path_fully */ false,
+    );
+    let mut count = 0i32;
+    for line in raw.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        count += 1;
+    }
+    count
 }
 
 fn get_correspondences(a: &mut [Patch], b: &mut [Patch], creation_factor: u64) {
@@ -813,47 +952,6 @@ fn truncate_funcname(text: &str) -> String {
     } else {
         text.to_owned()
     }
-}
-
-/// Git-style line diff (one prefix character per output line).
-fn line_diff_inner(a: &str, b: &str) -> String {
-    let la: Vec<&str> = a.lines().collect();
-    let lb: Vec<&str> = b.lines().collect();
-    let n = la.len();
-    let m = lb.len();
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if la[i] == lb[j] {
-                1 + dp[i + 1][j + 1]
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let mut i = 0usize;
-    let mut j = 0usize;
-    let mut out = String::new();
-    while i < n || j < m {
-        if i < n && j < m && la[i] == lb[j] {
-            out.push(' ');
-            out.push_str(la[i]);
-            out.push('\n');
-            i += 1;
-            j += 1;
-        } else if i < n && (j == m || dp[i + 1][j] >= dp[i][j + 1]) {
-            out.push('-');
-            out.push_str(la[i]);
-            out.push('\n');
-            i += 1;
-        } else if j < m {
-            out.push('+');
-            out.push_str(lb[j]);
-            out.push('\n');
-            j += 1;
-        }
-    }
-    out
 }
 
 fn write_pair_header(
