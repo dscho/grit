@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 focus: `./scripts/run-tests.sh t2071-restore-patch.sh --verbose` passes 15/15 after restore
+  patch pathspec/source handling fixes.
 - t2 cwd-empty: `./scripts/run-tests.sh t2501-cwd-empty.sh --verbose` passes 24/24 after
   checkout/rebase/rm/apply/stash cwd-removal guards.
 - t2 focus: `./scripts/run-tests.sh t2061-switch-orphan.sh --verbose` passes 15/15 after making

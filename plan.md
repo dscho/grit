@@ -28,6 +28,8 @@
     parent cleanup from removing the current working directory, refusing checkout/rebase/revert
     transitions that would replace the current directory with a file, and teaching stash
     `--include-untracked` to clean from the worktree root while preserving cwd.
+  - Completed: `t2071-restore-patch.sh` (15/15). Fixed `restore -p` with no pathspec and made
+    restore patch mode with `--source` update only the worktree, not the index.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---

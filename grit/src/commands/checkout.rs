@@ -4943,6 +4943,23 @@ pub(crate) fn checkout_patch(
     source: Option<&str>,
     paths: &[String],
 ) -> Result<()> {
+    checkout_patch_inner(repo, source, paths, false)
+}
+
+pub(crate) fn restore_patch_worktree_only(
+    repo: &Repository,
+    source: Option<&str>,
+    paths: &[String],
+) -> Result<()> {
+    checkout_patch_inner(repo, source, paths, true)
+}
+
+fn checkout_patch_inner(
+    repo: &Repository,
+    source: Option<&str>,
+    paths: &[String],
+    worktree_only: bool,
+) -> Result<()> {
     use similar::TextDiff;
     use std::io::{self, BufRead, Write};
 
@@ -5113,13 +5130,16 @@ pub(crate) fn checkout_patch(
 
         let hunk_texts: Vec<String> = hunks.iter().map(|h| format!("{h}")).collect();
 
-        let update_index = matches!(patch_mode, PatchMode::HeadTree | PatchMode::OtherTree)
+        let update_index = !worktree_only
+            && matches!(patch_mode, PatchMode::HeadTree | PatchMode::OtherTree)
             && staged_data != source_data;
 
         // `checkout -p HEAD` / `@` always uses Git's `patch_mode_checkout_head` prompts and
         // `apply --cached` + `apply` verification, even when the index already matches HEAD.
         let prompt = match patch_mode {
-            PatchMode::HeadTree => "Discard this hunk from index and worktree [y,n,q,a,d,?]? ",
+            PatchMode::HeadTree if !worktree_only => {
+                "Discard this hunk from index and worktree [y,n,q,a,d,?]? "
+            }
             PatchMode::OtherTree if update_index => {
                 "Apply this hunk to index and worktree [y,n,q,a,d,?]? "
             }
@@ -5163,7 +5183,7 @@ pub(crate) fn checkout_patch(
                     skip_file = true;
                 }
                 "q" | "Q" => {
-                    if matches!(patch_mode, PatchMode::HeadTree) {
+                    if matches!(patch_mode, PatchMode::HeadTree) && !worktree_only {
                         apply_checkout_head_mode(
                             repo,
                             &mut index,
@@ -5195,7 +5215,7 @@ pub(crate) fn checkout_patch(
             }
         }
 
-        if matches!(patch_mode, PatchMode::HeadTree) {
+        if matches!(patch_mode, PatchMode::HeadTree) && !worktree_only {
             apply_checkout_head_mode(
                 repo,
                 &mut index,
