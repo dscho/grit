@@ -36,6 +36,10 @@ pub struct Args {
     #[arg(long = "no-dual-color")]
     pub no_dual_color: bool,
 
+    /// Explicit `--dual-color` (Git forces color output on when given).
+    #[arg(long = "dual-color")]
+    pub dual_color: bool,
+
     #[arg(long = "left-only")]
     pub left_only: bool,
 
@@ -47,6 +51,11 @@ pub struct Args {
 
     #[arg(long = "stat")]
     pub stat: bool,
+
+    /// `--submodule[=<format>]` diff option (accepted for compatibility; the inner
+    /// patch text already renders submodule changes as ordinary file sections).
+    #[arg(long = "submodule", value_name = "FORMAT", num_args = 0..=1, default_missing_value = "log", require_equals = true)]
+    pub submodule: Option<String>,
 
     #[arg(long = "color", default_missing_value = "always", num_args = 0..=1, require_equals = true)]
     pub color: Option<String>,
@@ -88,10 +97,56 @@ struct Patch {
 /// Parse argv after `range-diff` and run (used from `main` so `--` / pathspecs work).
 pub fn run_with_rest(rest: &[String]) -> Result<()> {
     upstream_synopsis_help::try_print_upstream_help_and_exit("range-diff", rest);
-    let mut argv = vec!["grit range-diff".to_string()];
-    argv.extend(rest.iter().cloned());
+    // Git's `parse_options` accepts options interspersed with the commit-range
+    // operands (e.g. `range-diff A...B --color --dual-color`). Clap's
+    // `trailing_var_arg` would swallow any option after the first operand, so
+    // move options ahead of operands (preserving everything after a literal `--`).
+    let argv = reorder_options_first(rest);
     let args = Args::try_parse_from(&argv).map_err(|e| anyhow::anyhow!("{e}"))?;
     run(args)
+}
+
+/// Reorder `range-diff` argv so options precede operands (stopping at `--`),
+/// returning a fresh argv with the program name prepended.
+fn reorder_options_first(rest: &[String]) -> Vec<String> {
+    let mut opts: Vec<String> = Vec::new();
+    let mut operands: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    let mut seen_dashdash = false;
+    while i < rest.len() {
+        let tok = &rest[i];
+        if seen_dashdash {
+            tail.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        if tok == "--" {
+            seen_dashdash = true;
+            tail.push(tok.clone());
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') && tok.len() > 1 {
+            opts.push(tok.clone());
+            // `--creation-factor N` / `-s` etc.: only `--creation-factor` (and its
+            // alias forms) consumes a following separate value token.
+            if (tok == "--creation-factor") && i + 1 < rest.len() {
+                opts.push(rest[i + 1].clone());
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        operands.push(tok.clone());
+        i += 1;
+    }
+    let mut argv = vec!["grit range-diff".to_string()];
+    argv.extend(opts);
+    argv.extend(operands);
+    argv.extend(tail);
+    argv
 }
 
 fn run(args: Args) -> Result<()> {
@@ -113,15 +168,26 @@ fn run(args: Args) -> Result<()> {
     find_exact_matches(&mut branch1, &mut branch2);
     get_correspondences(&mut branch1, &mut branch2, creation);
 
+    // Git uses one `--[no-]dual-color` toggle (`simple_color`, default -1). `--dual-color`
+    // sets it to 0 and forces color on; `--no-dual-color` sets it to 1 (simple colors).
+    let dual_color = !args.no_dual_color;
+    let force_color = args.dual_color && !args.no_dual_color;
+
     let use_color = !args.no_color
-        && args
-            .color
-            .as_deref()
-            .map(|c| c == "always" || c.is_empty())
-            .unwrap_or_else(|| {
-                std::io::stdout().is_terminal() || std::env::var_os("GIT_PAGER_IN_USE").is_some()
-            })
-        && !args.no_dual_color;
+        && (force_color
+            || args
+                .color
+                .as_deref()
+                .map(|c| c == "always" || c.is_empty())
+                .unwrap_or_else(|| {
+                    std::io::stdout().is_terminal()
+                        || std::env::var_os("GIT_PAGER_IN_USE").is_some()
+                }));
+    let use_color = use_color
+        && !matches!(
+            args.color.as_deref(),
+            Some("never") | Some("false") | Some("no")
+        );
 
     let abbrev_len = args
         .abbrev
@@ -139,6 +205,7 @@ fn run(args: Args) -> Result<()> {
         args.no_patch,
         args.stat,
         use_color,
+        dual_color,
         abbrev_len,
     )?;
 
@@ -290,12 +357,9 @@ fn read_patches_from_log(
         .arg("--date-order")
         .arg("--decorate=no")
         .arg("--no-prefix")
-        .arg("--output-indicator-new")
-        .arg(">")
-        .arg("--output-indicator-old")
-        .arg("<")
-        .arg("--output-indicator-context")
-        .arg("#")
+        .arg("--output-indicator-new=>")
+        .arg("--output-indicator-old=<")
+        .arg("--output-indicator-context=#")
         .arg("--pretty=medium")
         .arg("-p");
     for arg in rev_args {
@@ -349,10 +413,19 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
     let mut current: Option<Patch> = None;
     let mut in_header = true;
     let mut current_filename: Option<String> = None;
-    let mut skip_diff_header = false;
+    let mut pending: Option<DiffHeader> = None;
 
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("commit ") {
+            // Flush a trailing hunk-less diff header from the previous commit. The
+            // file name is irrelevant here since the new commit resets it below.
+            if let Some(h) = pending.take() {
+                let summary = h.summary();
+                if let Some(p) = current.as_mut() {
+                    p.diffsize += summary.lines().count() as i32;
+                }
+                buf.push_str(&summary);
+            }
             if let Some(p) = current.take() {
                 list.push(finish_patch(p, &buf)?);
                 buf.clear();
@@ -386,25 +459,77 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
         })?;
 
         if line.starts_with("diff --git ") {
+            // Flush any previous (hunk-less, e.g. pure mode change) diff header first.
+            if let Some(h) = pending.take() {
+                let summary = h.summary();
+                util.diffsize += summary.lines().count() as i32;
+                buf.push_str(&summary);
+                current_filename = Some(h.context_filename());
+            }
             in_header = false;
             buf.push('\n');
             if util.diff_offset == 0 {
                 util.diff_offset = buf.len();
             }
-            let (summary, fname) = parse_diff_git_header(line);
-            util.diffsize += summary.lines().count() as i32;
-            buf.push_str(&summary);
-            current_filename = Some(fname);
-            skip_diff_header = true;
+            pending = Some(DiffHeader::from_diff_git_line(line));
             continue;
         }
 
-        if skip_diff_header {
-            if line.starts_with("@@ ") {
-                skip_diff_header = false;
-            } else {
+        // While accumulating a `diff --git` header, capture mode/new/delete/rename
+        // metadata and consume the header lines until the first hunk or content.
+        if let Some(h) = pending.as_mut() {
+            if line.starts_with("old mode ") {
+                h.old_mode = line["old mode ".len()..].trim().to_string();
                 continue;
             }
+            if line.starts_with("new mode ") {
+                h.new_mode = line["new mode ".len()..].trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("new file mode ") {
+                h.is_new = true;
+                h.new_mode = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("deleted file mode ") {
+                h.is_delete = true;
+                h.old_mode = rest.trim().to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("rename from ") {
+                h.is_rename = true;
+                h.old_name = rest.to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("rename to ") {
+                h.is_rename = true;
+                h.new_name = rest.to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("copy from ") {
+                h.old_name = rest.to_string();
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("copy to ") {
+                h.new_name = rest.to_string();
+                continue;
+            }
+            if line.starts_with("similarity index ")
+                || line.starts_with("dissimilarity index ")
+                || line.starts_with("index ")
+                || line.starts_with("--- ")
+                || line.starts_with("+++ ")
+                || line.starts_with("Binary files ")
+                || line.starts_with("GIT binary patch")
+            {
+                continue;
+            }
+            // First real content line (a hunk or otherwise): flush the summary now.
+            let summary = h.summary();
+            util.diffsize += summary.lines().count() as i32;
+            buf.push_str(&summary);
+            current_filename = Some(h.context_filename());
+            pending = None;
         }
 
         if in_header {
@@ -417,8 +542,10 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
                 buf.push_str("\n\n");
                 let name = line.trim_end_matches(':');
                 buf.push_str(&format!(" ## {name} ##\n"));
-            } else if let Some(body) = line.strip_prefix("    ") {
-                let trimmed = body.trim_end();
+            } else if line.starts_with("    ") {
+                // Keep the full message line (including its 4-space indent), like
+                // Git's range-diff; only trailing whitespace is stripped.
+                let trimmed = line.trim_end_matches(char::is_whitespace);
                 buf.push_str(trimmed);
                 buf.push('\n');
             }
@@ -464,6 +591,14 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
         util.diffsize += 1;
     }
 
+    if let Some(h) = pending.take() {
+        let summary = h.summary();
+        if let Some(p) = current.as_mut() {
+            p.diffsize += summary.lines().count() as i32;
+        }
+        buf.push_str(&summary);
+    }
+
     if let Some(p) = current {
         list.push(finish_patch(p, &buf)?);
     }
@@ -479,22 +614,73 @@ fn finish_patch(mut p: Patch, buf: &str) -> Result<Patch> {
     Ok(p)
 }
 
-fn parse_diff_git_header(line: &str) -> (String, String) {
-    let rest = line.strip_prefix("diff --git ").unwrap_or("");
-    let mut parts = rest.split_whitespace();
-    let a_raw = parts.next().unwrap_or("");
-    let b_raw = parts.next().unwrap_or("");
-    let a = a_raw.strip_prefix("a/").unwrap_or(a_raw);
-    let b = b_raw.strip_prefix("b/").unwrap_or(b_raw);
-    let summary = format!(" ## {b} ##\n");
-    (
-        summary,
-        if b.is_empty() {
-            a.to_string()
+/// Accumulated state for one `diff --git` section, used to render the range-diff
+/// `## ... ##` file summary line (mirrors Git `range-diff.c`'s use of
+/// `parse_git_diff_header`).
+struct DiffHeader {
+    old_name: String,
+    new_name: String,
+    is_new: bool,
+    is_delete: bool,
+    is_rename: bool,
+    old_mode: String,
+    new_mode: String,
+}
+
+impl DiffHeader {
+    fn from_diff_git_line(line: &str) -> Self {
+        let rest = line.strip_prefix("diff --git ").unwrap_or("");
+        let mut parts = rest.split_whitespace();
+        let a_raw = parts.next().unwrap_or("");
+        let b_raw = parts.next().unwrap_or("");
+        let a = a_raw.strip_prefix("a/").unwrap_or(a_raw);
+        let b = b_raw.strip_prefix("b/").unwrap_or(b_raw);
+        DiffHeader {
+            old_name: a.to_string(),
+            new_name: b.to_string(),
+            is_new: false,
+            is_delete: false,
+            is_rename: false,
+            old_mode: String::new(),
+            new_mode: String::new(),
+        }
+    }
+
+    /// The `## ... ##` summary line (with trailing newline).
+    fn summary(&self) -> String {
+        let mut s = String::from(" ## ");
+        if self.is_new {
+            s.push_str(&format!("{} (new)", self.new_name));
+        } else if self.is_delete {
+            s.push_str(&format!("{} (deleted)", self.old_name));
+        } else if self.is_rename {
+            s.push_str(&format!("{} => {}", self.old_name, self.new_name));
         } else {
-            b.to_string()
-        },
-    )
+            s.push_str(&self.new_name);
+        }
+        if !self.old_mode.is_empty()
+            && !self.new_mode.is_empty()
+            && self.old_mode != self.new_mode
+            && !self.is_new
+            && !self.is_delete
+        {
+            s.push_str(&format!(
+                " (mode change {} => {})",
+                self.old_mode, self.new_mode
+            ));
+        }
+        s.push_str(" ##\n");
+        s
+    }
+
+    /// File name used for `@@ <file>: <func>` inner-hunk headers.
+    fn context_filename(&self) -> String {
+        if self.is_delete {
+            self.old_name.clone()
+        } else {
+            self.new_name.clone()
+        }
+    }
 }
 
 fn find_exact_matches(a: &mut [Patch], b: &mut [Patch]) {
@@ -517,11 +703,26 @@ fn find_exact_matches(a: &mut [Patch], b: &mut [Patch]) {
     }
 }
 
+/// Cost of pairing two patch texts: the number of lines a real unified diff
+/// (Myers, 3 context lines) of them would emit, mirroring Git `range-diff.c`'s
+/// `diffsize()` (each hunk header + each emitted body line counts once).
 fn diffsize_lines(x: &str, y: &str) -> i32 {
+    use grit_lib::diff::unified_diff_with_prefix_and_funcname;
     if x == y {
         return 0;
     }
-    line_diff_inner(x, y).lines().count() as i32
+    let raw = unified_diff_with_prefix_and_funcname(
+        x, y, "a", "b", 3, 0, "", "", None, /* indent_heuristic */ true,
+        /* quote_path_fully */ false,
+    );
+    let mut count = 0i32;
+    for line in raw.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
+        }
+        count += 1;
+    }
+    count
 }
 
 fn get_correspondences(a: &mut [Patch], b: &mut [Patch], creation_factor: u64) {
@@ -592,10 +793,12 @@ fn output(
     no_patch: bool,
     stat_mode: bool,
     use_color: bool,
+    dual_color: bool,
     abbrev_len: usize,
 ) -> Result<()> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let dual = use_color && dual_color;
     let max_n = 1 + a.len().max(b.len());
     let w = decimal_width(max_n);
     let reset = if use_color { "\x1b[m" } else { "" };
@@ -669,6 +872,10 @@ fn output(
                 let inner = diff_patches(&ai.full, &bj.full);
                 if stat_mode {
                     write_stat_summary(&mut out, &inner)?;
+                } else if dual {
+                    for line in inner.lines() {
+                        writeln!(out, "    {}", render_inner_dual_color(line))?;
+                    }
                 } else {
                     for line in inner.lines() {
                         writeln!(out, "    {line}")?;
@@ -713,49 +920,218 @@ fn write_stat_summary(out: &mut impl Write, diff: &str) -> Result<()> {
     Ok(())
 }
 
+/// Inner diff between two normalized patch texts, formatted like Git `range-diff`:
+/// a real unified diff (Myers, 3 context lines) with `--- /+++ ` headers suppressed,
+/// hunk-header line counts suppressed (`@@ <funcname>` instead of `@@ -a,b +c,d @@`),
+/// and the `range-diff` section-header function-name driver.
 fn diff_patches(x: &str, y: &str) -> String {
-    line_diff_inner(x, y)
-}
+    use grit_lib::diff::unified_diff_with_prefix_and_funcname;
 
-/// Git-style line diff (one prefix character per output line).
-fn line_diff_inner(a: &str, b: &str) -> String {
-    let la: Vec<&str> = a.lines().collect();
-    let lb: Vec<&str> = b.lines().collect();
-    let n = la.len();
-    let m = lb.len();
-    let mut dp = vec![vec![0usize; m + 1]; n + 1];
-    for i in (0..n).rev() {
-        for j in (0..m).rev() {
-            dp[i][j] = if la[i] == lb[j] {
-                1 + dp[i + 1][j + 1]
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
-        }
-    }
-    let mut i = 0usize;
-    let mut j = 0usize;
+    // Full unified diff with empty prefixes; we strip the file headers and rebuild
+    // each hunk header ourselves (Git suppresses line counts and uses a custom funcname).
+    let raw = unified_diff_with_prefix_and_funcname(
+        x, y, "a", "b", 3, 0, "", "", None, /* indent_heuristic */ true,
+        /* quote_path_fully */ false,
+    );
+
+    let old_lines: Vec<&str> = x.lines().collect();
     let mut out = String::new();
-    while i < n || j < m {
-        if i < n && j < m && la[i] == lb[j] {
-            out.push(' ');
-            out.push_str(la[i]);
-            out.push('\n');
-            i += 1;
-            j += 1;
-        } else if i < n && (j == m || dp[i + 1][j] >= dp[i][j + 1]) {
-            out.push('-');
-            out.push_str(la[i]);
-            out.push('\n');
-            i += 1;
-        } else if j < m {
-            out.push('+');
-            out.push_str(lb[j]);
-            out.push('\n');
-            j += 1;
+    for line in raw.lines() {
+        if line.starts_with("--- ") || line.starts_with("+++ ") {
+            continue;
         }
+        if line.starts_with("@@ ") || line == "@@" {
+            // Parse the old start line from "@@ -<start>[,<count>] +..." and rebuild the
+            // header with line counts suppressed plus the section-header funcname.
+            let start = parse_hunk_old_start(line);
+            out.push_str("@@");
+            if let Some(s) = start {
+                if let Some(func) = section_funcname(&old_lines, s) {
+                    out.push(' ');
+                    out.push_str(&func);
+                }
+            }
+            out.push('\n');
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
     }
     out
+}
+
+// Git diff color codes (defaults), used for `--dual-color` inner-diff rendering.
+const C_RESET: &str = "\x1b[m";
+const C_REVERSE: &str = "\x1b[7m";
+const C_OLD: &str = "\x1b[31m"; // red
+const C_NEW: &str = "\x1b[32m"; // green
+const C_FRAG: &str = "\x1b[36m"; // cyan
+const C_CONTEXT: &str = ""; // no color
+const C_FUNC: &str = ""; // no color
+const C_OLD_BOLD: &str = "\x1b[1;31m";
+const C_NEW_BOLD: &str = "\x1b[1;32m";
+const C_CONTEXT_BOLD: &str = "\x1b[1m";
+const C_OLD_DIM: &str = "\x1b[2;31m";
+const C_NEW_DIM: &str = "\x1b[2;32m";
+const C_CONTEXT_DIM: &str = "\x1b[2m";
+
+/// Render one inner-diff line in Git `--dual-color` style (mirrors `emit_diff_symbol`
+/// with `dual_color_diffed_diffs`). `line` carries the outer diff prefix
+/// (` `/`+`/`-`) or is a rebuilt hunk header beginning with `@@`.
+fn render_inner_dual_color(line: &str) -> String {
+    // Rebuilt inner hunk header: "@@" or "@@ <funcname>".
+    if let Some(rest) = line.strip_prefix("@@") {
+        let mut s = String::new();
+        s.push_str(C_REVERSE);
+        s.push_str(C_FRAG);
+        s.push_str("@@");
+        s.push_str(C_RESET);
+        // Anything after "@@" is " <funcname>": a context-colored leading blank,
+        // then the function name in funcinfo color.
+        let trimmed = rest.trim_start_matches(' ');
+        let blanks = &rest[..rest.len() - trimmed.len()];
+        if !blanks.is_empty() {
+            s.push_str(C_CONTEXT);
+            s.push_str(blanks);
+            s.push_str(C_RESET);
+        }
+        if !trimmed.is_empty() {
+            s.push_str(C_FUNC);
+            s.push_str(trimmed);
+            s.push_str(C_RESET);
+        }
+        return s;
+    }
+
+    let (outer, content) = line.split_at(line.len().min(1));
+    let inner_first = content.as_bytes().first().copied();
+    match outer {
+        "+" => {
+            // set_sign = NEW; content color depends on the inner first char.
+            let set = match inner_first {
+                Some(b'-') => C_OLD_BOLD,
+                Some(b'@') => C_FRAG,
+                Some(b'+') => C_NEW_BOLD,
+                _ => C_CONTEXT_BOLD,
+            };
+            emit_line0(C_REVERSE, C_NEW, Some(set), '+', content)
+        }
+        "-" => {
+            let set = match inner_first {
+                Some(b'+') => C_NEW_DIM,
+                Some(b'@') => C_FRAG,
+                Some(b'-') => C_OLD_DIM,
+                _ => C_CONTEXT_DIM,
+            };
+            emit_line0(C_REVERSE, C_OLD, Some(set), '-', content)
+        }
+        _ => {
+            // Context line: emit_line_0(set_sign=set, set=NULL, reverse=0).
+            // Git's set_sign is a non-NULL (possibly empty) string, so a trailing
+            // RESET is always emitted once the sign char is written.
+            let set = match inner_first {
+                Some(b'+') => C_NEW,
+                Some(b'@') => C_FRAG,
+                Some(b'-') => C_OLD,
+                _ => C_CONTEXT,
+            };
+            let mut s = String::new();
+            s.push_str(set); // possibly ""
+            s.push(' ');
+            s.push_str(content);
+            s.push_str(C_RESET);
+            s
+        }
+    }
+}
+
+/// Mirror of Git's `emit_line_0` for the `+`/`-` (set_sign present, reverse) cases.
+/// When `content` is empty, Git jumps to end-of-line before emitting `set`.
+fn emit_line0(
+    reverse: &str,
+    set_sign: &str,
+    set: Option<&str>,
+    sign: char,
+    content: &str,
+) -> String {
+    let mut s = String::new();
+    s.push_str(reverse);
+    s.push_str(set_sign);
+    s.push(sign);
+    if !content.is_empty() {
+        if let Some(set) = set {
+            if set != set_sign {
+                s.push_str(C_RESET);
+            }
+            s.push_str(set);
+        }
+        s.push_str(content);
+    }
+    s.push_str(C_RESET);
+    s
+}
+
+/// Parse the 1-based old-file start line from a unified-diff hunk header
+/// (`@@ -<start>[,<count>] +... @@`). Returns `None` if it cannot be parsed.
+fn parse_hunk_old_start(header: &str) -> Option<usize> {
+    let minus = header.find('-')?;
+    let rest = &header[minus + 1..];
+    let end = rest.find([',', ' '])?;
+    rest[..end].parse::<usize>().ok()
+}
+
+/// Reproduce Git `range-diff`'s `section_headers` funcname driver:
+/// `^ ## (.*) ##$` and `^.?@@ (.*)$`. Scans the old patch text backward from the
+/// hunk start for the nearest line matching either rule, returning the captured name.
+fn section_funcname(old_lines: &[&str], old_start_1based: usize) -> Option<String> {
+    if old_start_1based <= 1 {
+        return None;
+    }
+    let search_end = (old_start_1based - 1).min(old_lines.len());
+    for i in (0..search_end).rev() {
+        let line = old_lines[i];
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(name) = match_section_header(line) {
+            return Some(truncate_funcname(&name));
+        }
+    }
+    None
+}
+
+/// Match a single line against the two `range-diff` section-header rules.
+fn match_section_header(line: &str) -> Option<String> {
+    // Rule 1: ` ## <name> ##`
+    if let Some(inner) = line.strip_prefix(" ## ") {
+        if let Some(name) = inner.strip_suffix(" ##") {
+            return Some(name.trim_end_matches(char::is_whitespace).to_owned());
+        }
+    }
+    // Rule 2: `.?@@ <name>` — an optional leading byte, then "@@ ", then the name.
+    let after = if let Some(a) = line.strip_prefix("@@ ") {
+        a
+    } else {
+        let bytes = line.as_bytes();
+        if bytes.len() >= 4 && &bytes[1..4] == b"@@ " {
+            &line[4..]
+        } else {
+            return None;
+        }
+    };
+    Some(after.trim_end_matches(char::is_whitespace).to_owned())
+}
+
+fn truncate_funcname(text: &str) -> String {
+    if text.len() > 80 {
+        let mut end = 80;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].to_owned()
+    } else {
+        text.to_owned()
+    }
 }
 
 fn write_pair_header(
@@ -854,13 +1230,13 @@ fn write_pair_header(
         _ => {}
     }
 
+    // Git always appends " <subject>" for the commit; for `!` it first re-emits
+    // `reset` + the header color (DIFF_COMMIT = color_commit).
     let subj = lookup_commit_subject(repo, oid_for_subject)?;
-    if !subj.is_empty() {
-        if status == '!' {
-            write!(out, "{reset}")?;
-        }
-        write!(out, " {subj}")?;
+    if status == '!' {
+        write!(out, "{reset}{color_commit}")?;
     }
+    write!(out, " {subj}")?;
     writeln!(out, "{reset}")?;
     Ok(())
 }

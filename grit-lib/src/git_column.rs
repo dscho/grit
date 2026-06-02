@@ -252,33 +252,38 @@ pub fn print_columns(
     }
     let mut rows = div_round_up(n, cols);
 
-    let mut width_idx: Vec<usize> = vec![0; cols];
-    compute_column_width(layout, n, &len, cols, rows, &mut width_idx);
+    // Git only allocates `data->width` (per-column widest index) inside `shrink_columns`, i.e. the
+    // dense path. In non-dense mode `display_cell`'s `data->width` is NULL, so every cell is padded
+    // to the uniform `initial_width`. Mirror that: `width_idx` is `Some` only when dense.
+    let mut width_idx: Option<Vec<usize>> = None;
 
     if colopts.dense() {
+        let mut wi: Vec<usize> = vec![0; cols];
+        compute_column_width(layout, n, &len, cols, rows, &mut wi);
         while rows > 1 {
             let prev_rows = rows;
             let prev_cols = cols;
             rows -= 1;
             cols = div_round_up(n, rows);
             if cols != prev_cols {
-                width_idx.resize(cols, 0);
+                wi.resize(cols, 0);
             }
-            compute_column_width(layout, n, &len, cols, rows, &mut width_idx);
+            compute_column_width(layout, n, &len, cols, rows, &mut wi);
 
             let mut total = indent_len;
             for x in 0..cols {
-                total += len[width_idx[x]];
+                total += len[wi[x]];
                 total += opts.padding;
             }
             if total > width_budget {
                 rows = prev_rows;
                 cols = prev_cols;
-                width_idx.resize(cols, 0);
-                compute_column_width(layout, n, &len, cols, rows, &mut width_idx);
+                wi.resize(cols, 0);
+                compute_column_width(layout, n, &len, cols, rows, &mut wi);
                 break;
             }
         }
+        width_idx = Some(wi);
     }
 
     let initial_width = len.iter().copied().max().unwrap_or(0) + opts.padding;
@@ -293,9 +298,11 @@ pub fn print_columns(
 
             let cell_len = len[i];
             let mut pad_len = cell_len;
-            if len[width_idx[x]] < initial_width {
-                pad_len += initial_width - len[width_idx[x]];
-                pad_len = pad_len.saturating_sub(opts.padding);
+            if let Some(ref wi) = width_idx {
+                if len[wi[x]] < initial_width {
+                    pad_len += initial_width - len[wi[x]];
+                    pad_len = pad_len.saturating_sub(opts.padding);
+                }
             }
 
             let newline = match layout {
