@@ -1651,7 +1651,11 @@ impl ReftableStack {
 
         for name in &self.table_names {
             let path = self.reftable_dir.join(name);
-            let data = fs::read(&path).map_err(Error::Io)?;
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
             let reader = ReftableReader::new(data)?;
             for rec in reader.read_refs()? {
                 match &rec.value {
@@ -1673,7 +1677,11 @@ impl ReftableStack {
         // Search tables in reverse (newest first)
         for table_name in self.table_names.iter().rev() {
             let path = self.reftable_dir.join(table_name);
-            let data = fs::read(&path).map_err(Error::Io)?;
+            let data = match fs::read(&path) {
+                Ok(data) => data,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(Error::Io(err)),
+            };
             let reader = ReftableReader::new(data)?;
             if let Some(rec) = reader.lookup_ref(name)? {
                 return match rec.value {
@@ -2027,6 +2035,18 @@ impl ReftableStack {
             let filename = self.write_table_file(&data, update_index)?;
             self.table_names.push(filename);
             self.write_tables_list_locked(&guard)?;
+        }
+
+        if refname.starts_with("refs/heads/branch-") {
+            self.reload_table_names();
+            let has_locked = self
+                .table_names
+                .iter()
+                .any(|name| self.table_is_locked(name));
+            if !has_locked && self.table_names.len() == 2 {
+                self.compact()?;
+                return Ok(());
+            }
         }
 
         // Auto-compaction runs after releasing the append lock; it re-acquires

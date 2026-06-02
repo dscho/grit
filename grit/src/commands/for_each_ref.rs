@@ -445,7 +445,10 @@ fn parse_sort_key(raw: &str) -> Result<SortKey> {
     } else {
         (false, raw)
     };
-    let field = if let Some(rest) = key.strip_prefix("version:") {
+    let field = if let Some(rest) = key
+        .strip_prefix("version:")
+        .or_else(|| key.strip_prefix("v:"))
+    {
         match rest {
             "refname" => SortField::RefNameVersion,
             _ => bail!("unsupported sort key: {raw}"),

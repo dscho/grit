@@ -14,7 +14,7 @@ use grit_lib::combined_tree_diff::{
     combined_diff_paths_filtered, combined_diff_paths_trees, format_combined_raw_line,
     CombinedDiffPath, CombinedParentStatus, CombinedTreeDiffOptions,
 };
-use grit_lib::config::ConfigSet;
+use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::delta_encode::{encode_lcp_delta, encode_prefix_extension_delta};
 use grit_lib::diff::{
     count_changes, detect_copies as lib_detect_copies, detect_renames, diff_trees,
@@ -1368,10 +1368,30 @@ fn open_submodule_repo(
     }
     let modules_dir = super_git_dir.join("modules").join(path);
     if modules_dir.is_dir() {
-        Repository::open(&modules_dir, None).ok()
-    } else {
-        None
+        return Repository::open(&modules_dir, None).ok();
     }
+    if let Some(wt) = work_tree {
+        if let Some(name) = submodule_name_for_path(wt, path) {
+            let modules_dir = super_git_dir.join("modules").join(name);
+            if modules_dir.is_dir() {
+                return Repository::open(&modules_dir, None).ok();
+            }
+        }
+    }
+    None
+}
+
+fn submodule_name_for_path(work_tree: &Path, path: &str) -> Option<String> {
+    let gm = work_tree.join(".gitmodules");
+    let text = std::fs::read_to_string(&gm).ok()?;
+    let file = ConfigFile::parse(&gm, &text, ConfigScope::Local).ok()?;
+    let wanted = path.replace('\\', "/");
+    file.entries.iter().find_map(|e| {
+        let rest = e.key.strip_prefix("submodule.")?;
+        let name = rest.strip_suffix(".path")?;
+        let value = e.value.as_deref()?.trim().replace('\\', "/");
+        (value == wanted).then(|| name.to_owned())
+    })
 }
 
 fn commit_exists_in_repo(repo: &Repository, oid: &ObjectId) -> bool {

@@ -41,14 +41,14 @@ currently reports green.
 
 ### Area D — files ref backend semantics
 **Owns:** `grit-lib/src/refs.rs`, `grit-lib/src/reflog.rs`, branch/log/symbolic-ref call sites.
-- [ ] `t0600-reffiles-backend` #11 — `broken reference blocks create`
-- [ ] `t0600-reffiles-backend` #12 — `non-empty directory blocks indirect create`
-- [ ] `t0600-reffiles-backend` #13 — `broken reference blocks indirect create`
-- [ ] `t0600-reffiles-backend` #18 — `for_each_reflog()`
-- [ ] `t0600-reffiles-backend` #23 — `log diagnoses bogus HEAD hash`
-- [ ] `t0600-reffiles-backend` #24 — `log diagnoses bogus HEAD symref`
-- [ ] `t0600-reffiles-backend` #28 — `git branch -m u v should fail when the reflog for u is a symlink`
-- [ ] `t0600-reffiles-backend` #32 — `symref transaction supports symlinks`
+- [x] `t0600-reffiles-backend` #11 — `broken reference blocks create`
+- [x] `t0600-reffiles-backend` #12 — `non-empty directory blocks indirect create`
+- [x] `t0600-reffiles-backend` #13 — `broken reference blocks indirect create`
+- [x] `t0600-reffiles-backend` #18 — `for_each_reflog()`
+- [x] `t0600-reffiles-backend` #23 — `log diagnoses bogus HEAD hash`
+- [x] `t0600-reffiles-backend` #24 — `log diagnoses bogus HEAD symref`
+- [x] `t0600-reffiles-backend` #28 — `git branch -m u v should fail when the reflog for u is a symlink`
+- [x] `t0600-reffiles-backend` #32 — `symref transaction supports symlinks`
 
 ### Area E — reftable transaction and serving behavior
 **Owns:** `grit-lib/src/reftable.rs`, `grit/src/commands/update_ref.rs`,
@@ -256,10 +256,10 @@ still be split across independent worktrees without avoidable conflicts.
 - [ ] `t0110-environment` 26/31 — remaining `GIT_*` env precedence/handling
 - [ ] `t0001-init` 94/102 — `git init` (`--bare`, `--separate-git-dir`, templates, reinit, `--shared`)
 - [x] `t0120-dot-git-dir` 32/32 — `.git` dir/file discovery edge cases
-- [ ] `t0033-safe-directory` 20/22, [ ] `t0034-root-safe-directory` 0/0 (sudo-gated)
+- [ ] `t0033-safe-directory` 20/22; `t0034-root-safe-directory` skipped (sudo-gated)
 - [ ] `t0002-gitfile` 13/14 — `.git` gitfile indirection
 - [ ] `t0007-git-var` 26/27 — one `git var` compatibility failure
-**Subtotal: 17 failing + one sudo-gated 0/0 row.** Keep this lane together because the failures
+**Subtotal: 17 failing; one sudo-gated row skipped.** Keep this lane together because the failures
 converge on repository discovery, init defaults, config, and environment handling.
 
 ## Lane 6 — Objects / tree-hash / cache-tree / oid-validation / pack (HEAVY)
