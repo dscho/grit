@@ -863,7 +863,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         t
                     );
                 }
-                if !is_rev && is_path {
+                if !is_rev {
                     patch_paths.push(t.clone());
                     patch_target = None;
                 }
@@ -1276,21 +1276,52 @@ pub fn run(mut args: Args) -> Result<()> {
     };
     if !args.detach && dwim_enabled {
         let remote_prefix = "refs/remotes/";
-        let all_remote_refs = refs::list_refs(&repo.git_dir, remote_prefix).unwrap_or_default();
-        let matching: Vec<(String, ObjectId)> = all_remote_refs
+        let all_remote_refs = refs::list_refs(&repo.git_dir, "refs/").unwrap_or_default();
+        let mut matching: Vec<(String, ObjectId)> = all_remote_refs
             .into_iter()
             .filter(|(r, _)| {
-                // refs/remotes/<remote>/<branch>
-                let parts: Vec<&str> = r.trim_start_matches(remote_prefix).splitn(2, '/').collect();
-                parts.len() == 2 && parts[1] == target
+                remote_tracking_branch_for_ref(&repo, r).as_deref() == Some(target.as_str())
             })
             .collect();
+        if matching.len() > 1 {
+            if let Some(default_remote) = ConfigSet::load(Some(&repo.git_dir), true)
+                .ok()
+                .and_then(|cfg| cfg.get("checkout.defaultRemote"))
+            {
+                let preferred: Vec<(String, ObjectId)> = matching
+                    .iter()
+                    .filter(|(r, _)| {
+                        r.trim_start_matches(remote_prefix)
+                            .split('/')
+                            .next()
+                            == Some(default_remote.as_str())
+                    })
+                    .cloned()
+                    .collect();
+                if preferred.len() == 1 {
+                    matching = preferred;
+                }
+            }
+        }
         if matching.len() == 1 {
+            if !has_separator {
+                if let Some(wt) = repo.work_tree.as_deref() {
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let rel = resolve_pathspec(&target, wt, &cwd);
+                    let abs = wt.join(&rel);
+                    if abs.exists() || abs.is_symlink() {
+                        bail!(
+                            "'{target}' could be both a local file and a tracking branch.\nPlease use -- (and optionally --no-guess) to disambiguate"
+                        );
+                    }
+                }
+            }
             let remote_ref = &matching[0].0;
             let oid = matching[0].1;
             // Extract remote name from refs/remotes/<remote>/<branch>
             let remote_part = remote_ref.trim_start_matches(remote_prefix);
-            let remote_name = remote_part.split('/').next().unwrap_or("");
+            let remote_name = remote_name_for_tracking_ref(&repo, remote_ref)
+                .unwrap_or_else(|| remote_part.split('/').next().unwrap_or("").to_string());
             // Create the local branch tracking the remote
             let new_branch_ref = format!("refs/heads/{target}");
             refs::write_ref(&repo.git_dir, &new_branch_ref, &oid)?;
@@ -1316,22 +1347,41 @@ pub fn run(mut args: Args) -> Result<()> {
                 &merge_cli,
             );
         } else if matching.len() > 1 {
-            eprintln!(
-                "hint: If you meant to check out a remote tracking branch on, e.g. 'origin',"
-            );
-            eprintln!("hint: try again with the --track option:");
-            eprintln!("hint:");
-            for (r, _) in &matching {
-                let remote_part = r.trim_start_matches(remote_prefix);
-                let mut parts = remote_part.splitn(2, '/');
-                let rname = parts.next().unwrap_or("");
-                let bname = parts.next().unwrap_or("");
-                eprintln!("hint:     git checkout --track {rname}/{bname}");
+            let advice_enabled = ConfigSet::load(Some(&repo.git_dir), true)
+                .ok()
+                .and_then(|cfg| cfg.get_bool("advice.checkoutAmbiguousRemoteBranchName"))
+                != Some(Ok(false));
+            if advice_enabled {
+                eprintln!(
+                    "hint: If you meant to check out a remote tracking branch on, e.g. 'origin',"
+                );
+                eprintln!("hint: try again with the --track option:");
+                eprintln!("hint:");
+                for (r, _) in &matching {
+                    let remote_part = r.trim_start_matches(remote_prefix);
+                    let mut parts = remote_part.splitn(2, '/');
+                    let rname = parts.next().unwrap_or("");
+                    let bname = parts.next().unwrap_or("");
+                    eprintln!("hint:     git checkout --track {rname}/{bname}");
+                }
+                eprintln!("hint:");
             }
-            eprintln!("hint:");
             bail!(
-                "'{target}' matched multiple (\'{}\') remote tracking branches",
+                "'{target}' matched multiple ({}) remote tracking branches",
                 matching.len()
+            );
+        }
+    }
+
+    if !args.detach && !dwim_enabled {
+        let has_matching_remote = refs::list_refs(&repo.git_dir, "refs/")
+            .unwrap_or_default()
+            .into_iter()
+            .any(|(r, _)| remote_tracking_branch_for_ref(&repo, &r).as_deref() == Some(target.as_str()));
+        if has_matching_remote {
+            bail!(
+                "pathspec '{}' did not match any file(s) known to git",
+                target
             );
         }
     }
@@ -5667,6 +5717,72 @@ fn resolve_to_commit(repo: &Repository, spec: &str) -> Result<ObjectId> {
     peel_to_commit(repo, oid)
 }
 
+fn remote_name_for_tracking_ref(repo: &Repository, remote_ref: &str) -> Option<String> {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).ok()?;
+    for entry in config.entries().iter().rev() {
+        let key = entry.key.as_str();
+        let Some(stripped) = key.strip_prefix("remote.") else {
+            continue;
+        };
+        let Some(remote_name) = stripped.strip_suffix(".fetch") else {
+            continue;
+        };
+        let Some(fetch) = entry.value.as_deref() else {
+            continue;
+        };
+        let Some((_, dst)) = fetch.split_once(':') else {
+            continue;
+        };
+        if refspec_destination_matches(dst.trim(), remote_ref) {
+            return Some(remote_name.to_string());
+        }
+    }
+    None
+}
+
+fn remote_tracking_branch_for_ref(repo: &Repository, remote_ref: &str) -> Option<String> {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).ok()?;
+    for entry in config.entries().iter().rev() {
+        let key = entry.key.as_str();
+        let is_fetch = key
+            .strip_prefix("remote.")
+            .and_then(|rest| rest.strip_suffix(".fetch"))
+            .is_some();
+        if !is_fetch {
+            continue;
+        }
+        let Some(fetch) = entry.value.as_deref() else {
+            continue;
+        };
+        let Some((_, dst)) = fetch.split_once(':') else {
+            continue;
+        };
+        if let Some(branch) = refspec_destination_capture(dst.trim(), remote_ref) {
+            return Some(branch);
+        }
+    }
+    remote_ref
+        .strip_prefix("refs/remotes/")
+        .and_then(|rest| rest.split_once('/').map(|(_, branch)| branch.to_string()))
+}
+
+fn refspec_destination_matches(pattern: &str, remote_ref: &str) -> bool {
+    refspec_destination_capture(pattern, remote_ref).is_some()
+}
+
+fn refspec_destination_capture(pattern: &str, remote_ref: &str) -> Option<String> {
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        if remote_ref.starts_with(prefix)
+            && remote_ref.ends_with(suffix)
+            && remote_ref.len() >= prefix.len() + suffix.len()
+        {
+            return Some(remote_ref[prefix.len()..remote_ref.len() - suffix.len()].to_string());
+        }
+        return None;
+    }
+    (pattern == remote_ref).then(String::new)
+}
+
 /// Resolve `spec` to a root tree OID (commit → tree, tag → peel, tree → identity).
 fn resolve_treeish_to_tree_oid(repo: &Repository, spec: &str) -> Result<ObjectId> {
     let oid =
@@ -6378,18 +6494,6 @@ fn write_blob_to_worktree(
         // Path checkout from index: always materialize (may follow symlinked submodule paths).
         checkout_gitlink_worktree_entry(repo, work_tree, rel_path, oid, false)?;
         return Ok(true);
-    }
-
-    if !full_smudge_meta && mode != MODE_SYMLINK {
-        let abs_path = work_tree.join(rel_path);
-        if let (Some(entry), Ok(meta)) = (
-            index.get(rel_path.as_bytes(), 0),
-            std::fs::symlink_metadata(&abs_path),
-        ) {
-            if entry.oid == *oid && entry.mode == mode && stat_matches(entry, &meta) {
-                return Ok(false);
-            }
-        }
     }
 
     let obj = read_object_for_checkout(repo, oid).context("reading object for checkout")?;
