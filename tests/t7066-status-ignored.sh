@@ -100,8 +100,8 @@ test_expect_success 'status shows only non-ignored untracked files' '
 	git status --porcelain >../actual &&
 	grep "?? TODO" ../actual &&
 	grep "?? notes.txt" ../actual &&
-	lines=$(grep -v "^##" ../actual | wc -l) &&
-	test "$lines" = "2"
+	grep -v "^##" ../actual >../actual_filtered &&
+	test_line_count = 2 ../actual_filtered
 	)
 '
 
@@ -257,10 +257,10 @@ test_expect_success 'ls-files --ignored shows ignored files' '
 	)
 '
 
-test_expect_success 'ls-files --others shows untracked non-ignored files' '
+test_expect_success 'ls-files --others --exclude-standard shows untracked non-ignored files' '
 	(
 	cd repo &&
-	git ls-files --others >../actual &&
+	git ls-files --others --exclude-standard >../actual &&
 	grep "notes.txt" ../actual &&
 	grep "TODO" ../actual &&
 	! grep "main.o" ../actual
