@@ -1575,7 +1575,7 @@ fn reset_commit(
                     &mut new_index,
                     Some((&target_oid, Some(commit_spec))),
                     recurse_submodules,
-                    allow_gitlink_overwrite,
+                    true,
                 ) {
                     if recurse_submodules {
                         let _ = rollback_reset_after_failed_submodule_update(
