@@ -54,6 +54,10 @@ pub struct Args {
     #[arg(long = "match")]
     pub match_pattern: Vec<String>,
 
+    /// Do not consider tags matching the given glob(7) pattern.
+    #[arg(long = "exclude")]
+    pub exclude_pattern: Vec<String>,
+
     /// Only output exact matches (a tag directly references the commit).
     #[arg(long)]
     pub exact_match: bool,
@@ -94,6 +98,60 @@ struct Candidate {
     depth: usize,
 }
 
+#[derive(Debug, Clone)]
+struct RefCandidate {
+    name: String,
+    annotated: bool,
+    tagger_time: i64,
+}
+
+/// Options controlling how a commit-ish is described.
+#[derive(Debug, Clone)]
+pub(crate) struct DescribeOptions {
+    /// Include lightweight tags in addition to annotated tags.
+    pub(crate) tags: bool,
+    /// Fall back to an abbreviated object name when no tag describes the object.
+    pub(crate) always: bool,
+    /// Always print the long `<name>-<count>-g<oid>` form.
+    pub(crate) long: bool,
+    /// Minimum object-name abbreviation length to print.
+    pub(crate) abbrev: usize,
+    /// Maximum number of candidate tags to consider during the walk.
+    pub(crate) candidates: usize,
+    /// Tag glob patterns to include.
+    pub(crate) match_pattern: Vec<String>,
+    /// Tag glob patterns to exclude.
+    pub(crate) exclude_pattern: Vec<String>,
+    /// Require the tag to point directly at the target commit.
+    pub(crate) exact_match: bool,
+    /// Walk only the first-parent chain.
+    pub(crate) first_parent: bool,
+    /// Include heads and remote-tracking refs in addition to tags.
+    pub(crate) all: bool,
+    /// Describe by finding a ref that contains the target commit.
+    pub(crate) contains: bool,
+}
+
+impl DescribeOptions {
+    /// Build describe options from parsed CLI arguments.
+    #[must_use]
+    pub(crate) fn from_args(args: &Args) -> Self {
+        Self {
+            tags: args.tags,
+            always: args.always,
+            long: args.long,
+            abbrev: args.abbrev,
+            candidates: args.candidates,
+            match_pattern: args.match_pattern.clone(),
+            exclude_pattern: args.exclude_pattern.clone(),
+            exact_match: args.exact_match,
+            first_parent: args.first_parent,
+            all: args.all,
+            contains: args.contains,
+        }
+    }
+}
+
 /// Run the `describe` command.
 pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
@@ -128,18 +186,9 @@ pub fn run(args: Args) -> Result<()> {
     let target_oid = peel_to_commit(&repo, &resolved_oid)
         .ok_or_else(|| anyhow::anyhow!("Not a valid commit: {rev}"))?;
 
-    // Build a map from commit OID → ref name for all qualifying refs.
-    // `git describe --contains` considers lightweight tags too (see submodule--helper
-    // `compute_rev_name`, which runs `describe --contains` as the third attempt).
-    let use_all_tags = args.tags || args.contains;
-    let ref_map = build_ref_map(&repo, use_all_tags, args.all, &args.match_pattern)?;
+    let options = DescribeOptions::from_args(&args);
 
-    // --contains mode: find the nearest tag that is a descendant of the target
-    if args.contains {
-        return run_contains(&repo, &target_oid, &ref_map);
-    }
-
-    // Determine the dirty suffix (if applicable)
+    // Determine the dirty suffix before formatting the final description.
     let dirty_suffix = if args.dirty.is_some() || args.broken.is_some() {
         if is_worktree_dirty(&repo) {
             args.dirty.as_deref().unwrap_or("-dirty").to_string()
@@ -150,40 +199,89 @@ pub fn run(args: Args) -> Result<()> {
         String::new()
     };
 
+    let description = describe_commit(&repo, target_oid, &options, &dirty_suffix)?;
+    println!("{description}");
+
+    Ok(())
+}
+
+/// Describe a resolved object using Git-compatible `describe` semantics.
+///
+/// The object may be a commit or a tag object that peels to a commit. The returned
+/// string does not include a trailing newline.
+///
+/// # Errors
+///
+/// Returns an error when the object cannot be peeled to a commit, no suitable ref
+/// exists and `always` is false, or repository objects cannot be read.
+pub(crate) fn describe_object(
+    repo: &Repository,
+    oid: ObjectId,
+    options: &DescribeOptions,
+) -> Result<String> {
+    let target_oid = peel_to_commit(repo, &oid)
+        .ok_or_else(|| anyhow::anyhow!("Not a valid commit: {}", oid.to_hex()))?;
+    describe_commit(repo, target_oid, options, "")
+}
+
+fn describe_commit(
+    repo: &Repository,
+    target_oid: ObjectId,
+    options: &DescribeOptions,
+    dirty_suffix: &str,
+) -> Result<String> {
+    // Build a map from commit OID -> ref name for all qualifying refs.
+    // `git describe --contains` considers lightweight tags too (see submodule--helper
+    // `compute_rev_name`, which runs `describe --contains` as the third attempt).
+    let use_all_tags = options.tags || options.contains;
+    let ref_map = build_ref_map(
+        repo,
+        use_all_tags,
+        options.all,
+        &options.match_pattern,
+        &options.exclude_pattern,
+    )?;
+
+    if options.contains {
+        return describe_contains(repo, &target_oid, &ref_map);
+    }
+
     // Check if the target commit itself is tagged (exact match).
     if let Some(ref_name) = ref_map.get(&target_oid) {
-        if args.long {
-            let abbrev = abbreviate(&target_oid, args.abbrev);
-            println!("{ref_name}-0-g{abbrev}{dirty_suffix}");
+        if options.long {
+            let abbrev = abbreviate(&target_oid, options.abbrev);
+            return Ok(format!("{ref_name}-0-g{abbrev}{dirty_suffix}"));
         } else {
-            println!("{ref_name}{dirty_suffix}");
+            return Ok(format!("{ref_name}{dirty_suffix}"));
         }
-        return Ok(());
     }
 
     // If --exact-match, we must have found it above.
-    if args.exact_match {
+    if options.exact_match {
         bail!("no tag exactly matches '{}'", target_oid.to_hex());
     }
 
     // BFS walk backwards from target to find the nearest tagged ancestor.
     let candidate = bfs_find_tag(
-        &repo,
+        repo,
         &target_oid,
         &ref_map,
-        args.candidates,
-        args.first_parent,
+        options.candidates,
+        options.first_parent,
     )?;
 
     match candidate {
         Some(c) => {
-            let abbrev = abbreviate(&target_oid, args.abbrev);
-            println!("{}-{}-g{abbrev}{dirty_suffix}", c.tag_name, c.depth);
+            let abbrev = abbreviate(&target_oid, options.abbrev);
+            Ok(format!(
+                "{}-{}-g{abbrev}{dirty_suffix}",
+                c.tag_name, c.depth
+            ))
         }
         None => {
-            if args.always {
-                let abbrev = abbreviate(&target_oid, args.abbrev);
-                println!("{abbrev}{dirty_suffix}");
+            if options.always {
+                let abbrev = abbreviate(&target_oid, options.abbrev);
+                Ok(format!("{abbrev}{dirty_suffix}"))
             } else {
                 bail!(
                     "No names found, cannot describe anything.\n\
@@ -194,18 +292,16 @@ pub fn run(args: Args) -> Result<()> {
             }
         }
     }
-
-    Ok(())
 }
 
 /// Check if the working tree has uncommitted changes.
 /// --contains: find the nearest tag that is a descendant of (contains) the target commit.
 /// Walk forward from each tag's commit to check if the target is an ancestor.
-fn run_contains(
+fn describe_contains(
     repo: &Repository,
     target_oid: &ObjectId,
     ref_map: &HashMap<ObjectId, String>,
-) -> Result<()> {
+) -> Result<String> {
     // For each tag, check if target is reachable from the tag commit.
     // Track the best (shortest path) tag.
     let mut best: Option<(String, usize)> = None;
@@ -221,11 +317,10 @@ fn run_contains(
     match best {
         Some((name, depth)) => {
             if depth == 0 {
-                println!("{name}");
+                Ok(name)
             } else {
-                println!("{name}~{depth}");
+                Ok(format!("{name}~{depth}"))
             }
-            Ok(())
         }
         None => {
             bail!("fatal: cannot describe '{}'", target_oid.to_hex());
@@ -302,13 +397,16 @@ fn is_worktree_dirty(repo: &Repository) -> bool {
 /// - `use_all_refs`: include refs/heads/ and refs/remotes/ too (--all).
 /// - If `patterns` is non-empty, only refs whose short name matches one of the
 ///   glob patterns are included.
+/// - If `exclude_patterns` is non-empty, refs whose short name matches one of
+///   those glob patterns are omitted.
 fn build_ref_map(
     repo: &Repository,
     use_all_tags: bool,
     use_all_refs: bool,
     patterns: &[String],
+    exclude_patterns: &[String],
 ) -> Result<HashMap<ObjectId, String>> {
-    let mut map: HashMap<ObjectId, String> = HashMap::new();
+    let mut map: HashMap<ObjectId, RefCandidate> = HashMap::new();
 
     // Collect all refs under refs/tags/ (loose)
     let loose_tags = list_refs(&repo.git_dir, "refs/tags/").unwrap_or_default();
@@ -345,6 +443,12 @@ fn build_ref_map(
         {
             continue;
         }
+        if exclude_patterns
+            .iter()
+            .any(|p| crate::commands::tag::glob_matches(p, &short_name))
+        {
+            continue;
+        }
 
         // Read the object to check if it's an annotated tag or a direct commit ref
         let obj = match repo.odb.read(oid) {
@@ -357,14 +461,34 @@ fn build_ref_map(
                 // Annotated tag — peel to commit
                 if let Ok(tag_data) = parse_tag(&obj.data) {
                     if let Some(commit_oid) = peel_to_commit(repo, &tag_data.object) {
-                        map.entry(commit_oid).or_insert_with(|| short_name.clone());
+                        insert_ref_candidate(
+                            &mut map,
+                            commit_oid,
+                            RefCandidate {
+                                name: short_name.clone(),
+                                annotated: true,
+                                tagger_time: tag_data
+                                    .tagger
+                                    .as_deref()
+                                    .and_then(tagger_timestamp)
+                                    .unwrap_or(0),
+                            },
+                        );
                     }
                 }
             }
             ObjectKind::Commit => {
                 // Lightweight tag pointing directly at a commit
                 if use_all_tags || use_all_refs {
-                    map.entry(*oid).or_insert_with(|| short_name.clone());
+                    insert_ref_candidate(
+                        &mut map,
+                        *oid,
+                        RefCandidate {
+                            name: short_name.clone(),
+                            annotated: false,
+                            tagger_time: 0,
+                        },
+                    );
                 }
             }
             _ => {}
@@ -386,17 +510,62 @@ fn build_ref_map(
                 {
                     continue;
                 }
+                if exclude_patterns
+                    .iter()
+                    .any(|p| crate::commands::tag::glob_matches(p, &display))
+                {
+                    continue;
+                }
 
                 // Peel to commit
                 if let Some(commit_oid) = peel_to_commit(repo, oid) {
-                    // Tags have higher priority — only insert if not already present
-                    map.entry(commit_oid).or_insert_with(|| display.clone());
+                    insert_ref_candidate(
+                        &mut map,
+                        commit_oid,
+                        RefCandidate {
+                            name: display.clone(),
+                            annotated: false,
+                            tagger_time: 0,
+                        },
+                    );
                 }
             }
         }
     }
 
-    Ok(map)
+    Ok(map
+        .into_iter()
+        .map(|(oid, cand)| (oid, cand.name))
+        .collect())
+}
+
+fn insert_ref_candidate(
+    map: &mut HashMap<ObjectId, RefCandidate>,
+    oid: ObjectId,
+    candidate: RefCandidate,
+) {
+    match map.get_mut(&oid) {
+        None => {
+            map.insert(oid, candidate);
+        }
+        Some(existing) => {
+            let replace = if candidate.annotated != existing.annotated {
+                candidate.annotated
+            } else if candidate.tagger_time != existing.tagger_time {
+                candidate.tagger_time > existing.tagger_time
+            } else {
+                candidate.name > existing.name
+            };
+            if replace {
+                *existing = candidate;
+            }
+        }
+    }
+}
+
+fn tagger_timestamp(raw: &str) -> Option<i64> {
+    let after_email = raw.split_once('>')?.1.trim();
+    after_email.split_whitespace().next()?.parse().ok()
 }
 
 /// Read tag refs from packed-refs file.

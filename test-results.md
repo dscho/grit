@@ -5,6 +5,28 @@
 
 # Test Results
 
+Updated: 2026-06-02
+- t6 for-each-ref focus: `TZ=UTC ./scripts/run-tests.sh t6300-for-each-ref.sh` passes 429/429
+  after ref-filter atom/sort/trailer/signature support, recursive tag peeling, and tag
+  `--cleanup=verbatim` fixes.
+- Test scope update: `t5326-multi-pack-bitmaps` and `t5327-multi-pack-bitmaps-rev` are marked
+  `in_scope=skip` in `data/test-files.csv`; dashboards were regenerated.
+- t6 fmt-merge-msg fixture: `./scripts/run-tests.sh t6200-fmt-merge-msg-extra.sh --verbose` passes
+  23/23 after making the synthetic fixture explicitly request its expected `master` initial branch.
+- t6 tracking/status focus: `./scripts/run-tests.sh t6040-tracking-info.sh --verbose` passes 44/44
+  after preserving blank lines in multi-branch status comparisons, allowing detached `HEAD` pushes
+  to an existing one-level destination ref, and filtering remote-only haves from local thin
+  push-pack generation.
+- t6 post-rebase focused verification: `TZ=UTC ./scripts/run-tests.sh t6040-tracking-info.sh
+  t6200-fmt-merge-msg-extra.sh t6300-for-each-ref.sh t6301-for-each-ref-errors.sh --verbose`
+  passes all four files: 44/44, 23/23, 429/429, and 6/6.
+- t6 verification: `cargo check -p grit-cli` and `cargo build --release -p grit-cli` pass with the
+  existing warning backlog (`ignore.rs`, `refs.rs`, `difftool.rs`, `sparse_checkout.rs`,
+  `worktree.rs`).
+- Pre-commit: `cargo fmt` ran; `git diff --check` passed. `cargo clippy --fix --allow-dirty` ran
+  and completed with the existing clippy warning backlog plus failed auto-fixes in unrelated files;
+  unrelated auto-fixes were not kept.
+
 Updated: 2026-06-01
 - Final t2 verification: `./scripts/run-tests.sh t2 --verbose` ran all 70 in-scope t2 files with
   zero failing tests. All t2 rows are now in scope and `failing=0`.

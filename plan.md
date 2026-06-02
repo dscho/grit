@@ -1,5 +1,42 @@
 # PLAN.md — Current execution queue
 
+## Active task — t6 family 100% pass
+
+- [~] Make current in-scope `t6` family tests fully pass. Work one dependency group at a time,
+  choosing a high-value non-green file, fixing the underlying Rust behavior, and re-running that
+  file until `failing=0` before moving to the next file.
+  - Dependency groups from current `data/test-files.csv`:
+    - Rev-list/revision traversal: `t6000`, `t6001`, `t6002`, `t6003`, `t6006`, `t6007`, `t6010`,
+      `t6011`, `t6012`, `t6013`, `t6014`, `t6015`, `t6016`, `t6018`, `t6019`, `t6021`, `t6022`,
+      `t6111`, `t6112`, `t6113`, `t6136-rev-list-date-range`, `t6137-rev-parse-misc`,
+      `t6138`, `t6600`.
+    - Bundle/object reachability/gc: `t6020`, `t6500`, `t6501`.
+    - Bisect: `t6030`, `t6041`.
+    - Tracking/refs/ref formatting: `t6040`, `t6200-fmt-merge-msg-extra`, `t6300`.
+    - Pathspec: `t6131`, `t6133-pathspec-rev-dwim`, `t6135-pathspec-with-attrs`,
+      `t6136-pathspec-in-bare`.
+    - Describe: `t6120-describe`.
+    - Merge machinery: `t6400`, `t6402`, `t6404`, `t6406`, `t6411`, `t6414`, `t6415`,
+      `t6416`, `t6418`, `t6421`, `t6422`, `t6423`, `t6424`, `t6425`, `t6427`, `t6430`,
+      `t6430-merge-strategy-option`, `t6432-*`, `t6434-merge-with-no-common-ancestor`,
+      `t6435-merge-sparse-directory`, `t6436`, `t6437`, `t6438`, `t6439`.
+  - Completed first file: `t6300-for-each-ref.sh` (429/429) after implementing missing
+    ref-format atoms/options, recursive tag peeling, signature fields, and tag message cleanup.
+  - Completed adjacent ref-format fixture: `t6200-fmt-merge-msg-extra.sh` (23/23) after making the
+    synthetic fixture explicitly request its expected `master` initial branch under the harness.
+  - Completed tracking/status/push file: `t6040-tracking-info.sh` (44/44) after fixing
+    multi-branch status comparison spacing, detached `HEAD:<existing>` push destination
+    resolution, and thin push-pack negotiation for remote-only haves.
+  - Verified adjacent ref-format error fixture: `t6301-for-each-ref-errors.sh` (6/6) after making
+    ignored broken/zero loose refs remove any preloaded entry from the refs list.
+  - Next t6 work should continue with the remaining rev-list/revision traversal group unless a
+    higher-value dependency group is selected from the CSV.
+  - Execution logs: `logs/2026-06-02_1427-t6-for-each-ref.md`,
+    `logs/2026-06-02_1655-t6200-fmt-merge-msg-extra.md`,
+    `logs/2026-06-02_1710-t6040-tracking-info.md`.
+
+---
+
 ## Active task — t2 family 100% pass
 
 - [x] Make all `t2` family tests fully pass. Work one file at a time, always choosing the

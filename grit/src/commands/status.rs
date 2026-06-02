@@ -2168,10 +2168,7 @@ pub(crate) fn write_status_branch_header(
                 show_hints && !omit_diverged_pull_hint,
             )?;
             if !tracking.is_empty() {
-                for line in tracking.trim().lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
+                for line in tracking.trim_end_matches('\n').lines() {
                     cpw(out, cp, line)?;
                 }
                 cpw(out, cp, "")?;
@@ -2797,10 +2794,7 @@ fn format_long(
                 show_hints,
             )?;
             if !tracking.is_empty() {
-                for line in tracking.trim().lines() {
-                    if line.is_empty() {
-                        continue;
-                    }
+                for line in tracking.trim_end_matches('\n').lines() {
                     cpw(out, cp, line)?;
                 }
                 cpw(out, cp, "")?;

@@ -2,11 +2,12 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
+use grit_lib::config::ConfigSet;
 use grit_lib::error::Error as GustError;
 use grit_lib::git_date::show::{date_mode_release, parse_date_format, show_date};
 use grit_lib::git_date::tm::atoi_bytes;
 use grit_lib::mailmap::{load_mailmap_table, map_contact_table, parse_contact, MailmapTable};
-use grit_lib::merge_base::{ancestor_closure, is_ancestor};
+use grit_lib::merge_base::{ancestor_closure, count_symmetric_ahead_behind, is_ancestor};
 use grit_lib::objects::{
     parse_commit, parse_tag, tag_header_field, tag_object_line_oid, ObjectId, ObjectKind,
 };
@@ -14,14 +15,15 @@ use grit_lib::refs::{read_head, resolve_ref};
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse::resolve_revision;
 
+use crate::commands::describe::{describe_object, DescribeOptions};
 use crate::porcelain_rev::{
     resolve_porcelain_commitish_filter, resolve_porcelain_merged_commit,
     resolve_porcelain_points_at,
 };
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -86,19 +88,43 @@ fn run_with_invocation(args: Args, inv: ForEachRefInvocation) -> Result<()> {
         opts.exclude.is_empty()
             || !ref_matches_patterns(&entry.name, &opts.exclude, opts.ignore_case)
     });
-    apply_filters(&repo, &opts, &mut refs)?;
-    refs.sort_by(|left, right| compare_refs(&repo, left, right, &opts.sort_keys, opts.ignore_case));
-
     let format = opts
         .format
+        .as_deref()
+        .map(str::to_owned)
         .unwrap_or_else(|| "%(objectname) %(objecttype)\t%(refname)".to_owned());
     if let Err(msg) = validate_format_quoting(&format, opts.quote_style) {
         eprintln!("fatal: {msg}");
         std::process::exit(128);
     }
+    if let Err(err) = validate_format_atoms(&format) {
+        match err {
+            FormatError::Fatal(message) => eprintln!("fatal: {message}"),
+            FormatError::Other(message) => eprintln!("error: {message}"),
+            FormatError::MissingObject(oid, refname) => {
+                eprintln!("fatal: missing object {oid} for {refname}");
+            }
+        }
+        std::process::exit(1);
+    }
+    apply_filters(&repo, &opts, &mut refs)?;
+    let is_base_targets = collect_is_base_targets(&format, &opts.sort_keys);
+    let is_base = compute_is_base_winners(&repo, &refs, &is_base_targets);
+    refs.sort_by(|left, right| {
+        compare_refs(
+            &repo,
+            left,
+            right,
+            &opts.sort_keys,
+            opts.ignore_case,
+            &is_base,
+        )
+    });
     let head_branch = read_head(&repo.git_dir).ok().flatten();
     let max = opts.count.unwrap_or(usize::MAX);
     let mut printed = 0usize;
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
     for entry in refs {
         if printed >= max {
             break;
@@ -110,9 +136,15 @@ fn run_with_invocation(args: Args, inv: ForEachRefInvocation) -> Result<()> {
             &head_branch,
             &mailmap,
             opts.quote_style,
+            opts.color,
+            &is_base,
         ) {
             Ok(line) => {
-                println!("{line}");
+                if opts.omit_empty && line.is_empty() {
+                    continue;
+                }
+                stdout.write_all(&line)?;
+                stdout.write_all(b"\n")?;
                 printed += 1;
             }
             Err(FormatError::MissingObject(oid, refname)) => {
@@ -138,7 +170,7 @@ struct RefEntry {
     symref_target: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SortField {
     RefName,
     /// `version:refname` — Git-style natural/version sort of the refname.
@@ -147,9 +179,15 @@ enum SortField {
     ObjectType,
     Raw,
     RawSize,
+    ContentsSize,
+    Subject,
+    TaggerEmail,
+    TaggerDate(Option<String>),
+    CreatorDate(Option<String>),
+    IsBase(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SortKey {
     field: SortField,
     descending: bool,
@@ -178,6 +216,9 @@ struct Options {
     stdin: bool,
     ignore_case: bool,
     quote_style: Option<QuoteStyle>,
+    color: bool,
+    no_sort: bool,
+    omit_empty: bool,
     include_root_refs: bool,
 }
 
@@ -223,6 +264,21 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
         }
         if arg == "--include-root-refs" {
             opts.include_root_refs = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--omit-empty" {
+            opts.omit_empty = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--color" || arg == "--color=always" {
+            opts.color = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--no-color" || arg == "--color=never" {
+            opts.color = false;
             i += 1;
             continue;
         }
@@ -276,6 +332,7 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
         }
         if let Some(value) = arg.strip_prefix("--sort=") {
             opts.sort_keys.push(parse_sort_key(value)?);
+            opts.no_sort = false;
             i += 1;
             continue;
         }
@@ -285,6 +342,13 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
                 bail!("--sort requires a value");
             };
             opts.sort_keys.push(parse_sort_key(value)?);
+            opts.no_sort = false;
+            i += 1;
+            continue;
+        }
+        if arg == "--no-sort" {
+            opts.sort_keys.clear();
+            opts.no_sort = true;
             i += 1;
             continue;
         }
@@ -407,7 +471,7 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
         i += 1;
     }
 
-    if opts.sort_keys.is_empty() {
+    if opts.sort_keys.is_empty() && !opts.no_sort {
         opts.sort_keys.push(SortKey {
             field: SortField::RefName,
             descending: false,
@@ -460,6 +524,20 @@ fn parse_sort_key(raw: &str) -> Result<SortKey> {
             "objecttype" => SortField::ObjectType,
             "raw" => SortField::Raw,
             "raw:size" => SortField::RawSize,
+            "contents:size" => SortField::ContentsSize,
+            "subject" => SortField::Subject,
+            "taggeremail" => SortField::TaggerEmail,
+            "taggerdate" => SortField::TaggerDate(None),
+            "creatordate" => SortField::CreatorDate(None),
+            _ if key.starts_with("taggerdate:") => {
+                SortField::TaggerDate(Some(key["taggerdate:".len()..].to_owned()))
+            }
+            _ if key.starts_with("creatordate:") => {
+                SortField::CreatorDate(Some(key["creatordate:".len()..].to_owned()))
+            }
+            _ if key.starts_with("is-base:") => {
+                SortField::IsBase(key["is-base:".len()..].to_owned())
+            }
             _ => bail!("unsupported sort key: {raw}"),
         }
     };
@@ -619,20 +697,23 @@ fn collect_loose_refs(
             collect_loose_refs(git_dir, &entry.path(), &next_relative, out)?;
         } else if file_type.is_file() {
             match read_loose_ref_oid(git_dir, &next_relative, &entry.path()) {
-                Ok(Some((oid, object_name))) => {
+                Ok(Some((oid, object_name, symref_target))) => {
                     out.insert(
                         next_relative.clone(),
                         RefEntry {
                             name: next_relative,
                             oid,
                             object_name,
-                            symref_target: None,
+                            symref_target,
                         },
                     );
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    out.remove(&next_relative);
+                }
                 Err(_) => {
                     eprintln!("warning: ignoring broken ref {next_relative}");
+                    out.remove(&next_relative);
                 }
             }
         }
@@ -644,15 +725,16 @@ fn read_loose_ref_oid(
     git_dir: &Path,
     refname: &str,
     path: &Path,
-) -> Result<Option<(Option<ObjectId>, String)>> {
+) -> Result<Option<(Option<ObjectId>, String, Option<String>)>> {
     let text = fs::read_to_string(path)?;
     let raw = text.trim();
     if raw.is_empty() {
         bail!("empty ref");
     }
     if raw.starts_with("ref: ") {
+        let target = raw["ref: ".len()..].trim().to_owned();
         return match grit_lib::refs::resolve_ref(git_dir, refname) {
-            Ok(oid) => Ok(Some((Some(oid), oid.to_string()))),
+            Ok(oid) => Ok(Some((Some(oid), oid.to_string(), Some(target)))),
             Err(_) => Ok(None),
         };
     }
@@ -660,7 +742,7 @@ fn read_loose_ref_oid(
         if is_zero_oid(&oid) {
             bail!("zero oid");
         }
-        return Ok(Some((Some(oid), raw.to_owned())));
+        return Ok(Some((Some(oid), raw.to_owned(), None)));
     }
     // The harness `test_oid` maps many names to the placeholder `unknown-oid`
     // (not valid hex). Git would reject that ref content; we synthesize a
@@ -670,7 +752,7 @@ fn read_loose_ref_oid(
         const PLACEHOLDER: &[u8; 20] = b"GritUnknownOidPlc!X!";
         let oid = ObjectId::from_bytes(PLACEHOLDER)
             .map_err(|e| anyhow::anyhow!("internal placeholder object id: {e}"))?;
-        return Ok(Some((Some(oid), raw.to_owned())));
+        return Ok(Some((Some(oid), raw.to_owned(), None)));
     }
     bail!("invalid direct ref")
 }
@@ -790,9 +872,10 @@ fn compare_refs(
     right: &RefEntry,
     keys: &[SortKey],
     ignore_case: bool,
+    is_base: &HashMap<String, String>,
 ) -> Ordering {
-    for key in keys {
-        let mut ord = compare_on_key(repo, left, right, key.field, ignore_case);
+    for key in keys.iter().rev() {
+        let mut ord = compare_on_key(repo, left, right, &key.field, ignore_case, is_base);
         if key.descending {
             ord = ord.reverse();
         }
@@ -807,9 +890,26 @@ fn compare_on_key(
     repo: &Repository,
     left: &RefEntry,
     right: &RefEntry,
-    field: SortField,
+    field: &SortField,
     ignore_case: bool,
+    is_base: &HashMap<String, String>,
 ) -> Ordering {
+    if matches!(field, SortField::RawSize) {
+        return raw_size_for_sort(repo, left).cmp(&raw_size_for_sort(repo, right));
+    }
+    if matches!(field, SortField::ContentsSize) {
+        return contents_size_for_sort(repo, left).cmp(&contents_size_for_sort(repo, right));
+    }
+    if let SortField::TaggerDate(modifier) = field {
+        return date_for_sort(repo, left, DateSortSource::Tagger, modifier.as_deref()).cmp(
+            &date_for_sort(repo, right, DateSortSource::Tagger, modifier.as_deref()),
+        );
+    }
+    if let SortField::CreatorDate(modifier) = field {
+        return date_for_sort(repo, left, DateSortSource::Creator, modifier.as_deref()).cmp(
+            &date_for_sort(repo, right, DateSortSource::Creator, modifier.as_deref()),
+        );
+    }
     let value = |entry: &RefEntry| -> String {
         match field {
             SortField::RefName => entry.name.clone(),
@@ -845,11 +945,19 @@ fn compare_on_key(
                     "0".to_owned()
                 }
             }
+            SortField::ContentsSize => contents_size_for_sort(repo, entry).to_string(),
+            SortField::Subject => entry
+                .oid
+                .and_then(|oid| subject_for_oid(repo, entry, oid).ok())
+                .unwrap_or_default(),
+            SortField::TaggerEmail => tagger_email_for_sort(repo, entry),
+            SortField::TaggerDate(_) | SortField::CreatorDate(_) => String::new(),
+            SortField::IsBase(target) => is_base_value(entry, target, is_base),
         }
     };
     let mut left_val = value(left);
     let mut right_val = value(right);
-    if field == SortField::RefNameVersion {
+    if matches!(field, SortField::RefNameVersion) {
         return compare_refname_version(&left_val, &right_val, ignore_case);
     }
     if ignore_case {
@@ -857,6 +965,100 @@ fn compare_on_key(
         right_val.make_ascii_lowercase();
     }
     left_val.cmp(&right_val)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DateSortSource {
+    Tagger,
+    Creator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum DateSortValue {
+    Timestamp(i64),
+    Formatted(String),
+}
+
+fn date_for_sort(
+    repo: &Repository,
+    entry: &RefEntry,
+    source: DateSortSource,
+    modifier: Option<&str>,
+) -> DateSortValue {
+    let Some(identity) = identity_for_date_sort(repo, entry, source) else {
+        return match modifier {
+            Some(_) => DateSortValue::Formatted(String::new()),
+            None => DateSortValue::Timestamp(0),
+        };
+    };
+    match modifier {
+        Some(modifier) => DateSortValue::Formatted(
+            format_identity_date_git(&identity, Some(modifier)).unwrap_or_default(),
+        ),
+        None => DateSortValue::Timestamp(
+            parse_identity_timestamp(&identity)
+                .map(|(timestamp, _)| timestamp)
+                .unwrap_or(0),
+        ),
+    }
+}
+
+fn identity_for_date_sort(
+    repo: &Repository,
+    entry: &RefEntry,
+    source: DateSortSource,
+) -> Option<String> {
+    let oid = entry.oid?;
+    let object = repo.read_replaced(&oid).ok()?;
+    match (source, object.kind) {
+        (DateSortSource::Tagger, ObjectKind::Tag) => parse_tag(&object.data).ok()?.tagger,
+        (DateSortSource::Creator, ObjectKind::Tag) => parse_tag(&object.data).ok()?.tagger,
+        (DateSortSource::Creator, ObjectKind::Commit) => {
+            Some(parse_commit(&object.data).ok()?.committer)
+        }
+        _ => None,
+    }
+}
+
+fn tagger_email_for_sort(repo: &Repository, entry: &RefEntry) -> String {
+    let Some(oid) = entry.oid else {
+        return String::new();
+    };
+    let Ok(object) = repo.read_replaced(&oid) else {
+        return String::new();
+    };
+    if object.kind != ObjectKind::Tag {
+        return String::new();
+    }
+    parse_tag(&object.data)
+        .ok()
+        .and_then(|tag| tag.tagger)
+        .map(|identity| parse_identity_email(&identity))
+        .unwrap_or_default()
+}
+
+fn raw_size_for_sort(repo: &Repository, entry: &RefEntry) -> usize {
+    entry
+        .oid
+        .and_then(|oid| repo.read_replaced(&oid).ok())
+        .map(|obj| obj.data.len())
+        .unwrap_or(0)
+}
+
+fn contents_size_for_sort(repo: &Repository, entry: &RefEntry) -> usize {
+    let Some(oid) = entry.oid else {
+        return 0;
+    };
+    let Ok(object) = repo.read_replaced(&oid) else {
+        return 0;
+    };
+    match object.kind {
+        ObjectKind::Commit => extract_commit_message(&object.data).len(),
+        ObjectKind::Tag => parse_tag(&object.data)
+            .map(|tag| tag.message.len())
+            .unwrap_or(0),
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -961,6 +1163,218 @@ fn validate_format_quoting(format: &str, quote: Option<QuoteStyle>) -> Result<()
     Ok(())
 }
 
+fn validate_format_atoms(format: &str) -> Result<(), FormatError> {
+    let mut rest = format;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        if after.starts_with('%') {
+            rest = &after[1..];
+            continue;
+        }
+        let Some(inner) = after.strip_prefix('(') else {
+            rest = after;
+            continue;
+        };
+        let Some(end) = inner.find(')') else {
+            return Ok(());
+        };
+        let atom = &inner[..end];
+        let body = atom.strip_prefix('*').unwrap_or(atom);
+        let (base, modifier) = body
+            .find(':')
+            .map(|p| (&body[..p], Some(&body[p + 1..])))
+            .unwrap_or((body, None));
+        if base == "describe" {
+            parse_describe_options(modifier)?;
+        }
+        rest = &inner[end + 1..];
+    }
+    Ok(())
+}
+
+fn collect_is_base_targets(format: &str, sort_keys: &[SortKey]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    collect_is_base_targets_from_format(format, &mut seen, &mut targets);
+    for key in sort_keys {
+        if let SortField::IsBase(target) = &key.field {
+            if seen.insert(target.clone()) {
+                targets.push(target.clone());
+            }
+        }
+    }
+    targets
+}
+
+fn collect_is_base_targets_from_format(
+    format: &str,
+    seen: &mut HashSet<String>,
+    targets: &mut Vec<String>,
+) {
+    let mut rest = format;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        if after.starts_with('%') {
+            rest = &after[1..];
+            continue;
+        }
+        let Some(inner) = after.strip_prefix('(') else {
+            rest = after;
+            continue;
+        };
+        let Some(end) = inner.find(')') else {
+            return;
+        };
+        let atom = &inner[..end];
+        let body = atom.strip_prefix('*').unwrap_or(atom);
+        if let Some(target) = body.strip_prefix("is-base:") {
+            if !target.is_empty() && seen.insert(target.to_owned()) {
+                targets.push(target.to_owned());
+            }
+        }
+        rest = &inner[end + 1..];
+    }
+}
+
+fn compute_is_base_winners(
+    repo: &Repository,
+    refs: &[RefEntry],
+    targets: &[String],
+) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for target in targets {
+        let Ok(target_oid) =
+            resolve_revision(repo, target).and_then(|oid| peel_to_commit(repo, oid))
+        else {
+            continue;
+        };
+        let mut seen_blob_error = false;
+        let mut seen_bad_tag_error = false;
+        let mut best: Option<(&str, usize)> = None;
+        for entry in refs {
+            let Some(commit_oid) =
+                commit_for_is_base(repo, entry, &mut seen_blob_error, &mut seen_bad_tag_error)
+            else {
+                continue;
+            };
+            let Some(distance) = commit_distance_to_ancestor(repo, commit_oid, target_oid) else {
+                continue;
+            };
+            let replace = match best {
+                None => true,
+                Some((best_name, best_distance)) => {
+                    distance < best_distance
+                        || (distance == best_distance && entry.name.as_str() < best_name)
+                }
+            };
+            if replace {
+                best = Some((&entry.name, distance));
+            }
+        }
+        if let Some((name, _)) = best {
+            out.insert(target.clone(), name.to_owned());
+        }
+    }
+    out
+}
+
+fn is_base_value(entry: &RefEntry, target: &str, is_base: &HashMap<String, String>) -> String {
+    match is_base.get(target) {
+        Some(name) if name == &entry.name => format!("({target})"),
+        _ => String::new(),
+    }
+}
+
+fn commit_for_is_base(
+    repo: &Repository,
+    entry: &RefEntry,
+    seen_blob_error: &mut bool,
+    seen_bad_tag_error: &mut bool,
+) -> Option<ObjectId> {
+    let mut oid = entry.oid?;
+    loop {
+        let object = match repo.read_replaced(&oid) {
+            Ok(object) => object,
+            Err(_) => return None,
+        };
+        match object.kind {
+            ObjectKind::Commit => return Some(oid),
+            ObjectKind::Blob => {
+                if !*seen_blob_error {
+                    eprintln!("error: object {oid} is a commit, not a blob");
+                    *seen_blob_error = true;
+                }
+                return None;
+            }
+            ObjectKind::Tag => {
+                let tag = match parse_tag(&object.data) {
+                    Ok(tag) => tag,
+                    Err(_) => {
+                        if !*seen_bad_tag_error {
+                            eprintln!("error: bad tag pointer to {oid}");
+                            *seen_bad_tag_error = true;
+                        }
+                        return None;
+                    }
+                };
+                let expected = match ObjectKind::from_str(&tag.object_type) {
+                    Ok(kind) => kind,
+                    Err(_) => {
+                        if !*seen_bad_tag_error {
+                            eprintln!("error: bad tag pointer to {}", tag.object);
+                            *seen_bad_tag_error = true;
+                        }
+                        return None;
+                    }
+                };
+                let target = match repo.read_replaced(&tag.object) {
+                    Ok(object) => object,
+                    Err(_) => {
+                        if !*seen_bad_tag_error {
+                            eprintln!("error: bad tag pointer to {}", tag.object);
+                            *seen_bad_tag_error = true;
+                        }
+                        return None;
+                    }
+                };
+                if target.kind != expected {
+                    if !*seen_bad_tag_error {
+                        eprintln!("error: bad tag pointer to {}", tag.object);
+                        *seen_bad_tag_error = true;
+                    }
+                    return None;
+                }
+                oid = tag.object;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn commit_distance_to_ancestor(
+    repo: &Repository,
+    start: ObjectId,
+    ancestor: ObjectId,
+) -> Option<usize> {
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back((start, 0usize));
+    while let Some((oid, distance)) = queue.pop_front() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        if oid == ancestor {
+            return Some(distance);
+        }
+        let object = repo.read_replaced(&oid).ok()?;
+        let commit = parse_commit(&object.data).ok()?;
+        for parent in commit.parents {
+            queue.push_back((parent, distance + 1));
+        }
+    }
+    None
+}
+
 fn quote_output(s: &str, style: Option<QuoteStyle>) -> String {
     let Some(style) = style else {
         return s.to_owned();
@@ -1053,31 +1467,203 @@ fn expand_format(
     head_branch: &Option<String>,
     mailmap: &MailmapTable,
     quote_style: Option<QuoteStyle>,
-) -> Result<String, FormatError> {
-    let mut out = String::new();
+    color: bool,
+    is_base: &HashMap<String, String>,
+) -> Result<Vec<u8>, FormatError> {
+    let mut out = Vec::new();
+    let mut emitted_color = false;
     let mut rest = format;
     while let Some(start) = rest.find('%') {
-        out.push_str(&rest[..start]);
+        out.extend_from_slice(rest[..start].as_bytes());
         let after = &rest[start + 1..];
         if after.starts_with('%') {
             let lit = quote_output("%", quote_style);
-            out.push_str(&lit);
+            out.extend_from_slice(lit.as_bytes());
             rest = &after[1..];
         } else if let Some(inner) = after.strip_prefix('(') {
             let Some(end) = inner.find(')') else {
                 return Err(FormatError::Other("unterminated format atom".to_owned()));
             };
             let atom = &inner[..end];
-            let expanded = atom_value(repo, entry, atom, head_branch, mailmap)?;
-            out.push_str(&quote_output(&expanded, quote_style));
+            if atom == "if" || atom.starts_with("if:") {
+                let after_if = &inner[end + 1..];
+                let (selected, after_block) = select_conditional_format(
+                    repo,
+                    entry,
+                    atom,
+                    after_if,
+                    head_branch,
+                    mailmap,
+                    color,
+                    is_base,
+                )?;
+                let expanded = expand_format(
+                    repo,
+                    entry,
+                    selected,
+                    head_branch,
+                    mailmap,
+                    quote_style,
+                    color,
+                    is_base,
+                )?;
+                out.extend_from_slice(&expanded);
+                rest = after_block;
+                continue;
+            } else if raw_atom_emits_bytes(atom) {
+                let expanded = raw_atom_bytes(repo, entry, atom)?;
+                if quote_style == Some(QuoteStyle::Perl) {
+                    out.extend_from_slice(&perl_quote_bytes(&expanded));
+                } else {
+                    out.extend_from_slice(&expanded);
+                }
+            } else if atom.starts_with("color:") {
+                let expanded = atom_value(repo, entry, atom, head_branch, mailmap, color, is_base)?;
+                if !expanded.is_empty() {
+                    emitted_color = true;
+                }
+                out.extend_from_slice(expanded.as_bytes());
+            } else {
+                let expanded = atom_value(repo, entry, atom, head_branch, mailmap, color, is_base)?;
+                let quoted = quote_output(&expanded, quote_style);
+                out.extend_from_slice(quoted.as_bytes());
+            }
             rest = &inner[end + 1..];
+        } else if let Some((byte, consumed)) = decode_percent_hex(after) {
+            out.push(byte);
+            rest = &after[consumed..];
         } else {
-            out.push('%');
+            out.push(b'%');
             rest = after;
         }
     }
-    out.push_str(rest);
+    out.extend_from_slice(rest.as_bytes());
+    if emitted_color {
+        out.extend_from_slice(b"\x1b[m");
+    }
     Ok(out)
+}
+
+fn decode_percent_hex(input: &str) -> Option<(u8, usize)> {
+    let bytes = input.as_bytes();
+    if bytes.len() < 2 {
+        return None;
+    }
+    let high = hex_nibble(bytes[0])?;
+    let low = hex_nibble(bytes[1])?;
+    Some(((high << 4) | low, 2))
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn select_conditional_format<'a>(
+    repo: &Repository,
+    entry: &RefEntry,
+    atom: &str,
+    rest: &'a str,
+    head_branch: &Option<String>,
+    mailmap: &MailmapTable,
+    color: bool,
+    is_base: &HashMap<String, String>,
+) -> Result<(&'a str, &'a str), FormatError> {
+    let Some(then_pos) = rest.find("%(then)") else {
+        return Err(FormatError::Other(
+            "format %(if) missing %(then)".to_owned(),
+        ));
+    };
+    let condition_fmt = &rest[..then_pos];
+    let after_then = &rest[then_pos + "%(then)".len()..];
+    let Some(end_pos) = after_then.find("%(end)") else {
+        return Err(FormatError::Other("format %(if) missing %(end)".to_owned()));
+    };
+    let body = &after_then[..end_pos];
+    let after_block = &after_then[end_pos + "%(end)".len()..];
+    let (then_fmt, else_fmt) = match body.find("%(else)") {
+        Some(else_pos) => (&body[..else_pos], &body[else_pos + "%(else)".len()..]),
+        None => (body, ""),
+    };
+
+    let condition = expand_format(
+        repo,
+        entry,
+        condition_fmt,
+        head_branch,
+        mailmap,
+        None,
+        color,
+        is_base,
+    )?;
+    let matched = match atom.strip_prefix("if:") {
+        None => !trim_ascii_whitespace_bytes(&condition).is_empty(),
+        Some(expected) if expected.starts_with("equals=") => {
+            condition == expected["equals=".len()..].as_bytes()
+        }
+        Some(expected) if expected.starts_with("notequals=") => {
+            condition != expected["notequals=".len()..].as_bytes()
+        }
+        Some(other) => {
+            return Err(FormatError::Fatal(format!(
+                "unrecognized %(if) argument: {other}"
+            )));
+        }
+    };
+
+    Ok((if matched { then_fmt } else { else_fmt }, after_block))
+}
+
+fn trim_ascii_whitespace_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map(|idx| idx + 1)
+        .unwrap_or(start);
+    &bytes[start..end]
+}
+
+fn raw_atom_emits_bytes(atom: &str) -> bool {
+    let body = atom.strip_prefix('*').unwrap_or(atom);
+    let (base, modifier) = body
+        .find(':')
+        .map(|p| (&body[..p], Some(&body[p + 1..])))
+        .unwrap_or((body, None));
+    base == "raw" && modifier != Some("size")
+}
+
+fn raw_atom_bytes(repo: &Repository, entry: &RefEntry, atom: &str) -> Result<Vec<u8>, FormatError> {
+    let object = if atom.strip_prefix('*').is_some() {
+        deref_object(repo, entry)?
+    } else {
+        read_object(repo, entry)?
+    };
+    Ok(object.data)
+}
+
+fn perl_quote_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut out = String::from("\"");
+    for &byte in bytes {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x20..=0x7e => out.push(char::from(byte)),
+            _ => out.push_str(&format!("\\x{byte:02x}")),
+        }
+    }
+    out.push('"');
+    out.into_bytes()
 }
 
 fn atom_value(
@@ -1086,11 +1672,21 @@ fn atom_value(
     atom: &str,
     head_branch: &Option<String>,
     mailmap: &MailmapTable,
+    color: bool,
+    is_base: &HashMap<String, String>,
 ) -> Result<String, FormatError> {
     // Handle deref atoms: %(* objectname), %(*objecttype), etc.
     // These dereference the pointed-to object (peel tags).
     if let Some(deref_atom) = atom.strip_prefix('*') {
-        return deref_atom_value(repo, entry, deref_atom, head_branch, mailmap);
+        return deref_atom_value(
+            repo,
+            entry,
+            deref_atom,
+            head_branch,
+            mailmap,
+            color,
+            is_base,
+        );
     }
 
     // Handle atoms with modifiers (e.g. "authordate:short")
@@ -1102,9 +1698,10 @@ fn atom_value(
 
     match base {
         "refname" => match modifier {
-            Some("short") => Ok(short_refname(&entry.name)),
+            Some("short") => Ok(short_refname(repo, &entry.name)),
             Some("") => Ok(entry.name.clone()),
-            Some(m) => apply_strip_modifier(&entry.name, m).map_err(FormatError::Other),
+            Some(m) => apply_strip_modifier(&entry.name, m)
+                .map_err(|_| FormatError::Fatal(format!("unrecognized %(refname) argument: {m}"))),
             None => Ok(entry.name.clone()),
         },
         "objectname" => match modifier {
@@ -1167,6 +1764,11 @@ fn atom_value(
             Ok("0".repeat(40))
         }
         "HEAD" => {
+            if modifier.is_some() {
+                return Err(FormatError::Fatal(
+                    "%(HEAD) does not take arguments".to_owned(),
+                ));
+            }
             if let Some(ref hb) = head_branch {
                 if entry.name == *hb {
                     return Ok("*".to_owned());
@@ -1174,7 +1776,25 @@ fn atom_value(
             }
             Ok(" ".to_owned())
         }
-        "symref" => Ok(entry.symref_target.clone().unwrap_or_default()),
+        "color" => format_color_atom(modifier, color),
+        "describe" => format_describe_atom(repo, entry, modifier),
+        "signature" => format_signature_atom(repo, entry, modifier),
+        "is-base" => match modifier {
+            Some(target) if !target.is_empty() => Ok(is_base_value(entry, target, is_base)),
+            _ => Err(FormatError::Fatal(
+                "expected format: %(is-base:<committish>)".to_owned(),
+            )),
+        },
+        "symref" => {
+            let target = entry.symref_target.clone().unwrap_or_default();
+            match modifier {
+                None | Some("") => Ok(target),
+                Some("short") => apply_strip_modifier(&target, "lstrip=1")
+                    .map_err(|err| FormatError::Other(err.to_string())),
+                Some(m) => apply_strip_modifier(&target, m)
+                    .map_err(|err| FormatError::Other(err.to_string())),
+            }
+        }
         "tree" => {
             let Some(oid) = entry.oid else {
                 return Err(FormatError::MissingObject(
@@ -1269,8 +1889,15 @@ fn atom_value(
             let subj = subject_for_oid(repo, entry, oid)?;
             match modifier {
                 Some("sanitize") => Ok(sanitize_subject(&subj)),
-                _ => Ok(subj),
+                Some(other) => Err(FormatError::Fatal(format!(
+                    "unrecognized %(subject) argument: {other}"
+                ))),
+                None => Ok(subj),
             }
+        }
+        "trailers" => {
+            let message = message_for_trailers(repo, entry)?;
+            format_trailers_atom(&message, modifier)
         }
         "*subject" => {
             let Some(oid) = entry.oid else {
@@ -1490,11 +2117,7 @@ fn atom_value(
                             lines.next();
                             let rest: String = lines.collect::<Vec<_>>().join("\n");
                             let rest = rest.trim_start_matches('\n');
-                            if rest.is_empty() {
-                                Ok(String::new())
-                            } else {
-                                Ok(format!("{rest}\n"))
-                            }
+                            Ok(body_with_single_trailing_lf(rest))
                         }
                         Some("signature") => {
                             if let Some(sig_start) = body.find("-----BEGIN") {
@@ -1504,6 +2127,13 @@ fn atom_value(
                             }
                         }
                         Some("size") => Ok(body.len().to_string()),
+                        Some("trailers") => format_trailers_atom(&body, None),
+                        Some(m) if m.starts_with("trailers:") => {
+                            format_trailers_atom(&body, Some(&m["trailers:".len()..]))
+                        }
+                        Some(m) if m.starts_with("trailers") => Err(FormatError::Fatal(format!(
+                            "unrecognized %(contents) argument: {m}"
+                        ))),
                         Some("") | None => Ok(body),
                         Some(m) => Err(FormatError::Other(format!(
                             "unsupported contents modifier: {m}"
@@ -1519,11 +2149,7 @@ fn atom_value(
                         Some("subject") => Ok(tag_subject_paragraph(body)),
                         Some("body") => {
                             let b = tag_body_after_first_para(body);
-                            if b.is_empty() {
-                                Ok(String::new())
-                            } else {
-                                Ok(format!("{b}\n"))
-                            }
+                            Ok(body_with_single_trailing_lf(&b))
                         }
                         Some("signature") => {
                             if let Some(sig_start) = body.find("-----BEGIN") {
@@ -1533,6 +2159,13 @@ fn atom_value(
                             }
                         }
                         Some("size") => Ok(body.len().to_string()),
+                        Some("trailers") => format_trailers_atom(body, None),
+                        Some(m) if m.starts_with("trailers:") => {
+                            format_trailers_atom(body, Some(&m["trailers:".len()..]))
+                        }
+                        Some(m) if m.starts_with("trailers") => Err(FormatError::Fatal(format!(
+                            "unrecognized %(contents) argument: {m}"
+                        ))),
                         Some("") | None => Ok(body.clone()),
                         Some(m) => Err(FormatError::Other(format!(
                             "unsupported contents modifier: {m}"
@@ -1597,36 +2230,20 @@ fn deref_atom_value(
     atom: &str,
     head_branch: &Option<String>,
     mailmap: &MailmapTable,
+    color: bool,
+    is_base: &HashMap<String, String>,
 ) -> Result<String, FormatError> {
-    use grit_lib::objects::ObjectKind;
-    // Read the object to check if it's a tag
-    let object = read_object(repo, entry)?;
-    if object.kind != ObjectKind::Tag {
+    let target_obj = match deref_object(repo, entry) {
+        Ok(object) => object,
+        Err(FormatError::Other(message)) if message == "not a tag" => {
+            return Ok(String::new());
+        }
+        Err(err) => return Err(err),
+    };
+    let Some(source_oid) = entry.oid else {
         return Ok(String::new());
-    }
-    let tag = parse_tag(&object.data).map_err(|_| {
-        FormatError::Fatal(format!(
-            "parse_object_buffer failed on {} for {}",
-            entry.object_name, entry.name
-        ))
-    })?;
-    let target_oid = tag.object;
-    let expected_kind = ObjectKind::from_str(&tag.object_type).map_err(|_| {
-        FormatError::Fatal(format!(
-            "parse_object_buffer failed on {} for {}",
-            entry.object_name, entry.name
-        ))
-    })?;
-
-    let target_obj = repo
-        .read_replaced(&target_oid)
-        .map_err(|_| FormatError::Fatal(format!("could not read tagged object '{target_oid}'")))?;
-    if target_obj.kind != expected_kind {
-        return Err(FormatError::Fatal(format!(
-            "bad tag pointer: object '{target_oid}' tagged as '{expected_kind}', but is a '{}' type",
-            target_obj.kind
-        )));
-    }
+    };
+    let target_oid = peel_tag_target_oid(repo, entry, source_oid)?;
 
     // Create a synthetic entry for the target object
     let deref_entry = RefEntry {
@@ -1635,8 +2252,227 @@ fn deref_atom_value(
         object_name: target_oid.to_string(),
         symref_target: None,
     };
+    if target_obj.kind == ObjectKind::Tag {
+        return Err(FormatError::Fatal(format!(
+            "bad tag pointer: object '{target_oid}' recursively resolved to tag"
+        )));
+    }
     // Evaluate the atom against the dereferenced entry
-    atom_value(repo, &deref_entry, atom, head_branch, mailmap)
+    atom_value(
+        repo,
+        &deref_entry,
+        atom,
+        head_branch,
+        mailmap,
+        color,
+        is_base,
+    )
+}
+
+fn deref_object(
+    repo: &Repository,
+    entry: &RefEntry,
+) -> Result<grit_lib::objects::Object, FormatError> {
+    let Some(oid) = entry.oid else {
+        return Err(FormatError::MissingObject(
+            entry.object_name.clone(),
+            entry.name.clone(),
+        ));
+    };
+    let mut object = repo
+        .read_replaced(&oid)
+        .map_err(|_| FormatError::MissingObject(entry.object_name.clone(), entry.name.clone()))?;
+    if object.kind != ObjectKind::Tag {
+        return Err(FormatError::Other("not a tag".to_owned()));
+    }
+
+    loop {
+        let tag = parse_tag(&object.data).map_err(|_| {
+            FormatError::Fatal(format!(
+                "parse_object_buffer failed on {} for {}",
+                entry.object_name, entry.name
+            ))
+        })?;
+        let target_oid = tag.object;
+        let expected_kind = ObjectKind::from_str(&tag.object_type).map_err(|_| {
+            FormatError::Fatal(format!(
+                "parse_object_buffer failed on {} for {}",
+                entry.object_name, entry.name
+            ))
+        })?;
+
+        let target_obj = repo.read_replaced(&target_oid).map_err(|_| {
+            FormatError::Fatal(format!("could not read tagged object '{target_oid}'"))
+        })?;
+        if target_obj.kind != expected_kind {
+            return Err(FormatError::Fatal(format!(
+                "bad tag pointer: object '{target_oid}' tagged as '{expected_kind}', but is a '{}' type",
+                target_obj.kind
+            )));
+        }
+        if target_obj.kind != ObjectKind::Tag {
+            return Ok(target_obj);
+        }
+        object = target_obj;
+    }
+}
+
+fn peel_tag_target_oid(
+    repo: &Repository,
+    entry: &RefEntry,
+    mut oid: ObjectId,
+) -> Result<ObjectId, FormatError> {
+    loop {
+        let object = repo
+            .read_replaced(&oid)
+            .map_err(|_| FormatError::MissingObject(oid.to_string(), entry.name.clone()))?;
+        if object.kind != ObjectKind::Tag {
+            return Ok(oid);
+        }
+        let tag = parse_tag(&object.data).map_err(|_| {
+            FormatError::Fatal(format!(
+                "parse_object_buffer failed on {} for {}",
+                entry.object_name, entry.name
+            ))
+        })?;
+        oid = tag.object;
+    }
+}
+
+fn format_color_atom(modifier: Option<&str>, enabled: bool) -> Result<String, FormatError> {
+    if !enabled {
+        return Ok(String::new());
+    }
+    let Some(name) = modifier else {
+        return Err(FormatError::Fatal("missing color name".to_owned()));
+    };
+    let code = match name {
+        "reset" => "\x1b[m",
+        "black" => "\x1b[30m",
+        "red" => "\x1b[31m",
+        "green" => "\x1b[32m",
+        "yellow" => "\x1b[33m",
+        "blue" => "\x1b[34m",
+        "magenta" => "\x1b[35m",
+        "cyan" => "\x1b[36m",
+        "white" => "\x1b[37m",
+        other => {
+            return Err(FormatError::Fatal(format!("invalid color value: {other}")));
+        }
+    };
+    Ok(code.to_owned())
+}
+
+fn format_describe_atom(
+    repo: &Repository,
+    entry: &RefEntry,
+    modifier: Option<&str>,
+) -> Result<String, FormatError> {
+    let Some(oid) = entry.oid else {
+        return Ok(String::new());
+    };
+    let options = parse_describe_options(modifier)?;
+    match describe_object(repo, oid, &options) {
+        Ok(description) => Ok(description),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+fn format_signature_atom(
+    repo: &Repository,
+    entry: &RefEntry,
+    modifier: Option<&str>,
+) -> Result<String, FormatError> {
+    let object = read_object(repo, entry)?;
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let signature = match grit_lib::signing::GpgConfig::from_config(&config) {
+        Ok(cfg) => match object.kind {
+            ObjectKind::Commit => grit_lib::signing::verify_commit(&cfg, &object.data)
+                .unwrap_or_else(|_| grit_lib::signing::SignatureCheck::default_none()),
+            ObjectKind::Tag => grit_lib::signing::verify_tag(&cfg, &object.data)
+                .unwrap_or_else(|_| grit_lib::signing::SignatureCheck::default_none()),
+            _ => grit_lib::signing::SignatureCheck::default_none(),
+        },
+        Err(_) => grit_lib::signing::SignatureCheck::default_none(),
+    };
+
+    match modifier {
+        None | Some("") => Ok(signature.output),
+        Some("grade") => Ok(signature.result.to_string()),
+        Some("key") => Ok(signature.key.unwrap_or_default()),
+        Some("signer") => Ok(signature.signer.unwrap_or_default()),
+        Some("fingerprint") => Ok(signature.fingerprint.unwrap_or_default()),
+        Some("primarykeyfingerprint") => Ok(signature.primary_key_fingerprint.unwrap_or_default()),
+        Some("trustlevel") => Ok(signature.trust_level.display_key().to_owned()),
+        Some(other) => Err(FormatError::Fatal(format!(
+            "unrecognized %(signature) argument: {other}"
+        ))),
+    }
+}
+
+fn parse_describe_options(modifier: Option<&str>) -> Result<DescribeOptions, FormatError> {
+    let mut options = DescribeOptions {
+        tags: false,
+        always: false,
+        long: false,
+        abbrev: 7,
+        candidates: 10,
+        match_pattern: Vec::new(),
+        exclude_pattern: Vec::new(),
+        exact_match: false,
+        first_parent: false,
+        all: false,
+        contains: false,
+    };
+    let Some(mut rest) = modifier else {
+        return Ok(options);
+    };
+    if rest.is_empty() {
+        return Ok(options);
+    }
+
+    while !rest.is_empty() {
+        let token_end = rest.find(',').unwrap_or(rest.len());
+        let token = &rest[..token_end];
+        if token == "tags" {
+            options.tags = true;
+        } else if let Some(value) = token.strip_prefix("abbrev=") {
+            options.abbrev = value.parse::<usize>().map_err(|_| {
+                FormatError::Fatal(format!("unrecognized %(describe) argument: {rest}"))
+            })?;
+        } else if let Some(value) = token.strip_prefix("match=") {
+            options
+                .match_pattern
+                .push(unquote_describe_pattern(value).to_owned());
+        } else if let Some(value) = token.strip_prefix("exclude=") {
+            options
+                .exclude_pattern
+                .push(unquote_describe_pattern(value).to_owned());
+        } else {
+            return Err(FormatError::Fatal(format!(
+                "unrecognized %(describe) argument: {rest}"
+            )));
+        }
+
+        if token_end == rest.len() {
+            break;
+        }
+        rest = &rest[token_end + 1..];
+    }
+
+    Ok(options)
+}
+
+fn unquote_describe_pattern(value: &str) -> &str {
+    if value.len() >= 2 {
+        let bytes = value.as_bytes();
+        let first = bytes[0];
+        let last = bytes[value.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }
 
 /// Tag subject: first paragraph with inner newlines replaced by spaces (matches Git `ref-filter`).
@@ -1655,6 +2491,260 @@ fn tag_body_after_first_para(message: &str) -> String {
     let mut paras = message.splitn(2, "\n\n");
     let _first = paras.next().unwrap_or("");
     paras.next().unwrap_or("").to_owned()
+}
+
+fn body_with_single_trailing_lf(body: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    if body.ends_with('\n') {
+        body.to_owned()
+    } else {
+        format!("{body}\n")
+    }
+}
+
+fn message_for_trailers(repo: &Repository, entry: &RefEntry) -> Result<String, FormatError> {
+    let object = read_object(repo, entry)?;
+    match object.kind {
+        ObjectKind::Commit => Ok(extract_commit_message(&object.data)),
+        ObjectKind::Tag => {
+            let tag = parse_tag(&object.data).map_err(|_| {
+                FormatError::Other(format!("failed to parse tag for {}", entry.name))
+            })?;
+            Ok(tag.message)
+        }
+        _ => Ok(String::new()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TrailerFormatOptions {
+    only_trailers: bool,
+    only_seen: bool,
+    unfold: bool,
+    keys: Vec<String>,
+    value_only: bool,
+    separator: String,
+    key_value_separator: String,
+}
+
+impl Default for TrailerFormatOptions {
+    fn default() -> Self {
+        Self {
+            only_trailers: false,
+            only_seen: false,
+            unfold: false,
+            keys: Vec::new(),
+            value_only: false,
+            separator: "\n".to_owned(),
+            key_value_separator: ": ".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TrailerLine {
+    Trailer { key: String, value: String },
+    NonTrailer(String),
+}
+
+fn format_trailers_atom(message: &str, modifier: Option<&str>) -> Result<String, FormatError> {
+    let opts = parse_trailer_format_options(modifier)?;
+    let lines = parse_trailer_lines(message);
+    let mut rendered = Vec::new();
+    for line in lines {
+        match line {
+            TrailerLine::Trailer { key, mut value } => {
+                if !opts.keys.is_empty() && !opts.keys.iter().any(|k| k.eq_ignore_ascii_case(&key))
+                {
+                    continue;
+                }
+                if opts.unfold {
+                    value = unfold_trailer_value(&value);
+                }
+                if opts.value_only {
+                    rendered.push(value);
+                } else {
+                    rendered.push(format!("{}{}{}", key, opts.key_value_separator, value));
+                }
+            }
+            TrailerLine::NonTrailer(line) => {
+                if !opts.only_trailers {
+                    rendered.push(line);
+                }
+            }
+        }
+    }
+
+    if rendered.is_empty() {
+        return Ok(String::new());
+    }
+    let mut out = rendered.join(&opts.separator);
+    if opts.separator == "\n" {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn parse_trailer_format_options(
+    modifier: Option<&str>,
+) -> Result<TrailerFormatOptions, FormatError> {
+    let mut opts = TrailerFormatOptions::default();
+    let Some(modifier) = modifier else {
+        return Ok(opts);
+    };
+    if modifier.is_empty() {
+        return Ok(opts);
+    }
+    for arg in modifier.split(',') {
+        if arg == "unfold" {
+            opts.unfold = true;
+        } else if arg == "only" {
+            opts.only_trailers = true;
+            opts.only_seen = true;
+        } else if let Some(value) = arg.strip_prefix("only=") {
+            opts.only_trailers = parse_trailer_bool(value);
+            opts.only_seen = true;
+        } else if arg == "key" {
+            return Err(FormatError::Fatal(
+                "expected %(trailers:key=<value>)".to_owned(),
+            ));
+        } else if let Some(value) = arg.strip_prefix("key=") {
+            let key = value.trim_end_matches(':');
+            opts.keys.push(key.to_owned());
+        } else if arg == "valueonly" {
+            opts.value_only = true;
+        } else if let Some(value) = arg.strip_prefix("separator=") {
+            opts.separator = decode_trailer_format_value(value);
+        } else if let Some(value) = arg.strip_prefix("key_value_separator=") {
+            opts.key_value_separator = decode_trailer_format_value(value);
+        } else {
+            return Err(FormatError::Fatal(format!(
+                "unknown %(trailers) argument: {arg}"
+            )));
+        }
+    }
+    if !opts.keys.is_empty() && !opts.only_seen {
+        opts.only_trailers = true;
+    }
+    Ok(opts)
+}
+
+fn parse_trailer_bool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+fn decode_trailer_format_value(value: &str) -> String {
+    let mut out = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        if chars.peek().is_some_and(|next| *next == 'x') {
+            chars.next();
+            let hi = chars.next();
+            let lo = chars.next();
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                let hex = format!("{hi}{lo}");
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    out.push(byte as char);
+                    continue;
+                }
+                out.push('%');
+                out.push('x');
+                out.push_str(&hex);
+                continue;
+            }
+            out.push('%');
+            out.push('x');
+            if let Some(hi) = hi {
+                out.push(hi);
+            }
+            continue;
+        }
+        out.push('%');
+    }
+    out
+}
+
+fn parse_trailer_lines(message: &str) -> Vec<TrailerLine> {
+    let block = trailer_block(message);
+    if block.is_empty() || !block.iter().any(|line| split_trailer_line(line).is_some()) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for line in block {
+        if line.starts_with(|ch: char| ch.is_whitespace()) {
+            if let Some(TrailerLine::Trailer { value, .. }) = out.last_mut() {
+                value.push('\n');
+                value.push_str(line);
+                continue;
+            }
+        }
+        if let Some((key, value)) = split_trailer_line(line) {
+            out.push(TrailerLine::Trailer { key, value });
+        } else {
+            out.push(TrailerLine::NonTrailer(line.to_owned()));
+        }
+    }
+    out
+}
+
+fn trailer_block(message: &str) -> Vec<&str> {
+    let trimmed = message.trim_end_matches('\n');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let lines = trimmed.lines().collect::<Vec<_>>();
+    let mut start = lines.len();
+    while start > 0 {
+        let prev = lines[start - 1];
+        if prev.trim().is_empty() {
+            break;
+        }
+        start -= 1;
+    }
+    lines[start..].to_vec()
+}
+
+fn split_trailer_line(line: &str) -> Option<(String, String)> {
+    let sep = line.find(':')?;
+    let key = &line[..sep];
+    if key.is_empty()
+        || key
+            .chars()
+            .any(|ch| !(ch.is_ascii_alphanumeric() || ch == '-'))
+    {
+        return None;
+    }
+    let value = line[sep + 1..]
+        .strip_prefix(' ')
+        .unwrap_or(&line[sep + 1..]);
+    Some((key.to_owned(), value.to_owned()))
+}
+
+fn unfold_trailer_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            while chars.peek().is_some_and(|next| next.is_whitespace()) {
+                chars.next();
+            }
+            if !out.is_empty() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn subject_for_oid(
@@ -1916,23 +3006,11 @@ fn resolve_upstream(
     let upstream_ref = format!("refs/remotes/{remote}/{remote_branch}");
 
     match modifier {
-        Some("track") => {
-            // Simple ahead/behind tracking
-            let upstream_oid = grit_lib::refs::resolve_ref(&repo.git_dir, &upstream_ref).ok();
-            match upstream_oid {
-                Some(up_oid) if Some(up_oid) == entry.oid => Ok(String::new()),
-                Some(_up_oid) => Ok("[differs]".to_owned()),
-                None => Ok("[gone]".to_owned()),
-            }
+        Some(m) if tracking_modifier(m).is_some() => {
+            format_tracking_atom(repo, entry, &upstream_ref, m)
         }
-        Some("trackshort") => {
-            let upstream_oid = grit_lib::refs::resolve_ref(&repo.git_dir, &upstream_ref).ok();
-            match upstream_oid {
-                Some(up_oid) if Some(up_oid) == entry.oid => Ok("=".to_owned()),
-                Some(_) => Ok("<>".to_owned()),
-                None => Ok(String::new()),
-            }
-        }
+        Some("remotename") => Ok(remote),
+        Some("remoteref") => Ok(merge),
         Some("short") => Ok(format!("{remote}/{remote_branch}")),
         Some(m)
             if m.starts_with("lstrip=") || m.starts_with("rstrip=") || m.starts_with("strip=") =>
@@ -1974,10 +3052,51 @@ fn resolve_push(
         None => return Ok(String::new()),
     };
 
-    let push_ref = format!("refs/remotes/{remote}/{branch}");
+    let explicit_remote_ref = resolve_push_remote_ref(&config_text, branch, &remote);
+    let branch_remote = parse_branch_config(&config_text, branch, "remote");
+    let branch_merge = parse_branch_config(&config_text, branch, "merge");
+    let push_default = crate::protocol::check_config_param("push.default")
+        .or_else(|| parse_config_value(&config_text, "push", "default"))
+        .unwrap_or_else(|| "simple".to_owned());
+    if explicit_remote_ref.is_none()
+        && push_default.eq_ignore_ascii_case("simple")
+        && (branch_remote.as_deref() != Some(remote.as_str())
+            || branch_merge.as_deref() != Some(&format!("refs/heads/{branch}")))
+    {
+        return match modifier {
+            Some("remotename") => Ok(remote),
+            Some("remoteref") | Some("") | None | Some("short") => Ok(String::new()),
+            Some(m) if tracking_modifier(m).is_some() => Ok(String::new()),
+            Some(m)
+                if m.starts_with("lstrip=")
+                    || m.starts_with("rstrip=")
+                    || m.starts_with("strip=") =>
+            {
+                Ok(String::new())
+            }
+            Some(m) => Err(FormatError::Other(format!(
+                "unsupported push modifier: {m}"
+            ))),
+        };
+    }
+
+    let remote_ref = explicit_remote_ref.or(branch_merge);
+    let push_ref = remote_ref
+        .as_deref()
+        .and_then(|remote_ref| remote_ref.strip_prefix("refs/heads/"))
+        .map(|branch| format!("refs/remotes/{remote}/{branch}"))
+        .unwrap_or_default();
 
     match modifier {
-        Some("short") => Ok(format!("{remote}/{branch}")),
+        Some(m) if tracking_modifier(m).is_some() => {
+            format_tracking_atom(repo, entry, &push_ref, m)
+        }
+        Some("remotename") => Ok(remote),
+        Some("remoteref") => Ok(remote_ref.unwrap_or_default()),
+        Some("short") => Ok(push_ref
+            .strip_prefix("refs/remotes/")
+            .unwrap_or(&push_ref)
+            .to_owned()),
         Some(m)
             if m.starts_with("lstrip=") || m.starts_with("rstrip=") || m.starts_with("strip=") =>
         {
@@ -1988,6 +3107,92 @@ fn resolve_push(
             "unsupported push modifier: {m}"
         ))),
     }
+}
+
+#[derive(Clone, Copy)]
+enum TrackingModifier {
+    Track { nobracket: bool },
+    TrackShort,
+}
+
+fn tracking_modifier(raw: &str) -> Option<TrackingModifier> {
+    let mut track = false;
+    let mut trackshort = false;
+    let mut nobracket = false;
+
+    for part in raw.split(',') {
+        match part {
+            "track" => track = true,
+            "trackshort" => trackshort = true,
+            "nobracket" => nobracket = true,
+            _ => return None,
+        }
+    }
+
+    match (track, trackshort) {
+        (true, false) => Some(TrackingModifier::Track { nobracket }),
+        (false, true) if !nobracket => Some(TrackingModifier::TrackShort),
+        _ => None,
+    }
+}
+
+fn format_tracking_atom(
+    repo: &Repository,
+    entry: &RefEntry,
+    tracking_ref: &str,
+    modifier: &str,
+) -> Result<String, FormatError> {
+    let Some(kind) = tracking_modifier(modifier) else {
+        return Err(FormatError::Other(format!(
+            "unsupported tracking modifier: {modifier}"
+        )));
+    };
+    let Some(local_oid) = entry.oid else {
+        return Ok(String::new());
+    };
+    let upstream_oid = match grit_lib::refs::resolve_ref(&repo.git_dir, tracking_ref) {
+        Ok(oid) => oid,
+        Err(_) => {
+            return Ok(match kind {
+                TrackingModifier::Track { .. } => "[gone]".to_owned(),
+                TrackingModifier::TrackShort => String::new(),
+            });
+        }
+    };
+
+    if local_oid == upstream_oid {
+        return Ok(match kind {
+            TrackingModifier::Track { .. } => String::new(),
+            TrackingModifier::TrackShort => "=".to_owned(),
+        });
+    }
+
+    let (ahead, behind) = count_symmetric_ahead_behind(repo, local_oid, upstream_oid)
+        .map_err(|err| FormatError::Other(err.to_string()))?;
+
+    Ok(match kind {
+        TrackingModifier::TrackShort => match (ahead > 0, behind > 0) {
+            (true, true) => "<>".to_owned(),
+            (true, false) => ">".to_owned(),
+            (false, true) => "<".to_owned(),
+            (false, false) => "=".to_owned(),
+        },
+        TrackingModifier::Track { nobracket } => {
+            let mut parts = Vec::new();
+            if ahead > 0 {
+                parts.push(format!("ahead {ahead}"));
+            }
+            if behind > 0 {
+                parts.push(format!("behind {behind}"));
+            }
+            let inner = parts.join(", ");
+            if nobracket {
+                inner
+            } else {
+                format!("[{inner}]")
+            }
+        }
+    })
 }
 
 /// Parse a top-level config value (`[section] key = value`).
@@ -2039,6 +3244,41 @@ fn parse_branch_config(config: &str, branch: &str, key: &str) -> Option<String> 
     None
 }
 
+fn parse_remote_config(config: &str, remote: &str, key: &str) -> Option<String> {
+    let section_header = format!("[remote \"{}\"]", remote);
+    let mut in_section = false;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == section_header;
+            continue;
+        }
+        if in_section {
+            if let Some(eq_pos) = trimmed.find('=') {
+                let k = trimmed[..eq_pos].trim();
+                if k.eq_ignore_ascii_case(key) {
+                    return Some(trimmed[eq_pos + 1..].trim().to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn resolve_push_remote_ref(config: &str, branch: &str, remote: &str) -> Option<String> {
+    let push = parse_remote_config(config, remote, "push")?;
+    let (src, dst) = push.split_once(':')?;
+    let local_ref = format!("refs/heads/{branch}");
+    if let (Some(src_prefix), Some(dst_prefix)) = (src.strip_suffix('*'), dst.strip_suffix('*')) {
+        let suffix = local_ref.strip_prefix(src_prefix)?;
+        return Some(format!("{dst_prefix}{suffix}"));
+    }
+    if src == local_ref {
+        return Some(dst.to_owned());
+    }
+    None
+}
+
 fn read_object(
     repo: &Repository,
     entry: &RefEntry,
@@ -2053,13 +3293,40 @@ fn read_object(
         .map_err(|_| FormatError::MissingObject(entry.object_name.clone(), entry.name.clone()))
 }
 
-fn short_refname(name: &str) -> String {
-    for prefix in ["refs/heads/", "refs/tags/", "refs/remotes/"] {
-        if let Some(short) = name.strip_prefix(prefix) {
-            return short.to_owned();
+fn short_refname(repo: &Repository, name: &str) -> String {
+    if let Some(short) = name.strip_prefix("refs/heads/") {
+        if ref_exists(repo, &format!("refs/tags/{short}")) {
+            return format!("heads/{short}");
         }
+        return short.to_owned();
+    }
+    if let Some(short) = name.strip_prefix("refs/tags/") {
+        if core_warn_ambiguous_refs(repo) && ref_exists(repo, &format!("refs/heads/{short}")) {
+            return format!("tags/{short}");
+        }
+        return short.to_owned();
+    }
+    if let Some(short) = name.strip_prefix("refs/remotes/") {
+        return short.to_owned();
     }
     name.to_owned()
+}
+
+fn ref_exists(repo: &Repository, name: &str) -> bool {
+    grit_lib::refs::resolve_ref(&repo.git_dir, name).is_ok()
+}
+
+fn core_warn_ambiguous_refs(repo: &Repository) -> bool {
+    let config_path = repo.git_dir.join("config");
+    let config_text = fs::read_to_string(&config_path).unwrap_or_default();
+    parse_config_value(&config_text, "core", "warnambiguousrefs")
+        .map(|value| {
+            !matches!(
+                value.to_ascii_lowercase().as_str(),
+                "false" | "no" | "off" | "0"
+            )
+        })
+        .unwrap_or(true)
 }
 
 /// Sanitize a subject line: replace whitespace and non-printable characters

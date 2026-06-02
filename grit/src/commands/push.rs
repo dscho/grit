@@ -4682,9 +4682,6 @@ fn resolve_destination_ref_for_push(
     if check_refname_format(dst, &onelevel_opts).is_err() {
         bail!("The destination you provided is not a full refname");
     }
-    if !local_ref.starts_with("refs/") {
-        bail!("The destination you provided is not a full refname");
-    }
     if prefer_source_namespace {
         if local_ref.starts_with("refs/heads/") {
             return Ok(format!("refs/heads/{dst}"));
@@ -4710,6 +4707,19 @@ fn resolve_destination_ref_for_push(
                 .map(|_| c.to_owned())
         })
         .collect();
+    if !local_ref.starts_with("refs/") {
+        return match existing.len() {
+            1 => Ok(existing
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| dst.to_owned())),
+            0 => bail!("The destination you provided is not a full refname"),
+            _ => {
+                eprintln!("error: dst refspec {dst} matches more than one");
+                bail!("failed to push some refs");
+            }
+        };
+    }
     match existing.len() {
         0 => Ok(format!("refs/heads/{dst}")),
         1 => Ok(existing

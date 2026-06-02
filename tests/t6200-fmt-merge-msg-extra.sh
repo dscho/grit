@@ -12,7 +12,7 @@ cd "$(dirname "$0")" || exit 1
 
 test_expect_success 'setup repo with branches' '
 	(
-	grit init repo &&
+	grit init --initial-branch=master repo &&
 	cd repo &&
 	git config user.email "t@t.com" &&
 	git config user.name "T" &&

@@ -48,6 +48,10 @@ pub struct Args {
     #[arg(short = 'F', long = "file")]
     pub file: Option<String>,
 
+    /// Cleanup mode for tag messages.
+    #[arg(long = "cleanup")]
+    pub cleanup: Option<String>,
+
     /// Delete a tag.
     #[arg(short = 'd', long = "delete")]
     pub delete: bool,
@@ -755,6 +759,9 @@ fn strip_comments(s: &str) -> String {
 fn build_tag_message(args: &Args) -> Result<String> {
     if !args.message.is_empty() {
         let msg = args.message.join("\n\n");
+        if args.cleanup.as_deref() == Some("verbatim") {
+            return Ok(msg);
+        }
         let stripped = strip_comments(&msg);
         return Ok(stripped);
     }
@@ -768,6 +775,9 @@ fn build_tag_message(args: &Args) -> Result<String> {
         } else {
             fs::read_to_string(file_path)?
         };
+        if args.cleanup.as_deref() == Some("verbatim") {
+            return Ok(content);
+        }
         let stripped = strip_comments(&content);
         return Ok(stripped);
     }

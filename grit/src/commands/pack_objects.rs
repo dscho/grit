@@ -1550,6 +1550,7 @@ pub fn build_thin_push_pack(
             }
         }
     }
+    have_roots.retain(|oid| local_repo.odb.read(oid).is_ok());
 
     build_thin_push_pack_from_have_set(local_repo, push_tips, &have_roots)
 }
