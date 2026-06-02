@@ -366,3 +366,49 @@ pub fn commit_message_unicode_for_display(
         message.to_owned()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_utf8_accepts_plain_ascii_and_multibyte() {
+        assert!(is_strict_utf8(b"Commit message\n"));
+        // Valid multi-byte UTF-8 (Latin small letter a with acute, CJK).
+        assert!(is_strict_utf8("Ábçdèfg はれひほふ".as_bytes()));
+        // ISO-2022-JP is a 7-bit encoding using ESC control bytes; valid UTF-8.
+        assert!(is_strict_utf8(b"\x1b$B$O$l$R$[$U\x1b(B"));
+    }
+
+    #[test]
+    fn strict_utf8_rejects_surrogates() {
+        // Encoded surrogate U+D800 (ED A0 80) — invalid in UTF-8.
+        assert_eq!(find_invalid_utf8(b"abc\xed\xa0\x80"), Some(3));
+        assert!(!is_strict_utf8(b"\xed\xa0\x80"));
+    }
+
+    #[test]
+    fn strict_utf8_rejects_overlong_sequences() {
+        // Overlong encoding of U+0029 and the C0 A0 "fake space".
+        assert!(!is_strict_utf8(b"\xe0\x82\xa9"));
+        assert!(!is_strict_utf8(b"\xc0\xa0"));
+    }
+
+    #[test]
+    fn strict_utf8_rejects_noncharacters_rust_would_accept() {
+        // U+10FFFE non-character: F4 8F BF BE.
+        assert!(core::str::from_utf8(b"\xf4\x8f\xbf\xbe").is_ok());
+        assert!(!is_strict_utf8(b"\xf4\x8f\xbf\xbe"));
+        // U+FDD0 (in the U+FDD0..=U+FDEF non-character block): EF B7 90.
+        assert!(core::str::from_utf8(b"\xef\xb7\x90").is_ok());
+        assert!(!is_strict_utf8(b"\xef\xb7\x90"));
+    }
+
+    #[test]
+    fn latin1_round_trips_through_encode_and_decode() {
+        let unicode = "Áéí óú";
+        let encoded = encode_header_text("ISO8859-1", unicode).expect("latin1 encodes");
+        assert_eq!(encoded, vec![0xC1, 0xE9, 0xED, 0x20, 0xF3, 0xFA]);
+        assert_eq!(decode_bytes(Some("ISO8859-1"), &encoded), unicode);
+    }
+}
