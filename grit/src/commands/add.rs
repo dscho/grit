@@ -469,13 +469,11 @@ pub fn run(mut args: Args) -> Result<()> {
     let _dry_stdout_guard =
         DryRunMultispecStdoutGuard::maybe_begin(args.dry_run, args.pathspec.len());
 
-    // "git add" with no pathspecs and no flags: give advice
-    if args.pathspec.is_empty()
-        && !args.all
-        && !args.update
-        && !args.refresh
-        && args.chmod.is_none()
-    {
+    // "git add" with no pathspecs and no -A/-u/--refresh: give advice and do nothing.
+    // Per Git (`require_pathspec && pathspec.nr == 0`), `--chmod` does NOT exempt this — a bare
+    // `git add --chmod=+x` prints "Nothing specified" and leaves the index untouched (Git only
+    // runs `chmod_pathspec` when `pathspec.nr` is nonzero), so we must not flip any entries here.
+    if args.pathspec.is_empty() && !args.all && !args.update && !args.refresh {
         eprintln!("Nothing specified, nothing added.");
         eprintln!("hint: Maybe you wanted to say 'git add .'?");
         eprintln!(
@@ -494,32 +492,6 @@ pub fn run(mut args: Args) -> Result<()> {
             &args,
             &sparse_state,
         );
-    }
-
-    // --chmod with no pathspecs: update all matching index entries (Git chmod_pathspec).
-    if args.chmod.is_some() && args.pathspec.is_empty() {
-        let flip = match args.chmod.as_deref() {
-            Some("+x") => b'+',
-            Some("-x") => b'-',
-            Some(other) => bail!("unrecognized --chmod value: {}", other),
-            None => bail!("internal: chmod without value"),
-        };
-        let mut _sparse_chmod: Vec<String> = Vec::new();
-        chmod_index_entries(
-            &mut index,
-            &args,
-            None,
-            flip,
-            &sparse_state,
-            &mut _sparse_chmod,
-            work_tree,
-            prefix.as_deref(),
-            precompose_unicode,
-        )?;
-        if !args.dry_run {
-            write_index_or_lock_err(&repo, &mut index, &index_path)?;
-        }
-        return Ok(());
     }
 
     // Build ignore matcher if needed (not needed with --force)
@@ -542,39 +514,11 @@ pub fn run(mut args: Args) -> Result<()> {
         );
     }
 
-    if args.chmod.is_some() && !args.pathspec.is_empty() {
-        let flip = match args.chmod.as_deref() {
-            Some("+x") => b'+',
-            Some("-x") => b'-',
-            Some(other) => bail!("unrecognized --chmod value: {}", other),
-            None => bail!("internal: chmod without value"),
-        };
-        let mut sparse_chmod: Vec<String> = Vec::new();
-        chmod_index_entries(
-            &mut index,
-            &args,
-            Some(&args.pathspec),
-            flip,
-            &sparse_state,
-            &mut sparse_chmod,
-            work_tree,
-            prefix.as_deref(),
-            precompose_unicode,
-        )?;
-        sparse_chmod.sort();
-        sparse_chmod.dedup();
-        if !sparse_chmod.is_empty() {
-            emit_sparse_path_advice(&mut std::io::stderr(), &add_cfg.config, &sparse_chmod)?;
-            if !args.dry_run {
-                write_index_or_lock_err(&repo, &mut index, &index_path)?;
-            }
-            std::process::exit(1);
-        }
-        if !args.dry_run {
-            write_index_or_lock_err(&repo, &mut index, &index_path)?;
-        }
-        return Ok(());
-    }
+    // NOTE: `--chmod` WITH pathspecs flows through the normal add path below. Git stages the
+    // matched paths first (`add_files_to_cache`/`add_files`), then applies the chmod flip
+    // (`chmod_pathspec`); our `stage_file` applies the chmod inline while staging, which is
+    // equivalent. The standalone `chmod_index_entries` helper is only used for the
+    // no-pathspec case above (Git's `chmod_arg && pathspec.nr` guard).
 
     let mut exit_for_sparse_advice = false;
     let mut sparse_advice_paths: Vec<String> = Vec::new();
@@ -1346,97 +1290,6 @@ impl From<anyhow::Error> for AddPathError {
     }
 }
 
-/// Apply `--chmod` to index entries matching optional pathspecs (Git `chmod_pathspec`).
-///
-/// When `pathspecs` is `None`, every stage-0 entry is considered. Appends to `sparse_advice_out`
-/// pathspecs that only matched skip-worktree / outside-sparse entries (caller prints advice and exits).
-fn chmod_index_entries(
-    index: &mut Index,
-    args: &Args,
-    pathspecs: Option<&[String]>,
-    flip: u8,
-    sparse: &AddSparseState,
-    sparse_advice_out: &mut Vec<String>,
-    work_tree: &Path,
-    prefix: Option<&str>,
-    _precompose_unicode: bool,
-) -> Result<()> {
-    if let Some(ps) = pathspecs {
-        if !args.sparse {
-            for spec in ps {
-                let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix);
-                let mut matched_any = false;
-                let mut all_blocked = true;
-                for ie in &index.entries {
-                    if ie.stage() != 0 {
-                        continue;
-                    }
-                    let p = String::from_utf8_lossy(&ie.path);
-                    if !pathspec_matches_index_path(spec, &resolved, p.as_ref()) {
-                        continue;
-                    }
-                    matched_any = true;
-                    let blocked = sparse.add_update_blocked(false, Some(ie), p.as_ref())
-                        || (sparse.sparse_enabled && !sparse.path_in_sparse_definition(p.as_ref()));
-                    if !blocked {
-                        all_blocked = false;
-                        break;
-                    }
-                }
-                if matched_any && all_blocked {
-                    sparse_advice_out.push(spec.clone());
-                }
-            }
-        }
-    }
-
-    for ie in &mut index.entries {
-        if ie.stage() != 0 {
-            continue;
-        }
-        let path_str = String::from_utf8_lossy(&ie.path);
-        let matches_spec = match pathspecs {
-            None => true,
-            Some(p) => p.iter().any(|spec| {
-                let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix);
-                pathspec_matches_index_path(spec, &resolved, path_str.as_ref())
-            }),
-        };
-        if !matches_spec {
-            continue;
-        }
-        if sparse.add_update_blocked(args.sparse, Some(ie), path_str.as_ref()) {
-            continue;
-        }
-        // Without `--sparse`, paths outside the sparse definition stay blocked even if
-        // `skip-worktree` was cleared locally (`git update-index --no-skip-worktree`).
-        if !args.sparse
-            && sparse.sparse_enabled
-            && !sparse.path_in_sparse_definition(path_str.as_ref())
-        {
-            continue;
-        }
-        let is_symlink = ie.mode == 0o120000;
-        let is_reg = ie.mode & 0o170000 == 0o100000;
-        if !is_reg {
-            if is_symlink {
-                eprintln!(
-                    "error: cannot chmod {} '{}'",
-                    if flip == b'+' { "+x" } else { "-x" },
-                    path_str
-                );
-            }
-            continue;
-        }
-        if args.dry_run {
-            continue;
-        }
-        ie.mode = if flip == b'+' { 0o100755 } else { 0o100644 };
-    }
-
-    Ok(())
-}
-
 /// Run --refresh: update stat info in the index.
 fn run_refresh(
     repo: &Repository,
@@ -1509,19 +1362,14 @@ fn run_refresh(
                 }
             }
             if !matched_any && !args.ignore_missing {
-                eprintln!(
-                    "fatal: pathspec '{}' did not match any file(s) known to git",
-                    pathspec
-                );
+                // Git's `refresh()` dies with this exact wording (builtin/add.c).
+                eprintln!("fatal: pathspec '{}' did not match any files", pathspec);
                 std::process::exit(128);
             }
             if matched_any && all_matches_blocked && !args.sparse {
                 sparse_advice.push(pathspec.clone());
             } else if matched_any && !all_matches_blocked && !refreshed && !args.ignore_missing {
-                eprintln!(
-                    "fatal: pathspec '{}' did not match any file(s) known to git",
-                    pathspec
-                );
+                eprintln!("fatal: pathspec '{}' did not match any files", pathspec);
                 std::process::exit(128);
             }
         }
