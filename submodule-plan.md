@@ -71,7 +71,10 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
   - Fixed this iteration: `fsck` now skips index gitlinks as superproject-local object
     requirements, and recursive submodule update skips clean parent submodules that are already at
     the recorded commit while still recursing into nested submodules.
-- [ ] `t7423-submodule-symlinks.sh` - 4/6 passing, 2 failing. Focus: symlink safety.
+- [x] `t7423-submodule-symlinks.sh` - 6/6 passing. Focus: symlink safety.
+  - Fixed this iteration: `submodule update` validates configured submodule paths before any
+    reattach/clone work, and recursive checkout validates dropped gitlink paths before removing or
+    absorbing symlinked worktree paths.
 - [ ] `t7418-submodule-sparse-gitmodules.sh` - 8/9 passing, 1 failing. Focus: sparse `.gitmodules`.
 - [ ] `t7426-submodule-get-default-remote.sh` - 14/15 passing, 1 failing. Focus: default remote lookup.
 

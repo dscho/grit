@@ -6,6 +6,16 @@
 # Test Results
 
 Updated: 2026-06-02
+- t7 submodule focus: `./scripts/run-tests.sh t7423-submodule-symlinks.sh` improved `t7423`
+  from 4/6 to 6/6 by rejecting submodule operations through symlinked paths before update can
+  reattach an existing module gitdir and before recursive checkout can remove or absorb a dropped
+  gitlink path. Direct `sh t7423-submodule-symlinks.sh -v` also passed all 6 tests after the
+  release rebuild.
+- Verification: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed. Build/check
+  and clippy still report the existing warning backlog; grit-lib unit tests passed 238/238.
+  Clippy's unrelated auto-fixes in `grit-lib/src/config.rs` and
+  `grit-lib/src/filter_process.rs` were reverted.
 - t7 submodule focus: `./scripts/run-tests.sh t7412-submodule-absorbgitdirs.sh` improved
   `t7412` from 10/12 to 12/12 by making `fsck` ignore index gitlink OIDs as local object
   requirements and by allowing recursive submodule update to skip clean parent submodules that are

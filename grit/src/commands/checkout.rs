@@ -43,7 +43,7 @@ use grit_lib::rev_parse::{
 };
 use grit_lib::sparse_checkout::apply_sparse_checkout_skip_worktree;
 use grit_lib::state::{resolve_head, HeadState};
-use grit_lib::submodule_gitdir::submodule_modules_git_dir;
+use grit_lib::submodule_gitdir::{submodule_modules_git_dir, validate_submodule_path};
 use grit_lib::write_tree::{build_cache_tree_from_index, write_tree_from_index};
 
 use crate::branch_tracking::{format_tracking_info, AheadBehindMode};
@@ -6565,6 +6565,10 @@ pub(crate) fn checkout_index_to_worktree(
                 if old_entry.mode == MODE_GITLINK && !git_dir_is_nested_modules_repo(&repo.git_dir)
                 {
                     let rel = String::from_utf8_lossy(old_path).into_owned();
+                    if RECURSE_SUBMODULES.with(|r| r.get()) {
+                        validate_submodule_path(work_tree, &rel)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    }
                     let abs = work_tree.join(&rel);
                     if submodule_dir_has_non_dotgit_content(&abs) {
                         continue;
@@ -6574,6 +6578,13 @@ pub(crate) fn checkout_index_to_worktree(
         }
         let rel = String::from_utf8_lossy(old_path).into_owned();
         let abs = work_tree.join(&rel);
+        if RECURSE_SUBMODULES.with(|r| r.get())
+            && old_map
+                .get(old_path.as_slice())
+                .is_some_and(|e| e.mode == MODE_GITLINK)
+        {
+            validate_submodule_path(work_tree, &rel).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         // Safety: don't follow symlinks when removing paths.
         // Check if any parent path component is a symlink.
         let path_through_symlink = {

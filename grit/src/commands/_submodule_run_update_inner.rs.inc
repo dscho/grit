@@ -158,6 +158,9 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
             continue;
         };
 
+        validate_submodule_path(work_tree, &m.path)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
         let modules_dir = submodule_separate_git_dir(&repo, work_tree, &m.name, &m.path)?;
         if let Some(outer) = submodule_gitdir_outer_conflict(&modules_dir, &m.name) {
             bail!(
@@ -269,9 +272,6 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                         let _ = fs::remove_file(&sub_path);
                     }
                 }
-
-                validate_submodule_path(work_tree, &m.path)
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
                 let clone_src_str =
                     resolve_submodule_super_url(work_tree, &repo.git_dir, &clone_url)?;
