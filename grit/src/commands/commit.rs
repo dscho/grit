@@ -20,7 +20,7 @@ use grit_lib::index::{Index, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
 use grit_lib::mailmap::load_mailmap_table;
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::reflog::read_reflog;
-use grit_lib::refs::{append_reflog, list_refs, write_ref};
+use grit_lib::refs::{append_reflog, list_refs, should_autocreate_reflog, write_ref};
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::{rev_list, RevListOptions};
 use grit_lib::rev_parse::resolve_revision;
@@ -1448,15 +1448,25 @@ pub fn run(mut args: Args) -> Result<()> {
 
     match &head {
         HeadState::Branch { refname, .. } => {
-            append_reflog(
-                &repo.git_dir,
-                refname,
-                &old_oid,
-                &commit_oid,
-                &commit_data.committer,
-                &reflog_msg,
-                false,
-            )?;
+            if repo
+                .git_dir
+                .join("logs")
+                .join(refname)
+                .metadata()
+                .map(|_| true)
+                .unwrap_or(false)
+                || should_autocreate_reflog(&repo.git_dir, refname)
+            {
+                append_reflog(
+                    &repo.git_dir,
+                    refname,
+                    &old_oid,
+                    &commit_oid,
+                    &commit_data.committer,
+                    &reflog_msg,
+                    false,
+                )?;
+            }
             // Append the same entry to `logs/HEAD` instead of replacing it with a copy of
             // `logs/refs/heads/<branch>` — mirroring would drop `checkout: moving from …`
             // lines and break `git switch -` / `@{-1}` (t3452-history-split).
@@ -1519,7 +1529,15 @@ pub fn run(mut args: Args) -> Result<()> {
             .ok()
             .and_then(|e| e.last().map(|l| l.new_oid == commit_oid))
             .unwrap_or(false);
-        if head_ok && !branch_ok {
+        let branch_log_wants_entry = repo
+            .git_dir
+            .join("logs")
+            .join(refname)
+            .metadata()
+            .map(|_| true)
+            .unwrap_or(false)
+            || should_autocreate_reflog(&repo.git_dir, refname);
+        if head_ok && !branch_ok && branch_log_wants_entry {
             append_reflog(
                 &repo.git_dir,
                 refname,

@@ -894,6 +894,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 // on `switch --orphan` leaving a clean worktree).
                 switch_style: args.switch_mode,
                 force: args.force,
+                create_reflog: args.create_reflog,
             },
         );
     }
@@ -2542,6 +2543,8 @@ struct CreateOrphanOptions {
     switch_style: bool,
     /// `-f` / `--discard-changes` / `-m` (same as branch switch force).
     force: bool,
+    /// `-l`: create the unborn branch reflog so the first commit records into it.
+    create_reflog: bool,
 }
 
 /// Create an orphan branch (`checkout --orphan <name> [<start_point>]`).
@@ -2581,6 +2584,15 @@ fn create_orphan_branch(
             RECURSE_SUBMODULES.with(|r| r.get()),
         )?;
         std::fs::write(repo.git_dir.join("HEAD"), format!("ref: {branch_ref}\n"))?;
+        if opts.create_reflog || refs::should_autocreate_reflog(&repo.git_dir, &branch_ref) {
+            if let Some(parent) = repo.git_dir.join("logs").join(&branch_ref).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(repo.git_dir.join("logs").join(&branch_ref))?;
+        }
         checkout_eprintln!("Switched to a new branch '{}'", name);
         return Ok(());
     }
@@ -2643,6 +2655,15 @@ fn create_orphan_branch(
 
     // Point HEAD at the new branch (which doesn't exist yet = unborn)
     std::fs::write(repo.git_dir.join("HEAD"), format!("ref: {branch_ref}\n"))?;
+    if opts.create_reflog || refs::should_autocreate_reflog(&repo.git_dir, &branch_ref) {
+        if let Some(parent) = repo.git_dir.join("logs").join(&branch_ref).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(repo.git_dir.join("logs").join(&branch_ref))?;
+    }
 
     checkout_eprintln!("Switched to a new branch '{}'", name);
     Ok(())

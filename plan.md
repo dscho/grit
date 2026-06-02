@@ -59,6 +59,9 @@
     no-op `EDITOR=:` fallback so checkout-last reflog tests can run without a terminal editor.
   - Completed: `t2015-checkout-unborn.sh` (6/6). Bare `checkout` in a newly-created unborn repo
     now fails instead of silently succeeding.
+  - Completed: `t2017-checkout-orphan.sh` (13/13). Orphan branch reflog behavior now respects
+    `core.logAllRefUpdates=false` while honoring `checkout -l --orphan`; rev-parse no longer
+    treats a missing branch reflog selector as the branch tip.
   - Completed: `t2201-add-update-typechange.sh` (6/6) by treating index paths under symlinked
     parents as deleted in diff/add/commit flows and by reporting worktree gitlink typechanges in
     `diff-index`.
