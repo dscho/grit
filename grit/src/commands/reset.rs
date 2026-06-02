@@ -1499,7 +1499,7 @@ Use '--' to separate paths from revisions, like this:\n\
                 &old_index,
                 head_tree_oid,
                 target_tree_oid,
-                recurse_submodules,
+                true,
             )?;
             preserve_index_cache_flags_from(&old_index, &mut phase1);
             if repo.work_tree.is_some() {
@@ -1619,7 +1619,7 @@ Use '--' to separate paths from revisions, like this:\n\
                     &mut new_index,
                     Some((&target_oid, Some(commit_spec))),
                     recurse_submodules,
-                    true,
+                    recurse_submodules,
                 ) {
                     if recurse_submodules {
                         let _ = rollback_reset_after_failed_submodule_update(
@@ -1878,11 +1878,20 @@ fn check_merge_reset_worktree(
                 }
             }
             (Some(ie), None) => {
+                if ie.mode == MODE_GITLINK && !map_has_strict_path_descendant(&target_map, &path) {
+                    continue;
+                }
                 merge_reset_verify_worktree_matches_index(repo, ie, &abs_path, path_str.as_ref())?;
             }
             (Some(ie), Some(te)) => {
                 if ie.oid == te.oid && ie.mode == te.mode {
                     continue;
+                }
+                if ie.mode == MODE_GITLINK {
+                    if te.mode == MODE_GITLINK {
+                        continue;
+                    }
+                    bail!("Entry '{}' not uptodate. Cannot merge.", path_str);
                 }
                 merge_reset_verify_worktree_matches_index(repo, ie, &abs_path, path_str.as_ref())?;
             }
@@ -1891,6 +1900,11 @@ fn check_merge_reset_worktree(
     }
 
     Ok(())
+}
+
+fn map_has_strict_path_descendant(map: &HashMap<Vec<u8>, &IndexEntry>, parent: &[u8]) -> bool {
+    map.keys()
+        .any(|path| is_strict_path_descendant(path, parent))
 }
 
 fn merge_reset_verify_worktree_matches_index(
@@ -2932,6 +2946,29 @@ fn checkout_index_to_worktree(
         .map(|e| (e.path.as_slice(), e))
         .collect();
 
+    if !force_submodule_removal {
+        for old in old_index.entries.iter().filter(|e| e.stage() == 0) {
+            if old.mode != MODE_GITLINK {
+                continue;
+            }
+            let rel = String::from_utf8_lossy(&old.path);
+            let abs = work_tree.join(rel.as_ref());
+            if !abs.join(".git").exists() {
+                continue;
+            }
+            let same_path_replaced = new_index
+                .get(&old.path, 0)
+                .is_some_and(|new| new.mode != MODE_GITLINK);
+            let descendant_replaced = new_index
+                .entries
+                .iter()
+                .any(|new| new.stage() == 0 && is_strict_path_descendant(&new.path, &old.path));
+            if same_path_replaced || descendant_replaced {
+                bail!("Cannot update submodule:\n{}", rel);
+            }
+        }
+    }
+
     // Remove paths that are no longer present in the new index.
     // Sort by descending path length so nested files are removed before parent directories
     // (HashSet iteration order is unspecified; wrong order can leave stale files on disk).
@@ -3178,6 +3215,10 @@ fn checkout_index_to_worktree(
     }
 
     Ok(())
+}
+
+fn is_strict_path_descendant(path: &[u8], parent: &[u8]) -> bool {
+    path.len() > parent.len() && path.starts_with(parent) && path.get(parent.len()) == Some(&b'/')
 }
 
 /// Remove a submodule work tree (and nested submodules when `recurse_submodules`) before dropping

@@ -952,6 +952,12 @@ fn remove_index_descendants(result: &mut HashMap<Vec<u8>, IndexEntry>, root: &[u
     }
 }
 
+fn tree_has_strict_descendant(tree: &HashMap<Vec<u8>, IndexEntry>, root: &[u8]) -> bool {
+    tree.keys().any(|path| {
+        path.len() > root.len() && path.starts_with(root) && path.get(root.len()) == Some(&b'/')
+    })
+}
+
 fn two_way_merge(
     repo: &Repository,
     current_index: &Index,
@@ -1005,7 +1011,10 @@ fn two_way_merge(
                     remove_index_descendants(&mut result, &path);
                 }
                 Some(c) if same_blob(c, o) => {
-                    if !(allow_clean_gitlink_removal && c.mode == MODE_GITLINK) {
+                    let pure_gitlink_removal = allow_clean_gitlink_removal
+                        && c.mode == MODE_GITLINK
+                        && !tree_has_strict_descendant(new_tree, &path);
+                    if !pure_gitlink_removal {
                         require_uptodate(repo, c)?;
                     }
                     result.remove(&path);
