@@ -2562,19 +2562,20 @@ pub(crate) struct GlobalOpts {
 }
 
 /// Directory used to resolve `git-<cmd>` helpers, matching upstream Git order:
-/// `GIT_EXEC_PATH` (when non-empty), then `--exec-path`, then the directory of the running binary.
+/// `--exec-path` (CLI), then `GIT_EXEC_PATH` (when non-empty), then the directory of the running binary.
 #[must_use]
 pub(crate) fn git_exec_path_for_helpers(cli_exec_path: Option<&Path>) -> Option<PathBuf> {
+    if let Some(p) = cli_exec_path {
+        return Some(p.to_path_buf());
+    }
     if let Ok(ep) = std::env::var("GIT_EXEC_PATH") {
         if !ep.is_empty() {
             return Some(PathBuf::from(ep));
         }
     }
-    cli_exec_path.map(Path::to_path_buf).or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(|p| p.to_path_buf()))
-    })
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|p| p.to_path_buf()))
 }
 
 /// Extract global options and return (globals, subcommand_name, remaining_args).
