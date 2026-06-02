@@ -75,7 +75,10 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
   - Fixed this iteration: `submodule update` validates configured submodule paths before any
     reattach/clone work, and recursive checkout validates dropped gitlink paths before removing or
     absorbing symlinked worktree paths.
-- [ ] `t7418-submodule-sparse-gitmodules.sh` - 8/9 passing, 1 failing. Focus: sparse `.gitmodules`.
+- [x] `t7418-submodule-sparse-gitmodules.sh` - 9/9 passing. Focus: sparse `.gitmodules`.
+  - Fixed this iteration: `fetch` now starts the submodule changed-gitlink record and uses the
+    typed recursive fetch path with Git's implicit on-demand default, so `pull` fetches missing
+    submodule commits before sparse `.gitmodules` status summaries inspect them.
 - [ ] `t7426-submodule-get-default-remote.sh` - 14/15 passing, 1 failing. Focus: default remote lookup.
 
 ## Passing

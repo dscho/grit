@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::{canonical_key, parse_bool, ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::error::Error as GritError;
+use grit_lib::fetch_submodules::{parse_fetch_recurse_submodules_arg, FetchRecurseSubmodules};
 use grit_lib::hooks::{run_hook, HookResult};
 use grit_lib::merge_base;
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
@@ -328,6 +329,11 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    let recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
+    if recurse_mode.is_some() {
+        crate::fetch_submodule_record::begin_fetch_submodule_record(&git_dir);
+    }
+
     let result = if args.multiple {
         if args.all {
             bail!("--multiple and --all are incompatible");
@@ -392,8 +398,16 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     };
 
-    if result.is_ok() && should_recurse_fetch_submodules(&config, &args) {
-        super::submodule::recursive_fetch_submodules(true)?;
+    if result.is_ok() {
+        if let Some(cmd_recurse) = recurse_mode {
+            crate::fetch_submodule_record::finish_record_tips_after(&git_dir);
+            crate::fetch_submodule_recurse::recursive_fetch_submodules_after_fetch(
+                &git_dir,
+                &config,
+                &args,
+                cmd_recurse,
+            )?;
+        }
     }
     result
 }
@@ -518,26 +532,30 @@ fn pick_default_remote_name(remotes: &[String]) -> String {
     }
 }
 
-fn should_recurse_fetch_submodules(config: &ConfigSet, args: &Args) -> bool {
+fn fetch_recurse_submodules_mode(
+    config: &ConfigSet,
+    args: &Args,
+) -> Result<Option<FetchRecurseSubmodules>> {
+    if args.negotiate_only {
+        return Ok(None);
+    }
     if args.no_recurse_submodules {
-        return false;
+        return Ok(None);
     }
-    if args.recurse_submodules.as_deref() == Some("no")
-        || args.recurse_submodules.as_deref() == Some("false")
-    {
-        return false;
+    if let Some(raw) = args.recurse_submodules.as_deref() {
+        let mode = parse_fetch_recurse_submodules_arg("--recurse-submodules", raw)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        return Ok((mode != FetchRecurseSubmodules::Off).then_some(mode));
     }
-    if args.recurse_submodules.is_some() {
-        return true;
-    }
-    config
+    if let Some(raw) = config
         .get("fetch.recursesubmodules")
         .or_else(|| config.get("fetch.recurseSubmodules"))
-        .map(|v| {
-            let l = v.to_ascii_lowercase();
-            l == "true" || l == "yes" || l == "on" || l == "1"
-        })
-        .unwrap_or(false)
+    {
+        let mode = parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", raw.trim())
+            .map_err(|e| anyhow::anyhow!(e))?;
+        return Ok((mode != FetchRecurseSubmodules::Off).then_some(mode));
+    }
+    Ok(Some(FetchRecurseSubmodules::Default))
 }
 
 fn exit_fatal(msg: &str) -> ! {
