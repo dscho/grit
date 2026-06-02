@@ -8027,22 +8027,22 @@ fn write_compact_summary(
         let old_raw = read_content_raw(odb, &entry.old_oid);
         let new_raw = read_content_raw_or_worktree(odb, &entry.new_oid, work_tree, entry.path());
         let binary = is_binary(&old_raw) || is_binary(&new_raw);
+        let mode_only = entry.status == DiffStatus::Modified
+            && entry.old_mode != entry.new_mode
+            && old_raw == new_raw;
         let (ins, del) = if binary {
-            let deleted = if entry.old_oid == zero_oid() {
+            let deleted = if mode_only || entry.old_oid == zero_oid() {
                 0
             } else {
                 old_raw.len()
             };
-            let added = if entry.new_oid == zero_oid() {
+            let added = if mode_only || entry.new_oid == zero_oid() {
                 0
             } else {
                 new_raw.len()
             };
             (added, deleted)
         } else {
-            let mode_only = entry.status == DiffStatus::Modified
-                && entry.old_mode != entry.new_mode
-                && old_raw == new_raw;
             if mode_only {
                 (0, 0)
             } else {
@@ -8215,13 +8215,16 @@ fn write_stat(
         let old_raw = read_content_raw(odb, &entry.old_oid);
         let new_raw = read_content_raw_or_worktree(odb, &entry.new_oid, work_tree, entry.path());
         let binary = is_binary(&old_raw) || is_binary(&new_raw);
+        let mode_only = entry.status == DiffStatus::Modified
+            && entry.old_mode != entry.new_mode
+            && old_raw == new_raw;
         if binary {
-            let deleted = if entry.old_oid == zero_oid() {
+            let deleted = if mode_only || entry.old_oid == zero_oid() {
                 0
             } else {
                 old_raw.len()
             };
-            let added = if entry.new_oid == zero_oid() {
+            let added = if mode_only || entry.new_oid == zero_oid() {
                 0
             } else {
                 new_raw.len()
@@ -8233,9 +8236,6 @@ fn write_stat(
                 is_binary: true,
             });
         } else {
-            let mode_only = entry.status == DiffStatus::Modified
-                && entry.old_mode != entry.new_mode
-                && old_raw == new_raw;
             let (ins, del) = if mode_only {
                 (0, 0)
             } else {

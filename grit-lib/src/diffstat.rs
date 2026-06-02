@@ -182,7 +182,11 @@ pub fn write_diffstat_block(
             max_len = w;
         }
         if f.is_binary {
-            let w = 14 + decimal_width(f.insertions) + decimal_width(f.deletions);
+            let w = if f.insertions == 0 && f.deletions == 0 {
+                3
+            } else {
+                14 + decimal_width(f.insertions) + decimal_width(f.deletions)
+            };
             if bin_width < w {
                 bin_width = w;
             }
@@ -268,7 +272,19 @@ pub fn write_diffstat_block(
         if f.is_binary {
             let (display_name, _) = truncate_path_for_name_area(&f.path_display, name_width);
             let name_col = pad_name_to_display_width(&display_name, name_width);
-            if prefix.is_empty() {
+            if f.insertions == 0 && f.deletions == 0 {
+                if prefix.is_empty() {
+                    writeln!(out, " {} | {:>nw$}", name_col, "Bin", nw = number_width)?;
+                } else {
+                    writeln!(
+                        out,
+                        "{prefix}{} | {:>nw$}",
+                        name_col,
+                        "Bin",
+                        nw = number_width
+                    )?;
+                }
+            } else if prefix.is_empty() {
                 writeln!(
                     out,
                     " {} | {:>nw$} {} -> {} bytes",
