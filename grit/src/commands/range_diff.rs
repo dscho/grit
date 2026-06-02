@@ -417,13 +417,14 @@ fn parse_log_into_patches(contents: &str) -> Result<Vec<Patch>> {
 
     for line in contents.lines() {
         if let Some(rest) = line.strip_prefix("commit ") {
+            // Flush a trailing hunk-less diff header from the previous commit. The
+            // file name is irrelevant here since the new commit resets it below.
             if let Some(h) = pending.take() {
                 let summary = h.summary();
                 if let Some(p) = current.as_mut() {
                     p.diffsize += summary.lines().count() as i32;
                 }
                 buf.push_str(&summary);
-                current_filename = Some(h.context_filename());
             }
             if let Some(p) = current.take() {
                 list.push(finish_patch(p, &buf)?);
