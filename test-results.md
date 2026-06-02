@@ -10,6 +10,7 @@ Updated: 2026-06-02
 - t4 stat validation: `./scripts/run-tests.sh t4052-stat-output.sh --verbose` passes 89/89 with the current diffstat fixes.
 - t4 abbrev focus: `./scripts/run-tests.sh t4044-diff-index-unique-abbrev.sh --verbose` passes 2/2 after disambiguating old/new patch index-line abbreviations.
 - t4 symlink focus: `./scripts/run-tests.sh t4011-diff-symlink.sh --verbose` passes 8/8 after suppressing header-only patch output for stat-only worktree placeholders with unchanged content.
+- t4 submodule focus: `./scripts/run-tests.sh t4059-diff-submodule-not-initialized.sh --verbose` passes 8/8 after resolving moved submodule paths through `.gitmodules` for removed checkouts.
 - `cargo check -p grit-cli`: passes with the same existing warning backlog.
 - `cargo test --workspace`: not run for this focused t4 iteration.
 - `./tests/harness/run.sh`: skipped; project uses `./scripts/run-tests.sh` for CSV/dashboard updates.
