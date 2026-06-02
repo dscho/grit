@@ -1149,10 +1149,10 @@ t7001-mv	t7	yes	54	51	3	false	ok	0
 t7002-mv-sparse-checkout	t7	yes	22	22	0	true	ok	0
 t7003-filter-branch	t7	skip	48	0	0	false	ok	0
 t7004-tag	t7	skip	219	0	0	false	ok	0
-t7005-editor	t7	yes	11	10	1	false	ok	0
+t7005-editor	t7	yes	12	12	0	true	ok	0
 t7006-pager	t7	yes	109	109	0	true	ok	1
 t7007-show	t7	yes	18	18	0	true	ok	0
-t7008-filter-branch-null-sha1	t7	yes	6	5	1	false	ok	0
+t7008-filter-branch-null-sha1	t7	yes	6	6	0	true	ok	0
 t7008-show-stat-raw-name	t7	yes	21	21	0	true	ok	0
 t7010-setup	t7	yes	16	12	4	false	ok	0
 t7011-skip-worktree-reading	t7	yes	15	15	0	true	ok	0
@@ -1230,7 +1230,7 @@ t7505-prepare-commit-msg	t7	yes	30	30	0	true	ok	0
 t7505-prepare-commit-msg-hook	t7	yes	23	22	1	false	ok	0
 t7506-status-submodule	t7	yes	40	20	20	false	ok	0
 t7507-commit-verbose	t7	yes	45	10	35	false	ok	0
-t7508-status	t7	yes	126	124	2	false	ok	0
+t7508-status	t7	yes	126	125	1	false	ok	0
 t7509-commit-authorship	t7	yes	12	4	8	false	ok	0
 t7510-signed-commit	t7	yes	28	28	0	true	ok	0
 t7511-status-index	t7	yes	24	24	0	true	ok	0

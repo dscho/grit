@@ -2553,6 +2553,7 @@ pub(crate) struct GlobalOpts {
     attr_source: Option<String>,
     bare: bool,
     no_advice: bool,
+    no_optional_locks: bool,
     literal_pathspecs: bool,
     no_literal_pathspecs: bool,
     glob_pathspecs: bool,
@@ -2705,6 +2706,13 @@ pub(crate) fn extract_globals(
             continue;
         }
 
+        // --no-optional-locks (Git sets GIT_OPTIONAL_LOCKS=0)
+        if arg == "--no-optional-locks" {
+            opts.no_optional_locks = true;
+            i += 1;
+            continue;
+        }
+
         // --no-lazy-fetch (Git sets GIT_NO_LAZY_FETCH=1)
         if arg == "--no-lazy-fetch" {
             std::env::set_var("GIT_NO_LAZY_FETCH", "1");
@@ -2825,6 +2833,9 @@ fn apply_globals(opts: &GlobalOpts) -> Result<()> {
     }
     if opts.no_advice {
         std::env::set_var("GIT_ADVICE", "false");
+    }
+    if opts.no_optional_locks {
+        std::env::set_var("GIT_OPTIONAL_LOCKS", "0");
     }
     if let Some(attr_source) = &opts.attr_source {
         std::env::set_var("GIT_ATTR_SOURCE", attr_source);

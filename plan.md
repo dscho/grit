@@ -1,5 +1,12 @@
 # PLAN.md — Current execution queue
 
+## Active task — t7 family toward 100% pass
+
+- [~] Group non-passing in-scope `t7` rows by subsystem (see `logs/2026-06-02_t7-family-grouping.md`).
+- [x] Group A quick wins: `t7005-editor` (12/12), `t7008-filter-branch-null-sha1` (6/6).
+- [~] Group A: `t7508-status` — global `--no-optional-locks` (passes 126/126 in isolation; harness may flake on index refresh).
+- [ ] Group B–J: worktree status, reset, commit porcelain, grep, submodules (largest blockers).
+
 ## Active task — t2 family 100% pass
 
 - [x] Make all `t2` family tests fully pass. Work one file at a time, always choosing the
