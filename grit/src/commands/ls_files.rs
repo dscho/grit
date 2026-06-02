@@ -47,6 +47,140 @@ fn write_eol_record<W: Write + ?Sized>(
     write!(out, "{index_field:<8}{wt_field:<8}{attr_field:<22}\t{name}")
 }
 
+/// Object type name for an index entry mode (Git `object_type`): gitlink → commit,
+/// directory → tree, everything else (regular/exec/symlink) → blob.
+fn ls_format_objecttype(mode: u32) -> &'static str {
+    match mode & 0o170000 {
+        0o160000 => "commit",
+        0o040000 => "tree",
+        _ => "blob",
+    }
+}
+
+/// Object size for `%(objectsize)` (Git `expand_objectsize`): blob size, or `-` for non-blobs.
+/// `padded` right-justifies in a 7-wide field.
+fn ls_format_objectsize(entry: &IndexEntry, repo: &Repository, padded: bool) -> String {
+    let is_blob = matches!(entry.mode & 0o170000, 0o100000 | 0o120000);
+    let value = if is_blob {
+        match repo.odb.read(&entry.oid) {
+            Ok(obj) => obj.data.len().to_string(),
+            Err(_) => "-".to_string(),
+        }
+    } else {
+        "-".to_string()
+    };
+    if padded {
+        format!("{value:>7}")
+    } else {
+        value
+    }
+}
+
+/// Expand a `git ls-files --format` template for one index entry (Git `show_ce_fmt`).
+///
+/// Supports `%%`, `%n`, `%xXX` literal escapes and the `%(...)` atoms:
+/// objectmode, objectname, objecttype, objectsize[:padded], stage, eolinfo:index,
+/// eolinfo:worktree, eolattr, path. Output is byte-oriented to preserve the path encoding.
+#[allow(clippy::too_many_arguments)]
+fn expand_ls_format(
+    fmt: &str,
+    entry: &IndexEntry,
+    display_name: &str,
+    repo_rel_path: &str,
+    work_tree: &Path,
+    repo: &Repository,
+    attrs_for_eol: &[grit_lib::crlf::AttrRule],
+    config: &grit_lib::config::ConfigSet,
+) -> Result<Vec<u8>> {
+    let bytes = fmt.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(fmt.len());
+    let is_regular = matches!(entry.mode & 0o170000, 0o100000);
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let rest = &fmt[i + 1..];
+        if let Some(after) = rest.strip_prefix('%') {
+            out.push(b'%');
+            i = fmt.len() - after.len();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('n') {
+            out.push(b'\n');
+            i = fmt.len() - after.len();
+            continue;
+        }
+        if let Some(hex) = rest.strip_prefix('x') {
+            let hb = hex.as_bytes();
+            if hb.len() >= 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex[..2], 16) {
+                    out.push(byte);
+                    i = (i + 1) + 3; // consume "%xHH"
+                    continue;
+                }
+            }
+        }
+        let atom = |name: &str| rest.strip_prefix(name);
+        if let Some(after) = atom("(objectmode)") {
+            out.extend_from_slice(format!("{:06o}", entry.mode).as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(objectname)") {
+            out.extend_from_slice(entry.oid.to_hex().as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(objecttype)") {
+            out.extend_from_slice(ls_format_objecttype(entry.mode).as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(objectsize:padded)") {
+            out.extend_from_slice(ls_format_objectsize(entry, repo, true).as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(objectsize)") {
+            out.extend_from_slice(ls_format_objectsize(entry, repo, false).as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(stage)") {
+            out.extend_from_slice(format!("{}", entry.stage()).as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(eolinfo:index)") {
+            if is_regular && entry.oid != grit_lib::diff::zero_oid() {
+                if let Ok(obj) = repo.odb.read(&entry.oid) {
+                    out.extend_from_slice(
+                        grit_lib::crlf::gather_convert_stats_ascii(&obj.data).as_bytes(),
+                    );
+                }
+            }
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(eolinfo:worktree)") {
+            let wt_path = work_tree.join(repo_rel_path);
+            if let Ok(meta) = std::fs::symlink_metadata(&wt_path) {
+                if meta.file_type().is_file() {
+                    if let Ok(data) = std::fs::read(&wt_path) {
+                        out.extend_from_slice(
+                            grit_lib::crlf::gather_convert_stats_ascii(&data).as_bytes(),
+                        );
+                    }
+                }
+            }
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(eolattr)") {
+            let attr_str = grit_lib::crlf::convert_attr_ascii_for_ls_files(
+                attrs_for_eol,
+                repo_rel_path,
+                config,
+            );
+            out.extend_from_slice(attr_str.as_bytes());
+            i = fmt.len() - after.len();
+        } else if let Some(after) = atom("(path)") {
+            out.extend_from_slice(display_name.as_bytes());
+            i = fmt.len() - after.len();
+        } else {
+            anyhow::bail!("fatal: bad ls-files format: {fmt}");
+        }
+    }
+    Ok(out)
+}
+
 /// Arguments for `grit ls-files`.
 #[derive(Debug, ClapArgs)]
 pub struct Args {
@@ -235,10 +369,25 @@ pub fn run(args: Args) -> Result<()> {
         anyhow::bail!("fatal: ls-files --recurse-submodules does not support --error-unmatch");
     }
 
-    if args.resolve_undo && args.format.is_some() {
-        anyhow::bail!(
-            "fatal: --format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol"
-        );
+    // `--format` is incompatible with several output modes (Git `cmd_ls_files`): -s/-u (stage),
+    // -o (others), -k (killed), -t (tag/-v/-f), --resolve-undo, --deduplicate, --eol.
+    // Git reports this as a usage error (exit code 129).
+    if args.format.is_some()
+        && (args.stage
+            || args.unmerged
+            || args.others
+            || args.killed
+            || args.resolve_undo
+            || args.deduplicate
+            || args.eol
+            || args.show_tag
+            || args.show_untracked_cache_tag
+            || args.show_fsmonitor_valid_tag)
+    {
+        return Err(anyhow::Error::new(ExplicitExit {
+            code: 129,
+            message: "fatal: --format cannot be used with -s, -o, -k, -t, --resolve-undo, --deduplicate, --eol".to_string(),
+        }));
     }
 
     let stdout = io::stdout();
@@ -538,8 +687,10 @@ pub fn run(args: Args) -> Result<()> {
                 let name = String::from_utf8_lossy(display.as_ref());
                 let path_str = std::str::from_utf8(&entry.path).unwrap_or("");
 
-                // Index / worktree EOL stats: match Git `convert.c` `gather_convert_stats_ascii`.
-                let index_eol = if entry.oid != grit_lib::diff::zero_oid() {
+                // Index / worktree EOL stats: match Git `write_eolinfo`, which only computes
+                // stats for **regular** files (`S_ISREG`); symlinks/gitlinks/dirs show empty.
+                let index_is_regular = matches!(entry.mode & 0o170000, 0o100000);
+                let index_eol = if index_is_regular && entry.oid != grit_lib::diff::zero_oid() {
                     if let Ok(obj) = repo.odb.read(&entry.oid) {
                         grit_lib::crlf::gather_convert_stats_ascii(&obj.data).to_string()
                     } else {
@@ -550,10 +701,12 @@ pub fn run(args: Args) -> Result<()> {
                 };
 
                 let wt_path = work_tree.join(path_str);
-                let wt_eol = if let Ok(data) = std::fs::read(&wt_path) {
-                    grit_lib::crlf::gather_convert_stats_ascii(&data).to_string()
-                } else {
-                    String::new()
+                let wt_eol = match std::fs::symlink_metadata(&wt_path) {
+                    Ok(meta) if meta.file_type().is_file() => match std::fs::read(&wt_path) {
+                        Ok(data) => grit_lib::crlf::gather_convert_stats_ascii(&data).to_string(),
+                        Err(_) => String::new(),
+                    },
+                    _ => String::new(),
                 };
 
                 let attr_str = grit_lib::crlf::convert_attr_ascii_for_ls_files(
@@ -578,21 +731,18 @@ pub fn run(args: Args) -> Result<()> {
                     &config,
                 )?;
                 let name = String::from_utf8_lossy(display.as_ref());
-                let hex = entry.oid.to_hex();
-                let line = fmt
-                    .replace("%(objectmode)", &format!("{:06o}", entry.mode))
-                    .replace("%(objectname)", &hex)
-                    .replace(
-                        "%(objecttype)",
-                        if entry.mode & 0o170000 == 0o040000 {
-                            "tree"
-                        } else {
-                            "blob"
-                        },
-                    )
-                    .replace("%(stage)", &format!("{}", entry.stage()))
-                    .replace("%(path)", &name);
-                write!(out, "{}", line)?;
+                let path_str = std::str::from_utf8(&entry.path).unwrap_or("");
+                let line = expand_ls_format(
+                    fmt,
+                    entry,
+                    &name,
+                    path_str,
+                    work_tree,
+                    &repo,
+                    &attrs_for_eol,
+                    &config,
+                )?;
+                out.write_all(&line)?;
                 out.write_all(&[term])?;
                 if args.debug {
                     write_ls_files_debug(&mut out, entry)?;
@@ -1135,7 +1285,8 @@ fn ls_files_recurse_submodules(
                 super_config,
             )?;
             let name = String::from_utf8_lossy(display.as_ref());
-            let index_eol = if entry.oid != grit_lib::diff::zero_oid() {
+            let index_is_regular = matches!(entry.mode & 0o170000, 0o100000);
+            let index_eol = if index_is_regular && entry.oid != grit_lib::diff::zero_oid() {
                 if let Ok(obj) = repo.odb.read(&entry.oid) {
                     grit_lib::crlf::gather_convert_stats_ascii(&obj.data).to_string()
                 } else {
@@ -1145,10 +1296,12 @@ fn ls_files_recurse_submodules(
                 String::new()
             };
             let wt_path = work_tree.join(path_str);
-            let wt_eol = if let Ok(data) = std::fs::read(&wt_path) {
-                grit_lib::crlf::gather_convert_stats_ascii(&data).to_string()
-            } else {
-                String::new()
+            let wt_eol = match std::fs::symlink_metadata(&wt_path) {
+                Ok(meta) if meta.file_type().is_file() => match std::fs::read(&wt_path) {
+                    Ok(data) => grit_lib::crlf::gather_convert_stats_ascii(&data).to_string(),
+                    Err(_) => String::new(),
+                },
+                _ => String::new(),
             };
             let attr_str =
                 grit_lib::crlf::convert_attr_ascii_for_ls_files(p.attrs_for_eol, path_str, config);
@@ -1167,21 +1320,17 @@ fn ls_files_recurse_submodules(
                 super_config,
             )?;
             let name = String::from_utf8_lossy(display.as_ref());
-            let hex = entry.oid.to_hex();
-            let line = fmt
-                .replace("%(objectmode)", &format!("{:06o}", entry.mode))
-                .replace("%(objectname)", &hex)
-                .replace(
-                    "%(objecttype)",
-                    if entry.mode & 0o170000 == 0o040000 {
-                        "tree"
-                    } else {
-                        "blob"
-                    },
-                )
-                .replace("%(stage)", &format!("{}", entry.stage()))
-                .replace("%(path)", &name);
-            write!(out, "{}", line)?;
+            let line = expand_ls_format(
+                fmt,
+                entry,
+                &name,
+                path_str,
+                work_tree,
+                repo,
+                p.attrs_for_eol,
+                config,
+            )?;
+            out.write_all(&line)?;
             out.write_all(&[p.term])?;
             if p.debug {
                 write_ls_files_debug(out, entry)?;
