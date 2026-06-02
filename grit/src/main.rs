@@ -3394,7 +3394,10 @@ fn preprocess_blame_h_rev(rest: &[String]) -> Vec<String> {
 ///
 /// `commit -C <rev>` is `--reuse-message`, not a directory change (t7500).
 fn strip_subcommand_leading_change_dir(subcmd: &str, rest: &mut Vec<String>) -> Result<()> {
-    if matches!(subcmd, "switch" | "checkout" | "commit") {
+    if matches!(
+        subcmd,
+        "switch" | "checkout" | "commit" | "diff" | "diff-index" | "diff-tree" | "diff-files"
+    ) {
         return Ok(());
     }
     while rest.len() >= 2 && rest[0] == "-C" {

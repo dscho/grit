@@ -5,6 +5,7 @@ Updated: 2026-06-02
 - t4 focus build: `cargo build --release -p grit-cli` passes with the existing warning backlog (`ignore.rs`, `refs.rs`, `difftool.rs`, `sparse_checkout.rs`, `worktree.rs`).
 - t4 focus harness: `./scripts/run-tests.sh t4017-diff-retval.sh --verbose` passes 38/38 after rejecting unknown long `git diff` options with usage instead of resolving them as revisions.
 - t4 rename focus: `./scripts/run-tests.sh t4001-diff-rename.sh --verbose` passes 23/23 after accepting repeated `-C`, parsing `-l`, and routing porcelain copy detection through modified-file sources.
+- t4 rename raw focus: `./scripts/run-tests.sh t4005-diff-rename-2.sh --verbose` passes 4/4 after preserving diff-family `-C` as copy detection instead of post-subcommand chdir.
 - `cargo check -p grit-cli`: passes with the same existing warning backlog.
 - `cargo test --workspace`: not run for this focused t4 iteration.
 - `./tests/harness/run.sh`: skipped; project uses `./scripts/run-tests.sh` for CSV/dashboard updates.
