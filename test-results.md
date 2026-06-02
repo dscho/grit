@@ -25,6 +25,8 @@ Updated: 2026-06-01
   unskipping.
 - t2 focus: `./scripts/run-tests.sh t2407-worktree-heads.sh --verbose` passes 12/12 after
   unskipping.
+- t2 focus: `./scripts/run-tests.sh t2401-worktree-prune.sh --verbose` passes 13/13 after
+  unskipping.
 - t2 focus: `./scripts/run-tests.sh t2022-checkout-paths.sh --verbose` passes 5/5 with prior
   checkout path fixes.
 - t2 focus: `./scripts/run-tests.sh t2025-checkout-no-overlay.sh --verbose` passes 6/6 after

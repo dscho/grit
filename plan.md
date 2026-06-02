@@ -71,6 +71,8 @@
   - Completed: `t2406-worktree-repair.sh` (24/24). Unskipped and passed with prior worktree fixes.
   - Completed: `t2407-worktree-heads.sh` (12/12). Unskipped and passed with prior worktree/branch
     occupancy fixes.
+  - Completed: `t2401-worktree-prune.sh` (13/13). Unskipped and passed with prior worktree prune
+    support.
   - Completed: `t2022-checkout-paths.sh` (5/5). Passed with prior checkout path fixes.
   - Completed: `t2025-checkout-no-overlay.sh` (6/6). `checkout --theirs --no-overlay` now deletes
     the path when the requested conflict side is absent.
