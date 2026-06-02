@@ -2560,14 +2560,21 @@ fn submodule_head_oid(path: &std::path::Path) -> Option<grit_lib::objects::Objec
 fn is_modified(entry: &IndexEntry, path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
 
-    // Gitlink (submodule): "modified" iff the checked-out submodule HEAD differs from the recorded
-    // gitlink object id (Git compares the submodule's HEAD commit). If the submodule isn't checked
-    // out, treat it as unmodified (Git skips the diff in that case for `ls-files -m`).
+    // Gitlink (submodule): Git's `ce_match_stat_basic` first lstats the worktree path. If the
+    // path is missing or is not a directory, the gitlink is TYPE_CHANGED (modified) — e.g. a
+    // mode-160000 entry added via `update-index --cacheinfo` with nothing checked out (t3013).
+    // Only when the path is a directory does Git compare the submodule HEAD against the recorded
+    // gitlink oid; a populated-but-missing-.git checkout is treated as matching (ce_compare_gitlink).
     if entry.mode == grit_lib::index::MODE_GITLINK {
-        return match submodule_head_oid(path) {
-            Some(head) => head != entry.oid,
-            None => false,
-        };
+        match std::fs::symlink_metadata(path) {
+            Ok(meta) if meta.file_type().is_dir() => {
+                return match submodule_head_oid(path) {
+                    Some(head) => head != entry.oid,
+                    None => false,
+                };
+            }
+            _ => return true,
+        }
     }
 
     let meta = match std::fs::symlink_metadata(path) {
