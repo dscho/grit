@@ -2672,6 +2672,18 @@ pub(crate) fn write_patch_entry_inner(
     let git_old = format_diff_path_with_prefix("a/", &disp_old, quote_fully);
     let git_new = format_diff_path_with_prefix("b/", &disp_new, quote_fully);
 
+    if entry.status == DiffStatus::Modified
+        && entry.old_mode == entry.new_mode
+        && entry.new_oid == zero_oid()
+    {
+        if let Some(wt) = work_tree {
+            let new_raw = read_worktree_path_raw(&wt.join(new_path));
+            if read_blob_raw(odb, &entry.old_oid) == new_raw {
+                return Ok(());
+            }
+        }
+    }
+
     if entry.old_mode == "160000" || entry.new_mode == "160000" {
         writeln!(out, "diff --git {git_old} {git_new}")?;
         match entry.status {

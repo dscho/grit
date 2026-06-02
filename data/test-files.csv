@@ -34,7 +34,7 @@ t0034-root-safe-directory	t0	yes	0	0	0	false	ok	0
 t0035-safe-bare-repository	t0	yes	12	12	0	true	ok	0
 t0040-parse-options	t0	yes	94	94	0	true	ok	0
 t0041-usage	t0	yes	16	16	0	true	ok	0
-t0050-filesystem	t0	yes	13	11	0	true	ok	2
+t0050-filesystem	t0	yes	11	11	0	true	ok	2
 t0051-windows-named-pipe	t0	skip	1	0	0	false	ok	0
 t0052-simple-ipc	t0	yes	9	9	0	true	ok	0
 t0055-beyond-symlinks	t0	yes	3	3	0	true	ok	0
@@ -684,7 +684,7 @@ t4007-rename-3	t4	yes	13	13	0	true	ok	0
 t4008-diff-break-rewrite	t4	yes	14	12	2	false	ok	0
 t4009-diff-rename-4	t4	yes	7	7	0	true	ok	0
 t4010-diff-pathspec	t4	yes	17	15	2	false	ok	0
-t4011-diff-symlink	t4	yes	8	7	1	false	ok	0
+t4011-diff-symlink	t4	yes	8	8	0	true	ok	0
 t4011-diff-tree	t4	yes	110	109	1	false	ok	0
 t4012-diff-binary	t4	yes	13	6	7	false	ok	0
 t4013-diff-various	t4	yes	230	62	168	false	ok	0
