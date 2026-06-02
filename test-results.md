@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 focus: `./scripts/run-tests.sh t2040-checkout-file-modes.sh --verbose` passes 28/28 after
+  making the synthetic file-mode fixture explicitly request its hard-coded `master` initial branch.
 - t2 focus: `./scripts/run-tests.sh t2045-checkout-conflict.sh --verbose` passes 29/29 after
   making the synthetic conflict fixture explicitly request its hard-coded `master` initial branch.
 - t2 submodule checkout: `./scripts/run-tests.sh t2013-checkout-submodule.sh --verbose` passes

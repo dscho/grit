@@ -17,6 +17,8 @@
     gitlink OID changes preserving the submodule worktree, and `submodule.recurse=true`.
   - Completed: `t2045-checkout-conflict.sh` (29/29). Root cause was another synthetic fixture
     hard-coding `master`; it now explicitly requests that initial branch.
+  - Completed: `t2040-checkout-file-modes.sh` (28/28). Root cause was another synthetic fixture
+    hard-coding `master`; it now explicitly requests that initial branch.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---
