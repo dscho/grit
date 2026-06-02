@@ -211,6 +211,10 @@ pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let head = resolve_head(&repo.git_dir)?;
 
+    // Git validates `branch.autosetuprebase` while reading config, so any `git branch` invocation
+    // fails when the value is malformed or missing (t3200 145/146).
+    validate_autosetuprebase_config(&repo);
+
     if args.no_remotes_neg {
         eprintln!("error: unknown option `no-remotes'");
         eprintln!("usage: git branch [<options>] [-r | -a] [--merged] [--no-merged]");
@@ -348,10 +352,8 @@ pub fn run(args: Args) -> Result<()> {
             && args.merged.is_empty()
             && args.no_merged.is_empty()
         {
-            // Reject invalid branch names
-            if name == "HEAD" || name.starts_with('-') {
-                bail!("'{name}' is not a valid branch name");
-            }
+            // Reject invalid branch names (Git `check_branch_ref` / `die` + advice.refSyntax hint).
+            validate_new_branch_name_or_die(&repo, name);
             return create_branch(&repo, &head, name, args.start_point.as_deref(), &args);
         }
     }
@@ -1425,12 +1427,23 @@ fn set_upstream(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
         upstream_raw.to_string()
     };
 
+    // The branch is the first positional; any further positionals are an error (Git: argc > 1).
+    if args.start_point.is_some() || !args.extra_names.is_empty() {
+        eprintln!("fatal: too many arguments to set new upstream");
+        std::process::exit(128);
+    }
+
     let branch_name = match args.name.as_deref() {
-        Some(n) => n.to_owned(),
-        None => head
-            .branch_name()
-            .ok_or_else(|| anyhow::anyhow!("no current branch; specify branch name"))?
-            .to_owned(),
+        Some(n) if n != "HEAD" => n.to_owned(),
+        _ => match head.branch_name() {
+            Some(n) => n.to_owned(),
+            None => {
+                eprintln!(
+                    "fatal: could not set upstream of HEAD to {upstream} when it does not point to any branch"
+                );
+                std::process::exit(128);
+            }
+        },
     };
 
     let branch_ref = format!("refs/heads/{branch_name}");
@@ -1442,6 +1455,9 @@ fn set_upstream(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
         eprintln!("fatal: branch '{branch_name}' does not exist");
         std::process::exit(128);
     }
+
+    // Validate the upstream resolves to a branch (Git `dwim_branch_start` with explicit tracking).
+    validate_upstream_is_branch(repo, &upstream);
 
     // Parse upstream as remote/branch
     let (remote, upstream_branch) = parse_upstream(repo, &upstream)?;
@@ -1474,16 +1490,55 @@ fn set_upstream(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
     Ok(())
 }
 
+/// Validate that the `--set-upstream-to` argument names a branch (Git `dwim_branch_start` with
+/// explicit tracking). Exits 128 with the matching Git diagnostic on failure.
+fn validate_upstream_is_branch(repo: &Repository, upstream: &str) {
+    // Does it resolve to any object at all? If not, the upstream branch is missing.
+    if resolve_revision(repo, upstream).is_err() {
+        eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
+        eprintln!(
+            "\nIf you are planning on basing your work on an upstream\n\
+             branch that already exists at the remote, you may need to\n\
+             run \"git fetch\" to retrieve it.\n\n\
+             If you are planning to push out a new local branch that\n\
+             will track its remote counterpart, you may want to use\n\
+             \"git push -u\" to set the upstream config as you push."
+        );
+        std::process::exit(128);
+    }
+
+    // It resolves to an object; it must DWIM to a real branch (local or remote-tracking).
+    let is_branch = match symbolic_full_name(repo, upstream) {
+        Some(full) => full.starts_with("refs/heads/") || full.starts_with("refs/remotes/"),
+        None => false,
+    };
+    if !is_branch {
+        eprintln!(
+            "fatal: cannot set up tracking information; starting point '{upstream}' is not a branch"
+        );
+        std::process::exit(128);
+    }
+}
+
 /// Remove upstream tracking configuration.
-fn unset_upstream(repo: &Repository, _head: &HeadState, args: &Args) -> Result<()> {
+fn unset_upstream(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
+    // The branch is the first positional; further positionals are an error (Git: argc > 1).
+    if args.start_point.is_some() || !args.extra_names.is_empty() {
+        eprintln!("fatal: too many arguments to unset upstream");
+        std::process::exit(128);
+    }
+
     let branch_name = match args.name.as_deref() {
-        Some(n) => n.to_owned(),
-        None => {
-            eprintln!(
-                "fatal: could not unset upstream of HEAD when it does not point to any branch"
-            );
-            std::process::exit(128);
-        }
+        Some(n) if n != "HEAD" => n.to_owned(),
+        _ => match head.branch_name() {
+            Some(n) => n.to_owned(),
+            None => {
+                eprintln!(
+                    "fatal: could not unset upstream of HEAD when it does not point to any branch"
+                );
+                std::process::exit(128);
+            }
+        },
     };
 
     let config_path = repo.git_dir.join("config");
@@ -1818,49 +1873,131 @@ fn create_branch(
         };
         let want_tracking = args.track.is_some() || (!args.no_track && remote_ref.is_some());
         if want_tracking {
-            if let Some(rref) = remote_ref {
+            // Resolve the tracking pair (remote, merge-ref). `.` denotes a local-branch upstream.
+            let pair: Option<(String, String)> = if let Some(rref) = remote_ref {
                 let stripped = rref.strip_prefix("refs/remotes/").unwrap_or(&rref);
-                if let Some(slash) = stripped.find('/') {
-                    let remote = &stripped[..slash];
-                    let branch = &stripped[slash + 1..];
-                    let config_path = repo.git_dir.join("config");
-                    let mut cfg = std::fs::read_to_string(&config_path).unwrap_or_default();
-                    cfg.push_str(&format!("\n[branch \"{}\"]", name));
-                    cfg.push_str(&format!("\n\tremote = {}", remote));
-                    cfg.push_str(&format!("\n\tmerge = refs/heads/{}\n", branch));
-                    std::fs::write(&config_path, cfg)?;
-                }
+                stripped.find('/').map(|slash| {
+                    (
+                        stripped[..slash].to_owned(),
+                        format!("refs/heads/{}", &stripped[slash + 1..]),
+                    )
+                })
             } else if args.track.is_some() {
                 if let Ok(full) = resolve_upstream_symbolic_name(repo, sp) {
-                    let config_path = repo.git_dir.join("config");
-                    let mut cfg = std::fs::read_to_string(&config_path).unwrap_or_default();
-                    cfg.push_str(&format!("\n[branch \"{}\"]", name));
                     if let Some(rest) = full.strip_prefix("refs/remotes/") {
-                        if let Some(slash) = rest.find('/') {
-                            let remote = &rest[..slash];
-                            let branch = &rest[slash + 1..];
-                            cfg.push_str(&format!("\n\tremote = {}", remote));
-                            cfg.push_str(&format!("\n\tmerge = refs/heads/{}\n", branch));
-                        }
+                        rest.find('/').map(|slash| {
+                            (
+                                rest[..slash].to_owned(),
+                                format!("refs/heads/{}", &rest[slash + 1..]),
+                            )
+                        })
                     } else if full.starts_with("refs/heads/") {
-                        cfg.push_str("\n\tremote = .");
-                        cfg.push_str(&format!("\n\tmerge = {}\n", full));
+                        Some((".".to_owned(), full))
+                    } else {
+                        None
                     }
-                    std::fs::write(&config_path, cfg)?;
-                } else if let Some(full) =
-                    symbolic_full_name(repo, sp).filter(|f| f.starts_with("refs/heads/"))
-                {
-                    let config_path = repo.git_dir.join("config");
-                    let mut cfg = std::fs::read_to_string(&config_path).unwrap_or_default();
-                    cfg.push_str(&format!("\n[branch \"{}\"]", name));
-                    cfg.push_str("\n\tremote = .");
-                    cfg.push_str(&format!("\n\tmerge = {full}\n"));
-                    std::fs::write(&config_path, cfg)?;
+                } else {
+                    symbolic_full_name(repo, sp)
+                        .filter(|f| f.starts_with("refs/heads/"))
+                        .map(|full| (".".to_owned(), full))
                 }
+            } else {
+                None
+            };
+
+            if let Some((remote, merge_ref)) = pair {
+                write_branch_tracking_config(repo, name, &remote, &merge_ref)?;
             }
         }
     }
 
+    Ok(())
+}
+
+/// Validate a new branch name (`git check-ref-format refs/heads/<name>` with onelevel allowed).
+/// On failure, prints Git's `fatal:` line plus the `advice.refSyntax` hints and exits 128.
+fn validate_new_branch_name_or_die(repo: &Repository, name: &str) {
+    use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
+
+    let refname = format!("refs/heads/{name}");
+    let opts = RefNameOptions {
+        allow_onelevel: true,
+        ..Default::default()
+    };
+    let valid =
+        name != "HEAD" && !name.starts_with('-') && check_refname_format(&refname, &opts).is_ok();
+    if valid {
+        return;
+    }
+
+    // Both the message and the hints share one stream; tests capture `2>&1`.
+    eprintln!("fatal: '{name}' is not a valid branch name");
+    let advice_on = ConfigSet::load(Some(&repo.git_dir), true)
+        .ok()
+        .and_then(|c| c.get_bool("advice.refSyntax").and_then(|r| r.ok()))
+        .unwrap_or(true);
+    if advice_on {
+        eprintln!("hint: See 'git help check-ref-format'");
+        eprintln!("hint: Disable this message with \"git config set advice.refSyntax false\"");
+    }
+    std::process::exit(128);
+}
+
+/// Mirror Git's `branch.autosetuprebase` config validation (`environment.c`): a missing value or a
+/// value outside {never, local, remote, always} aborts the command with exit 128.
+fn validate_autosetuprebase_config(repo: &Repository) {
+    let Ok(cfg) = ConfigSet::load(Some(&repo.git_dir), true) else {
+        return;
+    };
+    let raws = cfg.get_all_raw("branch.autosetuprebase");
+    let Some(last) = raws.last() else {
+        return;
+    };
+    match last {
+        None => {
+            eprintln!("error: missing value for 'branch.autosetuprebase'");
+            std::process::exit(128);
+        }
+        Some(v) => {
+            if !matches!(v.as_str(), "never" | "local" | "remote" | "always") {
+                eprintln!("error: malformed value for branch.autosetuprebase");
+                std::process::exit(128);
+            }
+        }
+    }
+}
+
+/// Write `branch.<name>.remote`/`.merge` (and `.rebase = true` per `branch.autosetuprebase`).
+///
+/// `remote == "."` means the upstream is a local branch. `branch.autosetuprebase` (already
+/// validated) selects whether to also set `rebase = true`: `always` for any tracking, `local`
+/// only for local upstreams, `remote` only for remote-tracking upstreams (t3200 124/125/130/131).
+fn write_branch_tracking_config(
+    repo: &Repository,
+    name: &str,
+    remote: &str,
+    merge_ref: &str,
+) -> Result<()> {
+    let is_local = remote == ".";
+    let autosetuprebase = ConfigSet::load(Some(&repo.git_dir), true)
+        .ok()
+        .and_then(|c| c.get("branch.autosetuprebase"));
+    let set_rebase = match autosetuprebase.as_deref() {
+        Some("always") => true,
+        Some("local") => is_local,
+        Some("remote") => !is_local,
+        _ => false,
+    };
+
+    let config_path = repo.git_dir.join("config");
+    let mut cfg = fs::read_to_string(&config_path).unwrap_or_default();
+    cfg.push_str(&format!("\n[branch \"{name}\"]"));
+    cfg.push_str(&format!("\n\tremote = {remote}"));
+    cfg.push_str(&format!("\n\tmerge = {merge_ref}\n"));
+    if set_rebase {
+        cfg.push_str("\trebase = true\n");
+    }
+    fs::write(&config_path, cfg)?;
     Ok(())
 }
 
@@ -1932,6 +2069,17 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
         (name_input.to_owned(), format!("refs/heads/{name_input}"))
     };
 
+    // A branch that is itself a symbolic ref is deleted as-is (its symref target is reported as the
+    // "was" value, not the resolved OID); the target branch is left intact (t3200 81-83).
+    if let Ok(Some(target)) = refs::read_symbolic_ref(&repo.git_dir, &refname) {
+        grit_lib::refs::delete_ref(&repo.git_dir, &refname).map_err(|e| anyhow::anyhow!("{e}"))?;
+        remove_branch_config_section(repo, &name);
+        if !args.quiet {
+            println!("Deleted branch {name} (was {target}).");
+        }
+        return Ok(());
+    }
+
     if let Some(path) = branch_checked_out_in_other_worktree(repo, &name) {
         bail!(
             "cannot delete branch '{}' used by worktree at '{}'",
@@ -1957,16 +2105,19 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
     let branch_oid = grit_lib::refs::resolve_ref(&repo.git_dir, &refname)
         .map_err(|_| anyhow::anyhow!("branch '{name}' not found."))?;
 
-    // For -d (not -D), check if branch is merged into HEAD
+    // For -d (not -D), check if branch is merged into HEAD. When HEAD is unborn/orphan (no commit),
+    // the branch cannot be shown merged, so Git requires `-D` (t3200 42/43).
     if args.delete && !args.force_delete {
-        if let Some(head_oid) = head.oid() {
-            if !is_ancestor(repo, branch_oid, *head_oid).unwrap_or(false) {
-                bail!(
-                    "error: the branch '{}' is not fully merged.\nIf you are sure you want to delete it, run 'git branch -D {}'",
-                    name,
-                    name
-                );
-            }
+        let merged = match head.oid() {
+            Some(head_oid) => is_ancestor(repo, branch_oid, *head_oid).unwrap_or(false),
+            None => false,
+        };
+        if !merged {
+            bail!(
+                "error: the branch '{}' is not fully merged.\nIf you are sure you want to delete it, run 'git branch -D {}'",
+                name,
+                name
+            );
         }
     }
 
@@ -1988,6 +2139,9 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
         }
     }
 
+    // Git removes the `branch.<name>.*` config section when deleting a branch (t3200 92).
+    remove_branch_config_section(repo, &name);
+
     if !args.quiet {
         let hex = branch_oid.to_hex();
         let short = &hex[..7.min(hex.len())];
@@ -1995,6 +2149,35 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
     }
 
     Ok(())
+}
+
+/// Remove the entire `[branch "<name>"]` config section (used after deleting a branch).
+fn remove_branch_config_section(repo: &Repository, name: &str) {
+    let config_path = repo.git_dir.join("config");
+    let Ok(content) = fs::read_to_string(&config_path) else {
+        return;
+    };
+    let section = format!("[branch \"{name}\"]");
+    if !content.contains(&section) {
+        return;
+    }
+    let mut out = String::new();
+    let mut in_section = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == section;
+            if in_section {
+                continue;
+            }
+        }
+        if in_section {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let _ = fs::write(&config_path, out);
 }
 
 /// Rename a branch.
@@ -2034,6 +2217,15 @@ fn rename_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
 
     let old_ref = format!("refs/heads/{old_name}");
     let new_ref = format!("refs/heads/{new_name}");
+
+    // Renaming a branch that is a symbolic ref is not allowed (t3200 84).
+    if matches!(
+        refs::read_symbolic_ref(&repo.git_dir, &old_ref),
+        Ok(Some(_))
+    ) {
+        eprintln!("fatal: Branch '{old_name}' has a symref, not a branch.");
+        std::process::exit(128);
+    }
 
     // Git only rejects a rename when a worktree is mid-rebase/bisect on the branch; a branch that
     // is merely checked out in another worktree CAN be renamed (its HEAD symref is rewritten).
