@@ -52,6 +52,13 @@ pub struct IgnoreMatcher {
     /// Patterns from `git ls-files -X` / `--exclude-from` (Git `EXC_FILE`, after global/info).
     exclude_from_rules: Vec<IgnoreRule>,
     gitignore_cache: HashMap<String, Vec<IgnoreRule>>,
+    /// Per-directory exclude filename (`ls-files --exclude-per-directory`, default `.gitignore`).
+    per_directory_name: Option<String>,
+    /// Whether per-directory exclude files are read at all (Git `EXC_DIRS`).
+    ///
+    /// `from_repository` (standard excludes) and an explicit `--exclude-per-directory`/`--ignored`
+    /// enable this; a matcher built only for `-x`/`-X` does not consult per-directory files.
+    read_per_directory: bool,
     /// Warnings emitted while loading in-tree `.gitignore` (e.g. symlink paths).
     pub warnings: Vec<String>,
 }
@@ -70,6 +77,8 @@ impl IgnoreMatcher {
         Ok(Self {
             global_rules: load_global_excludes(repo)?,
             info_rules: load_info_excludes(repo)?,
+            // Standard excludes include the per-directory `.gitignore` set (Git `EXC_DIRS`).
+            read_per_directory: true,
             ..Self::default()
         })
     }
@@ -90,6 +99,16 @@ impl IgnoreMatcher {
             self.exclude_from_rules.append(&mut more);
         }
         Ok(())
+    }
+
+    /// Override the per-directory exclude filename (`ls-files --exclude-per-directory=<file>`).
+    ///
+    /// When unset, per-directory excludes are read from `.gitignore` (Git's standard name).
+    pub fn set_per_directory_name(&mut self, name: &str) {
+        self.per_directory_name = Some(name.to_owned());
+        self.read_per_directory = true;
+        // The cache is keyed by directory only; clear it so a new filename is honored.
+        self.gitignore_cache.clear();
     }
 
     /// Append patterns from `ls-files --exclude` / `-x` (Git command-line exclude list).
@@ -135,23 +154,46 @@ impl IgnoreMatcher {
             return Ok((false, None));
         }
 
-        let mut matched: Option<IgnoreMatch> = None;
-        let mut ignored = false;
+        // Git evaluates exclude pattern groups in priority order
+        // (`last_matching_pattern_from_lists`, dir.c):
+        //   1. EXC_CMDL  — command-line `-x`/`--exclude` patterns
+        //   2. EXC_DIRS  — per-directory `.gitignore` (deepest directory wins)
+        //   3. EXC_FILE  — `-X`/`--exclude-from`, then `core.excludesfile`, then `.git/info/exclude`
+        // The FIRST group that yields a match decides the result; within a group, the last
+        // matching pattern (last line) wins. This means a CLI `--exclude` overrides a per-directory
+        // `!negation`, and a per-directory `.gitignore` overrides `core.excludesfile`.
+        let per_dir_groups = self.rules_for_path_grouped(repo, index, repo_rel_path)?;
 
-        let per_dir_rules = self.rules_for_path(repo, index, repo_rel_path)?;
-        // Approximate Git precedence with a single "last match wins" pass: command-line and
-        // `ls-files -X` patterns sit next to the standard file group, then per-directory
-        // `.gitignore` (highest priority), matching the historical behavior that passed t0008.
-        let all_rules = self
-            .cli_rules
+        // EXC_CMDL: command-line `-x` patterns (single list).
+        let cmdl_rules: Vec<&IgnoreRule> = self.cli_rules.iter().collect();
+        // EXC_DIRS: per-directory lists, deepest directory first.
+        let mut dir_groups: Vec<Vec<&IgnoreRule>> = Vec::new();
+        for rules in per_dir_groups.iter().rev() {
+            dir_groups.push(rules.iter().collect());
+        }
+        // EXC_FILE: `--exclude-from`, then global, then info (each a separate list, last-to-first).
+        let file_rules: Vec<&IgnoreRule> = self
+            .exclude_from_rules
             .iter()
             .chain(self.global_rules.iter())
             .chain(self.info_rules.iter())
-            .chain(self.exclude_from_rules.iter())
-            .chain(per_dir_rules.iter())
-            .collect::<Vec<_>>();
-        for rule in &all_rules {
-            if rule_matches(rule, repo_rel_path, is_dir) {
+            .collect();
+
+        let mut groups: Vec<Vec<&IgnoreRule>> = Vec::new();
+        groups.push(cmdl_rules);
+        groups.extend(dir_groups);
+        groups.push(file_rules);
+
+        let mut matched: Option<IgnoreMatch> = None;
+        let mut ignored = false;
+        for group in &groups {
+            let mut group_match: Option<&&IgnoreRule> = None;
+            for rule in group {
+                if rule_matches(rule, repo_rel_path, is_dir) {
+                    group_match = Some(rule);
+                }
+            }
+            if let Some(rule) = group_match {
                 matched = Some(IgnoreMatch {
                     source_display: rule.source_display.clone(),
                     line_number: rule.line_number,
@@ -159,9 +201,12 @@ impl IgnoreMatcher {
                     negative: rule.negative,
                 });
                 ignored = !rule.negative;
+                break;
             }
         }
 
+        // For `check-ignore -v` attribution, the verbose refinement walks the full flattened set.
+        let all_rules: Vec<&IgnoreRule> = groups.iter().flatten().copied().collect();
         let matched = refine_match_for_check_ignore_verbose(
             repo_rel_path,
             is_dir,
@@ -173,12 +218,19 @@ impl IgnoreMatcher {
         Ok((ignored, matched))
     }
 
-    fn rules_for_path(
+    /// Per-directory `.gitignore` rules for the ancestors of `repo_rel_path`, grouped by
+    /// directory and ordered root-first (deepest directory last). The caller evaluates the
+    /// groups deepest-first to honor Git's `EXC_DIRS` precedence (a nested `.gitignore` wins
+    /// over an ancestor's, and over `EXC_FILE` sources).
+    fn rules_for_path_grouped(
         &mut self,
         repo: &Repository,
         index: Option<&Index>,
         repo_rel_path: &str,
-    ) -> Result<Vec<IgnoreRule>> {
+    ) -> Result<Vec<Vec<IgnoreRule>>> {
+        if !self.read_per_directory {
+            return Ok(Vec::new());
+        }
         let parent = parent_dir(repo_rel_path);
         let mut dirs = Vec::new();
         dirs.push(String::new());
@@ -193,20 +245,29 @@ impl IgnoreMatcher {
             }
         }
 
+        let per_dir_name = self.per_directory_name.clone();
         for dir in &dirs {
             if !self.gitignore_cache.contains_key(dir) {
-                let rules = load_gitignore_for_dir(repo, index, dir, &mut self.warnings)?;
+                let rules = load_gitignore_for_dir(
+                    repo,
+                    index,
+                    dir,
+                    per_dir_name.as_deref(),
+                    &mut self.warnings,
+                )?;
                 self.gitignore_cache.insert(dir.clone(), rules);
             }
         }
 
-        let mut all: Vec<IgnoreRule> = Vec::new();
+        let mut groups: Vec<Vec<IgnoreRule>> = Vec::new();
         for dir in dirs {
             if let Some(rules) = self.gitignore_cache.get(&dir) {
-                all.extend(rules.iter().cloned());
+                groups.push(rules.clone());
+            } else {
+                groups.push(Vec::new());
             }
         }
-        Ok(all)
+        Ok(groups)
     }
 }
 
@@ -260,25 +321,27 @@ fn load_gitignore_for_dir(
     repo: &Repository,
     index: Option<&Index>,
     dir: &str,
+    per_dir_name: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<IgnoreRule>> {
     let Some(work_tree) = &repo.work_tree else {
         return Ok(Vec::new());
     };
+    let file_name = per_dir_name.unwrap_or(".gitignore");
     let path = if dir.is_empty() {
-        work_tree.join(".gitignore")
+        work_tree.join(file_name)
     } else {
-        work_tree.join(dir).join(".gitignore")
+        work_tree.join(dir).join(file_name)
     };
     let source_display = if dir.is_empty() {
-        ".gitignore".to_owned()
+        file_name.to_owned()
     } else {
-        format!("{dir}/.gitignore")
+        format!("{dir}/{file_name}")
     };
     let rel_key = if dir.is_empty() {
-        ".gitignore".to_owned()
+        file_name.to_owned()
     } else {
-        format!("{dir}/.gitignore")
+        format!("{dir}/{file_name}")
     };
 
     // In-tree `.gitignore` must not be a symlink (Git follows symlinks for global/info excludes

@@ -330,15 +330,25 @@ pub fn run(args: Args) -> Result<()> {
         || !args.exclude.is_empty()
         || !args.exclude_from.is_empty()
         || args.exclude_per_directory.is_some();
-    let use_standard_ignores = args.exclude_standard || args.ignored;
-    let need_matcher =
-        use_standard_ignores || !args.exclude.is_empty() || !args.exclude_from.is_empty();
+    // `--ignored` only changes *which* files are shown (the excluded ones); it does NOT by itself
+    // pull in the standard exclude sources. Git requires an explicit `--exclude-standard`, `-x`,
+    // `-X`, or `--exclude-per-directory` to populate the exclude lists.
+    let use_standard_ignores = args.exclude_standard;
+    let need_matcher = use_standard_ignores
+        || !args.exclude.is_empty()
+        || !args.exclude_from.is_empty()
+        || args.exclude_per_directory.is_some();
     let mut matcher = if need_matcher {
         let mut m = if use_standard_ignores {
             IgnoreMatcher::from_repository(&repo).unwrap_or_default()
         } else {
             IgnoreMatcher::default()
         };
+        // `--exclude-per-directory=<file>` enables per-directory excludes from <file> (Git
+        // `EXC_DIRS`) without pulling in the standard global/info sources.
+        if let Some(ref per_dir) = args.exclude_per_directory {
+            m.set_per_directory_name(per_dir);
+        }
         if !args.exclude_from.is_empty() {
             m.add_exclude_from_files(&args.exclude_from, &cwd)?;
         }
