@@ -543,9 +543,149 @@ fn commit_batch_staged(repo: &Repository, args: &Args, staged: &[(bool, BatchOp)
     verify_batch_staged(repo, staged)?;
     let hook_updates = hook_updates_for_ops(staged)?;
     run_ref_transaction_prepare(repo, &hook_updates)?;
-    apply_batch_staged(repo, args, staged)?;
+    if grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
+        apply_reftable_batch_staged(repo, args, staged)?;
+    } else {
+        apply_batch_staged(repo, args, staged)?;
+    }
     run_ref_transaction_committed(repo, &hook_updates);
     Ok(())
+}
+
+fn apply_reftable_batch_staged(
+    repo: &Repository,
+    args: &Args,
+    staged: &[(bool, BatchOp)],
+) -> Result<()> {
+    let mut updates = Vec::new();
+    for (no_deref, op) in staged {
+        match op {
+            BatchOp::UpdateOid {
+                refname,
+                new_oid,
+                expected_old,
+            } => {
+                let target_refname = effective_refname(repo, refname, *no_deref)?;
+                ensure_lockable_ref_path(repo, refname, &target_refname, expected_old.is_none())?;
+                if let Some(expected) = *expected_old {
+                    verify_expected_old(repo, refname, &target_refname, *no_deref, expected)?;
+                }
+                let old_oid =
+                    resolve_ref(&repo.git_dir, &target_refname).unwrap_or_else(|_| zero_oid());
+                let msg = args.log_message.as_deref().unwrap_or("");
+                let log = if should_write_update_reflog(repo, args, &target_refname, msg) {
+                    let (name, email, time_seconds, tz_offset) =
+                        reftable_log_identity_parts(&resolve_reflog_identity(repo));
+                    Some(grit_lib::reftable::LogRecord {
+                        refname: target_refname.clone(),
+                        update_index: 0,
+                        old_id: old_oid,
+                        new_id: *new_oid,
+                        name,
+                        email,
+                        time_seconds,
+                        tz_offset,
+                        message: msg.to_owned(),
+                    })
+                } else {
+                    None
+                };
+                updates.push(grit_lib::reftable::ReftableTransactionUpdate {
+                    refname: target_refname,
+                    value: grit_lib::reftable::RefValue::Val1(*new_oid),
+                    log,
+                });
+            }
+            BatchOp::CreateOid { refname, new_oid } => {
+                let target_refname = effective_refname(repo, refname, *no_deref)?;
+                ensure_lockable_ref_path(repo, refname, &target_refname, true)?;
+                if resolve_ref(&repo.git_dir, &target_refname).is_ok() {
+                    return Err(anyhow::Error::from(GritError::Message(format!(
+                        "fatal: cannot lock ref '{refname}': reference already exists"
+                    ))));
+                }
+                updates.push(grit_lib::reftable::ReftableTransactionUpdate {
+                    refname: target_refname,
+                    value: grit_lib::reftable::RefValue::Val1(*new_oid),
+                    log: None,
+                });
+            }
+            BatchOp::DeleteOid {
+                refname,
+                expected_old,
+            } => {
+                let target_refname = effective_refname(repo, refname, *no_deref)?;
+                if let Some(expected) = *expected_old {
+                    verify_expected_old(repo, refname, &target_refname, *no_deref, expected)?;
+                }
+                updates.push(grit_lib::reftable::ReftableTransactionUpdate {
+                    refname: target_refname,
+                    value: grit_lib::reftable::RefValue::Deletion,
+                    log: None,
+                });
+            }
+            BatchOp::VerifyOid {
+                refname,
+                expected_old,
+            } => {
+                let target_refname = effective_refname(repo, refname, *no_deref)?;
+                if let Some(expected) = *expected_old {
+                    verify_expected_old(repo, refname, &target_refname, *no_deref, expected)?;
+                } else if resolve_ref(&repo.git_dir, &target_refname).is_err() {
+                    bail!("ref '{target_refname}' does not exist");
+                }
+            }
+            BatchOp::UpdateSymref {
+                refname,
+                new_target,
+                expected_old,
+            } => {
+                if let Some(expected) = expected_old.clone() {
+                    verify_symref_expected_old(repo, refname, expected)?;
+                }
+                updates.push(grit_lib::reftable::ReftableTransactionUpdate {
+                    refname: refname.clone(),
+                    value: grit_lib::reftable::RefValue::Symref(new_target.clone()),
+                    log: None,
+                });
+            }
+            BatchOp::CreateSymref {
+                refname,
+                new_target,
+            } => {
+                if ref_exists_no_deref(repo, refname)? {
+                    return Err(anyhow::Error::from(GritError::Message(format!(
+                        "fatal: cannot lock ref '{refname}': reference already exists"
+                    ))));
+                }
+                updates.push(grit_lib::reftable::ReftableTransactionUpdate {
+                    refname: refname.clone(),
+                    value: grit_lib::reftable::RefValue::Symref(new_target.clone()),
+                    log: None,
+                });
+            }
+            BatchOp::DeleteSymref {
+                refname,
+                expected_old,
+            } => {
+                if let Some(expected) = expected_old.clone() {
+                    verify_symref_expected_old(repo, refname, expected)?;
+                }
+                updates.push(grit_lib::reftable::ReftableTransactionUpdate {
+                    refname: refname.clone(),
+                    value: grit_lib::reftable::RefValue::Deletion,
+                    log: None,
+                });
+            }
+            BatchOp::VerifySymref {
+                refname,
+                expected_old,
+            } => verify_symref_expected_old(repo, refname, expected_old.clone())?,
+        }
+    }
+
+    grit_lib::reftable::reftable_write_transaction(&repo.git_dir, updates)
+        .map_err(|err| anyhow::anyhow!("{err}"))
 }
 
 fn queue_or_apply(
@@ -1254,6 +1394,38 @@ fn symref_old_for_hook(expected_old: Option<SymrefOldExpectation>) -> String {
         Some(SymrefOldExpectation::MustTarget(target)) => format!("ref:{target}"),
         Some(SymrefOldExpectation::MustOid(oid)) => oid.to_hex(),
     }
+}
+
+fn reftable_log_identity_parts(identity: &str) -> (String, String, u64, i16) {
+    let (name_part, rest) = identity
+        .rsplit_once(" <")
+        .map(|(name, rest)| (name.to_owned(), rest))
+        .unwrap_or_else(|| ("Unknown".to_owned(), identity));
+    let (email, after_email) = rest
+        .split_once("> ")
+        .map(|(email, after)| (email.to_owned(), after))
+        .unwrap_or_else(|| (String::new(), rest));
+    let mut parts = after_email.split_whitespace();
+    let time_seconds = parts
+        .next()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let tz_offset = parts.next().map(parse_reftable_tz_offset).unwrap_or(0);
+    (name_part, email, time_seconds, tz_offset)
+}
+
+fn parse_reftable_tz_offset(raw: &str) -> i16 {
+    if raw.len() != 5 {
+        return 0;
+    }
+    let sign = if raw.as_bytes().first() == Some(&b'-') {
+        -1
+    } else {
+        1
+    };
+    let hours = raw[1..3].parse::<i16>().unwrap_or(0);
+    let minutes = raw[3..5].parse::<i16>().unwrap_or(0);
+    sign * (hours * 60 + minutes)
 }
 
 pub(crate) fn resolve_reflog_identity(repo: &Repository) -> String {

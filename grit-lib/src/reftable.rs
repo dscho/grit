@@ -195,6 +195,22 @@ impl Default for WriteOptions {
     }
 }
 
+/// A ref update that should be written to a reftable transaction.
+///
+/// The `refname` must already be the backend storage refname (for example a
+/// namespaced or per-worktree ref after storage routing). All updates passed to
+/// one transaction are written with the same update index, matching Git's
+/// reftable backend for `update-ref --stdin` batches.
+#[derive(Debug, Clone)]
+pub struct ReftableTransactionUpdate {
+    /// Full storage refname to update.
+    pub refname: String,
+    /// New ref value, or a deletion tombstone.
+    pub value: RefValue,
+    /// Optional reflog entry to record in the same table and update index.
+    pub log: Option<LogRecord>,
+}
+
 // ---------------------------------------------------------------------------
 // Writer
 // ---------------------------------------------------------------------------
@@ -2055,6 +2071,52 @@ impl ReftableStack {
         Ok(())
     }
 
+    /// Write several ref updates as a single reftable transaction.
+    ///
+    /// All ref and log records are stored in one table with one shared update
+    /// index. This mirrors Git's reftable transaction behavior and keeps
+    /// compacted table layout stable for large `update-ref --stdin` batches.
+    pub fn write_transaction(
+        &mut self,
+        updates: Vec<ReftableTransactionUpdate>,
+        opts: &WriteOptions,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        {
+            let guard = self.acquire_tables_list_lock()?;
+            self.reload_table_names();
+            let update_index = self.max_update_index_unlocked()? + 1;
+            let mut writer = ReftableWriter::new(opts.clone(), update_index, update_index);
+
+            let mut updates = updates;
+            updates.sort_by(|a, b| a.refname.cmp(&b.refname));
+            for update in &updates {
+                writer.add_ref(RefRecord {
+                    name: update.refname.clone(),
+                    update_index,
+                    value: update.value.clone(),
+                })?;
+            }
+            for update in updates {
+                if let Some(mut log) = update.log {
+                    log.update_index = update_index;
+                    writer.add_log(log)?;
+                }
+            }
+
+            let data = writer.finish()?;
+            let filename = self.write_table_file(&data, update_index)?;
+            self.table_names.push(filename);
+            self.write_tables_list_locked(&guard)?;
+        }
+
+        self.maybe_auto_compact()?;
+        Ok(())
+    }
+
     /// Max update index from the *current* in-memory `table_names` (caller is
     /// expected to have reloaded under the lock), tolerating tables removed by a
     /// concurrent compaction.
@@ -2491,6 +2553,33 @@ pub fn reftable_write_symref(
         log,
         &opts,
     )
+}
+
+/// Write multiple reftable ref updates as one transaction per backing store.
+///
+/// Ref names are routed through the same worktree/common-dir rules as the
+/// single-ref helpers. Updates targeting different reftable stacks are grouped
+/// by stack; each group is written with one shared update index.
+pub fn reftable_write_transaction(
+    git_dir: &Path,
+    updates: Vec<ReftableTransactionUpdate>,
+) -> Result<()> {
+    let mut grouped: BTreeMap<PathBuf, Vec<ReftableTransactionUpdate>> = BTreeMap::new();
+    for mut update in updates {
+        let (store_git_dir, storage_refname) = reftable_storage_location(git_dir, &update.refname);
+        update.refname = storage_refname.clone();
+        if let Some(log) = update.log.as_mut() {
+            log.refname = storage_refname;
+        }
+        grouped.entry(store_git_dir).or_default().push(update);
+    }
+
+    for (store_git_dir, updates) in grouped {
+        let mut stack = ReftableStack::open(&store_git_dir)?;
+        let opts = read_write_options(&store_git_dir);
+        stack.write_transaction(updates, &opts)?;
+    }
+    Ok(())
 }
 
 /// Delete a ref from a reftable repo.
