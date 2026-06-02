@@ -493,7 +493,7 @@ t2031-checkout-index-symlink	t2	yes	25	24	1	false	ok	0
 t2032-checkout-index-parallel	t2	yes	28	25	3	false	ok	0
 t2040-checkout-file-modes	t2	yes	28	12	16	false	ok	0
 t2045-checkout-conflict	t2	yes	29	11	18	false	ok	0
-t2050-checkout	t2	yes	80	8	72	false	ok	0
+t2050-checkout	t2	yes	80	80	0	true	ok	0
 t2050-git-dir-relative	t2	yes	4	4	0	true	ok	0
 t2060-switch	t2	yes	16	8	8	false	ok	0
 t2061-switch-orphan	t2	yes	15	1	14	false	ok	0

@@ -6,7 +6,8 @@
   non-green in-scope `t2` row with the largest `failing` count in `data/test-files.csv`, then
   re-running that file until it has `failing=0` before moving on. After all current in-scope rows
   pass, audit skipped t240x worktree rows so literal t2 completion is not hidden behind skips.
-  - Current first target: `t2050-checkout.sh` (8/80, failing=72 at claim time).
+  - Completed: `t2050-checkout.sh` (80/80). Root cause was a synthetic fixture hard-coding
+    `master` while `grit init` defaults to `main`; the file now explicitly requests `master`.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---

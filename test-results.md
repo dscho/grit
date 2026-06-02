@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 focus: `./scripts/run-tests.sh t2050-checkout.sh --verbose` passes 80/80 after making the
+  synthetic checkout fixture explicitly request its hard-coded `master` initial branch.
 - Final t9 verification: `./scripts/run-tests.sh t9 --verbose` ran 90 in-scope t9 files with zero
   failing tests; files with executable tests all passed. `t9832-unshelve.sh` and `t9833-errors.sh`
   reported 0/0 due unavailable git-p4 external prereqs.
