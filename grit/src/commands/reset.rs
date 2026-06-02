@@ -392,6 +392,18 @@ pub fn run(mut args: Args) -> Result<()> {
     let (commit_spec, paths, mut paths_explicit) = split_commit_and_paths(&repo, &args.rest);
     paths_explicit |= args.raw_argv_had_path_separator;
 
+    // Track whether the user explicitly passed a commit-ish (e.g. `reset HEAD`)
+    // vs relying on the implicit default (e.g. bare `reset`). On an unborn branch,
+    // an explicit `HEAD` must fail while the implicit default silently resets the index.
+    let head_was_implicit = commit_spec == "HEAD" && paths.is_empty() && {
+        let non_flag: Vec<_> = args
+            .rest
+            .iter()
+            .filter(|a| !a.starts_with('-') && *a != "--")
+            .collect();
+        non_flag.is_empty()
+    };
+
     if !paths.is_empty() {
         // Pathspec reset: only update index entries, HEAD stays put.
         if mode != ResetMode::Mixed {
@@ -420,6 +432,7 @@ Use '--' to separate paths from revisions, like this:\n\
         args.quiet,
         args.refresh,
         args.no_refresh,
+        head_was_implicit,
         &mut args,
     )
 }
@@ -1333,6 +1346,7 @@ fn reset_commit(
     quiet: bool,
     refresh: bool,
     no_refresh: bool,
+    head_was_implicit: bool,
     extra: &mut Args,
 ) -> Result<()> {
     let head = resolve_head(&repo.git_dir)?;
@@ -1357,8 +1371,17 @@ fn reset_commit(
 
     let target_oid = match resolve_to_commit(repo, commit_spec) {
         Ok(oid) => oid,
+        Err(e) if head.oid().is_none() && !head_was_implicit => {
+            // Explicit HEAD on unborn branch: error like Git C
+            bail!(
+                "fatal: ambiguous argument '{}': unknown revision or path not in the working tree.\n\
+Use '--' to separate paths from revisions, like this:\n\
+'git <command> [<revision>...] -- [<file>...]'",
+                commit_spec
+            );
+        }
         Err(_) if head.oid().is_none() => {
-            // Unborn branch handling
+            // Unborn branch handling (implicit HEAD default)
             match mode {
                 ResetMode::Soft => {
                     // --soft on unborn: no-op (nothing to move)
