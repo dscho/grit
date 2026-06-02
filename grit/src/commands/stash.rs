@@ -1006,9 +1006,10 @@ fn do_push(mut opts: PushOpts) -> Result<()> {
                     let cwd = std::env::current_dir().ok();
                     for child in children.flatten() {
                         let child_path = child.path();
-                        if cwd.as_ref().is_some_and(|cwd| {
-                            cwd == &child_path || cwd.starts_with(&child_path)
-                        }) {
+                        if cwd
+                            .as_ref()
+                            .is_some_and(|cwd| cwd == &child_path || cwd.starts_with(&child_path))
+                        {
                             continue;
                         }
                         if child_path.is_dir() {

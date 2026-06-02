@@ -1363,11 +1363,7 @@ fn refresh_entry_stat(entry: &mut IndexEntry, meta: &std::fs::Metadata) {
     entry.size = refreshed.size;
 }
 
-fn stat_matches_refresh(
-    entry: &IndexEntry,
-    meta: &std::fs::Metadata,
-    trust_ctime: bool,
-) -> bool {
+fn stat_matches_refresh(entry: &IndexEntry, meta: &std::fs::Metadata, trust_ctime: bool) -> bool {
     if trust_ctime {
         return grit_lib::diff::stat_matches(entry, meta);
     }

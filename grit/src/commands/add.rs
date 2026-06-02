@@ -3149,7 +3149,8 @@ fn walk_directory(
 }
 
 fn submodule_ignore_all_for_add(repo: &Repository, work_tree: &Path, rel: &str) -> bool {
-    if let Ok(modules) = crate::commands::submodule::parse_gitmodules_with_repo(work_tree, Some(repo))
+    if let Ok(modules) =
+        crate::commands::submodule::parse_gitmodules_with_repo(work_tree, Some(repo))
     {
         if let Some(module) = modules.iter().find(|m| m.path == rel) {
             let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
@@ -3160,7 +3161,10 @@ fn submodule_ignore_all_for_add(repo: &Repository, work_tree: &Path, rel: &str) 
             {
                 return true;
             }
-            return module.ignore.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("all"));
+            return module
+                .ignore
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case("all"));
         }
     }
     false

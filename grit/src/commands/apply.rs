@@ -2373,7 +2373,8 @@ fn validate_patch_headers(patches: &[FilePatch], strip: usize) -> Result<()> {
             if let (Some(diff_old), Some(old)) =
                 (fp.diff_old_path.as_deref(), fp.old_path.as_deref())
             {
-                if old != "/dev/null" && path_after_strip(diff_old, strip) != old && diff_old != old {
+                if old != "/dev/null" && path_after_strip(diff_old, strip) != old && diff_old != old
+                {
                     bail!("inconsistent old filename");
                 }
             }
@@ -2383,7 +2384,8 @@ fn validate_patch_headers(patches: &[FilePatch], strip: usize) -> Result<()> {
             if let (Some(diff_new), Some(new)) =
                 (fp.diff_new_path.as_deref(), fp.new_path.as_deref())
             {
-                if new != "/dev/null" && path_after_strip(diff_new, strip) != new && diff_new != new {
+                if new != "/dev/null" && path_after_strip(diff_new, strip) != new && diff_new != new
+                {
                     bail!("inconsistent new filename");
                 }
             }

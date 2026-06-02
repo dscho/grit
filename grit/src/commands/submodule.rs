@@ -2781,13 +2781,16 @@ fn run_add(args: &AddArgs) -> Result<()> {
                     })
                 })
                 .unwrap_or_else(|| cwd.clone());
-            relative_base.join(&args.url).canonicalize().with_context(|| {
-                format!(
-                    "cannot resolve relative submodule URL '{}' from '{}'",
-                    args.url,
-                    relative_base.display()
-                )
-            })?
+            relative_base
+                .join(&args.url)
+                .canonicalize()
+                .with_context(|| {
+                    format!(
+                        "cannot resolve relative submodule URL '{}' from '{}'",
+                        args.url,
+                        relative_base.display()
+                    )
+                })?
         } else {
             PathBuf::from(&args.url)
         };

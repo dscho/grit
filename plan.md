@@ -2,7 +2,7 @@
 
 ## Active task — t2 family 100% pass
 
-- [~] Make all `t2` family tests fully pass. Work one file at a time, always choosing the
+- [x] Make all `t2` family tests fully pass. Work one file at a time, always choosing the
   non-green in-scope `t2` row with the largest `failing` count in `data/test-files.csv`, then
   re-running that file until it has `failing=0` before moving on. After all current in-scope rows
   pass, audit skipped t240x worktree rows so literal t2 completion is not hidden behind skips.
@@ -73,6 +73,9 @@
     occupancy fixes.
   - Completed: `t2401-worktree-prune.sh` (13/13). Unskipped and passed with prior worktree prune
     support.
+  - Final verification: `./scripts/run-tests.sh t2 --verbose` ran all 70 in-scope t2 files with
+    zero failing tests.
+  - All current t2 rows are `in_scope=yes`, `fully_passing=true`, and `failing=0`.
   - Completed: `t2022-checkout-paths.sh` (5/5). Passed with prior checkout path fixes.
   - Completed: `t2025-checkout-no-overlay.sh` (6/6). `checkout --theirs --no-overlay` now deletes
     the path when the requested conflict side is absent.

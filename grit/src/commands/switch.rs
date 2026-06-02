@@ -191,8 +191,12 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 fn reject_commitish_switch_target(args: &[String]) -> Result<()> {
-    if args.iter().any(|a| matches!(a.as_str(), "--detach" | "-d" | "-c" | "-C" | "--create" | "--force-create" | "--orphan"))
-    {
+    if args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "--detach" | "-d" | "-c" | "-C" | "--create" | "--force-create" | "--orphan"
+        )
+    }) {
         return Ok(());
     }
     let Some(target) = extract_switch_target(args) else {

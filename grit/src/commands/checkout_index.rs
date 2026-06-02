@@ -221,8 +221,12 @@ pub fn run(args: Args) -> Result<()> {
             // Git `index_name_pos` expands the sparse index on lookup; mirror that by
             // resolving the path against sparse-directory placeholders. The classification
             // (has_same_name / is_file / is_skipped) reproduces git's checkout_file().
-            let class =
-                classify_checkout_index_path(&index, &sparse_dir_prefixes, &path_bytes, target_stage);
+            let class = classify_checkout_index_path(
+                &index,
+                &sparse_dir_prefixes,
+                &path_bytes,
+                target_stage,
+            );
             match class {
                 PathClass::File { skip_worktree } => {
                     if skip_worktree && !args.ignore_skip_worktree_bits {

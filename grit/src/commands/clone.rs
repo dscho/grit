@@ -3881,10 +3881,21 @@ fn overlay_clone_submodule_contents(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "submodule".to_string());
-    let tmp = parent.join(format!(".grit-submodule-overlay-{}-{name}", std::process::id()));
+    let tmp = parent.join(format!(
+        ".grit-submodule-overlay-{}-{name}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&tmp);
-    let status =
-        clone_with_optional_superproject_refs(grit_bin, resolved_url, &tmp, &[], quiet, None, false, depth)?;
+    let status = clone_with_optional_superproject_refs(
+        grit_bin,
+        resolved_url,
+        &tmp,
+        &[],
+        quiet,
+        None,
+        false,
+        depth,
+    )?;
     if !status.success() {
         let _ = fs::remove_dir_all(&tmp);
         anyhow::bail!("clone of '{resolved_url}' into temporary submodule overlay failed");

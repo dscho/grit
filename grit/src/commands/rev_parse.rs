@@ -659,8 +659,7 @@ pub fn run(args: Args) -> Result<()> {
             }
         } else {
             if spec.contains("@{") {
-                if let Ok(Some(log_ref)) = grit_lib::rev_parse::reflog_walk_refname(current, spec)
-                {
+                if let Ok(Some(log_ref)) = grit_lib::rev_parse::reflog_walk_refname(current, spec) {
                     if grit_lib::reflog::read_reflog(&current.git_dir, &log_ref)
                         .map(|entries| entries.is_empty())
                         .unwrap_or(true)
@@ -1138,9 +1137,8 @@ pub fn run(args: Args) -> Result<()> {
                                 } else {
                                     current.git_dir.join(common_path)
                                 };
-                                let common_display = common_path
-                                    .canonicalize()
-                                    .unwrap_or(common_path);
+                                let common_display =
+                                    common_path.canonicalize().unwrap_or(common_path);
                                 println!("{}/{}", common_display.display(), path_arg_out);
                                 continue;
                             }

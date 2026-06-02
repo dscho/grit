@@ -1,6 +1,11 @@
 # Test Results
 
 Updated: 2026-06-01
+- Final t2 verification: `./scripts/run-tests.sh t2 --verbose` ran all 70 in-scope t2 files with
+  zero failing tests. All t2 rows are now in scope and `failing=0`.
+- Final quality gates: `cargo fmt`, `cargo clippy --fix --allow-dirty`, `cargo test -p grit-lib --lib`,
+  and `cargo check -p grit-cli` completed successfully. Clippy/check still report the existing
+  warning backlog; grit-lib unit tests passed 229/229.
 - t2 parallel checkout: `./scripts/run-tests.sh t2080-parallel-checkout-basics.sh --verbose`
   passes 11/11 after submodule update/clone overlay, symlink diff, and delayed-filter count fixes.
 - t2 focus: `./scripts/run-tests.sh t2032-checkout-index-parallel.sh --verbose` passes 28/28

@@ -1297,9 +1297,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 let preferred: Vec<(String, ObjectId)> = matching
                     .iter()
                     .filter(|(r, _)| {
-                        r.trim_start_matches(remote_prefix)
-                            .split('/')
-                            .next()
+                        r.trim_start_matches(remote_prefix).split('/').next()
                             == Some(default_remote.as_str())
                     })
                     .cloned()
@@ -1383,7 +1381,9 @@ pub fn run(mut args: Args) -> Result<()> {
         let has_matching_remote = refs::list_refs(&repo.git_dir, "refs/")
             .unwrap_or_default()
             .into_iter()
-            .any(|(r, _)| remote_tracking_branch_for_ref(&repo, &r).as_deref() == Some(target.as_str()));
+            .any(|(r, _)| {
+                remote_tracking_branch_for_ref(&repo, &r).as_deref() == Some(target.as_str())
+            });
         if has_matching_remote {
             bail!(
                 "pathspec '{}' did not match any file(s) known to git",
@@ -3220,15 +3220,17 @@ fn refuse_checkout_removing_cwd(
     }
     let cwd_rel_str = cwd_rel.to_string_lossy().replace('\\', "/");
     let cwd_prefix = format!("{cwd_rel_str}/");
-    let cwd_had_tracked_children = old_index.entries.iter().any(|e| {
-        e.stage() == 0 && String::from_utf8_lossy(&e.path).starts_with(&cwd_prefix)
-    });
+    let cwd_had_tracked_children = old_index
+        .entries
+        .iter()
+        .any(|e| e.stage() == 0 && String::from_utf8_lossy(&e.path).starts_with(&cwd_prefix));
     if !cwd_had_tracked_children {
         return Ok(());
     }
-    let cwd_becomes_file = new_index.entries.iter().any(|e| {
-        e.stage() == 0 && String::from_utf8_lossy(&e.path).as_ref() == cwd_rel_str
-    });
+    let cwd_becomes_file = new_index
+        .entries
+        .iter()
+        .any(|e| e.stage() == 0 && String::from_utf8_lossy(&e.path).as_ref() == cwd_rel_str);
     if cwd_becomes_file {
         bail!("Refusing to remove the current working directory");
     }
@@ -6426,17 +6428,15 @@ pub(crate) fn checkout_index_to_worktree(
                     .get(old_path.as_slice())
                     .is_some_and(|e| e.mode == MODE_GITLINK)
             {
-                let _ =
-                    crate::commands::submodule::absorb_submodule_dot_git_dir_into_modules(
-                        repo, &rel,
-                    );
+                let _ = crate::commands::submodule::absorb_submodule_dot_git_dir_into_modules(
+                    repo, &rel,
+                );
                 if let Ok(modules_git) =
                     submodule_modules_git_dir_for_checkout(repo, work_tree, &rel)
                 {
-                    let _ =
-                        crate::commands::submodule::unset_submodule_core_worktree_config(
-                            &modules_git,
-                        );
+                    let _ = crate::commands::submodule::unset_submodule_core_worktree_config(
+                        &modules_git,
+                    );
                     let _ = unset_nested_submodule_core_worktrees(&modules_git);
                 }
                 let _ = std::fs::remove_dir_all(&abs);
