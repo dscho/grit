@@ -36,7 +36,13 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
     divergent commit summaries with shared limits, gitlink/blob typechange summaries, worktree
     submodule detection when the index holds a blob, deleted submodule summaries, and missing
     commit warnings.
-- [ ] `t7814-grep-recurse-submodules.sh` - 17/27 passing, 10 failing. Focus: grep recursion.
+- [x] `t7814-grep-recurse-submodules.sh` - 27/27 aggregate passing; 7 upstream TODO cases
+  tracked separately, with 2 still known breakages. Focus: grep recursion.
+  - Fixed this iteration: glued `-ePATTERN` parsing, cwd-relative grep output for paths outside
+    the current directory, parent gitlink pathspec handoff to recursive submodule searches,
+    historical moved-submodule tree lookup through `.git/modules`, promisor trace reporting for
+    partial-clone submodule object reads, and per-repository replace-ref scoping for cached/tree
+    grep object reads.
 - [ ] `t7422-submodule-output.sh` - 9/18 passing, 9 failing. Focus: submodule command output.
 - [ ] `t7408-submodule-reference.sh` - 8/16 passing, 8 failing. Focus: reference clone/update.
 - [ ] `t7425-submodule-gitdir-path-extension.sh` - 18/23 passing, 5 failing. Focus: gitdir path extension.

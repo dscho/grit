@@ -6,6 +6,19 @@
 # Test Results
 
 Updated: 2026-06-02
+- t7 submodule focus: `./scripts/run-tests.sh t7814-grep-recurse-submodules.sh --verbose`
+  improved `t7814` from 17/27 to 27/27 aggregate passing (`failing=0`, `todo=7`) by fixing
+  glued `-ePATTERN` parsing, cwd-relative recursive grep output, direct-gitlink pathspec handoff,
+  moved-submodule historical tree lookup, partial-clone promisor trace reporting, and scoped
+  replace-ref object reads for cached/tree grep. Direct `sh t7814-grep-recurse-submodules.sh -v`
+  also has all 27 non-TODO cases passing, with 2 upstream TODO known breakages remaining.
+- Verification: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed. Build/check
+  and clippy still report the existing warning backlog; grit-lib unit tests passed 238/238.
+  Clippy's unrelated auto-fixes in `grit-lib/src/config.rs` and
+  `grit-lib/src/filter_process.rs` were reverted. Final rebuilt harness run:
+  `./scripts/run-tests.sh t7814-grep-recurse-submodules.sh --verbose` remains 27/34 with
+  `failing=0`.
 - t7 submodule focus: `./scripts/run-tests.sh t7401-submodule-summary.sh --verbose` improved
   `t7401` from 10/25 to 25/25 by fixing cwd-relative summary pathspec/display handling,
   right-before-left divergent log output with shared limits, gitlink/blob typechange summaries,

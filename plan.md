@@ -3,8 +3,8 @@
 ## Active task — t7 submodule tests 100% pass
 
 - [~] Make all in-scope t7 submodule tests fully pass. Detailed queue and per-file status are in
-  `submodule-plan.md`; work one file at a time. Next unclaimed file is
-  `t7814-grep-recurse-submodules.sh`.
+  `submodule-plan.md`; work one file at a time. No next file is claimed because this checkpoint is
+  stopping after the completed `t7814-grep-recurse-submodules.sh` work.
   - Completed: `t7406-submodule-update.sh` improved from 10/70 to 70/70.
   - Completed: `t7400-submodule-basic.sh` improved from 96/124 to 124/124.
   - Completed: `t7112-reset-submodule.sh` improved from 34/82 to 78/78 aggregate passing, with 4 upstream TODO known breakages omitted from the failing count; log:
@@ -18,7 +18,10 @@
     `logs/2026-06-02_2004-t7403-submodule-sync.md`.
   - Completed: `t7401-submodule-summary.sh` improved from 10/25 to 25/25; log:
     `logs/2026-06-02_2010-t7401-submodule-summary.md`.
-  - Next focus: `t7814-grep-recurse-submodules.sh` at 17/27.
+  - Completed: `t7814-grep-recurse-submodules.sh` improved from 17/27 to 27/27 aggregate
+    passing, with 7 upstream TODO cases tracked separately; log:
+    `logs/2026-06-02_2023-t7814-grep-recurse-submodules.md`.
+  - Next unclaimed item: `t7422-submodule-output.sh`.
 
 ## Active task — t2 family 100% pass
 
