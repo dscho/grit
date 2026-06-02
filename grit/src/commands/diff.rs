@@ -2191,6 +2191,15 @@ pub fn run(mut args: Args) -> Result<()> {
                 "-W" | "--function-context" => {
                     args.function_context = true;
                 }
+                s if s.starts_with("--") => {
+                    return Err(anyhow::Error::new(ExplicitExit {
+                        code: 129,
+                        message: format!(
+                            "error: unknown option `{}`\nusage: git diff [<options>] [<commit>] [--] [<path>...]",
+                            s.trim_start_matches('-')
+                        ),
+                    }));
+                }
                 _ => {
                     extra_revs.push(r.clone());
                     rev_idx += 1;

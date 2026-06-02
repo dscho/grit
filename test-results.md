@@ -1,6 +1,13 @@
 # Test Results
 
 Updated: 2026-06-02
+- t4 workflow: dependency breakdown created for diff-family tests; started with `t4017-diff-retval.sh`.
+- t4 focus build: `cargo build --release -p grit-cli` passes with the existing warning backlog (`ignore.rs`, `refs.rs`, `difftool.rs`, `sparse_checkout.rs`, `worktree.rs`).
+- t4 focus harness: `./scripts/run-tests.sh t4017-diff-retval.sh --verbose` passes 38/38 after rejecting unknown long `git diff` options with usage instead of resolving them as revisions.
+- `cargo check -p grit-cli`: passes with the same existing warning backlog.
+- `cargo test --workspace`: not run for this focused t4 iteration.
+- `./tests/harness/run.sh`: skipped; project uses `./scripts/run-tests.sh` for CSV/dashboard updates.
+
 - t0 worktree merge: `cargo build --release -p grit-cli` passes with the existing warning backlog
   (`ignore.rs`, `refs.rs`, `difftool.rs`, `sparse_checkout.rs`, `worktree.rs`).
 - t0 worktree merge: `cargo clippy --fix --allow-dirty --allow-staged` completed after sandbox
