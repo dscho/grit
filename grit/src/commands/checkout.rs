@@ -3000,6 +3000,7 @@ fn switch_to_tree(
     let new_entries = tree_to_flat_entries(repo, target_tree_oid, "")?;
     let mut new_index = old_index.clone();
     new_index.entries = new_entries;
+    new_index.clear_resolve_undo();
     new_index.sort();
 
     let work_units = new_index

@@ -36,6 +36,9 @@
     previous-HEAD descriptions, tracking output parity, and `GIT_PRINT_SHA1_ELLIPSIS` formatting.
   - Completed: `t2108-update-index-refresh-racy.sh` (6/6). `update-index --refresh` now honors
     `core.trustctime=false` when deciding whether stat-only differences require rewriting.
+  - In progress: `t2030-unresolve-info.sh` improved from 8/14 to 9/14 by clearing resolve-undo
+    records on checkout tree switches. Next failure is in `rerere forget` after rerere
+    re-resolves a conflict.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---
