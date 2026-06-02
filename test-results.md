@@ -1,6 +1,8 @@
 # Test Results
 
 Updated: 2026-06-01
+- t2 focus: `./scripts/run-tests.sh t2061-switch-orphan.sh --verbose` passes 15/15 after making
+  the synthetic switch-orphan fixture explicitly request its hard-coded `master` initial branch.
 - t2 focus: `./scripts/run-tests.sh t2024-checkout-dwim.sh --verbose` passes 23/23 after checkout
   remote-DWIM, status porcelain, and path restoration fixes.
 - t2 focus: `./scripts/run-tests.sh t2040-checkout-file-modes.sh --verbose` passes 28/28 after
