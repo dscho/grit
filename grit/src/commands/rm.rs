@@ -403,13 +403,15 @@ pub fn run(mut args: Args) -> Result<()> {
         // Require -r for directories (but not gitlinks, which are single entries).
         // Wildcard pathspecs may match several files at once without `-r` (Git: `ce_path_match`).
         if !args.recursive {
-            // Check if this is a gitlink entry (mode 160000)
+            // Check if this is a gitlink entry (mode 160000) at any stage —
+            // a conflicted (unmerged) submodule lives at stages 1/2/3, not 0,
+            // but `git rm submod` still matches it exactly and needs no `-r`.
             let is_gitlink = eligible.len() == 1
                 && eligible[0] == rel
                 && index
-                    .get(rel.as_bytes(), 0)
-                    .map(|e| e.mode == 0o160000)
-                    .unwrap_or(false);
+                    .entries
+                    .iter()
+                    .any(|e| e.path == rel.as_bytes() && e.mode == 0o160000);
             if !is_gitlink && !is_glob {
                 for m in &eligible {
                     if Path::new(m) != Path::new(&rel) {
@@ -489,13 +491,15 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Determine which paths slated for removal are gitlinks (submodules); used
     // for the `.gitmodules` pre-check below and the post-removal cleanup.
+    // Detect the gitlink mode at any stage so conflicted (unmerged) submodules,
+    // whose entries live at stages 1/2/3, are also recognised.
     let to_remove_gitlinks: BTreeSet<String> = to_remove
         .iter()
         .filter(|p| {
             index
-                .get(p.as_bytes(), 0)
-                .map(|e| e.mode == 0o160000)
-                .unwrap_or(false)
+                .entries
+                .iter()
+                .any(|e| e.path == p.as_bytes() && e.mode == 0o160000)
         })
         .cloned()
         .collect();
@@ -701,7 +705,22 @@ fn safety_check(
     let path_bytes = path_str.as_bytes();
     let entry = match index.get(path_bytes, 0) {
         Some(e) => e,
-        None => return Ok(()),
+        None => {
+            // No stage-0 entry. For an unmerged (conflicted) *submodule* Git still
+            // guards against losing work: it inspects the "ours" (stage 2) entry
+            // and refuses removal if the submodule has a different HEAD or a dirty
+            // work tree (t3600 conflicted-submodule tests). Plain conflicted files
+            // are safe to remove (Git's "resolve by removal").
+            if let Some(ours) = index.get(path_bytes, 2) {
+                if ours.mode == 0o160000 {
+                    let abs_path = work_tree.join(path_str);
+                    if gitlink_worktree_differs(&abs_path, &ours.oid) {
+                        return Err(RmErrorKind::LocalModifications);
+                    }
+                }
+            }
+            return Ok(());
+        }
     };
 
     let index_oid = entry.oid;
