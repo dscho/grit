@@ -1380,9 +1380,19 @@ pub fn run(mut args: Args) -> Result<()> {
             committer_raw = grit_lib::commit_encoding::encode_header_text(enc_label, &committer)
                 .ok_or_else(|| anyhow::anyhow!("unsupported i18n.commitencoding: {enc_label}"))?;
         }
-        // The commit message body is stored verbatim: when raw bytes are present
-        // they are written unchanged; otherwise the UTF-8 message string is the
-        // byte sequence Git would store. We never transcode the body.
+        // The commit message body is stored verbatim when it already has a raw
+        // byte representation (e.g. a `-F` file already in this charset). When the
+        // message originates from a Unicode source (`-m`, an editor, or a `-s`
+        // sign-off trailer built from a non-ASCII committer name), its bytes must
+        // match the declared encoding: encode the Unicode body to the charset so a
+        // Latin-1 / EUC-JP committer name in the trailer is stored in that charset
+        // rather than as mislabeled UTF-8.
+        if raw_message.is_none() && !message.is_ascii() {
+            let body = message.trim_end_matches('\n');
+            if let Some(encoded) = grit_lib::commit_encoding::encode_unicode(enc_label, body) {
+                raw_message = Some(encoded);
+            }
+        }
     }
 
     // Git refuses a NUL byte anywhere in the commit log message (commit.c:
