@@ -5148,8 +5148,40 @@ fn apply_clone_config(git_dir: &Path, configs: &[String]) -> Result<()> {
         }
     }
 
+    if config_bool_value(&config, "extensions.submodulepathconfig")
+        && config_repository_format_version(&config) == 0
+    {
+        config.set("core.repositoryformatversion", "1")?;
+    }
+
     config.write().context("writing config")?;
     Ok(())
+}
+
+fn config_bool_value(config: &ConfigFile, key: &str) -> bool {
+    config
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.key == key)
+        .and_then(|e| e.value.as_deref())
+        .is_some_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "true" | "yes" | "on" | "1"
+            )
+        })
+}
+
+fn config_repository_format_version(config: &ConfigFile) -> u32 {
+    config
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.key == "core.repositoryformatversion")
+        .and_then(|e| e.value.as_deref())
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 fn effective_clone_server_options(args: &Args, remote_name: &str) -> Result<Vec<String>> {

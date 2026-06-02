@@ -53,7 +53,11 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
     derive submodule alternates from superproject alternates with `die`/`info` strategy parity,
     nested submodules inherit alternate config, and failed recursive clones preserve partial
     worktrees with Git-compatible retry diagnostics.
-- [ ] `t7425-submodule-gitdir-path-extension.sh` - 18/23 passing, 5 failing. Focus: gitdir path extension.
+- [x] `t7425-submodule-gitdir-path-extension.sh` - 23/23 passing. Focus: gitdir path extension.
+  - Fixed this iteration: `git clone -c extensions.submodulePathConfig=true` now upgrades the
+    repository format to v1 when writing the v1-only extension, and push `updateInstead` refreshes
+    the remote worktree/index against the old tip before hard-resetting the current branch without
+    detaching `HEAD`.
 - [ ] `t7402-submodule-rebase.sh` - 4/6 passing, 2 failing. Focus: submodule rebase update mode.
 - [ ] `t7409-submodule-detached-work-tree.sh` - 1/3 passing, 2 failing. Focus: detached work tree handling.
 - [ ] `t7412-submodule-absorbgitdirs.sh` - 10/12 passing, 2 failing. Focus: absorbgitdirs.
