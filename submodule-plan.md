@@ -67,7 +67,10 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
     `GIT_DIR`/`GIT_WORK_TREE` for detached worktrees, and local upload-pack server processes strip
     the caller's repository env so pulls from explicit-worktree repos serve the remote object
     store instead of the client one.
-- [ ] `t7412-submodule-absorbgitdirs.sh` - 10/12 passing, 2 failing. Focus: absorbgitdirs.
+- [x] `t7412-submodule-absorbgitdirs.sh` - 12/12 passing. Focus: absorbgitdirs.
+  - Fixed this iteration: `fsck` now skips index gitlinks as superproject-local object
+    requirements, and recursive submodule update skips clean parent submodules that are already at
+    the recorded commit while still recursing into nested submodules.
 - [ ] `t7423-submodule-symlinks.sh` - 4/6 passing, 2 failing. Focus: symlink safety.
 - [ ] `t7418-submodule-sparse-gitmodules.sh` - 8/9 passing, 1 failing. Focus: sparse `.gitmodules`.
 - [ ] `t7426-submodule-get-default-remote.sh` - 14/15 passing, 1 failing. Focus: default remote lookup.

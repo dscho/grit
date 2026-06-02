@@ -171,9 +171,9 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
         // commit: nested `.gitmodules` paths may still need `submodule update` (t5531 nested clone).
         if !args.remote
             && !args.force
-            && !args.recursive
             && sub_path.join(".git").exists()
             && read_submodule_head(&sub_path).as_deref() == Some(recorded_oid)
+            && submodule_worktree_clean_for_update(&modules_dir, &sub_path)
         {
             continue;
         }

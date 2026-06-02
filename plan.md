@@ -4,7 +4,7 @@
 
 - [~] Make all in-scope t7 submodule tests fully pass. Detailed queue and per-file status are in
   `submodule-plan.md`; work one file at a time, currently
-  `t7412-submodule-absorbgitdirs.sh`.
+  `t7423-submodule-symlinks.sh`.
   - Completed: `t7406-submodule-update.sh` improved from 10/70 to 70/70.
   - Completed: `t7400-submodule-basic.sh` improved from 96/124 to 124/124.
   - Completed: `t7112-reset-submodule.sh` improved from 34/82 to 78/78 aggregate passing, with 4 upstream TODO known breakages omitted from the failing count; log:
@@ -40,7 +40,11 @@
     explicit superproject env for `submodule add` staging and stripping client repo env from
     local upload-pack server processes; log:
     `logs/2026-06-02_2124-t7409-submodule-detached-work-tree.md`.
-  - Next focus: `t7412-submodule-absorbgitdirs.sh` at 10/12.
+  - Completed: `t7412-submodule-absorbgitdirs.sh` improved from 10/12 to 12/12 by skipping
+    index gitlinks in `fsck` reachability seeds and by letting recursive submodule update skip
+    clean, already-current parent submodules while still recursing; log:
+    `logs/2026-06-02_2136-t7412-submodule-absorbgitdirs.md`.
+  - Next focus: `t7423-submodule-symlinks.sh` at 4/6.
 
 ## Active task — t2 family 100% pass
 

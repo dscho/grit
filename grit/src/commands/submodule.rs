@@ -1647,7 +1647,9 @@ fn checkout_submodule_worktree(
 }
 
 fn submodule_worktree_clean_for_update(modules_dir: &Path, sub_path: &Path) -> bool {
-    let Ok(sub_repo) = Repository::open(modules_dir, Some(sub_path)) else {
+    let sub_repo = Repository::open(modules_dir, Some(sub_path))
+        .or_else(|_| Repository::discover(Some(sub_path)));
+    let Ok(sub_repo) = sub_repo else {
         return false;
     };
     let Ok(index) = sub_repo.load_index() else {
