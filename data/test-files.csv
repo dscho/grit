@@ -1220,7 +1220,7 @@ t7425-submodule-gitdir-path-extension	t7	yes	23	18	5	false	ok	0
 t7426-submodule-get-default-remote	t7	yes	15	14	1	false	ok	0
 t7450-bad-git-dotfiles	t7	yes	50	49	1	false	ok	0
 t7500-commit-template-squash-signoff	t7	yes	57	42	15	false	ok	0
-t7501-commit-basic	t7	yes	146	139	7	false	ok	0
+t7501-commit-basic	t7	yes	146	146	0	true	ok	0
 t7501-commit-basic-functionality	t7	yes	77	52	25	false	ok	0
 t7502-commit-porcelain	t7	yes	82	32	50	false	ok	0
 t7503-pre-commit-and-diff-whitespace	t7	yes	22	22	0	true	ok	0
