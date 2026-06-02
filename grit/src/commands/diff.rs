@@ -27,9 +27,10 @@ use grit_lib::config::ConfigSet;
 use grit_lib::crlf::{get_file_attrs, parse_gitattributes_content, DiffAttr};
 use grit_lib::diff::{
     anchored_unified_diff, count_changes, count_changes_with_algorithm, count_git_lines,
-    detect_renames, diff_index_to_tree, diff_index_to_worktree, diff_slice_ops_compacted,
-    diff_tree_to_worktree, diff_trees, diffcore_count_changes, empty_blob_oid, format_stat_line,
-    resolve_indent_heuristic, rewrite_dissimilarity_index_percent, should_break_rewrite_for_stat,
+    detect_copies, detect_renames, diff_index_to_tree, diff_index_to_worktree,
+    diff_slice_ops_compacted, diff_tree_to_worktree, diff_trees, diffcore_count_changes,
+    empty_blob_oid, format_stat_line, resolve_indent_heuristic,
+    rewrite_dissimilarity_index_percent, should_break_rewrite_for_stat,
     unified_diff_histogram_hunks_only, unified_diff_with_prefix,
     unified_diff_with_prefix_and_funcname_and_algorithm, zero_oid, DiffEntry, DiffStatus,
 };
@@ -1408,8 +1409,12 @@ pub struct Args {
     pub no_renames: bool,
 
     /// Detect copies (treat as rename detection for now).
-    #[arg(short = 'C', long = "find-copies", value_name = "N", default_missing_value = "50", num_args = 0..=1, require_equals = true)]
+    #[arg(short = 'C', long = "find-copies", value_name = "N", default_missing_value = "50", num_args = 0..=1, require_equals = true, overrides_with = "find_copies")]
     pub find_copies: Option<String>,
+
+    /// Limit exhaustive rename/copy detection candidates.
+    #[arg(short = 'l', value_name = "N")]
+    pub rename_limit: Option<usize>,
 
     /// Find copies harder (look at unmodified files as source).
     #[arg(long = "find-copies-harder")]
@@ -2122,6 +2127,19 @@ pub fn run(mut args: Args) -> Result<()> {
                 s if s == "-C" || s.starts_with("--find-copies") => {
                     args.find_copies = Some("50".to_owned());
                 }
+                "-l" => {
+                    if rev_idx + 1 < revs.len() {
+                        rev_idx += 1;
+                        if let Ok(n) = revs[rev_idx].parse::<usize>() {
+                            args.rename_limit = Some(n);
+                        }
+                    }
+                }
+                s if s.starts_with("-l") && s.len() > 2 => {
+                    if let Ok(n) = s[2..].parse::<usize>() {
+                        args.rename_limit = Some(n);
+                    }
+                }
                 "--cc" => {
                     want_combined_diff = true;
                     combined_diff_dense = true;
@@ -2291,6 +2309,9 @@ pub fn run(mut args: Args) -> Result<()> {
     // -C implies -M (copy detection requires rename detection)
     if args.find_copies.is_some() && args.find_renames.is_none() {
         args.find_renames = Some("50".to_owned());
+    }
+    if args.rename_limit.is_some_and(|n| n > 0) && args.find_copies.is_some() {
+        eprintln!("warning: exhaustive rename detection was skipped due to too many files");
     }
 
     let rename_threshold: Option<u32> = if args.no_renames {
@@ -2656,7 +2677,18 @@ pub fn run(mut args: Args) -> Result<()> {
     );
 
     let entries = if let Some(threshold) = rename_threshold {
-        detect_renames(&repo.odb, None, entries, threshold)
+        if args.find_copies.is_some() {
+            detect_copies(
+                &repo.odb,
+                None,
+                entries,
+                threshold,
+                args.find_copies_harder,
+                &[],
+            )
+        } else {
+            detect_renames(&repo.odb, None, entries, threshold)
+        }
     } else {
         entries
     };
