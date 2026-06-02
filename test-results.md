@@ -25,7 +25,13 @@ Updated: 2026-06-02
 - t7 submodule focus: `./scripts/run-tests.sh t7112-reset-submodule.sh --verbose` improved
   `t7112` from 69/82 to 76/82 by allowing `reset --merge` to introduce gitlinks over empty
   directories and clean tracked directories without misclassifying them as untracked obstructions.
-- Verification: `cargo build --release -p grit-cli` passed with the existing warning backlog.
+- t7 submodule focus: `./scripts/run-tests.sh t7112-reset-submodule.sh --verbose` improved
+  `t7112` from 76/82 to 78/82, failing=0 with 4 upstream TODO known breakages, by forcing
+  same-OID submodule cleanup during recursive hard reset and relaxing non-recursive keep-mode
+  gitlink OID changes.
+- Verification: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed. Build/check
+  and clippy still report the existing warning backlog; grit-lib unit tests passed 238/238.
 
 Updated: 2026-06-01
 - Final t2 verification: `./scripts/run-tests.sh t2 --verbose` ran all 70 in-scope t2 files with

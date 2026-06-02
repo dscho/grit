@@ -80,7 +80,7 @@ fn effective_reset_recurse_submodules(repo: &Repository, args: &Args) -> Result<
     Ok(false)
 }
 
-fn submodule_update_after_reset(repo: &Repository) -> Result<()> {
+fn submodule_update_after_reset(repo: &Repository, force: bool) -> Result<()> {
     let work_tree = repo
         .work_tree
         .as_deref()
@@ -88,8 +88,11 @@ fn submodule_update_after_reset(repo: &Repository) -> Result<()> {
     let grit_bin = crate::grit_exe::grit_executable();
     let mut cmd = Command::new(&grit_bin);
     crate::grit_exe::strip_trace2_env(&mut cmd);
+    cmd.args(["submodule", "update", "--init", "--recursive"]);
+    if force {
+        cmd.arg("--force");
+    }
     let status = cmd
-        .args(["submodule", "update", "--init", "--recursive"])
         .current_dir(work_tree)
         .status()
         .context("spawning submodule update after reset")?;
@@ -1672,7 +1675,7 @@ Use '--' to separate paths from revisions, like this:\n\
     {
         repo.write_index_at(&index_path, &mut new_index)
             .context("writing index before submodule update")?;
-        if let Err(e) = submodule_update_after_reset(repo) {
+        if let Err(e) = submodule_update_after_reset(repo, mode == ResetMode::Hard) {
             let _ = rollback_reset_after_failed_submodule_update(
                 repo,
                 &head,

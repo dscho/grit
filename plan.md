@@ -3,10 +3,10 @@
 ## Active task — t7 submodule tests 100% pass
 
 - [~] Make all in-scope t7 submodule tests fully pass. Detailed queue and per-file status are in
-  `submodule-plan.md`; work one file at a time, currently `t7112-reset-submodule.sh`.
+  `submodule-plan.md`; work one file at a time. Next unclaimed file is `t7506-status-submodule.sh`.
   - Completed: `t7406-submodule-update.sh` improved from 10/70 to 70/70.
   - Completed: `t7400-submodule-basic.sh` improved from 96/124 to 124/124.
-  - Current focus: `t7112-reset-submodule.sh` at 76/82; log:
+  - Completed: `t7112-reset-submodule.sh` improved from 34/82 to 78/82, failing=0 with 4 upstream TODO known breakages; log:
     `logs/2026-06-02_2220-t7112-reset-submodule.md`.
 
 ## Active task — t2 family 100% pass

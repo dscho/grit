@@ -1041,7 +1041,12 @@ fn two_way_merge(
                 }
                 Some(c) if same_blob(c, o) => {
                     if !same_blob(o, n) {
-                        require_uptodate(repo, c)?;
+                        let pure_gitlink_oid_change = c.mode == MODE_GITLINK
+                            && o.mode == MODE_GITLINK
+                            && n.mode == MODE_GITLINK;
+                        if !pure_gitlink_oid_change {
+                            require_uptodate(repo, c)?;
+                        }
                     }
                     result.insert(path.clone(), n.clone());
                     remove_index_descendants_not_in_tree(&mut result, &path, new_tree);
