@@ -1056,6 +1056,86 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
+    // --killed: untracked working-tree paths that would be clobbered by a checkout because a
+    // leading directory of the path (or the path itself, expected to be a directory) is a tracked
+    // *file* in the index (Git `show_killed_files`).
+    if args.killed {
+        let indexed_paths: BTreeSet<Vec<u8>> =
+            index.entries.iter().map(|e| e.path.clone()).collect();
+        // Sorted list of stage-0 tracked names for prefix / immediate-successor lookups.
+        let mut cache_names: Vec<&[u8]> = index
+            .entries
+            .iter()
+            .filter(|e| e.stage() == 0)
+            .map(|e| e.path.as_slice())
+            .collect();
+        cache_names.sort_unstable();
+
+        let mut untracked = Vec::new();
+        walk_worktree(
+            work_tree,
+            work_tree,
+            &indexed_paths,
+            &mut untracked,
+            true,
+            false, // no --directory collapsing: killed needs the full file list
+            false,
+            precompose_walk,
+            if pathspec_filter.is_empty() {
+                None
+            } else {
+                Some(pathspec_filter.as_slice())
+            },
+            &own_git_dir,
+            false,
+        )?;
+        untracked.sort();
+
+        for path_bytes in &untracked {
+            if path_bytes.ends_with(b"/") {
+                continue;
+            }
+            if !pathspec_filter.is_empty() {
+                let path_str = String::from_utf8_lossy(path_bytes);
+                if !grit_lib::pathspec::matches_pathspec_set_for_object_ls_tree(
+                    &pathspec_lib_strings,
+                    path_str.as_ref(),
+                    0o100644,
+                    &attrs_for_eol,
+                ) {
+                    continue;
+                }
+            }
+            if !path_is_killed(path_bytes, &cache_names) {
+                continue;
+            }
+            for (i, spec) in pathspec_filter.iter().enumerate() {
+                if grit_lib::pathspec::pathspec_is_exclude(&pathspec_lib_strings[i]) {
+                    continue;
+                }
+                if spec.matches(path_bytes) {
+                    matched_others[i] = true;
+                }
+            }
+            let display = format_ls_display_path(
+                args.full_name,
+                &cwd,
+                work_tree,
+                path_bytes,
+                &cwd_prefix,
+                &config,
+            )?;
+            let name = String::from_utf8_lossy(display.as_ref());
+            let qname = format_ls_path(&name, use_nul, quote_fully);
+            if args.show_tag {
+                write!(out, "K {qname}")?;
+            } else {
+                write!(out, "{qname}")?;
+            }
+            out.write_all(&[term])?;
+        }
+    }
+
     // --error-unmatch: fail if any pathspec matched nothing in the active mode(s).
     if args.error_unmatch {
         let show_others_err = args.others || (args.ignored && !args.cached);
@@ -2351,9 +2431,65 @@ fn collapse_to_directories(paths: &[Vec<u8>]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Whether an untracked working-tree file `name` would be "killed" by a checkout (Git
+/// `show_killed_files`). `cache_names` is the sorted list of stage-0 tracked paths.
+///
+/// A path is killed when either:
+/// - a leading directory component of `name` is registered in the index as a file, or
+/// - `name` itself (with no further `/`) is an exact prefix-directory of some cache entry
+///   (i.e. the cache expects `name/...`, so the file `name` must be removed).
+fn path_is_killed(name: &[u8], cache_names: &[&[u8]]) -> bool {
+    let index_has = |needle: &[u8]| cache_names.binary_search(&needle).is_ok();
+
+    let mut start = 0usize;
+    while start < name.len() {
+        match name[start..].iter().position(|&b| b == b'/') {
+            Some(off) => {
+                let dir = &name[..start + off];
+                if index_has(dir) {
+                    // A leading directory is a tracked file → this path is killed.
+                    return true;
+                }
+                start += off + 1;
+            }
+            None => {
+                // Final component: does the cache expect `name` to be a directory?
+                // Find the first cache entry sorting after `name`; if it is `name/...`, killed.
+                let pos = cache_names.partition_point(|c| *c <= name);
+                if let Some(next) = cache_names.get(pos) {
+                    if next.len() > name.len() && next.starts_with(name) && next[name.len()] == b'/'
+                    {
+                        return true;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve the HEAD commit object id of a checked-out submodule at `path` (work tree directory).
+/// Returns `None` if `path/.git` does not resolve to a repository or HEAD cannot be read.
+fn submodule_head_oid(path: &std::path::Path) -> Option<grit_lib::objects::ObjectId> {
+    let dot_git = path.join(".git");
+    let git_dir = resolve_dot_git(&dot_git).ok()?;
+    grit_lib::refs::resolve_ref(&git_dir, "HEAD").ok()
+}
+
 /// Check whether an index entry's file has been modified on disk.
 fn is_modified(entry: &IndexEntry, path: &std::path::Path) -> bool {
     use std::os::unix::fs::MetadataExt;
+
+    // Gitlink (submodule): "modified" iff the checked-out submodule HEAD differs from the recorded
+    // gitlink object id (Git compares the submodule's HEAD commit). If the submodule isn't checked
+    // out, treat it as unmodified (Git skips the diff in that case for `ls-files -m`).
+    if entry.mode == grit_lib::index::MODE_GITLINK {
+        return match submodule_head_oid(path) {
+            Some(head) => head != entry.oid,
+            None => false,
+        };
+    }
 
     let meta = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
