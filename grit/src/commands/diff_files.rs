@@ -1745,6 +1745,10 @@ fn read_worktree_info_fast(
         return Ok(WorktreeStatus::Unchanged);
     }
 
+    if path_has_symlink_parent(super_worktree, abs_path) {
+        return Ok(WorktreeStatus::Missing);
+    }
+
     let meta = match fs::symlink_metadata(abs_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1885,6 +1889,11 @@ fn read_submodule_head(path: &Path) -> Result<ObjectId> {
 /// The OID is computed by hashing the file content so we can detect
 /// modifications.  The mode is canonicalized to one of the four Git modes.
 fn read_worktree_info(repo: &Repository, abs_path: &Path) -> Result<Option<(u32, ObjectId)>> {
+    if let Some(wt) = repo.work_tree.as_deref() {
+        if path_has_symlink_parent(wt, abs_path) {
+            return Ok(None);
+        }
+    }
     let meta = match fs::symlink_metadata(abs_path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1912,6 +1921,27 @@ fn read_worktree_info(repo: &Repository, abs_path: &Path) -> Result<Option<(u32,
     }
 
     Ok(None)
+}
+
+fn path_has_symlink_parent(work_tree: &Path, abs_path: &Path) -> bool {
+    let Ok(rel) = abs_path.strip_prefix(work_tree) else {
+        return false;
+    };
+    let mut cur = work_tree.to_path_buf();
+    let mut comps = rel.components().peekable();
+    while let Some(component) = comps.next() {
+        if comps.peek().is_none() {
+            break;
+        }
+        cur.push(component.as_os_str());
+        if fs::symlink_metadata(&cur)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Canonicalize a raw file mode to one of the four Git modes.

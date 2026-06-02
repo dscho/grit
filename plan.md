@@ -48,6 +48,9 @@
     submodule checkout during clone/update and treating clean symlink worktree snapshots as clean
     despite stale stat data. Remaining failure is clone-vs-checkout working tree comparison for
     submodule paths that are no longer gitlinks on the target branch.
+  - In progress: `t2201-add-update-typechange.sh` improved from 2/6 to 3/6 by treating index paths
+    under a symlinked parent as deleted in `diff-files`. Remaining failure is `diff-index` raw
+    output for typechanges/deletions involving directories, symlinks, and submodule gitlinks.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---
