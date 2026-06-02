@@ -457,3 +457,10 @@ Updated: 2026-06-01
 - t7418 validation: `cargo fmt` ran; `cargo check -p grit-cli` passed with existing warnings;
   `cargo test -p grit-lib --lib` passed 238/238; `cargo clippy --fix --allow-dirty` completed
   with the existing warning backlog and its unrelated auto-fixes were reverted.
+- Submodule focus: `cargo build --release -p grit-cli` passed with existing warnings; focused
+  `cd tests && sh t7426-submodule-get-default-remote.sh -v` passed 15/15.
+- Submodule harness: `./scripts/run-tests.sh t7426-submodule-get-default-remote.sh` passed 15/15
+  and refreshed `data/test-files.csv` plus dashboards.
+- t7426 validation: `cargo fmt` ran; `cargo check -p grit-cli` passed with existing warnings;
+  `cargo test -p grit-lib --lib` passed 238/238; `cargo clippy --fix --allow-dirty` completed
+  with the existing warning backlog and its unrelated auto-fixes were reverted.

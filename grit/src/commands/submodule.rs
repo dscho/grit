@@ -881,7 +881,8 @@ pub fn run_submodule_helper(rest: &[String]) -> Result<()> {
                 submodule_helper_usage();
             }
             let path = &rest[1];
-            let name = get_default_remote_for_path(path)?;
+            let cwd = std::env::current_dir().context("current directory")?;
+            let name = get_default_remote_for_path_in_super(path, &cwd)?;
             println!("{name}");
             Ok(())
         }

@@ -79,7 +79,10 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
   - Fixed this iteration: `fetch` now starts the submodule changed-gitlink record and uses the
     typed recursive fetch path with Git's implicit on-demand default, so `pull` fetches missing
     submodule commits before sparse `.gitmodules` status summaries inspect them.
-- [ ] `t7426-submodule-get-default-remote.sh` - 14/15 passing, 1 failing. Focus: default remote lookup.
+- [x] `t7426-submodule-get-default-remote.sh` - 15/15 passing. Focus: default remote lookup.
+  - Fixed this iteration: `submodule--helper get-default-remote` now resolves its path argument
+    relative to the caller's current directory before mapping it back to the superproject root, so
+    helper calls from subdirectories find initialized submodules correctly.
 
 ## Passing
 
