@@ -31,7 +31,11 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
 - [x] `t7403-submodule-sync.sh` - 18/18 passing. Focus: sync URL propagation.
   - Verified this iteration: previously fixed sync behavior now passes the full file; no Rust
     changes were needed beyond refreshing harness metadata.
-- [ ] `t7401-submodule-summary.sh` - 10/25 passing, 15 failing. Focus: submodule summary output.
+- [x] `t7401-submodule-summary.sh` - 25/25 passing. Focus: submodule summary output.
+  - Fixed this iteration: cwd-relative summary pathspec/display handling, right-before-left
+    divergent commit summaries with shared limits, gitlink/blob typechange summaries, worktree
+    submodule detection when the index holds a blob, deleted submodule summaries, and missing
+    commit warnings.
 - [ ] `t7814-grep-recurse-submodules.sh` - 17/27 passing, 10 failing. Focus: grep recursion.
 - [ ] `t7422-submodule-output.sh` - 9/18 passing, 9 failing. Focus: submodule command output.
 - [ ] `t7408-submodule-reference.sh` - 8/16 passing, 8 failing. Focus: reference clone/update.

@@ -175,7 +175,7 @@ fn run_with_top_opts(top: SubmoduleTopOpts, args: Args) -> Result<()> {
     }
 }
 use grit_lib::config::{canonical_key, ConfigFile, ConfigScope, ConfigSet};
-use grit_lib::diff::{diff_index_to_tree, DiffEntry, DiffStatus};
+use grit_lib::diff::{diff_index_to_tree, format_mode, head_path_states, DiffEntry, DiffStatus};
 use grit_lib::error::Error as LibError;
 use grit_lib::gitmodules::check_submodule_name;
 use grit_lib::index::{Index, IndexEntry, MODE_GITLINK};
@@ -4161,11 +4161,22 @@ fn short_oid_in_submodule(grit_bin: &Path, sub_path: &Path, committish: &str) ->
 }
 
 fn submodule_rev_list_count(grit_bin: &Path, sub_path: &Path, range: &str) -> Result<i32> {
-    let out = grit_subprocess(grit_bin)
-        .args(["rev-list", "--first-parent", "--count", range, "--"])
+    submodule_rev_list_count_args(grit_bin, sub_path, &[range])
+}
+
+fn submodule_rev_list_count_args(grit_bin: &Path, sub_path: &Path, revs: &[&str]) -> Result<i32> {
+    let mut args = vec!["rev-list", "--first-parent", "--count"];
+    args.extend_from_slice(revs);
+    args.push("--");
+    let out = match grit_subprocess(grit_bin)
+        .args(args)
         .current_dir(sub_path)
         .output()
-        .context("rev-list --count in submodule")?;
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(-1),
+        Err(e) => return Err(e).context("rev-list --count in submodule"),
+    };
     if !out.status.success() {
         return Ok(-1);
     }
@@ -4176,6 +4187,30 @@ fn submodule_rev_list_count(grit_bin: &Path, sub_path: &Path, range: &str) -> Re
     Ok(n)
 }
 
+fn submodule_log_side(
+    grit_bin: &Path,
+    sub_path: &Path,
+    include: &str,
+    exclude: &str,
+    prefix: char,
+    summary_limit: i32,
+) -> Result<()> {
+    let mut cmd = grit_subprocess(grit_bin);
+    cmd.current_dir(sub_path);
+    cmd.arg("log");
+    if summary_limit > 0 {
+        cmd.arg(format!("-{summary_limit}"));
+    }
+    let pretty = format!("--pretty=  {} %s", prefix);
+    let exclude = format!("^{exclude}");
+    cmd.args(["--first-parent", &pretty, include, &exclude, "--"]);
+    let st = cmd.status().context("submodule log for summary")?;
+    if !st.success() {
+        bail!("submodule log failed");
+    }
+    Ok(())
+}
+
 fn submodule_log_first_parent(
     grit_bin: &Path,
     sub_path: &Path,
@@ -4183,17 +4218,29 @@ fn submodule_log_first_parent(
     dst_abbrev: &str,
     summary_limit: i32,
 ) -> Result<()> {
-    let range = format!("{src_abbrev}...{dst_abbrev}");
-    let mut cmd = grit_subprocess(grit_bin);
-    cmd.current_dir(sub_path);
-    cmd.arg("log");
-    if summary_limit > 0 {
-        cmd.arg(format!("-{summary_limit}"));
+    let right_exclude = format!("^{src_abbrev}");
+    let left_exclude = format!("^{dst_abbrev}");
+    let right_count =
+        submodule_rev_list_count_args(grit_bin, sub_path, &[dst_abbrev, &right_exclude])?;
+    let left_count =
+        submodule_rev_list_count_args(grit_bin, sub_path, &[src_abbrev, &left_exclude])?;
+
+    let right_limit = if summary_limit > 0 { summary_limit } else { -1 };
+    if right_count != 0 {
+        submodule_log_side(grit_bin, sub_path, dst_abbrev, src_abbrev, '>', right_limit)?;
     }
-    cmd.args(["--pretty=  %m %s", "--first-parent", &range, "--"]);
-    let st = cmd.status().context("submodule log for summary")?;
-    if !st.success() {
-        bail!("submodule log failed");
+
+    let left_limit = if summary_limit > 0 {
+        let remaining = summary_limit - right_count.max(0);
+        if remaining <= 0 {
+            return Ok(());
+        }
+        remaining
+    } else {
+        -1
+    };
+    if left_count != 0 {
+        submodule_log_side(grit_bin, sub_path, src_abbrev, dst_abbrev, '<', left_limit)?;
     }
     Ok(())
 }
@@ -4241,7 +4288,45 @@ fn pathspec_selected(pathspecs: &[String], sm_path: &str) -> bool {
     if pathspecs.is_empty() {
         return true;
     }
+    if pathspecs.iter().any(|p| p == ".") {
+        return true;
+    }
     grit_lib::pathspec::matches_pathspec_list(sm_path, pathspecs)
+}
+
+fn summary_pathspec_from_cwd(work_tree: &Path, cwd: &Path, raw: &str) -> Option<String> {
+    if raw.starts_with(':') {
+        return Some(raw.to_string());
+    }
+    if raw == "." {
+        let rel = cwd.strip_prefix(work_tree).ok()?;
+        let s = rel
+            .to_string_lossy()
+            .replace(std::path::MAIN_SEPARATOR, "/");
+        return Some(if s.is_empty() { ".".to_string() } else { s });
+    }
+    normalize_submodule_path_arg(work_tree, cwd, raw)
+}
+
+fn summary_arg_matches_gitlink(
+    work_tree: &Path,
+    cwd: &Path,
+    gitlinks: &[String],
+    raw: &str,
+) -> bool {
+    let Some(norm) = summary_pathspec_from_cwd(work_tree, cwd, raw) else {
+        return false;
+    };
+    if norm == "." {
+        return true;
+    }
+    gitlinks
+        .iter()
+        .any(|g| *g == norm || g.starts_with(&format!("{norm}/")))
+}
+
+fn summary_display_path_from_cwd(work_tree: &Path, cwd: &Path, sm_path: &str) -> String {
+    rev_parse::to_relative_path(&work_tree.join(sm_path), cwd).replace('\\', "/")
 }
 
 /// Working tree directory for a submodule given the path Git uses in the summary diff (often the
@@ -4354,31 +4439,52 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let work_tree = repo.work_tree.as_ref().context("bare repository")?;
     let grit_bin = grit_exe::grit_executable();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| work_tree.to_path_buf());
+    let gitlinks = index_gitlink_paths(&repo);
 
     let mut commit_spec = "HEAD";
     let pathspecs: Vec<String> = if let Some(p) = args.rest.iter().position(|x| x.as_str() == "--")
     {
         let head_tokens = &args.rest[..p];
-        let tail = args.rest[p + 1..].to_vec();
+        let tail: Vec<String> = args.rest[p + 1..]
+            .iter()
+            .filter_map(|raw| summary_pathspec_from_cwd(work_tree, &cwd, raw))
+            .collect();
         if head_tokens.is_empty() {
             tail
-        } else if resolve_revision(&repo, &head_tokens[0]).is_ok() {
+        } else if !summary_arg_matches_gitlink(work_tree, &cwd, &gitlinks, &head_tokens[0])
+            && resolve_revision(&repo, &head_tokens[0]).is_ok()
+        {
             commit_spec = head_tokens[0].as_str();
-            let mut ps: Vec<String> = head_tokens[1..].to_vec();
+            let mut ps: Vec<String> = head_tokens[1..]
+                .iter()
+                .filter_map(|raw| summary_pathspec_from_cwd(work_tree, &cwd, raw))
+                .collect();
             ps.extend(tail);
             ps
         } else {
-            let mut ps = head_tokens.to_vec();
+            let mut ps: Vec<String> = head_tokens
+                .iter()
+                .filter_map(|raw| summary_pathspec_from_cwd(work_tree, &cwd, raw))
+                .collect();
             ps.extend(tail);
             ps
         }
     } else if args.rest.is_empty() {
         vec![]
-    } else if resolve_revision(&repo, &args.rest[0]).is_ok() {
+    } else if !summary_arg_matches_gitlink(work_tree, &cwd, &gitlinks, &args.rest[0])
+        && resolve_revision(&repo, &args.rest[0]).is_ok()
+    {
         commit_spec = args.rest[0].as_str();
-        args.rest[1..].to_vec()
+        args.rest[1..]
+            .iter()
+            .filter_map(|raw| summary_pathspec_from_cwd(work_tree, &cwd, raw))
+            .collect()
     } else {
-        args.rest.clone()
+        args.rest
+            .iter()
+            .filter_map(|raw| summary_pathspec_from_cwd(work_tree, &cwd, raw))
+            .collect()
     };
 
     let base_tree_oid = resolve_summary_base_tree(&repo, commit_spec)?;
@@ -4404,29 +4510,42 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
         // index gitlinks directly, NOT `.gitmodules` (which may be empty/unregistered — t7508).
         let mut out = Vec::new();
         for ie in &index.entries {
-            if ie.stage() != 0 || ie.mode != MODE_GITLINK || ie.skip_worktree() {
+            if ie.stage() != 0 || ie.skip_worktree() {
                 continue;
             }
             let path_str = String::from_utf8_lossy(&ie.path).into_owned();
             let sub_path = work_tree.join(&path_str);
-            let dst_oid = if let Some(h) = grit_lib::diff::read_submodule_head_oid(&sub_path) {
-                h
-            } else {
-                ObjectId::zero()
-            };
-            if ie.oid == dst_oid {
-                continue;
+            if ie.mode == MODE_GITLINK {
+                let dst_oid = if let Some(h) = grit_lib::diff::read_submodule_head_oid(&sub_path) {
+                    h
+                } else {
+                    ObjectId::zero()
+                };
+                if ie.oid == dst_oid {
+                    continue;
+                }
+                out.push(DiffEntry {
+                    status: DiffStatus::Modified,
+                    old_path: Some(path_str.clone()),
+                    new_path: Some(path_str),
+                    old_mode: format_mode(MODE_GITLINK),
+                    new_mode: format_mode(MODE_GITLINK),
+                    old_oid: ie.oid,
+                    new_oid: dst_oid,
+                    score: None,
+                });
+            } else if let Some(dst_oid) = grit_lib::diff::read_submodule_head_oid(&sub_path) {
+                out.push(DiffEntry {
+                    status: DiffStatus::TypeChanged,
+                    old_path: Some(path_str.clone()),
+                    new_path: Some(path_str),
+                    old_mode: format_mode(ie.mode),
+                    new_mode: format_mode(MODE_GITLINK),
+                    old_oid: ie.oid,
+                    new_oid: dst_oid,
+                    score: None,
+                });
             }
-            out.push(DiffEntry {
-                status: DiffStatus::Modified,
-                old_path: Some(path_str.clone()),
-                new_path: Some(path_str),
-                old_mode: format!("{:o}", MODE_GITLINK),
-                new_mode: format!("{:o}", MODE_GITLINK),
-                old_oid: ie.oid,
-                new_oid: dst_oid,
-                score: None,
-            });
         }
         out.sort_by(|a, b| a.path().cmp(b.path()));
         out
@@ -4473,6 +4592,59 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
                 entries.extend(extra);
                 entries.sort_by(|a, b| a.path().cmp(b.path()));
             }
+
+            let head_states = head_path_states(&repo.odb, base_tree_oid.as_ref())?;
+            let mut replacements: Vec<DiffEntry> = Vec::new();
+            for ie in &index.entries {
+                if ie.stage() != 0 || ie.skip_worktree() {
+                    continue;
+                }
+                let path_str = String::from_utf8_lossy(&ie.path).into_owned();
+                let sub_path = work_tree.join(&path_str);
+                if let Some(sub_head) = grit_lib::diff::read_submodule_head_oid(&sub_path) {
+                    if ie.mode == MODE_GITLINK && ie.oid == sub_head {
+                        continue;
+                    }
+                    let (old_mode, old_oid) = head_states
+                        .get(&path_str)
+                        .copied()
+                        .unwrap_or((0, ObjectId::zero()));
+                    let status = if old_mode == 0 {
+                        DiffStatus::Added
+                    } else if old_mode != MODE_GITLINK {
+                        DiffStatus::TypeChanged
+                    } else {
+                        DiffStatus::Modified
+                    };
+                    replacements.push(DiffEntry {
+                        status,
+                        old_path: (old_mode != 0).then_some(path_str.clone()),
+                        new_path: Some(path_str),
+                        old_mode: format_mode(old_mode),
+                        new_mode: format_mode(MODE_GITLINK),
+                        old_oid,
+                        new_oid: sub_head,
+                        score: None,
+                    });
+                } else if ie.mode == MODE_GITLINK && !work_tree.join(&path_str).exists() {
+                    replacements.push(DiffEntry {
+                        status: DiffStatus::Deleted,
+                        old_path: Some(path_str.clone()),
+                        new_path: None,
+                        old_mode: format_mode(MODE_GITLINK),
+                        new_mode: "000000".to_owned(),
+                        old_oid: ie.oid,
+                        new_oid: ObjectId::zero(),
+                        score: None,
+                    });
+                }
+            }
+            for replacement in replacements {
+                let key = replacement.path().to_string();
+                entries.retain(|e| e.path() != key);
+                entries.push(replacement);
+            }
+            entries.sort_by(|a, b| a.path().cmp(b.path()));
         }
         entries
     };
@@ -4488,6 +4660,7 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
         if !pathspec_selected(&pathspecs, sm_path) {
             continue;
         }
+        let display_path = summary_display_path_from_cwd(work_tree, &cwd, sm_path);
 
         if args.for_status
             && e.status != DiffStatus::Added
@@ -4500,21 +4673,25 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
             continue;
         }
 
+        let oid_src = e.old_oid;
+        let mut oid_dst = e.new_oid;
+        let src_gitlink = mode_is_gitlink(&e.old_mode);
+        let dst_gitlink = mode_is_gitlink(&e.new_mode);
+
         let sub_path = submodule_work_tree_for_summary(work_tree, sm_path);
-        if !args.cached && !sub_path.join(".git").exists() {
+        if !args.cached
+            && !sub_path.join(".git").exists()
+            && !oid_dst.is_zero()
+            && src_gitlink == dst_gitlink
+        {
             continue;
         }
 
-        let oid_src = e.old_oid;
-        let mut oid_dst = e.new_oid;
         if !args.cached && oid_dst.is_zero() && mode_is_gitlink(&e.new_mode) {
             if let Some(h) = grit_lib::diff::read_submodule_head_oid(&sub_path) {
                 oid_dst = h;
             }
         }
-
-        let src_gitlink = mode_is_gitlink(&e.old_mode);
-        let dst_gitlink = mode_is_gitlink(&e.new_mode);
 
         let src_hex = oid_src.to_hex();
         let dst_hex = oid_dst.to_hex();
@@ -4523,27 +4700,57 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
         let dst_abbrev = short_oid_in_submodule(&grit_bin, &sub_path, &dst_hex)
             .unwrap_or_else(|| dst_hex.chars().take(7).collect());
 
-        if e.status == DiffStatus::TypeChanged {
+        let null_side = oid_src.is_zero() || oid_dst.is_zero();
+        if (!null_side && src_gitlink != dst_gitlink) || e.status == DiffStatus::TypeChanged {
+            let gitlink_abbrev = if src_gitlink {
+                src_abbrev.as_str()
+            } else {
+                dst_abbrev.as_str()
+            };
+            let gitlink_count = if (src_gitlink || dst_gitlink) && sub_path.join(".git").exists() {
+                submodule_rev_list_count(&grit_bin, &sub_path, gitlink_abbrev).unwrap_or(-1)
+            } else {
+                -1
+            };
             if dst_gitlink && !src_gitlink {
-                writeln!(
+                write!(
                     out,
                     "* {} {}(blob)->{}(submodule)",
-                    sm_path, src_abbrev, dst_abbrev
+                    display_path, src_abbrev, dst_abbrev
                 )?;
+                if gitlink_count >= 0 {
+                    write!(out, " ({gitlink_count})")?;
+                }
+                writeln!(out, ":")?;
+                if gitlink_count > 0 {
+                    out.flush()?;
+                    submodule_log_one(&grit_bin, &sub_path, &dst_abbrev, '>')?;
+                }
             } else if src_gitlink && !dst_gitlink {
-                writeln!(
+                write!(
                     out,
                     "* {} {}(submodule)->{}(blob)",
-                    sm_path, src_abbrev, dst_abbrev
+                    display_path, src_abbrev, dst_abbrev
                 )?;
+                if gitlink_count >= 0 {
+                    write!(out, " ({gitlink_count})")?;
+                }
+                writeln!(out, ":")?;
+                if gitlink_count > 0 {
+                    out.flush()?;
+                    submodule_log_one(&grit_bin, &sub_path, &src_abbrev, '<')?;
+                }
             } else {
-                writeln!(out, "* {} {}...{}", sm_path, src_abbrev, dst_abbrev)?;
+                writeln!(out, "* {} {}...{}", display_path, src_abbrev, dst_abbrev)?;
             }
             writeln!(out)?;
             continue;
         }
 
-        let total_commits = if !src_abbrev.is_empty() && !dst_abbrev.is_empty() {
+        let submodule_repo_exists = sub_path.join(".git").exists();
+        let total_commits = if !submodule_repo_exists {
+            -1
+        } else if !src_abbrev.is_empty() && !dst_abbrev.is_empty() {
             if src_gitlink && dst_gitlink {
                 submodule_rev_list_count(
                     &grit_bin,
@@ -4557,7 +4764,7 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
             -1
         };
 
-        write!(out, "* {} {}...{}", sm_path, src_abbrev, dst_abbrev)?;
+        write!(out, "* {} {}...{}", display_path, src_abbrev, dst_abbrev)?;
         if total_commits < 0 {
             writeln!(out, ":")?;
         } else {
@@ -4579,6 +4786,12 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
             } else {
                 submodule_log_one(&grit_bin, &sub_path, &src_abbrev, '<')?;
             }
+        } else if total_commits < 0 && submodule_repo_exists && src_gitlink && dst_gitlink {
+            writeln!(
+                out,
+                "  Warn: {} doesn't contain commit {}",
+                display_path, src_hex
+            )?;
         }
         writeln!(out)?;
     }

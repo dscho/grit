@@ -6,6 +6,16 @@
 # Test Results
 
 Updated: 2026-06-02
+- t7 submodule focus: `./scripts/run-tests.sh t7401-submodule-summary.sh --verbose` improved
+  `t7401` from 10/25 to 25/25 by fixing cwd-relative summary pathspec/display handling,
+  right-before-left divergent log output with shared limits, gitlink/blob typechange summaries,
+  worktree submodule detection when the index holds a blob, deleted submodule summaries, and
+  missing-commit warnings. Regression check:
+  `./scripts/run-tests.sh t7403-submodule-sync.sh t7407-submodule-foreach.sh --verbose` remains
+  green at 18/18 and 23/23.
+- Verification: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed. Build/check
+  and clippy still report the existing warning backlog; grit-lib unit tests passed 238/238.
 - t7 submodule focus: `./scripts/run-tests.sh t7403-submodule-sync.sh --verbose` improved
   `t7403` from the stale 1/18 CSV baseline to 18/18. No Rust changes were needed; the harness
   run refreshed `data/test-files.csv` and dashboards. Rust validation was skipped for this
