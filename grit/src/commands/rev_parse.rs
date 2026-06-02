@@ -1132,7 +1132,16 @@ pub fn run(args: Args) -> Result<()> {
                                 .iter()
                                 .any(|p| path_arg == p || path_arg.starts_with(&format!("{}/", p)));
                             if is_common {
-                                println!("{}/{}", common_dir, path_arg_out);
+                                let common_path = std::path::PathBuf::from(&common_dir);
+                                let common_path = if common_path.is_absolute() {
+                                    common_path
+                                } else {
+                                    current.git_dir.join(common_path)
+                                };
+                                let common_display = common_path
+                                    .canonicalize()
+                                    .unwrap_or(common_path);
+                                println!("{}/{}", common_display.display(), path_arg_out);
                                 continue;
                             }
                         }
@@ -1193,6 +1202,11 @@ pub fn run(args: Args) -> Result<()> {
                         if use_common {
                             let common = refs::common_dir(&current.git_dir)
                                 .unwrap_or_else(|| current.git_dir.clone());
+                            if common != current.git_dir {
+                                let p = common.join(path_arg);
+                                println!("{}", p.canonicalize().unwrap_or(p).display());
+                                continue;
+                            }
                             common.join(path_arg)
                         } else {
                             current.git_dir.join(path_arg)

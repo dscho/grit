@@ -17,6 +17,8 @@ Updated: 2026-06-01
   branch reflog handling and missing reflog selector verification were fixed.
 - t2 focus: `./scripts/run-tests.sh t2018-checkout-branch.sh --verbose` passes 25/25 after invalid
   branch start-point reporting was fixed.
+- t2 focus: `./scripts/run-tests.sh t2402-worktree-list.sh --verbose` passes 27/27 after linked
+  worktree common-path and relative-gitdir path handling was fixed.
 - t2 focus: `./scripts/run-tests.sh t2022-checkout-paths.sh --verbose` passes 5/5 with prior
   checkout path fixes.
 - t2 focus: `./scripts/run-tests.sh t2025-checkout-no-overlay.sh --verbose` passes 6/6 after

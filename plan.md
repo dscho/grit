@@ -64,6 +64,8 @@
     treats a missing branch reflog selector as the branch tip.
   - Completed: `t2018-checkout-branch.sh` (25/25). `checkout -b <branch> <bad-start>` now reports
     an invalid start point as not-a-commit even when the token also looks path-like.
+  - Completed: `t2402-worktree-list.sh` (27/27). Linked worktree common paths and relative
+    `gitdir` entries are now displayed as absolute paths where Git expects them.
   - Completed: `t2022-checkout-paths.sh` (5/5). Passed with prior checkout path fixes.
   - Completed: `t2025-checkout-no-overlay.sh` (6/6). `checkout --theirs --no-overlay` now deletes
     the path when the requested conflict side is absent.
