@@ -79,6 +79,18 @@ pub struct Args {
     pub sparse: bool,
 }
 
+/// Print one `rm '<path>'` line, propagating a broken-pipe error instead of
+/// panicking.
+///
+/// The Rust runtime installs `SIG_IGN` for SIGPIPE, so a write to a closed pipe
+/// returns `EPIPE`; the `println!` macro escalates that into a panic. Returning
+/// the `io::Error` instead lets the top-level error handler exit with code
+/// 128+13 (the SIGPIPE convention) without leaving an `index.lock` behind
+/// (t3600 SIGPIPE "choke" tests pipe `git rm -n` into a closing reader).
+fn print_rm_line(stdout: &mut impl std::io::Write, path: &str) -> std::io::Result<()> {
+    writeln!(stdout, "rm '{path}'")
+}
+
 /// Run the `rm` command.
 pub fn run(mut args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
@@ -125,6 +137,13 @@ pub fn run(mut args: Args) -> Result<()> {
     }
     if args.pathspec.is_empty() {
         eprintln!("fatal: No pathspec was given. Which files should I remove?");
+        std::process::exit(128);
+    }
+    // An empty-string pathspec is invalid (matches Git's parse_pathspec).
+    if args.pathspec.iter().any(|s| s.is_empty()) {
+        eprintln!(
+            "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
+        );
         std::process::exit(128);
     }
 
@@ -230,7 +249,7 @@ pub fn run(mut args: Args) -> Result<()> {
             }
         } else {
             for path_str in &matches {
-                if check_symlink_in_path(work_tree, Path::new(path_str)).is_some() {
+                if symlink_leading_path_resolves(work_tree, Path::new(path_str)).is_some() {
                     bail!("'{path_str}' is beyond a symbolic link");
                 }
             }
@@ -289,9 +308,10 @@ pub fn run(mut args: Args) -> Result<()> {
         }
         let rel = resolve_rel(pathspec, work_tree)?;
 
-        // Refuse to rm through a symlinked leading path component.
-        // e.g. if `d` is a symlink to `e`, `git rm d/f` should fail.
-        if check_symlink_in_path(work_tree, Path::new(&rel)).is_some() {
+        // Refuse to rm through a leading path component that has become a symlink
+        // to a real directory (e.g. `d` -> `e`); a *dangling* leading symlink is
+        // allowed and falls through to index-only removal.
+        if symlink_leading_path_resolves(work_tree, Path::new(&rel)).is_some() {
             bail!("'{}' is beyond a symbolic link", rel);
         }
 
@@ -468,6 +488,11 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     // Phase 2: perform all removals (only reached when all checks passed).
+    // Lock stdout once: the SIGPIPE "choke" tests print thousands of lines into
+    // a pipe that closes, and `print_rm_line` surfaces the resulting EPIPE so the
+    // top-level handler can exit 128+13 instead of panicking.
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
     let mut removed_gitlinks: BTreeSet<String> = BTreeSet::new();
     for path_str in &to_remove {
         let removed_was_gitlink = index
@@ -481,7 +506,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
         if args.dry_run {
             if !args.quiet {
-                println!("rm '{path_str}'");
+                print_rm_line(&mut out, path_str)?;
             }
             continue;
         }
@@ -515,7 +540,7 @@ pub fn run(mut args: Args) -> Result<()> {
         index.remove(path_str.as_bytes());
 
         if !args.quiet {
-            println!("rm '{path_str}'");
+            print_rm_line(&mut out, path_str)?;
         }
     }
 
@@ -864,9 +889,16 @@ fn resolve_rel(pathspec: &str, work_tree: &Path) -> Result<String> {
 }
 
 /// Walk the parent components of `rel_path` (relative to `work_tree`) and
-/// return `Some(prefix)` if any of them is a symbolic link.  Only *parent*
-/// components are checked — the final path component itself may be a symlink.
-fn check_symlink_in_path(work_tree: &Path, rel_path: &Path) -> Option<std::path::PathBuf> {
+/// return `Some(prefix)` if any of them is a symbolic link whose target
+/// currently resolves (a *non-dangling* symlink).
+///
+/// `git rm d/f` must refuse to operate through a leading symlink that points
+/// at a real directory, since the path the index entry names no longer maps to
+/// a regular file under the work tree (t3600 "rm across a symlinked leading
+/// path"). A *dangling* leading symlink is allowed: the work-tree file has
+/// effectively vanished, so the entry is simply dropped from the index
+/// (t3600 "rm of d/f when d has become a dangling symlink").
+fn symlink_leading_path_resolves(work_tree: &Path, rel_path: &Path) -> Option<std::path::PathBuf> {
     let mut accumulated = std::path::PathBuf::new();
     let components: Vec<_> = rel_path.components().collect();
     for component in components.iter().take(components.len().saturating_sub(1)) {
@@ -874,7 +906,12 @@ fn check_symlink_in_path(work_tree: &Path, rel_path: &Path) -> Option<std::path:
         let abs = work_tree.join(&accumulated);
         if let Ok(meta) = fs::symlink_metadata(&abs) {
             if meta.file_type().is_symlink() {
-                return Some(accumulated);
+                // Only a symlink whose target exists blocks removal; a dangling
+                // symlink leaves the named work-tree path unreachable, so the
+                // index entry can be removed safely.
+                if abs.metadata().is_ok() {
+                    return Some(accumulated);
+                }
             }
         }
     }
