@@ -468,6 +468,11 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Phase 2: perform all removals (only reached when all checks passed).
     for path_str in &to_remove {
+        let removed_was_gitlink = index
+            .entries
+            .iter()
+            .filter(|e| e.path == path_str.as_bytes())
+            .any(|e| e.mode == 0o160000);
         if args.dry_run {
             if !args.quiet {
                 println!("rm '{path_str}'");
@@ -482,6 +487,24 @@ pub fn run(mut args: Args) -> Result<()> {
                     .map(|m| m.file_type().is_dir())
                     .unwrap_or(false);
                 if is_real_dir {
+                    if removed_was_gitlink && !args.force {
+                        let abs_cmp = abs_path.canonicalize().unwrap_or_else(|_| abs_path.clone());
+                        let candidate_inside = |p: Option<PathBuf>| {
+                            let Some(p) = p else {
+                                return false;
+                            };
+                            let p = p.canonicalize().unwrap_or(p);
+                            p == abs_cmp || p.starts_with(&abs_cmp)
+                        };
+                        let cwd_inside = candidate_inside(std::env::current_dir().ok())
+                            || candidate_inside(std::env::var_os("PWD").map(PathBuf::from))
+                            || candidate_inside(
+                                std::env::var_os("GRIT_INVOCATION_CWD").map(PathBuf::from),
+                            );
+                        if cwd_inside {
+                            bail!("refusing to remove submodule '{}' because it contains the current working directory", path_str);
+                        }
+                    }
                     if let Err(e) = fs::remove_dir_all(&abs_path) {
                         bail!("cannot remove '{path_str}': {e}");
                     }
@@ -727,9 +750,16 @@ fn flatten_tree_to_map(
 
 /// Remove empty parent directories up to (but not including) the worktree root.
 fn remove_empty_parents(file: &Path, work_tree: &Path) {
+    let cwd = std::env::current_dir().ok();
     let mut current = file.parent();
     while let Some(dir) = current {
         if dir == work_tree {
+            break;
+        }
+        if cwd
+            .as_ref()
+            .is_some_and(|cwd| cwd == dir || cwd.starts_with(dir))
+        {
             break;
         }
         match fs::remove_dir(dir) {

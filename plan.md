@@ -24,9 +24,10 @@
     `--no-guess`, file-vs-DWIM ambiguity, and same-size path checkout restoration from the index.
   - Completed: `t2061-switch-orphan.sh` (15/15). Root cause was another synthetic fixture
     hard-coding `master`; it now explicitly requests that initial branch.
-  - In progress: `t2501-cwd-empty.sh` improved from 13/24 to 17/24 by preventing checkout from
-    removing the current working directory incidentally and refusing checkout transitions that
-    would replace the current directory with a file.
+  - In progress: `t2501-cwd-empty.sh` improved from 13/24 to 22/24 by preventing checkout/rm/apply
+    parent cleanup from removing the current working directory, refusing checkout/rebase/revert
+    transitions that would replace the current directory with a file, and teaching stash
+    `--include-untracked` to clean from the worktree root while preserving cwd.
   - Execution log: `logs/2026-06-01_2000-t2-family.md`.
 
 ---

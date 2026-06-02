@@ -4036,6 +4036,7 @@ Use '--' to separate paths from revisions, like this:\n\
             // Fail before touching the work tree: `checkout_index_to_worktree` may apply partial
             // updates before refusal deep inside (t3426 `test_superproject_content` after failed rebase).
             refuse_populated_submodule_tree_replacement(&old_index, &idx, wt)?;
+            preflight_cherry_pick_cwd_obstruction(&repo, wt, &idx, &BTreeMap::new(), None)?;
         }
 
         // Update the work tree before moving HEAD or writing the new index so a failure (e.g.
