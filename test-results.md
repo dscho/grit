@@ -23,6 +23,8 @@ Updated: 2026-06-01
   and fixing linked worktree git-path, rebase branch-occupancy, and hook setup behavior.
 - t2 focus: `./scripts/run-tests.sh t2406-worktree-repair.sh --verbose` passes 24/24 after
   unskipping.
+- t2 focus: `./scripts/run-tests.sh t2407-worktree-heads.sh --verbose` passes 12/12 after
+  unskipping.
 - t2 focus: `./scripts/run-tests.sh t2022-checkout-paths.sh --verbose` passes 5/5 with prior
   checkout path fixes.
 - t2 focus: `./scripts/run-tests.sh t2025-checkout-no-overlay.sh --verbose` passes 6/6 after
