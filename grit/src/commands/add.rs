@@ -2160,6 +2160,15 @@ fn update_tracked(
             continue;
         }
         let abs_path = work_tree.join(path_str);
+        if path_has_symlink_parent_for_add(work_tree, &abs_path) {
+            if args.verbose || args.dry_run {
+                dry_run_stdout_push_line(format!("remove '{path_str}'"));
+            }
+            if !args.dry_run {
+                index.remove(raw_path);
+            }
+            continue;
+        }
         // Use symlink_metadata so a symlink whose target was removed still counts as
         // present (`exists()` follows the link and returns false).
         if let Ok(meta) = fs::symlink_metadata(&abs_path) {
@@ -2692,6 +2701,27 @@ fn is_nested_embedded_git_repo(abs_path: &Path, repo: &Repository) -> bool {
         return true;
     };
     emb != super_git
+}
+
+fn path_has_symlink_parent_for_add(work_tree: &Path, abs_path: &Path) -> bool {
+    let Ok(rel) = abs_path.strip_prefix(work_tree) else {
+        return false;
+    };
+    let mut cur = work_tree.to_path_buf();
+    let mut comps = rel.components().peekable();
+    while let Some(component) = comps.next() {
+        if comps.peek().is_none() {
+            break;
+        }
+        cur.push(component.as_os_str());
+        if fs::symlink_metadata(&cur)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn remove_obstructing_parent_file_entries(index: &mut Index, rel_path: &str) {
