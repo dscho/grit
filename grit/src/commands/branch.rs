@@ -2651,8 +2651,24 @@ fn copy_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
 
     // Check if dst already exists. Force can come from `-C` (force_copy) or `-c -f` (force).
     let force = args.force_copy || args.force;
-    if !force && grit_lib::refs::resolve_ref(&repo.git_dir, &dst_ref).is_ok() {
+    let dst_exists = grit_lib::refs::resolve_ref(&repo.git_dir, &dst_ref).is_ok();
+    if !force && dst_exists {
         bail!("A branch named '{dst_name}' already exists.");
+    }
+    // As in `validate_new_branchname`, the "used by worktree" guard only applies when the
+    // destination branch ref actually exists (Git short-circuits otherwise). A force-copy onto a
+    // branch currently checked out in any worktree must fail (t3200 73).
+    if force && dst_exists {
+        let dst_worktree = if head.branch_name() == Some(dst_name) {
+            repo.work_tree.as_deref().map(|p| p.display().to_string())
+        } else {
+            branch_checked_out_in_other_worktree(repo, dst_name)
+        };
+        if let Some(wt_path) = dst_worktree {
+            bail!(
+                "fatal: cannot force update the branch '{dst_name}' used by worktree at '{wt_path}'"
+            );
+        }
     }
 
     if let Some(conflict) = ref_namespace_conflict(repo, &dst_ref) {
