@@ -523,7 +523,9 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> Result<(), Strin
     }
     // Route: /smart/<repo> → git-http-backend CGI
     if req.path.starts_with("/smart/") {
-        if std::env::var("BUNDLE_URI_PROTOCOL").ok().as_deref() == Some("http") {
+        if std::env::var("BUNDLE_URI_PROTOCOL").ok().as_deref() == Some("http")
+            || smart_reftable_upload_pack(&req, config, "/smart")
+        {
             let r = handle_smart_http_grit_upload_pack(&mut stream, &req, config, "/smart");
             log_access(
                 config,
@@ -568,6 +570,16 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> Result<(), Strin
 
     log_access(config, &req.method, &req.path, &req.query, 404);
     send_response(&mut stream, 404, "Not Found", &[], b"Not Found\n")
+}
+
+fn smart_reftable_upload_pack(req: &Request, config: &Config, prefix: &str) -> bool {
+    if !(req.path.contains("git-upload-pack") || req.query.contains("service=git-upload-pack")) {
+        return false;
+    }
+    let Ok(repo_path) = smart_repo_path(req, config, prefix) else {
+        return false;
+    };
+    repo_path.join("reftable").join("tables.list").is_file()
 }
 
 fn check_auth(req: &Request, expected_user: &str, expected_pass: &str) -> bool {
