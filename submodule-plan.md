@@ -47,7 +47,12 @@ Rows marked `skip` remain out of aggregate scope until explicitly audited.
   - Fixed this iteration: `git pull` now opens local remote worktree paths before reading their
     default branch, allowing detached submodule clones to pull their origin branch and produce the
     expected status output fixture.
-- [ ] `t7408-submodule-reference.sh` - 8/16 passing, 8 failing. Focus: reference clone/update.
+- [x] `t7408-submodule-reference.sh` - 16/16 passing. Focus: reference clone/update.
+  - Fixed this iteration: local clone `--reference` now borrows only from explicit references,
+    `submodule update --reference --dissociate` is parsed and honored, recursive clone/update
+    derive submodule alternates from superproject alternates with `die`/`info` strategy parity,
+    nested submodules inherit alternate config, and failed recursive clones preserve partial
+    worktrees with Git-compatible retry diagnostics.
 - [ ] `t7425-submodule-gitdir-path-extension.sh` - 18/23 passing, 5 failing. Focus: gitdir path extension.
 - [ ] `t7402-submodule-rebase.sh` - 4/6 passing, 2 failing. Focus: submodule rebase update mode.
 - [ ] `t7409-submodule-detached-work-tree.sh` - 1/3 passing, 2 failing. Focus: detached work tree handling.

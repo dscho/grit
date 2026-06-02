@@ -508,6 +508,10 @@ pub struct UpdateArgs {
     #[arg(long = "reference", value_name = "REPO", action = clap::ArgAction::Append)]
     pub reference: Vec<String>,
 
+    /// Borrow objects from reference repositories only to reduce network transfer, then copy them locally.
+    #[arg(long = "dissociate")]
+    pub dissociate: bool,
+
     /// Ignore `.gitmodules` shallow recommendations (still shallow when the superproject is shallow).
     #[arg(long = "no-recommend-shallow")]
     pub no_recommend_shallow: bool,
@@ -713,6 +717,7 @@ pub(crate) fn update_after_superproject_merge(init: bool, recursive: bool) -> Re
         recursive,
         implicit_recursive: false,
         reference: vec![],
+        dissociate: false,
         no_recommend_shallow: false,
     })
 }
@@ -735,6 +740,7 @@ pub(crate) fn update_after_superproject_rebase(init: bool, recursive: bool) -> R
         recursive,
         implicit_recursive: false,
         reference: vec![],
+        dissociate: false,
         no_recommend_shallow: false,
     })
 }
@@ -2376,6 +2382,7 @@ pub(crate) fn ensure_submodule_modules_gitdir(repo: &Repository, rel: &str) -> R
                 recursive: true,
                 implicit_recursive: false,
                 reference: vec![],
+                dissociate: false,
                 no_recommend_shallow: false,
             },
             None,
@@ -2409,6 +2416,7 @@ pub(crate) fn ensure_submodule_modules_gitdir(repo: &Repository, rel: &str) -> R
                 recursive: true,
                 implicit_recursive: false,
                 reference: vec![],
+                dissociate: false,
                 no_recommend_shallow: false,
             },
             Some(sm_wt.clone()),
@@ -2424,16 +2432,13 @@ fn run_update(args: &UpdateArgs) -> Result<()> {
 /// Populate `objects/info/alternates` for a submodule git dir (matches `git clone --reference`).
 fn write_submodule_object_alternates(
     modules_dir: &Path,
-    super_git_dir: &Path,
+    _super_git_dir: &Path,
     reference_roots: &[PathBuf],
 ) -> Result<()> {
     let dst_info = modules_dir.join("objects/info");
     fs::create_dir_all(&dst_info)?;
 
-    let super_objects = super_git_dir.join("objects");
-    let super_objects_abs = super_objects.canonicalize().unwrap_or(super_objects);
-
-    let mut lines = vec![super_objects_abs.to_string_lossy().to_string()];
+    let mut lines = Vec::new();
     for root in reference_roots {
         let ref_git = if root.join("HEAD").exists() {
             root.clone()
@@ -2450,6 +2455,81 @@ fn write_submodule_object_alternates(
     let content = lines.join("\n") + "\n";
     fs::write(dst_info.join("alternates"), content)?;
     Ok(())
+}
+
+/// Derive a submodule reference gitdir from the superproject's alternate object stores.
+pub(crate) fn superproject_submodule_reference_roots(
+    super_git_dir: &Path,
+    submodule_logical_name: &str,
+) -> Result<Vec<PathBuf>> {
+    let Some(strategy) = superproject_submodule_alternate_error_strategy(super_git_dir)? else {
+        return Ok(Vec::new());
+    };
+
+    let objects_dir = super_git_dir.join("objects");
+    let alternates = grit_lib::pack::read_alternates_recursive(&objects_dir).unwrap_or_default();
+    let mut refs = Vec::new();
+    for alt_objects in alternates {
+        if alt_objects.file_name().and_then(|s| s.to_str()) != Some("objects") {
+            continue;
+        }
+        let Some(alt_git_dir) = alt_objects.parent() else {
+            continue;
+        };
+        let candidate = alt_git_dir.join("modules").join(submodule_logical_name);
+        let candidate = candidate.canonicalize().unwrap_or(candidate);
+        if candidate.join("HEAD").is_file() {
+            refs.push(candidate);
+            continue;
+        }
+        let msg = format!("path '{}' does not exist", candidate.display());
+        match strategy.as_str() {
+            "die" => {
+                bail!("fatal: submodule '{submodule_logical_name}' cannot add alternate: {msg}");
+            }
+            "info" => {
+                eprintln!("submodule '{submodule_logical_name}' cannot add alternate: {msg}");
+            }
+            _ => {}
+        }
+    }
+    Ok(refs)
+}
+
+/// Return the configured strategy for superproject-derived submodule alternates.
+pub(crate) fn superproject_submodule_alternate_error_strategy(
+    super_git_dir: &Path,
+) -> Result<Option<String>> {
+    let config_path = super_git_dir.join("config");
+    let config = match ConfigFile::from_path(&config_path, ConfigScope::Local)? {
+        Some(c) => c,
+        None => ConfigFile::parse(&config_path, "", ConfigScope::Local)?,
+    };
+    let loc = config_last_value(&config, "submodule.alternatelocation");
+    if !matches!(loc.as_deref(), Some("superproject")) {
+        return Ok(None);
+    }
+    Ok(Some(
+        config_last_value(&config, "submodule.alternateerrorstrategy")
+            .unwrap_or_else(|| "die".to_string()),
+    ))
+}
+
+/// Configure a submodule clone to derive nested alternates from its own superproject alternates.
+pub(crate) fn write_submodule_alternate_inheritance_config(
+    git_dir: &Path,
+    strategy: &str,
+) -> Result<()> {
+    let config_path = git_dir.join("config");
+    let mut config = match ConfigFile::from_path(&config_path, ConfigScope::Local)? {
+        Some(c) => c,
+        None => ConfigFile::parse(&config_path, "", ConfigScope::Local)?,
+    };
+    config.set("submodule.alternateLocation", "superproject")?;
+    config.set("submodule.alternateErrorStrategy", strategy)?;
+    config
+        .write()
+        .context("writing submodule alternate inheritance config")
 }
 
 /// Remove `core.worktree` from a separate submodule git dir (Git `submodule_unset_core_worktree`).

@@ -6,6 +6,16 @@
 # Test Results
 
 Updated: 2026-06-02
+- t7 submodule focus: `./scripts/run-tests.sh t7408-submodule-reference.sh` improved `t7408`
+  from 8/16 to 16/16 by fixing explicit reference alternates for clone/update, update
+  `--dissociate`, recursive superproject-derived alternates, nested alternate inheritance, and
+  missing-alternate retry diagnostics. Direct `sh t7408-submodule-reference.sh -v` also passed
+  all 16 tests after the release rebuild.
+- Verification: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed. Build/check
+  and clippy still report the existing warning backlog; grit-lib unit tests passed 238/238.
+  Clippy's unrelated auto-fixes in `grit-lib/src/config.rs` and
+  `grit-lib/src/filter_process.rs` were reverted.
 - t7 submodule focus: `./scripts/run-tests.sh t7422-submodule-output.sh --verbose` improved
   `t7422` from 9/18 to 18/18 by fixing `git pull` default-branch inference for local remote
   worktree paths. Direct `sh t7422-submodule-output.sh -v` also passed all 18 tests after the

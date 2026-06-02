@@ -3,8 +3,7 @@
 ## Active task — t7 submodule tests 100% pass
 
 - [~] Make all in-scope t7 submodule tests fully pass. Detailed queue and per-file status are in
-  `submodule-plan.md`; work one file at a time. No next file is claimed because this checkpoint is
-  stopping after the completed `t7422-submodule-output.sh` work.
+  `submodule-plan.md`; work one file at a time, next `t7425-submodule-gitdir-path-extension.sh`.
   - Completed: `t7406-submodule-update.sh` improved from 10/70 to 70/70.
   - Completed: `t7400-submodule-basic.sh` improved from 96/124 to 124/124.
   - Completed: `t7112-reset-submodule.sh` improved from 34/82 to 78/78 aggregate passing, with 4 upstream TODO known breakages omitted from the failing count; log:
@@ -24,7 +23,11 @@
   - Completed: `t7422-submodule-output.sh` improved from 9/18 to 18/18 by resolving local remote
     worktree paths before inferring pull default branches; log:
     `logs/2026-06-02_2029-t7422-submodule-output.md`.
-  - Next unclaimed item: `t7408-submodule-reference.sh`.
+  - Completed: `t7408-submodule-reference.sh` improved from 8/16 to 16/16 by fixing explicit
+    reference clone/update alternates, update dissociation, recursive superproject alternate
+    derivation, nested alternate inheritance, and missing-alternate retry diagnostics; log:
+    `logs/2026-06-02_2035-t7408-submodule-reference.md`.
+  - Next focus: `t7425-submodule-gitdir-path-extension.sh` at 18/23.
 
 ## Active task — t2 family 100% pass
 

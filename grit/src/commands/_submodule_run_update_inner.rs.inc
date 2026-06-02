@@ -70,6 +70,7 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
     let local_cfg = parse_local_config(&repo.git_dir)?;
 
     let mut any_failure = false;
+    let mut clone_retry_failures: Vec<(String, String)> = Vec::new();
 
     for m in &selected {
         if !grit_lib::gitmodules::check_submodule_name(&m.name) {
@@ -217,6 +218,28 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                     &config_last_value(&local_cfg, &url_key).unwrap_or_else(|| m.url.clone()),
                     &m.url,
                 );
+                let mut clone_reference_roots = reference_roots.clone();
+                if clone_reference_roots.is_empty() {
+                    match superproject_submodule_reference_roots(&repo.git_dir, &m.name) {
+                        Ok(roots) => clone_reference_roots = roots,
+                        Err(e) if args.recursive || args.implicit_recursive => {
+                            let msg = e.to_string();
+                            eprintln!("{msg}");
+                            eprintln!("Failed to clone '{}'. Retry scheduled", m.name);
+                            clone_retry_failures.push((m.name.clone(), msg));
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                let clone_alternate_strategy = if !args.dissociate && !clone_reference_roots.is_empty() {
+                    Some(
+                        superproject_submodule_alternate_error_strategy(&repo.git_dir)?
+                            .unwrap_or_else(|| "die".to_string()),
+                    )
+                } else {
+                    None
+                };
 
                 // git refuses to clone over an occupied path: a regular file, or a non-empty
                 // directory that is not itself the submodule checkout (t7400.52/53).
@@ -272,11 +295,16 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                     .arg("--no-checkout")
                     .arg("--separate-git-dir")
                     .arg(&modules_dir)
-                    .arg(&clone_src_str)
-                    .arg(&sub_path)
                     .current_dir(work_tree)
                     .env_remove("GIT_DIR")
                     .env_remove("GIT_WORK_TREE");
+                for r in &clone_reference_roots {
+                    clone_cmd.arg("--reference").arg(r);
+                }
+                if args.dissociate {
+                    clone_cmd.arg("--dissociate");
+                }
+                clone_cmd.arg(&clone_src_str).arg(&sub_path);
                 if args.quiet {
                     clone_cmd.arg("--quiet");
                 }
@@ -323,12 +351,15 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                 }
                 set_submodule_core_worktree(&grit_bin, &modules_dir, &sub_path);
 
-                if !reference_roots.is_empty() {
+                if !args.dissociate && !clone_reference_roots.is_empty() {
                     write_submodule_object_alternates(
                         &modules_dir,
                         &repo.git_dir,
-                        &reference_roots,
+                        &clone_reference_roots,
                     )?;
+                }
+                if let Some(strategy) = clone_alternate_strategy.as_deref() {
+                    write_submodule_alternate_inheritance_config(&modules_dir, strategy)?;
                 }
 
                 if args.init {
@@ -645,6 +676,12 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
         }
     }
 
+    if let Some((name, msg)) = clone_retry_failures.first() {
+        eprintln!("{msg}");
+        eprintln!("Failed to clone '{name}' a second time, aborting");
+        bail!("failed to clone submodule '{name}'");
+    }
+
     if any_failure {
         std::process::exit(1);
     }
@@ -674,6 +711,7 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                 recursive: recurse_nested,
                 implicit_recursive: args.implicit_recursive,
                 reference: args.reference.clone(),
+                dissociate: args.dissociate,
                 no_recommend_shallow: args.no_recommend_shallow,
             };
             if let Err(e) = run_update_inner(&nested, Some(sub_path.clone())) {
