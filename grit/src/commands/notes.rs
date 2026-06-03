@@ -816,10 +816,15 @@ fn append_separator(buf: &mut String, sep: Option<&str>) {
     if !s.starts_with('\n') && !buf.ends_with('\n') {
         buf.push('\n');
     }
-    if s.as_bytes().last() == Some(&b'\n') {
-        buf.push_str(s);
+    let separator = if buf.ends_with('\n') && s.starts_with('\n') {
+        &s[1..]
     } else {
-        buf.push_str(s);
+        s
+    };
+    if separator.as_bytes().last() == Some(&b'\n') {
+        buf.push_str(separator);
+    } else {
+        buf.push_str(separator);
         buf.push('\n');
     }
 }
@@ -1272,7 +1277,7 @@ Please use 'git notes add -f -m/-F/-c/-C' instead."
         }
         base
     };
-    if reedit_message.is_some() {
+    if reedit_message.is_some() && is_edit {
         combined = launch_editor(repo, &combined)?;
     } else if use_editor && has_cli && is_edit {
         combined = launch_editor(repo, &combined)?;

@@ -1331,3 +1331,13 @@ Updated: 2026-06-01
   `t3321` at 27/27 and records `t3301` at 133/153.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-03 — t3301-notes append reuse partial
+
+- Focus harness improved from 133/153 to 139/153 after default append separators account for the
+  existing note's trailing newline and `notes append -c` edits only the reused fragment before
+  appending it.
+- Related verification: `./scripts/run-tests.sh t3301-notes.sh t3321-notes-stripspace.sh` keeps
+  `t3321` at 27/27 and records `t3301` at 139/153.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
