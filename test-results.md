@@ -1,3 +1,7 @@
+## 2026-06-03 — t13130-diff-cached-delete-add
+
+- Focus harness: `./scripts/run-tests.sh t13130-diff-cached-delete-add.sh --verbose` passes 44/44 after wrapping setup `cd repo` in a subshell so all diff-cached tests start from the expected trash root.
+
 ## 2026-06-03 — t13020-mv-force-overwrite
 
 - Focus harness: `./scripts/run-tests.sh t13020-mv-force-overwrite.sh --verbose` passes 30/30 after wrapping the setup `cd repo` in a subshell so subsequent mv tests run from the expected trash root.
