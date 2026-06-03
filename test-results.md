@@ -99,6 +99,15 @@
 - Focus harness: `./scripts/run-tests.sh t3300-funny-names.sh` passes 21/21 with current
   diff/path quoting behavior.
 
+## 2026-06-03 — t3303-notes-subtrees
+
+- Focus harness: `./scripts/run-tests.sh t3303-notes-subtrees.sh` passes 23/23 after fast-import
+  concatenates duplicate notes during fanout normalization.
+- Adjacent verification: `./scripts/run-tests.sh t3303-notes-subtrees.sh t3305-notes-fanout.sh
+  t3306-notes-prune.sh t3206-range-diff.sh` all pass.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes log cleanup partial
 
 - Focus harness remains at 127/153 while separator fixes are preserved. Fixed `log --format=""`

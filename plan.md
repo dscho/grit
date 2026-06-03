@@ -70,6 +70,9 @@
     support; it remains in the notes group queue.
   - Completed opportunistic notes-adjacent fixture: `t3300-funny-names.sh` (21/21) after rerunning
     with the current diff/path quoting code; no additional code changes were needed.
+  - Completed: `t3303-notes-subtrees.sh` (23/23) after fast-import now concatenates duplicate
+    notes that normalize to the same object id across fanout layouts instead of overwriting one
+    with the other.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
