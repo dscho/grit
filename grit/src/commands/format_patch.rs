@@ -622,9 +622,19 @@ pub fn run(mut args: Args) -> Result<()> {
         .get("format.coverletter")
         .or_else(|| config.get("format.coverLetter"))
         .map(|v| v.trim().to_ascii_lowercase());
+    // --interdiff / --range-diff imply a cover letter (where the inter/range diff is placed)
+    // when there is more than one patch in the series. With an explicit --no-cover-letter
+    // (or format.coverLetter=no), git errors out rather than silently dropping the diff.
+    let has_inter_or_range = args.interdiff.is_some() || args.range_diff.is_some();
+    let cover_config_is_no = matches!(cover_config.as_deref(), Some("false" | "no" | "0" | "off"));
+    if has_inter_or_range && total > 1 && (args.no_cover_letter || cover_config_is_no) {
+        anyhow::bail!("--interdiff and --range-diff require --cover-letter or single patch");
+    }
     let want_cover = if args.no_cover_letter {
         false
     } else if cover_from_cli {
+        true
+    } else if has_inter_or_range && total > 1 {
         true
     } else {
         match cover_config.as_deref() {
@@ -958,6 +968,21 @@ pub fn run(mut args: Args) -> Result<()> {
         );
 
         let include_base = is_last_patch(idx);
+        // When there is no cover letter, an --interdiff / --range-diff is appended to the
+        // single (last) patch, with its body indented by two spaces.
+        let solo_extra = if !want_cover && is_last_patch(idx) {
+            build_solo_interdiff_block(
+                &repo,
+                &commits,
+                &opts,
+                args.interdiff.as_deref(),
+                args.range_diff.as_deref(),
+                reroll.as_deref(),
+                args.creation_factor,
+            )?
+        } else {
+            None
+        };
         let patch = format_single_patch(
             &repo,
             &repo.odb,
@@ -973,6 +998,7 @@ pub fn run(mut args: Args) -> Result<()> {
             thread.in_reply_to_for(seq),
             &thread.references_for(seq),
             encode_email_headers,
+            solo_extra.as_deref(),
         )?;
 
         let filename =
@@ -1459,7 +1485,10 @@ fn format_cover_letter(
         patch_opts,
     )?);
 
-    // Interdiff / Range-diff blocks.
+    // Interdiff / Range-diff blocks. In the cover letter the inter/range diff body is NOT
+    // indented (unlike the solo-patch case where it is indented by two spaces), and the
+    // signature line follows the diff directly (no trailing blank line).
+    let mut had_extra = false;
     if let Some(spec) = interdiff {
         out.push('\n');
         let prev_ver = reroll.and_then(prev_version_label);
@@ -1468,11 +1497,8 @@ fn format_cover_letter(
             None => out.push_str("Interdiff:\n"),
         }
         let body = compute_interdiff(repo, spec, commits, patch_opts)?;
-        for line in body.lines() {
-            out.push_str("  ");
-            out.push_str(line);
-            out.push('\n');
-        }
+        out.push_str(&body);
+        had_extra = true;
     }
     if let Some(spec) = range_diff {
         out.push('\n');
@@ -1483,8 +1509,11 @@ fn format_cover_letter(
         }
         let body = compute_range_diff(repo, spec, commits, creation_factor)?;
         out.push_str(&body);
+        had_extra = true;
     }
-    out.push('\n');
+    if !had_extra {
+        out.push('\n');
+    }
 
     write_signature(&mut out, patch_opts.signature.as_deref());
 
@@ -1613,6 +1642,7 @@ fn format_single_patch(
     in_reply_to: Option<&str>,
     references: &[String],
     encode_email_headers: bool,
+    solo_extra: Option<&str>,
 ) -> Result<String> {
     let mut out = String::new();
     let charset_label = rfc2047_charset_label(log_output_encoding);
@@ -1881,6 +1911,12 @@ fn format_single_patch(
                 out.push_str(&format!("prerequisite-patch-id: {pid}\n"));
             }
         }
+    }
+
+    // Solo interdiff / range-diff block (no cover letter): placed after the diff (and after
+    // any base-commit footer) and before the signature.
+    if let Some(extra) = solo_extra {
+        out.push_str(extra);
     }
 
     write_signature(&mut out, opts.signature.as_deref());
@@ -3275,6 +3311,55 @@ fn prev_version_label(reroll: &str) -> Option<String> {
         Some(format!("v{}", n - 1))
     } else {
         None
+    }
+}
+
+/// Build the solo-patch interdiff / range-diff block appended to a single patch when there
+/// is no cover letter. The label is unindented; the diff body is indented by two spaces
+/// (matching git's `s/^/  /`). Returns `None` if neither --interdiff nor --range-diff is set.
+fn build_solo_interdiff_block(
+    repo: &Repository,
+    commits: &[(ObjectId, CommitData)],
+    opts: &PatchOptions,
+    interdiff: Option<&str>,
+    range_diff: Option<&str>,
+    reroll: Option<&str>,
+    creation_factor: Option<usize>,
+) -> Result<Option<String>> {
+    if interdiff.is_none() && range_diff.is_none() {
+        return Ok(None);
+    }
+    let mut out = String::new();
+    let prev_ver = reroll.and_then(prev_version_label);
+    if let Some(spec) = interdiff {
+        out.push('\n');
+        match &prev_ver {
+            Some(v) => out.push_str(&format!("Interdiff against {v}:\n")),
+            None => out.push_str("Interdiff:\n"),
+        }
+        let body = compute_interdiff(repo, spec, commits, opts)?;
+        push_indented(&mut out, &body);
+    }
+    if let Some(spec) = range_diff {
+        out.push('\n');
+        match &prev_ver {
+            Some(v) => out.push_str(&format!("Range-diff against {v}:\n")),
+            None => out.push_str("Range-diff:\n"),
+        }
+        let body = compute_range_diff(repo, spec, commits, creation_factor)?;
+        push_indented(&mut out, &body);
+    }
+    Ok(Some(out))
+}
+
+/// Append `body` to `out`, indenting every line by two spaces (matching `sed -e "s/^/  /"`).
+fn push_indented(out: &mut String, body: &str) {
+    for line in body.split_inclusive('\n') {
+        out.push_str("  ");
+        out.push_str(line);
+    }
+    if !body.is_empty() && !body.ends_with('\n') {
+        out.push('\n');
     }
 }
 
