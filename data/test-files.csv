@@ -393,7 +393,7 @@ t13320-mv-case-sensitive	t1	yes	30	29	1	false	ok	0
 t13330-switch-reflog-entry	t1	yes	30	14	16	false	ok	0
 t13340-restore-merge-conflict	t1	yes	30	30	0	true	ok	0
 t13350-reset-orphan-branch	t1	yes	30	30	0	true	ok	0
-t13360-cherry-pick-allow-empty	t1	yes	30	0	30	false	ok	0
+t13360-cherry-pick-allow-empty	t1	yes	30	30	0	true	ok	0
 t13370-for-each-ref-objectname	t1	yes	34	26	8	false	ok	0
 t13380-show-ref-symref	t1	yes	32	24	8	false	ok	0
 t13390-update-ref-namespace	t1	yes	30	30	0	true	ok	0

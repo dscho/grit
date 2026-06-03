@@ -1,3 +1,7 @@
+## 2026-06-03 — t13360-cherry-pick-allow-empty
+
+- Focus harness: `./scripts/run-tests.sh t13360-cherry-pick-allow-empty.sh --verbose` passes 30/30 after wrapping cd-using setup blocks and switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t12760-cherry-pick-multi-range
 
 - Focus harness: `./scripts/run-tests.sh t12760-cherry-pick-multi-range.sh --verbose` passes 34/34 after switching synthetic `master` references to `main` and correcting an assertion to match its title: cherry-picked commits should have different object IDs from their originals.
