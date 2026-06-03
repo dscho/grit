@@ -1289,3 +1289,7 @@ Updated: 2026-06-01
   `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6012 baseline refresh: after claiming `t6012-rev-list-simplify.sh`, the official harness
+  records 33/42 instead of the stale 26/42 plan value, reflecting already-committed rev-list work
+  and refreshing `data/test-files.csv` plus dashboards. Full cargo validation was skipped because
+  this was a harness/progress refresh with no Rust code changes.
