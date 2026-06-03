@@ -9343,6 +9343,15 @@ fn write_raw(
     abbrev_len: usize,
     worktree_new_side: bool,
 ) -> Result<()> {
+    // When OIDs are abbreviated (abbrev_len < 40), git appends `...` if
+    // GIT_PRINT_SHA1_ELLIPSIS=yes (the default ellipsis behaviour for `--raw`).
+    let ell = if abbrev_len < 40
+        && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").ok().as_deref() == Some("yes")
+    {
+        "..."
+    } else {
+        ""
+    };
     for entry in entries {
         let old_mode = &entry.old_mode;
         let new_mode = &entry.new_mode;
@@ -9350,16 +9359,16 @@ fn write_raw(
         let new_oid_hex = entry.new_oid.to_hex();
         let olen = abbrev_len.min(old_oid_hex.len());
         let nlen = abbrev_len.min(new_oid_hex.len());
-        let old_oid = &old_oid_hex[..olen];
+        let old_oid = format!("{}{ell}", &old_oid_hex[..olen]);
         // A gitlink whose new side is the work tree (e.g. a blob→gitlink typechange or a
         // worktree-side submodule bump) prints the all-zero OID in raw plumbing, even though the
         // `--submodule` patch shows the real HEAD. See t4041/t4060.
         let zero_wt_gitlink = worktree_new_side && new_mode == "160000";
-        let zeroed = "0".repeat(nlen);
+        let zeroed = format!("{}{ell}", "0".repeat(nlen));
         let new_oid = if zero_wt_gitlink {
-            zeroed.as_str()
+            zeroed.clone()
         } else {
-            &new_oid_hex[..nlen]
+            format!("{}{ell}", &new_oid_hex[..nlen])
         };
         let status = entry.status.letter();
         match entry.status {
@@ -9373,8 +9382,8 @@ fn write_raw(
                 let zero_new = (old_mode == "160000"
                     && new_mode == "160000"
                     && entry.old_oid == entry.new_oid)
-                    .then(|| "0".repeat(abbrev_len));
-                let rn = zero_new.as_deref().unwrap_or(new_oid);
+                    .then(|| format!("{}{ell}", "0".repeat(abbrev_len)));
+                let rn = zero_new.as_deref().unwrap_or(new_oid.as_str());
                 if let Some(pct) = entry.score {
                     writeln!(
                         out,
