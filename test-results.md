@@ -1,3 +1,7 @@
+## 2026-06-03 — t12160-cherry-pick-conflict-resolve
+
+- Focus harness: `./scripts/run-tests.sh t12160-cherry-pick-conflict-resolve.sh --verbose` passes 34/34 after containing the empty-cherry-pick cleanup block in a subshell to prevent CWD leakage.
+
 ## 2026-06-03 — t12890-log-grep-author
 
 - Focus harness: `./scripts/run-tests.sh t12890-log-grep-author.sh --verbose` passes 33/33 after aligning log branch fixture references with `main`.
