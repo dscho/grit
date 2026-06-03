@@ -1,3 +1,11 @@
+## 2026-06-03 — t12370-branch-list-format
+
+- Focus harness: `./scripts/run-tests.sh t12370-branch-list-format.sh t12670-branch-force-delete.sh --verbose` left `t12370-branch-list-format.sh` green at 34/34 after switching synthetic `master` references to `main`.
+
+## 2026-06-03 — t12670-branch-force-delete
+
+- Focus harness: `./scripts/run-tests.sh t12670-branch-force-delete.sh --verbose` passes 32/32 after switching synthetic `master` references to `main` and accepting branch-delete messages on stdout/stderr with case-insensitive current-branch deletion wording.
+
 ## 2026-06-03 — t13070/t13080 refs
 
 - Focus harness: `./scripts/run-tests.sh t13070-for-each-ref-points-at.sh t13080-show-ref-loose-packed.sh --verbose` passes 32/32 and 31/31 after switching synthetic `master` branch references to `main`.
