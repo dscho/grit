@@ -1,3 +1,7 @@
+## 2026-06-03 — t13290-commit-allow-empty-msg
+
+- Focus harness: `./scripts/run-tests.sh t13290-commit-allow-empty-msg.sh --verbose` passes 30/30 after applying the documented cwd-leak wrapper to setup.
+
 ## 2026-06-03 — t12900-rev-list-cherry-pick
 
 - Focus harness: `./scripts/run-tests.sh t12900-rev-list-cherry-pick.sh --verbose` passes 30/30 after wrapping multiple setup blocks in subshells and switching synthetic `master` branch references to `main`.
