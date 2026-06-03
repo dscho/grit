@@ -1,3 +1,7 @@
+## 2026-06-03 — t11490-commit-fixup-squash
+
+- Focus harness: `./scripts/run-tests.sh t11490-commit-fixup-squash.sh --verbose` passes 33/33 with existing fixes.
+
 ## 2026-06-03 — t11670-status-untracked-dirs
 
 - Focus harness: `./scripts/run-tests.sh t11670-status-untracked-dirs.sh --verbose` passes 37/37 after making setup tolerate environments without the synthetic `.bin` wrapper path and using an empty setup commit instead.
