@@ -6086,9 +6086,202 @@ fn merge_trees(
         })
     };
 
+    // Sources handled by the colliding-1to2 pre-pass below; skipped by Case 1/Case 2.
+    let mut prepass_rr_sources: BTreeSet<Vec<u8>> = BTreeSet::new();
+
+    // Pre-pass: chains of rename/rename(1to2) whose destinations collide (t4301 mod6).
+    //
+    // When a single source path is renamed by both sides to *different* destinations
+    // (rename/rename 1to2) and those destinations also collide with the destinations of
+    // *other* 1to2 renames (forming an add/add cycle), merge-ort merges the source content
+    // once and places that merged blob at both destinations (stage2 at our destination,
+    // stage3 at theirs'), with stage1 at the source. Each destination that collects content
+    // from two distinct sources is additionally reported as an add/add conflict.
+    //
+    // The generic Case 1/Case 2 logic below handles isolated 1to2 renames; this pre-pass only
+    // fires for the colliding-cycle shape so that ordinary 1to2 merges are left untouched.
+    {
+        // Collect 1to2 sources: renamed by both sides to different destinations.
+        let mut one_to_two: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (src, od) in &ours_renames {
+            if let Some(td) = theirs_renames.get(src) {
+                if od != td {
+                    one_to_two.push((src.clone(), od.clone(), td.clone()));
+                }
+            }
+        }
+        // Detect a destination collision: some destination is claimed by two distinct sources.
+        let mut dest_count: HashMap<Vec<u8>, usize> = HashMap::new();
+        for (_, od, td) in &one_to_two {
+            *dest_count.entry(od.clone()).or_default() += 1;
+            *dest_count.entry(td.clone()).or_default() += 1;
+        }
+        let colliding = dest_count.values().any(|c| *c >= 2);
+
+        if colliding && !one_to_two.is_empty() {
+            for (src, _, _) in &one_to_two {
+                prepass_rr_sources.insert(src.clone());
+            }
+            one_to_two.sort();
+            // dest -> (Option<stage2 entry>, Option<stage3 entry>, ours_src, theirs_src)
+            let mut dest_stages: BTreeMap<Vec<u8>, (Option<IndexEntry>, Option<IndexEntry>)> =
+                BTreeMap::new();
+
+            for (src, od, td) in &one_to_two {
+                handled_paths.insert(src.clone());
+                handled_paths.insert(od.clone());
+                handled_paths.insert(td.clone());
+
+                let be = base.get(src);
+                let oe = ours_entries.get(od);
+                let te = theirs_entries.get(td);
+                let (Some(be), Some(oe), Some(te)) = (be, oe, te) else {
+                    continue;
+                };
+
+                let src_str = String::from_utf8_lossy(src).to_string();
+                let od_str = String::from_utf8_lossy(od).to_string();
+                let td_str = String::from_utf8_lossy(td).to_string();
+
+                // Merge the source content once. Use the source path as the auto-merge path so
+                // that "Auto-merging <source>" is reported exactly when a real three-way merge
+                // runs (i.e. both sides changed the content); when one side equals the base the
+                // merge is trivial and no auto-merge line is emitted.
+                let both_modified = oe.oid != be.oid && te.oid != be.oid;
+                let ours_marker = format!("{ours_label}:{od_str}");
+                let theirs_marker = format!("{their_name}:{td_str}");
+                let merged_entry: IndexEntry = if oe.oid == be.oid && oe.mode == be.mode {
+                    // Ours unchanged: take theirs' content.
+                    let mut e = te.clone();
+                    e.path = od.clone();
+                    e
+                } else if te.oid == be.oid && te.mode == be.mode {
+                    // Theirs unchanged: take ours' content.
+                    let mut e = oe.clone();
+                    e.path = od.clone();
+                    e
+                } else {
+                    match try_content_merge(
+                        repo,
+                        &src_str,
+                        be,
+                        oe,
+                        te,
+                        &ours_marker,
+                        base_label,
+                        &theirs_marker,
+                        favor,
+                        diff_algorithm,
+                        merge_renormalize,
+                        ignore_all_space,
+                        ignore_space_change,
+                        ignore_space_at_eol,
+                        ignore_cr_at_eol,
+                        if both_modified {
+                            auto_merge_paths.as_deref_mut()
+                        } else {
+                            None
+                        },
+                    )? {
+                        ContentMergeResult::Clean(oid, mode) => {
+                            let mut e = oe.clone();
+                            e.oid = oid;
+                            e.mode = mode;
+                            e
+                        }
+                        ContentMergeResult::Conflict(content)
+                        | ContentMergeResult::BinaryConflict(content) => {
+                            let oid = repo.odb.write(ObjectKind::Blob, &content)?;
+                            let mut e = oe.clone();
+                            e.oid = oid;
+                            e
+                        }
+                    }
+                };
+
+                // stage1 at the source path (base content).
+                index.remove(src);
+                stage_entry(&mut index, be, 1);
+                // stage2 at our destination, stage3 at theirs' destination — both the merged blob.
+                let mut s2 = merged_entry.clone();
+                s2.path = od.clone();
+                let mut s3 = merged_entry.clone();
+                s3.path = td.clone();
+                dest_stages.entry(od.clone()).or_default().0 = Some(s2);
+                dest_stages.entry(td.clone()).or_default().1 = Some(s3);
+
+                has_conflicts = true;
+                conflict_descriptions.push(ConflictDescription {
+                    kind: "rename/rename",
+                    body: format!(
+                        "{src_str} renamed to {od_str} in {ours_label} and to {td_str} in {their_name}."
+                    ),
+                    subject_path: src_str.clone(),
+                    remerge_anchor_path: Some(src_str.clone()),
+                    rename_rr_ours_dest: Some(od_str.clone()),
+                    rename_rr_theirs_dest: Some(td_str.clone()),
+                    // Auto-merging is driven by auto_merge_paths (populated above only when a
+                    // real merge ran), so leave the rename/rename hint unset to avoid a spurious
+                    // "Auto-merging" line for the trivial side.
+                    auto_merge_hint_path: None,
+                });
+            }
+
+            // Stage the destination entries and report add/add for collisions (a destination
+            // that received content from two distinct sources).
+            for (dest, (s2, s3)) in &dest_stages {
+                index.remove(dest);
+                if let Some(s2) = s2 {
+                    stage_entry(&mut index, s2, 2);
+                }
+                if let Some(s3) = s3 {
+                    stage_entry(&mut index, s3, 3);
+                }
+                if let (Some(s2), Some(s3)) = (s2, s3) {
+                    // add/add: merge the two destination contents to produce the working-tree
+                    // conflict file and an "Auto-merging <dest>" + CONFLICT(add/add) report.
+                    let dest_str = String::from_utf8_lossy(dest).to_string();
+                    let content = match try_content_merge_add_add(
+                        repo,
+                        &dest_str,
+                        s2,
+                        s3,
+                        ours_label,
+                        their_name,
+                        MergeFavor::None,
+                        diff_algorithm,
+                        merge_renormalize,
+                        ignore_all_space,
+                        ignore_space_change,
+                        ignore_space_at_eol,
+                        ignore_cr_at_eol,
+                        auto_merge_paths.as_deref_mut(),
+                    )? {
+                        ContentMergeResult::Clean(oid, _) => repo.odb.read(&oid)?.data,
+                        ContentMergeResult::Conflict(content)
+                        | ContentMergeResult::BinaryConflict(content) => content,
+                    };
+                    conflict_files.push((dest_str.clone(), content));
+                    conflict_descriptions.push(ConflictDescription {
+                        kind: "rename/add",
+                        body: format!("Merge conflict in {dest_str}"),
+                        subject_path: dest_str.clone(),
+                        remerge_anchor_path: Some(dest_str.clone()),
+                        rename_rr_ours_dest: None,
+                        rename_rr_theirs_dest: None,
+                        auto_merge_hint_path: None,
+                    });
+                }
+            }
+        }
+    }
+
     // First pass: handle rename cases
     // Case 1: ours renamed base_path → ours_new_path; theirs may have modified base_path
     for (base_path, ours_new_path) in &ours_renames {
+        if prepass_rr_sources.contains(base_path) {
+            continue;
+        }
         if let Some(oe) = ours_entries.get(ours_new_path) {
             if oe.mode != MODE_TREE && path_has_tree_descendant(&theirs_entries, ours_new_path) {
                 // Their side has paths under our rename destination (e.g. `newfile/realfile`).
@@ -6522,6 +6715,9 @@ fn merge_trees(
             .then_with(|| a.0.cmp(b.0))
     });
     for (base_path, theirs_new_path) in theirs_rename_pairs {
+        if prepass_rr_sources.contains(base_path) {
+            continue;
+        }
         if handled_paths.contains(base_path) {
             // Already handled by ours rename of the same source path. If both sides renamed
             // that source to different destinations, we must still stage `rename/rename(1to2)`
