@@ -1,5 +1,31 @@
 # PLAN.md — Current execution queue
 
+## Active task — t3 family 100% pass
+
+- [~] Make all current `t3` family tests fully pass. Work one dependency group at a time,
+  choosing one non-green file from `data/test-files.csv`, fixing the underlying Rust behavior, and
+  re-running that file until it has `failing=0` before moving on.
+  - Starting point from the current CSV: 143 `t3` harness files; 69 in-scope rows non-green; two
+    timeout rows (`t3418-rebase-continue.sh`, `t3422-rebase-incompatible-options.sh`); two skipped
+    GPG rows (`t3435-rebase-gpg-sign.sh`, `t3514-cherry-pick-revert-gpg.sh`) to audit after the
+    in-scope rows are green.
+  - Dependency groups:
+    1. Foundational index/path/merge/subproject plumbing: `t3000`, `t3050`, `t3030`, `t3040`.
+    2. Branch/refs/range-diff/pack-refs: `t3200`, `t3207`, `t3206-range-diff`, `t3203`,
+       `t3206-branch-advanced`, `t3204`, `t3210`.
+    3. Notes and notes merge: `t3301`, `t3321`, `t3309`, `t3310`, `t3308`, `t3311`, `t3303`,
+       `t3300`.
+    4. Sequencer/cherry-pick/revert/replay: `t3510`, `t3512`, `t3513`, `t3650`, then skipped
+       GPG audit for `t3514`.
+    5. Rebase/history: timeout/validation rows first (`t3422`, `t3418`), then core rebase,
+       interactive rebase, topology/merge/submodule rebase, and skipped GPG audit for `t3435`.
+    6. `rm`, `add`, and interactive patch: `t3701`, `t3600`, `t3700`, `t3702`.
+    7. Stash/i18n/precompose/CRLF messages: `t3903`, `t3900`, `t3920`, `t3905`, `t3906`,
+       `t3910`, `t3901`.
+  - Current focus: `t3000-ls-files-others.sh` (15 total, 11 passed, 4 failing), the largest
+    foundational index/path row.
+  - Execution log: `logs/2026-06-03_t3-family.md`.
+
 ## Active task — t6 family 100% pass
 
 - [~] Make current in-scope `t6` family tests fully pass. Work one dependency group at a time,
