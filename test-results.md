@@ -1293,3 +1293,11 @@ Updated: 2026-06-01
   records 33/42 instead of the stale 26/42 plan value, reflecting already-committed rev-list work
   and refreshing `data/test-files.csv` plus dashboards. Full cargo validation was skipped because
   this was a harness/progress refresh with no Rust code changes.
+- t6012 simplify-merges parent rewrite focus: after keeping all-TREESAME merge candidates through
+  the `--simplify-merges` full-history phase and rewriting merge parent lists through omitted
+  commits, the direct verbose run advances through tests 10-12 and
+  `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 33/42 to 36/42 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.

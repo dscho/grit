@@ -3298,22 +3298,18 @@ fn simplify_merges_commit_list(
     let mut out = Vec::new();
     for oid in commits {
         let raw_parents = load_commit(repo, *oid)?.parents;
-        let direct: Vec<ObjectId> = raw_parents
-            .iter()
-            .copied()
-            .filter(|p| selected.contains(p))
-            .collect();
-        if raw_parents.len() > 1 && direct.len() <= 1 {
+        let rewritten = visible_parents_for_graph_lib(repo, *oid, &selected, false)?;
+        if raw_parents.len() > 1 && rewritten.len() <= 1 {
             if path_merge_survives_simplify(repo, *oid, paths, excluded)? {
                 out.push(*oid);
             }
             continue;
         }
-        if direct.len() <= 1 {
+        if rewritten.len() <= 1 {
             out.push(*oid);
             continue;
         }
-        let mut simplified = graph_simplify_parent_list_lib(repo, &selected, &direct)?;
+        let mut simplified = graph_simplify_parent_list_lib(repo, &selected, &rewritten)?;
         simplified.sort_unstable();
         simplified.dedup();
         if simplified.len() > 1 {
@@ -3803,10 +3799,10 @@ fn commit_touches_paths(
 
     if full_history && simplify_merges {
         if treesame_parents == parents.len() {
-            return Ok(sparse);
+            return Ok(true);
         }
         if treesame_parents > 0 && !differs_any {
-            return Ok(sparse);
+            return Ok(true);
         }
         if show_pulls && first_parent_differs && treesame_parents > 0 {
             return Ok(true);
