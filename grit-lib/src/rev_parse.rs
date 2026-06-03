@@ -2173,13 +2173,13 @@ fn resolve_base(
             warn_if_branch_refname_collides_with_abbrev_hex(repo, spec, oid);
             return Ok(oid);
         } else if matches.len() > 1 {
-            if commit_only_hex {
-                let oid = disambiguate_hex_by_peel(repo, spec, &matches, "commit")?;
+            if let Some(p) = peel_for_disambig {
+                let oid = disambiguate_hex_by_peel(repo, spec, &matches, p)?;
                 warn_if_branch_refname_collides_with_abbrev_hex(repo, spec, oid);
                 return Ok(oid);
             }
-            if let Some(p) = peel_for_disambig {
-                let oid = disambiguate_hex_by_peel(repo, spec, &matches, p)?;
+            if commit_only_hex {
+                let oid = disambiguate_hex_by_peel(repo, spec, &matches, "commit")?;
                 warn_if_branch_refname_collides_with_abbrev_hex(repo, spec, oid);
                 return Ok(oid);
             }
@@ -3363,8 +3363,8 @@ fn resolve_commit_message_search_from(
     start: ObjectId,
     pattern: &str,
 ) -> Result<ObjectId> {
-    let (negate, effective_pattern) = commit_message_search_pattern(pattern)?;
-    let regex = Regex::new(effective_pattern).ok();
+    // Note: ! negation is NOT supported in ^{/pattern} peel context (only in :/! prefix)
+    let regex = Regex::new(pattern).ok();
     let mut visited = std::collections::HashSet::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(start);
@@ -3383,12 +3383,11 @@ fn resolve_commit_message_search_from(
             Err(_) => continue,
         };
 
-        let base_match = if let Some(re) = &regex {
+        let is_match = if let Some(re) = &regex {
             re.is_match(&commit.message)
         } else {
-            commit.message.contains(effective_pattern)
+            commit.message.contains(pattern)
         };
-        let is_match = if negate { !base_match } else { base_match };
         if is_match {
             return Ok(oid);
         }
@@ -3401,22 +3400,6 @@ fn resolve_commit_message_search_from(
     }
 
     Err(Error::ObjectNotFound(format!(":/{pattern}")))
-}
-
-fn commit_message_search_pattern(pattern: &str) -> Result<(bool, &str)> {
-    if pattern.starts_with("!!") {
-        return Ok((false, &pattern[1..]));
-    }
-    if let Some(rest) = pattern.strip_prefix("!-") {
-        if rest.is_empty() {
-            return Err(Error::ObjectNotFound(format!(":/{pattern}")));
-        }
-        return Ok((true, rest));
-    }
-    if pattern.starts_with('!') {
-        return Err(Error::ObjectNotFound(format!(":/{pattern}")));
-    }
-    Ok((false, pattern))
 }
 
 fn find_abbrev_matches(repo: &Repository, prefix: &str) -> Result<Vec<ObjectId>> {
@@ -3529,7 +3512,16 @@ fn resolve_commit_message_search(
     repo: &crate::repo::Repository,
     pattern: &str,
 ) -> Result<ObjectId> {
-    let (negate, effective_pattern) = commit_message_search_pattern(pattern)?;
+    // Handle negated pattern: /! means negate; /!! means literal /!
+    let (negate, effective_pattern) = if pattern.starts_with('!') {
+        if pattern.starts_with("!!") {
+            (false, &pattern[1..]) // !! = literal !
+        } else {
+            (true, &pattern[1..]) // ! = negate
+        }
+    } else {
+        (false, pattern)
+    };
     let regex = Regex::new(effective_pattern).ok();
     use crate::state::resolve_head;
     let head =
