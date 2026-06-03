@@ -427,7 +427,8 @@ fn dump_slines(slines: &[Sline], cnt: usize, num_parent: usize, context: usize) 
             rlines = rlines.saturating_sub(null_ctx as usize);
         }
 
-        out.push_str("@@@");
+        // Git emits `num_parent + 1` `@` characters on each side of a combined hunk
+        // header (e.g. `@@@` for a two-parent merge).
         for _ in 0..=num_parent {
             out.push('@');
         }
