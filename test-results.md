@@ -1,3 +1,7 @@
+## 2026-06-03 — t12060-init-bare-permissions
+
+- Focus harness: `./scripts/run-tests.sh t12060-init-bare-permissions.sh --verbose` passes 35/35 after correcting synthetic default-branch expectations to `main`.
+
 ## 2026-06-03 — t12960-init-quiet-template
 
 - Focus harness: `./scripts/run-tests.sh t12960-init-quiet-template.sh --verbose` passes 36/36 after correcting synthetic default-branch expectations to `main`.
