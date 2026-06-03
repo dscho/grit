@@ -1815,6 +1815,7 @@ fn print_submodule_log_for_entry(
 }
 
 /// Build normal [`DiffEntry`] list for first-parent vs merge tree on combined-diff paths only.
+#[allow(dead_code)]
 fn combined_paths_to_first_parent_entries(
     _odb: &Odb,
     paths: &[CombinedDiffPath],
@@ -1875,6 +1876,7 @@ fn combined_paths_to_first_parent_entries(
 }
 
 /// Print combined `--summary` lines (create/delete/mode) using first-parent vs merge semantics.
+#[allow(dead_code)]
 fn write_combined_summary(out: &mut impl Write, paths: &[CombinedDiffPath]) -> Result<()> {
     for p in paths {
         let p0 = match p.parents.first() {
@@ -1932,21 +1934,38 @@ fn print_combined_merge_output(
         .unwrap_or_default()
         .quote_path_fully();
 
-    let stat_entries = if want_stat {
-        combined_paths_to_first_parent_entries(odb, paths)?
+    // Git computes `--stat`/`--summary` for a combined diff as an ordinary diff
+    // against the FIRST parent (combine-diff.c: `diff_tree_oid(&parents->oid[0],
+    // oid, ...)` under STAT_FORMAT_MASK), not from the combined-interesting paths.
+    let first_parent_entries = if want_stat || opts.summary {
+        match parent_commits.first() {
+            Some(p0) => {
+                let p0_tree = commit_tree(odb, p0)?;
+                let entries = diff_with_opts(odb, Some(&p0_tree), Some(merge_tree), opts)?;
+                filter_entries(odb, repo, entries, opts)?
+            }
+            None => Vec::new(),
+        }
     } else {
         Vec::new()
     };
+    let stat_entries = &first_parent_entries;
 
     if want_stat && !stat_entries.is_empty() {
         print_stat_summary(
             out,
             odb,
-            &stat_entries,
+            stat_entries,
             quote_fully,
             opts.compact_summary,
             opts.shortstat,
         )?;
+    }
+
+    // `--summary` lines are part of the first-parent stat group and precede the
+    // patch (git emits them via diff_flush under STAT_FORMAT_MASK).
+    if opts.summary {
+        write_summary(out, stat_entries)?;
     }
 
     if want_raw {
@@ -1961,7 +1980,8 @@ fn print_combined_merge_output(
         }
     }
 
-    let need_patch_sep = (want_stat && !stat_entries.is_empty()) || want_raw;
+    let summary_emitted = opts.summary && summary_has_lines(stat_entries);
+    let need_patch_sep = (want_stat && !stat_entries.is_empty()) || want_raw || summary_emitted;
     if want_patch {
         let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
         let patch_abbrev = if opts.full_index {
@@ -2012,10 +2032,6 @@ fn print_combined_merge_output(
                 }
             }
         }
-    }
-
-    if opts.summary {
-        write_combined_summary(out, paths)?;
     }
 
     Ok(())
