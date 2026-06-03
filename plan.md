@@ -1,5 +1,21 @@
 # PLAN.md — Current execution queue
 
+## Active task — t1 family 100% pass
+
+- [~] Make all `t1` family tests fully pass. Work one file at a time, grouped by dependency:
+  config/init/repo setup, refs, rev-parse, read-tree/sparse/submodule plumbing, rev-list/log,
+  diff/status, dependent porcelain, then skipped-row audit. Within each group choose the
+  non-green in-scope row with the largest `failing` count in `data/test-files.csv`, re-running
+  that file until `failing=0` before moving on.
+  - Starting point: 368 in-scope rows; 234 already fully passing; 134 in-scope rows non-green.
+  - Current first focus group: config/init/repo setup, starting with `t1300-config.sh` (210 failing).
+  - Skipped rows to audit after current in-scope rows are green: `t1016-compatObjectFormat`,
+    `t1400-update-ref`, `t1407-worktree-ref-store`, `t1415-worktree-refs`,
+    `t1419-exclude-refs`, `t1423-ref-backend`, `t1450-fsck`, `t1460-refs-migrate`.
+  - Execution log: `logs/2026-06-02_0000-t1-family.md`.
+
+---
+
 ## Active task — t2 family 100% pass
 
 - [x] Make all `t2` family tests fully pass. Work one file at a time, always choosing the
