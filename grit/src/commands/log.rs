@@ -1268,7 +1268,10 @@ fn run_line_log(
             }
         }
         let this_has_notes = commit_has_notes_to_show(oid, &mut notes_cache, &args);
-        if !is_format_separator && i > 0 && prev_had_notes {
+        if !is_format_separator
+            && i > 0
+            && (prev_had_notes || log_wants_blank_line_between_commits(&args))
+        {
             writeln!(out_main)?;
         }
         let info = load_commit_info(repo, *oid)?;
@@ -4674,7 +4677,10 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
             let this_has_notes = commit_has_notes_to_show(&oid, &mut notes_cache, &args);
-            if !is_format_separator && shown > 0 && prev_had_notes {
+            if !is_format_separator
+                && shown > 0
+                && (prev_had_notes || log_wants_blank_line_between_commits(&args))
+            {
                 writeln!(out)?;
             }
             let oneline_fmt = args.oneline || args.format.as_deref() == Some("oneline");
@@ -4879,7 +4885,10 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
             let this_has_notes = commit_has_notes_to_show(oid, &mut notes_cache, &args);
-            if !is_format_separator && i > 0 && prev_had_notes {
+            if !is_format_separator
+                && i > 0
+                && (prev_had_notes || log_wants_blank_line_between_commits(&args))
+            {
                 writeln!(out)?;
             }
             let oneline_fmt = args.oneline || args.format.as_deref() == Some("oneline");
@@ -5226,7 +5235,10 @@ pub fn run_no_walk(
             writeln!(out)?;
         }
         let this_has_notes = commit_has_notes_to_show(oid, &mut notes_cache, args);
-        if !is_format_separator && i > 0 && prev_had_notes {
+        if !is_format_separator
+            && i > 0
+            && (prev_had_notes || log_wants_blank_line_between_commits(args))
+        {
             writeln!(out)?;
         }
         format_commit(
@@ -7480,6 +7492,16 @@ fn commit_has_notes_to_show(
     false
 }
 
+fn log_wants_blank_line_between_commits(args: &Args) -> bool {
+    if log_uses_builtin_oneline(args) {
+        return false;
+    }
+    matches!(
+        args.format.as_deref(),
+        None | Some("short" | "medium" | "full" | "fuller" | "raw" | "email")
+    )
+}
+
 /// Write notes for a commit if any exist.
 fn write_notes(
     out: &mut impl Write,
@@ -7996,7 +8018,7 @@ fn run_symmetric_log(
 
     for (i, oid) in ordered.iter().enumerate() {
         let this_has_notes = commit_has_notes_to_show(oid, &mut notes_cache, args);
-        if i > 0 && prev_had_notes {
+        if i > 0 && (prev_had_notes || log_wants_blank_line_between_commits(args)) {
             writeln!(out)?;
         }
         let is_boundary = boundary_set.contains(oid);

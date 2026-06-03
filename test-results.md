@@ -1350,3 +1350,13 @@ Updated: 2026-06-01
   `t3321` at 27/27 and records `t3301` at 148/153.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-03 — t3301-notes medium log spacing partial
+
+- Focus harness improved from 148/153 to 152/153 after builtin multi-line log formats began
+  inserting an inter-commit blank line even when the previous commit has no displayed notes.
+- Related verification: `./scripts/run-tests.sh t3301-notes.sh t3321-notes-stripspace.sh
+  t9260-log-oneline-format.sh` keeps `t3321` at 27/27 and `t9260` at 33/33 while recording
+  `t3301` at 152/153.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).

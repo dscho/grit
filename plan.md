@@ -59,7 +59,7 @@
   - Branch/refs/range-diff/pack-refs group sweep verified: `t3200`, `t3201`, `t3202`, `t3203`,
     `t3204`, `t3205`, `t3206-branch-advanced`, `t3206-range-diff`, `t3207`, `t3210`, and
     `t3211` all pass.
-  - Current focus: `t3301-notes.sh` (153 total, 148 passed, 5 failing after fixing raw log
+  - Current focus: `t3301-notes.sh` (153 total, 152 passed, 1 failing after fixing raw log
     spacing, format-patch `--show-notes` forwarding, default `-m`/`-F` separator handling, and
     wiring notes `--stripspace`/`--no-stripspace` support, plus notes display env/default header
     handling, exact/wildcard notes display ref matching, append separator handling, and
@@ -67,7 +67,8 @@
     no-stripspace append separator behavior, empty log pretty-format support, Git-compatible
     explicit/empty/no-separator line-boundary handling, default append separator newline
     accounting, single-editor handling for `notes append -c`, and rewrite-copy wildcard ref
-    expansion/overwrite semantics), first file in the notes group.
+    expansion/overwrite semantics, and medium-style log blank lines between commits), first file
+    in the notes group.
   - Completed: `t3321-notes-stripspace.sh` (27/27) after finishing raw no-stripspace newline
     preservation for multiple `-m` fragments and consecutive raw file/blob fragments.
   - Completed opportunistic notes-adjacent fixture: `t3300-funny-names.sh` (21/21) after rerunning
