@@ -617,3 +617,7 @@ Updated: 2026-06-01
   parents through omitted commits and use excluded range closures as boundary parents,
   `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to 51/65 and refreshed
   `data/test-files.csv` plus dashboards.
+- t6111 ancestry bottom focus: after making path-limited `--ancestry-path` omit merges that are
+  TREESAME to the effective ancestry bottom side, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 54/65 and refreshed `data/test-files.csv`
+  plus dashboards.

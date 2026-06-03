@@ -870,6 +870,7 @@ pub fn rev_list(
         included.retain(|oid| decorated.contains(oid));
     }
 
+    let mut effective_ancestry_path_bottoms = Vec::new();
     if options.ancestry_path {
         let mut bottoms = options.ancestry_path_bottoms.clone();
         if bottoms.is_empty() {
@@ -881,6 +882,7 @@ pub fn rev_list(
             ));
         }
         limit_to_ancestry(&mut graph, &mut included, &bottoms)?;
+        effective_ancestry_path_bottoms = bottoms;
     }
 
     // Git: `--ancestry-path` implies `--full-history` for path-limited walks.
@@ -980,6 +982,8 @@ pub fn rev_list(
                 options.simplify_merges,
                 options.show_pulls,
                 options.parent_rewrite,
+                options.ancestry_path,
+                &effective_ancestry_path_bottoms,
                 bloom_chain.as_ref(),
                 read_changed,
                 bloom_version,
@@ -3349,6 +3353,8 @@ fn commit_touches_paths(
     simplify_merges: bool,
     show_pulls: bool,
     parent_rewrite: bool,
+    ancestry_path: bool,
+    ancestry_path_bottoms: &[ObjectId],
     bloom_chain: Option<&CommitGraphChain>,
     read_changed_paths: bool,
     changed_paths_version: i32,
@@ -3418,6 +3424,7 @@ fn commit_touches_paths(
 
     // Merge commit: dense history omits the merge when exactly one parent is TREESAME.
     let mut treesame_parents = 0usize;
+    let mut treesame_parent_oids = Vec::new();
     let mut differs_any = false;
     let mut first_parent_differs = false;
     for (nth, parent_oid) in parents.iter().enumerate() {
@@ -3432,7 +3439,19 @@ fn commit_touches_paths(
             differs_any = true;
         } else {
             treesame_parents += 1;
+            treesame_parent_oids.push(*parent_oid);
         }
+    }
+
+    if ancestry_path
+        && !ancestry_path_bottoms.is_empty()
+        && treesame_parent_is_on_ancestry_bottom_side(
+            graph,
+            &treesame_parent_oids,
+            ancestry_path_bottoms,
+        )?
+    {
+        return Ok(sparse);
     }
 
     // `--full-history` without parent rewriting still omits merges that are TREESAME to every
@@ -3467,6 +3486,27 @@ fn commit_touches_paths(
     }
 
     Ok(sparse)
+}
+
+fn treesame_parent_is_on_ancestry_bottom_side(
+    graph: &mut CommitGraph<'_>,
+    treesame_parents: &[ObjectId],
+    bottoms: &[ObjectId],
+) -> Result<bool> {
+    if treesame_parents.is_empty() {
+        return Ok(false);
+    }
+    let treesame: HashSet<ObjectId> = treesame_parents.iter().copied().collect();
+    for bottom in bottoms {
+        if treesame.contains(bottom) {
+            return Ok(true);
+        }
+        let bottom_closure = walk_closure(graph, &[*bottom])?;
+        if bottom_closure.iter().any(|oid| treesame.contains(oid)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn walk_dense_path_limited_closure(
