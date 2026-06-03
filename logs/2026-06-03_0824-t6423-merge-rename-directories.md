@@ -74,3 +74,10 @@
   `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` reports 77/82 passing and
   regenerated `data/test-files.csv` plus dashboards.
 - Remaining real failures: `12i2`, `12n`, and `13e`. `9g` and `12h` remain expected failures.
+- Carried rename-to-self content-conflict paths out of directory-rename application and staged
+  those paths as unresolved instead of accepting a clean blob merge when the unrenamed side also
+  modified the path. This flipped `12i2` while preserving `12i`, `12j`, and `12k`.
+- Current release harness refresh: after `cargo build --release -p grit-cli`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` reports 78/82 passing and
+  regenerated `data/test-files.csv` plus dashboards.
+- Remaining real failures: `12n` and `13e`. `9g` and `12h` remain expected failures.

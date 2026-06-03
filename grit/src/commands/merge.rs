@@ -6159,6 +6159,7 @@ struct DirectoryRenameApplication {
     path_collisions: Vec<(Vec<u8>, Vec<u8>)>,
     multi_target_collisions: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
     applied_moves: Vec<(Vec<u8>, Vec<u8>)>,
+    rename_to_self_content_conflicts: Vec<Vec<u8>>,
 }
 
 fn apply_directory_renames_to_side(
@@ -6174,6 +6175,7 @@ fn apply_directory_renames_to_side(
         return DirectoryRenameApplication::default();
     }
 
+    let mut result = DirectoryRenameApplication::default();
     let original_side_rename_targets: BTreeSet<Vec<u8>> = side_renames.values().cloned().collect();
     let mut rename_to_self_content_conflict_targets: BTreeSet<Vec<u8>> = BTreeSet::new();
     for (source_path, target_path) in side_renames.iter_mut() {
@@ -6199,6 +6201,9 @@ fn apply_directory_renames_to_side(
                 });
             if rename_to_self_content_conflict {
                 rename_to_self_content_conflict_targets.insert(target_path.clone());
+                result
+                    .rename_to_self_content_conflicts
+                    .push(source_path.clone());
             }
             if remapped != *target_path
                 && (side_entries.contains_key(&remapped)
@@ -6216,7 +6221,6 @@ fn apply_directory_renames_to_side(
         }
     }
 
-    let mut result = DirectoryRenameApplication::default();
     let mut candidates: BTreeMap<Vec<u8>, Vec<Vec<u8>>> = BTreeMap::new();
     let mut original_paths: Vec<Vec<u8>> = side_entries.keys().cloned().collect();
     original_paths.sort();
@@ -6329,6 +6333,8 @@ fn merge_trees(
     let mut dir_renames_applied_to_ours: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut dir_renames_applied_to_theirs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut theirs_renames_pre_dir_for_labels: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let mut ours_rename_to_self_content_conflicts: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut theirs_rename_to_self_content_conflicts: BTreeSet<Vec<u8>> = BTreeSet::new();
 
     if merge_directory_renames_enabled_for_mode(repo, merge_directory_renames_mode) {
         let directory_renames_conflict =
@@ -6466,6 +6472,18 @@ fn merge_trees(
             &ours_dir_renames_for_theirs,
             directory_renames_conflict.then_some(&ours_entries),
             directory_renames_conflict.then_some(&ours_renames),
+        );
+        ours_rename_to_self_content_conflicts.extend(
+            ours_dir_rename_result
+                .rename_to_self_content_conflicts
+                .iter()
+                .cloned(),
+        );
+        theirs_rename_to_self_content_conflicts.extend(
+            theirs_dir_rename_result
+                .rename_to_self_content_conflicts
+                .iter()
+                .cloned(),
         );
         for (new_path, old_paths) in ours_dir_rename_result
             .multi_target_collisions
@@ -6794,7 +6812,30 @@ fn merge_trees(
                 // Symlink-at-source case handled above; skip three-way content merge on `te`.
             } else if let Some(te) = te {
                 // Theirs also has the file at the old path — merge content at new path
-                if be.oid == te.oid && be.mode == te.mode {
+                if ours_rename_to_self_content_conflicts.contains(base_path) {
+                    has_conflicts = true;
+                    has_conflict_at_new = true;
+                    let path_str = String::from_utf8_lossy(ours_new_path).to_string();
+                    let mut be_at_new = be.clone();
+                    be_at_new.path = ours_new_path.clone();
+                    stage_entry(&mut index, &be_at_new, 1);
+                    stage_entry(&mut index, oe, 2);
+                    let mut te_at_new = te.clone();
+                    te_at_new.path = ours_new_path.clone();
+                    stage_entry(&mut index, &te_at_new, 3);
+                    conflict_descriptions.push(ConflictDescription {
+                        kind: "content",
+                        body: format!("Merge conflict in {path_str}"),
+                        subject_path: path_str.clone(),
+                        remerge_anchor_path: None,
+                        rename_rr_ours_dest: None,
+                        rename_rr_theirs_dest: None,
+                        auto_merge_hint_path: None,
+                    });
+                    if let Ok(obj) = repo.odb.read(&oe.oid) {
+                        conflict_files.push((path_str, obj.data));
+                    }
+                } else if be.oid == te.oid && be.mode == te.mode {
                     // Theirs didn't modify — just use ours (renamed version)
                     index.entries.push(oe.clone());
                     resolved_entry_at_new = Some(oe.clone());
@@ -7380,7 +7421,30 @@ fn merge_trees(
             let mut has_conflict_at_new = false;
             if let Some(oe) = oe {
                 // Ours also has the file at the old path — merge content at theirs' new path
-                if be.oid == oe.oid && be.mode == oe.mode {
+                if theirs_rename_to_self_content_conflicts.contains(base_path) {
+                    has_conflicts = true;
+                    has_conflict_at_new = true;
+                    let path_str = String::from_utf8_lossy(theirs_new_path).to_string();
+                    let mut be_at_new = be.clone();
+                    be_at_new.path = theirs_new_path.clone();
+                    stage_entry(&mut index, &be_at_new, 1);
+                    let mut oe_at_new = oe.clone();
+                    oe_at_new.path = theirs_new_path.clone();
+                    stage_entry(&mut index, &oe_at_new, 2);
+                    stage_entry(&mut index, te, 3);
+                    conflict_descriptions.push(ConflictDescription {
+                        kind: "content",
+                        body: format!("Merge conflict in {path_str}"),
+                        subject_path: path_str.clone(),
+                        remerge_anchor_path: None,
+                        rename_rr_ours_dest: None,
+                        rename_rr_theirs_dest: None,
+                        auto_merge_hint_path: None,
+                    });
+                    if let Ok(obj) = repo.odb.read(&oe.oid) {
+                        conflict_files.push((path_str, obj.data));
+                    }
+                } else if be.oid == oe.oid && be.mode == oe.mode {
                     // Ours didn't modify — just use theirs (renamed version)
                     index.entries.push(te.clone());
                     resolved_entry_at_new = Some(te.clone());

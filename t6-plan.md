@@ -38,8 +38,8 @@ Completed rev-list/revision files: `t6004`, `t6005`, `t6007-rev-list-cherry-pick
 
 ## Merge Machinery
 
-- [~] `t6423-merge-rename-directories.sh` — 77/82 passing, 3 failing, with 2 expected
-  failures. Remaining real failures: `12i2`, `12n`, and `13e`.
+- [~] `t6423-merge-rename-directories.sh` — 78/82 passing, 2 failing, with 2 expected
+  failures. Remaining real failures: `12n` and `13e`.
 - [ ] `t6438-submodule-directory-file-conflicts.sh` — 23/56 passing, 33 failing.
 - [ ] `t6430-merge-recursive.sh` — 11/36 passing, 25 failing.
 - [ ] `t6402-merge-rename.sh` — 24/46 passing, 22 failing.

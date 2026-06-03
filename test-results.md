@@ -570,3 +570,8 @@ Updated: 2026-06-01
 - Checkpoint verification: `cargo fmt` ran; `cargo build -p grit-cli` passed with existing
   warnings; `cargo clippy --fix --allow-dirty` completed but still reports the existing warning
   backlog and unrelated auto-fixes were reverted; `cargo test -p grit-lib --lib` passed 238/238.
+- t6423 merge directory-rename focus: after carrying rename-to-self content-conflict state out of
+  directory-rename application and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 78/82 and
+  refreshed `data/test-files.csv` plus dashboards. Remaining real failures are `12n` and `13e`;
+  `9g` and `12h` remain expected failures.
