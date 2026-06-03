@@ -1,3 +1,7 @@
+## 2026-06-03 — t13060-cherry-pick-mainline
+
+- Focus harness: `./scripts/run-tests.sh t13060-cherry-pick-mainline.sh --verbose` passes 31/31 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t13050-reset-hard-untracked
 
 - Focus harness: `./scripts/run-tests.sh t13050-reset-hard-untracked.sh --verbose` passes 30/30 after wrapping setup `cd repo` in a subshell.
