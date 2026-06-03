@@ -231,9 +231,15 @@ pub struct Args {
     #[arg(long = "always")]
     pub always: bool,
 
-    /// Prepend "RFC" (or a custom string) to the subject prefix.
-    #[arg(long = "rfc", num_args = 0..=1, default_missing_value = "RFC", require_equals = true)]
-    pub rfc: Option<String>,
+    /// Prepend "RFC" (or a custom string) to the subject prefix. May be repeated; last wins.
+    #[arg(
+        long = "rfc",
+        num_args = 0..=1,
+        default_missing_value = "RFC",
+        require_equals = true,
+        action = clap::ArgAction::Append
+    )]
+    pub rfc: Vec<String>,
 
     /// Add extra header.
     #[arg(long = "add-header", value_name = "HEADER")]
@@ -511,18 +517,18 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Reject diff-only output modes (format-patch always emits the full patch).
     if args.name_only {
-        anyhow::bail!("--name-only does not make sense");
+        anyhow::bail!("fatal: --name-only does not make sense");
     }
     if args.name_status {
-        anyhow::bail!("--name-status does not make sense");
+        anyhow::bail!("fatal: --name-status does not make sense");
     }
     if args.check {
-        anyhow::bail!("--check does not make sense");
+        anyhow::bail!("fatal: --check does not make sense");
     }
 
     // --subject-prefix/--rfc cannot be combined with -k.
-    if args.keep_subject && (args.subject_prefix.is_some() || args.rfc.is_some()) {
-        anyhow::bail!("options '--subject-prefix/--rfc' and '-k' cannot be used together");
+    if args.keep_subject && (args.subject_prefix.is_some() || !args.rfc.is_empty()) {
+        anyhow::bail!("fatal: options '--subject-prefix/--rfc' and '-k' cannot be used together");
     }
 
     let filename_max_length = args.filename_max_length.or_else(|| {
@@ -659,7 +665,8 @@ pub fn run(mut args: Args) -> Result<()> {
                 .or_else(|| config.get("format.subjectPrefix"))
         })
         .unwrap_or_else(|| "PATCH".to_owned());
-    if let Some(rfc) = args.rfc.as_deref() {
+    // When `--rfc` is repeated the last occurrence wins (matches git's option parsing).
+    if let Some(rfc) = args.rfc.last() {
         if !args.no_rfc {
             prefix = apply_rfc_prefix(&prefix, rfc);
         }
