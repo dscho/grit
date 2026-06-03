@@ -94,6 +94,11 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-03 — t3300-funny-names
+
+- Focus harness: `./scripts/run-tests.sh t3300-funny-names.sh` passes 21/21 with current
+  diff/path quoting behavior.
+
 ## 2026-06-03 — t3301-notes log cleanup partial
 
 - Focus harness remains at 127/153 while separator fixes are preserved. Fixed `log --format=""`

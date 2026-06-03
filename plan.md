@@ -68,6 +68,8 @@
     the notes group.
   - Related progress: `t3321-notes-stripspace.sh` improved from 2/27 to 19/27 with the stripspace
     support; it remains in the notes group queue.
+  - Completed opportunistic notes-adjacent fixture: `t3300-funny-names.sh` (21/21) after rerunning
+    with the current diff/path quoting code; no additional code changes were needed.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
