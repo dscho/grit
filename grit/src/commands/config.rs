@@ -1040,16 +1040,44 @@ fn cmd_list(args: &Args, git_dir: Option<&Path>) -> Result<()> {
 
     for entry in config.entries() {
         let prefix = config_entry_prefix(args, entry, cwd.as_deref());
+        let raw_val = entry.value.as_deref().unwrap_or("true");
+        let formatted = if args.type_int
+            || args.type_bool
+            || args.type_bool_or_int
+            || args.type_path
+            || args.type_expiry_date
+            || args.type_name.is_some()
+        {
+            if is_optional_missing_path(args, raw_val) {
+                continue;
+            }
+            match format_typed_value(args, Some(&entry.key), raw_val) {
+                Ok(v)
+                    if (args.type_path || args.type_name.as_deref() == Some("path"))
+                        && v.is_empty() =>
+                {
+                    continue;
+                }
+                Ok(v) => v,
+                Err(_) => continue,
+            }
+        } else {
+            raw_val.to_owned()
+        };
         if args.name_only {
             print!("{}{}{}", prefix, entry.key, terminator);
         } else if args.null_terminated {
-            match entry.value.as_deref() {
-                Some(val) => print!("{}{}\n{}{}", prefix, entry.key, val, terminator),
-                None => print!("{}{}{}", prefix, entry.key, terminator),
+            if entry.value.is_some() || formatted != "true" {
+                print!(
+                    "{}{}
+{}{}",
+                    prefix, entry.key, formatted, terminator
+                );
+            } else {
+                print!("{}{}{}", prefix, entry.key, terminator);
             }
         } else {
-            let val = entry.value.as_deref().unwrap_or("true");
-            print!("{}{}={}{}", prefix, entry.key, val, terminator);
+            print!("{}{}={}{}", prefix, entry.key, formatted, terminator);
         }
     }
     Ok(())

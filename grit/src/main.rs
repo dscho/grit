@@ -2990,22 +2990,118 @@ fn print_stash_push_help_upstream() -> ! {
 /// `git config --get-color <slot> <default>` allows a multi-word default (e.g. `-1 black`).
 /// The shell passes `-1` and `black` as separate argv entries; clap would treat `-1` as a flag.
 /// Join all arguments after the slot into one default string, like Git's argv consumption.
+fn config_type_name_from_flag(flag: &str, value: Option<&str>) -> Option<String> {
+    match flag {
+        "--bool" => Some("bool".to_owned()),
+        "--int" => Some("int".to_owned()),
+        "--bool-or-int" => Some("bool-or-int".to_owned()),
+        "--path" => Some("path".to_owned()),
+        "--expiry-date" => Some("expiry-date".to_owned()),
+        "--type" => value.map(str::to_owned),
+        _ => flag.strip_prefix("--type=").map(str::to_owned),
+    }
+}
+
+fn normalized_type_flag(ty: &str) -> String {
+    match ty {
+        "bool" => "--bool".to_owned(),
+        "int" => "--int".to_owned(),
+        "bool-or-int" => "--bool-or-int".to_owned(),
+        "path" => "--path".to_owned(),
+        "expiry-date" => "--expiry-date".to_owned(),
+        "color" => "--type=color".to_owned(),
+        other => format!("--type={other}"),
+    }
+}
+
+fn validate_config_type_name(ty: &str) {
+    const VALID: &[&str] = &["bool", "int", "bool-or-int", "path", "expiry-date", "color"];
+    if !VALID.contains(&ty) {
+        eprintln!("error: unrecognized --type argument, {ty}");
+        std::process::exit(129);
+    }
+}
+
+fn normalize_config_type_args(rest: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut active_type: Option<String> = None;
+    let mut type_insert_pos: Option<usize> = None;
+    let mut i = 0usize;
+    while i < rest.len() {
+        let arg = &rest[i];
+        if arg == "--" {
+            out.extend_from_slice(&rest[i..]);
+            break;
+        }
+        if arg == "--no-type" {
+            if let Some(pos) = type_insert_pos.take() {
+                out.remove(pos);
+            }
+            active_type = None;
+            i += 1;
+            continue;
+        }
+        if arg == "--type" {
+            let Some(value) = rest.get(i + 1) else {
+                out.push(arg.clone());
+                i += 1;
+                continue;
+            };
+            validate_config_type_name(value);
+            if let Some(existing) = &active_type {
+                if existing != value {
+                    eprintln!("error: only one type at a time");
+                    std::process::exit(129);
+                }
+            } else {
+                active_type = Some(value.clone());
+                type_insert_pos = Some(out.len());
+                out.push(normalized_type_flag(value));
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(ty) = config_type_name_from_flag(arg, None) {
+            validate_config_type_name(&ty);
+            if let Some(existing) = &active_type {
+                if existing != &ty {
+                    eprintln!("error: only one type at a time");
+                    std::process::exit(129);
+                }
+            } else {
+                active_type = Some(ty.clone());
+                type_insert_pos = Some(out.len());
+                out.push(normalized_type_flag(&ty));
+            }
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
+}
+
+/// `git config --get-color <slot> <default>` allows a multi-word default (e.g. `-1 black`).
+/// The shell passes `-1` and `black` as separate argv entries; clap would treat `-1` as a flag.
+/// Join all arguments after the slot into one default string, like Git's argv consumption.
 fn preprocess_config_argv(rest: &[String]) -> Vec<String> {
+    let rest = normalize_config_type_args(rest);
     let Some(pos) = rest.iter().position(|a| a == "--get-color") else {
-        return rest.to_vec();
+        return rest;
     };
     let key_idx = pos + 1;
     if key_idx >= rest.len() {
-        return rest.to_vec();
+        return rest;
     }
     let mut tail_idx = key_idx + 1;
     if tail_idx >= rest.len() {
-        return rest.to_vec();
+        return rest;
     }
     if rest[tail_idx] == "--" {
         tail_idx += 1;
         if tail_idx >= rest.len() {
-            return rest.to_vec();
+            return rest;
         }
     }
     let default_str = rest[tail_idx..].join(" ");
