@@ -3299,6 +3299,7 @@ fn optimize_blob_deltas(
                     continue;
                 }
                 let mut best_base: Option<&PackEntry> = None;
+                let mut best_common = 0usize;
                 for b in &blobs {
                     if b.oid == t.oid {
                         continue;
@@ -3311,6 +3312,19 @@ fn optimize_blob_deltas(
                         && best_base.is_none_or(|bb| b.data.len() > bb.data.len())
                     {
                         best_base = Some(b);
+                        best_common = b.data.len();
+                        continue;
+                    }
+                    let common = common_prefix_len(&t.data, &b.data);
+                    if b.data.len() > t.data.len()
+                        && common > 64
+                        && common.saturating_mul(2) >= t.data.len()
+                        && (common > best_common
+                            || (common == best_common
+                                && best_base.is_none_or(|bb| b.data.len() < bb.data.len())))
+                    {
+                        best_base = Some(b);
+                        best_common = common;
                     }
                 }
                 if let Some(base) = best_base {
@@ -3797,6 +3811,13 @@ fn parse_pack_index_version(raw: Option<&str>) -> Result<PackIndexVersion> {
         });
     }
     bail!("unsupported index version: {raw}")
+}
+
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 /// CRC32 IEEE.

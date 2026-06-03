@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5303-pack-corruption-resilience partial
+
+- Focus harness: `./scripts/run-tests.sh t5303-pack-corruption-resilience.sh --verbose` improved to 24/36 after descending-size common-prefix blob deltas and loose-base REF_DELTA recovery.
+- Regression harness: `./scripts/run-tests.sh t5325-reverse-index.sh --verbose` passes 16/16.
+
+
 ## 2026-06-03 — t5302-show-index
 
 - Focus harness: `./scripts/run-tests.sh t5302-show-index.sh --verbose` passes 17/17 after pack reverse-index sidecar format compatibility and fixture verify-pack isolation fixes.

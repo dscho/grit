@@ -1198,6 +1198,7 @@ fn read_pack_object_at(
     pack_bytes: &[u8],
     offset: u64,
     idx: &PackIndex,
+    objects_dir: Option<&Path>,
     depth: usize,
 ) -> Result<(ObjectKind, Vec<u8>)> {
     if depth > 50 {
@@ -1218,7 +1219,7 @@ fn read_pack_object_at(
             let base_offset = parse_ofs_delta_base(pack_bytes, &mut pos, offset)?;
             let delta_data = decompress_pack_data(pack_bytes, &mut pos, size)?;
             let (base_kind, base_data) =
-                read_pack_object_at(pack_bytes, base_offset, idx, depth + 1)?;
+                read_pack_object_at(pack_bytes, base_offset, idx, objects_dir, depth + 1)?;
             let result = apply_delta(&base_data, &delta_data)?;
             Ok((base_kind, result))
         }
@@ -1232,6 +1233,21 @@ fn read_pack_object_at(
             let base_raw = pack_bytes[pos..pos + hb].to_vec();
             pos += hb;
             let delta_data = decompress_pack_data(pack_bytes, &mut pos, size)?;
+            if hb == 20 {
+                if let (Some(dir), Ok(base_oid)) =
+                    (objects_dir, ObjectId::from_bytes(base_raw.as_slice()))
+                {
+                    let loose = dir
+                        .join(base_oid.loose_prefix())
+                        .join(base_oid.loose_suffix());
+                    if loose.is_file() {
+                        if let Ok(obj) = crate::odb::Odb::read_loose_verify_oid(&loose, &base_oid) {
+                            let result = apply_delta(&obj.data, &delta_data)?;
+                            return Ok((obj.kind, result));
+                        }
+                    }
+                }
+            }
             // Find the base in the same pack index
             let base_entry = idx.entries.iter().find(|e| e.oid == base_raw).cloned();
             let Some(base_entry) = base_entry else {
@@ -1242,7 +1258,7 @@ fn read_pack_object_at(
                 return Ok((ObjectKind::Blob, delta_data));
             };
             let (base_kind, base_data) =
-                read_pack_object_at(pack_bytes, base_entry.offset, idx, depth + 1)?;
+                read_pack_object_at(pack_bytes, base_entry.offset, idx, objects_dir, depth + 1)?;
             let result = apply_delta(&base_data, &delta_data)?;
             Ok((base_kind, result))
         }
@@ -1263,7 +1279,14 @@ pub fn read_object_from_pack(idx: &PackIndex, oid: &ObjectId) -> Result<Object> 
     }
 
     let pack_bytes = read_pack_bytes_cached(&idx.pack_path)?;
-    read_object_from_pack_bytes(&pack_bytes, idx, oid.as_bytes().as_slice())
+    let objects_dir = idx.pack_path.parent().and_then(Path::parent);
+    let entry = idx
+        .entries
+        .iter()
+        .find(|e| e.oid.as_slice() == oid.as_bytes().as_slice())
+        .ok_or_else(|| Error::ObjectNotFound(oid.to_hex()))?;
+    let (kind, data) = read_pack_object_at(&pack_bytes, entry.offset, idx, objects_dir, 0)?;
+    Ok(Object::new(kind, data))
 }
 
 /// Resolve an object from already-loaded pack bytes (used by `verify-pack`).
@@ -1277,7 +1300,7 @@ pub fn read_object_from_pack_bytes(
         .iter()
         .find(|e| e.oid.as_slice() == oid)
         .ok_or_else(|| Error::ObjectNotFound(oid_bytes_to_hex(oid)))?;
-    let (kind, data) = read_pack_object_at(pack_bytes, entry.offset, idx, 0)?;
+    let (kind, data) = read_pack_object_at(pack_bytes, entry.offset, idx, None, 0)?;
     Ok(Object::new(kind, data))
 }
 

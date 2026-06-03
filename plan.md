@@ -38,7 +38,9 @@
     `GIT_EXEC_PATH`.
   - Adjacent regression `t5325-reverse-index.sh` is now 16/16 after updating reverse-index
     parsing/validation to the pack-checksum trailer format.
-  - Next focus: `t5303-pack-corruption-resilience.sh`.
+  - Partial `t5303-pack-corruption-resilience.sh`: improved from 23/36 to 24/36 by adding
+    descending-size common-prefix blob deltas and loose-base REF_DELTA recovery. Continue here;
+    remaining failures are repack/recovery and delta-application edge cases.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
