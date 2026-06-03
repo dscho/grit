@@ -12,6 +12,9 @@
 - Group 0 unsafe fixture audit: `t1509-root-work-tree.sh` was marked `in_scope=skip` after direct
   harness execution confirmed it intentionally emits `1..0 # SKIP Test requiring writable / ...`.
   The test requires clobbering root-level paths and is not safe for normal automated runs.
+- Group 1 read-tree foundation: `./scripts/run-tests.sh --timeout 120 --verbose
+  t1001-read-tree-m-2way.sh` passes 29/29 with the current codebase and refreshed its previously
+  stale CSV failure count.
 
 # Test Results
 

@@ -23,7 +23,9 @@
     - `t1509-root-work-tree.sh` is marked `in_scope=skip` after audit confirmed it intentionally
       requires unsafe writable-root execution and emits a zero-test SKIP.
   - Current focus: Group 1 foundational read-tree/sparse/index/object behavior, starting with
-    `t1001-read-tree-m-2way.sh`.
+    `t1002-read-tree-m-u-2way.sh`.
+  - Completed Group 1 files:
+    - `t1001-read-tree-m-2way.sh` passes 29/29 after harness refresh; no Rust change needed.
   - Execution log: `logs/2026-06-03_0000-t1-family.md`.
 
 ---
