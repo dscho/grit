@@ -1111,7 +1111,7 @@ fn run_line_log(
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
     let (show_decorations, decorate_full) =
@@ -2244,7 +2244,7 @@ fn run_rev_list_log(
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
     let (show_decorations, decorate_full) =
@@ -2631,7 +2631,7 @@ fn run_graph_log(
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
     let (show_decorations_graph, decorate_full_graph) =
@@ -4412,7 +4412,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
 
@@ -9074,15 +9074,15 @@ fn apply_format_string(
                         // Malformed: emit literally.
                         result.push('%');
                     } else if let Some(rest) = inner.strip_prefix("trailers") {
-                        // Advance the real iterator past `(...)`.
-                        chars = look;
                         if let Some(opts) = parse_trailers_opts(rest) {
+                            chars = look;
                             let formatted =
                                 grit_lib::commit_trailers::format_trailers(&info.message, &opts);
                             result.push_str(&formatted);
                         } else {
-                            // Invalid option (e.g. `key` without value): emit literally.
-                            result.push_str(&format!("%({inner})"));
+                            // Invalid option (e.g. `key` without value): emit the
+                            // leading `%` and let the loop reparse `(...)` as text.
+                            result.push('%');
                         }
                     } else if let Some(rest) = inner.strip_prefix("describe") {
                         if let Some(opts) = parse_describe_opts(rest) {
@@ -9095,8 +9095,25 @@ fn apply_format_string(
                         } else {
                             result.push('%');
                         }
+                    } else if let Some(rest) = inner.strip_prefix("decorate") {
+                        if let Some(opts) = parse_decorate_opts(rest) {
+                            chars = look;
+                            let dec = format_decorate_custom(
+                                &hex,
+                                decorations,
+                                use_color,
+                                decoration_paint,
+                                head_for_decor,
+                                &opts,
+                            );
+                            result.push_str(&dec);
+                        } else {
+                            // Unknown option (e.g. typo'd "separater"): emit the
+                            // leading `%` and reparse `(...)` as text.
+                            result.push('%');
+                        }
                     } else {
-                        // Unhandled extended placeholder (decorate): emit literally.
+                        // Unhandled extended placeholder: emit literally.
                         result.push('%');
                     }
                 }
@@ -9816,6 +9833,109 @@ fn current_branch_decoration_index(items: &[DecorationItem], head: &HeadState) -
 }
 
 /// Format decoration string for a commit (with parentheses), matching Git's `format_decorations`.
+/// Customisable options for the `%(decorate:...)` pretty placeholder.
+struct DecorateOpts {
+    prefix: String,
+    suffix: String,
+    separator: String,
+    pointer: String,
+    tag: String,
+}
+
+/// Parse `%(decorate...)` options. Returns `None` on an unrecognised option so
+/// the placeholder can be emitted literally (Git pretty.c behavior).
+fn parse_decorate_opts(rest: &str) -> Option<DecorateOpts> {
+    let mut opts = DecorateOpts {
+        prefix: " (".to_owned(),
+        suffix: ")".to_owned(),
+        separator: ", ".to_owned(),
+        pointer: " -> ".to_owned(),
+        tag: "tag: ".to_owned(),
+    };
+    let body = match rest.strip_prefix(':') {
+        Some(b) => b,
+        None => {
+            if rest.is_empty() {
+                return Some(opts);
+            }
+            return None;
+        }
+    };
+    if body.is_empty() {
+        return Some(opts);
+    }
+    for tok in body.split(',') {
+        let (name, value) = tok.split_once('=')?;
+        let v = expand_trailer_value(value);
+        match name {
+            "prefix" => opts.prefix = v,
+            "suffix" => opts.suffix = v,
+            "separator" => opts.separator = v,
+            "pointer" => opts.pointer = v,
+            "tag" => opts.tag = v,
+            _ => return None,
+        }
+    }
+    Some(opts)
+}
+
+/// Render `%(decorate:...)` with customisable prefix/suffix/separator/pointer/tag.
+fn format_decorate_custom(
+    hex: &str,
+    decorations: Option<&DecorationMap>,
+    use_color: bool,
+    paint: Option<&DecorationPaint>,
+    head: &HeadState,
+    opts: &DecorateOpts,
+) -> String {
+    let _ = use_color;
+    let _ = paint;
+    let Some(map) = decorations else {
+        return String::new();
+    };
+    let Some(items) = map.get(hex) else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let skip_idx = current_branch_decoration_index(items, head);
+    let mut parts: Vec<String> = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        if skip_idx == Some(i) {
+            continue;
+        }
+        let mut piece = String::new();
+        if it.kind == DecorationKind::Tag {
+            piece.push_str(&opts.tag);
+        }
+        piece.push_str(&it.display);
+        if it.kind == DecorationKind::Head {
+            if let Some(bi) = skip_idx {
+                let branch = &items[bi];
+                piece.push_str(&opts.pointer);
+                let d = &branch.display;
+                if branch.kind == DecorationKind::Tag && d.starts_with("tag: ") {
+                    piece.push_str(d.trim_start_matches("tag: "));
+                } else {
+                    piece.push_str(d);
+                }
+            }
+        }
+        parts.push(piece);
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{}{}{}",
+        opts.prefix,
+        parts.join(&opts.separator),
+        opts.suffix
+    )
+}
+
 fn format_decoration(
     hex: &str,
     decorations: Option<&DecorationMap>,
