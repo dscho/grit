@@ -1,3 +1,7 @@
+## 2026-06-03 — t11470-branch-copy-move
+
+- Focus harness: `./scripts/run-tests.sh t11470-branch-copy-move.sh --verbose` passes 31/31 after aligning branch copy/move fixture expectations with `main`.
+
 ## 2026-06-03 — t13220-rev-parse-worktree
 
 - Focus harness: `./scripts/run-tests.sh t13220-rev-parse-worktree.sh --verbose` passes 36/36 after aligning branch expectations with `main` and expecting absolute `--git-dir` paths from subdirectories.
