@@ -79,8 +79,12 @@ pub struct Args {
     pub all: bool,
 
     /// Read pack filenames from stdin instead of object IDs.
-    #[arg(long = "stdin-packs", num_args = 0..=1, default_missing_value = "", require_equals = true)]
-    pub stdin_packs: Option<String>,
+    #[arg(long = "stdin-packs")]
+    pub stdin_packs: bool,
+
+    /// `--stdin-packs=follow`, normalized by the top-level dispatcher.
+    #[arg(long = "stdin-packs-follow", hide = true)]
+    pub stdin_packs_follow: bool,
 
     /// Disambiguation placeholder: Git rejects this (revision.c `--stdin` must not apply).
     #[arg(long = "stdin", hide = true)]
@@ -261,6 +265,19 @@ pub struct Args {
     /// Extra args passed through (for forward compat with unknown flags).
     #[arg(value_name = "EXTRA", num_args = 0.., allow_hyphen_values = true, trailing_var_arg = true, hide = true)]
     pub extra: Vec<String>,
+}
+
+pub fn preprocess_argv(rest: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    for arg in rest {
+        if arg == "--stdin-packs=follow" {
+            out.push("--stdin-packs".to_string());
+            out.push("--stdin-packs-follow".to_string());
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
 }
 
 /// A pack entry to be written.
@@ -571,10 +588,10 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.stdin_disambiguation {
         bail!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
     }
-    if args.stdin_packs.is_some() && !args.filter.is_empty() {
+    if args.stdin_packs && !args.filter.is_empty() {
         bail!("options '--stdin-packs' and '--filter' cannot be used together");
     }
-    if args.stdin_packs.is_some() && args.revs {
+    if args.stdin_packs && args.revs {
         bail!("cannot use internal rev list with --stdin-packs");
     }
     if !args.extra.is_empty() {
@@ -653,7 +670,7 @@ pub fn run(mut args: Args) -> Result<()> {
         eprintln!("Enumerating objects: {}, done.", pack_list.oids.len());
     }
 
-    if pack_list.oids.is_empty() {
+    if pack_list.oids.is_empty() && !args.stdin_packs {
         // `--non-empty` means "do not write an empty pack": Git's pack-objects
         // simply succeeds writing nothing (`if (non_empty && !nr_result) goto
         // cleanup;`), it never errors. A `repack --geometric --exclude-promisor-objects`
@@ -2632,7 +2649,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
     // below, otherwise the leading `^` of an excluded pack makes the line look
     // like a rev exclusion and the pack name is fed to rev-parse (`repack
     // --geometric` on a partial clone: t5616 "after fetching descendants ...").
-    if args.stdin_packs.is_some() {
+    if args.stdin_packs {
         return collect_stdin_packs_oids(repo, args, &stdin_lines);
     }
 
@@ -2826,6 +2843,7 @@ fn collect_stdin_packs_oids(
             exclude.extend(promisor_pack_object_ids(&repo.git_dir.join("objects")));
         }
     }
+    let mut seen_included_specs: HashSet<String> = HashSet::new();
     for trimmed in stdin_lines
         .iter()
         .map(|s| s.trim())
@@ -2835,6 +2853,9 @@ fn collect_stdin_packs_oids(
             continue;
         }
         if excluded_specs.contains(&normalize_stdin_pack_spec_name(trimmed)) {
+            continue;
+        }
+        if !seen_included_specs.insert(normalize_stdin_pack_spec_name(trimmed)) {
             continue;
         }
         let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dirs, trimmed)?;
@@ -2850,10 +2871,25 @@ fn collect_stdin_packs_oids(
     }
     // `--unpacked` additionally packs loose objects not present in any pack.
     if args.unpacked {
+        let mut packed_any: HashSet<ObjectId> = HashSet::new();
+        for pack_dir in &pack_dirs {
+            let objects_dir = pack_dir.parent().unwrap_or(pack_dir.as_path());
+            if let Ok(indexes) = grit_lib::pack::read_local_pack_indexes(objects_dir) {
+                for idx in indexes {
+                    for entry in idx.entries {
+                        if entry.oid.len() == 20 {
+                            if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
+                                packed_any.insert(oid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut loose = BTreeSet::new();
         collect_all_loose(&repo.odb, &mut loose)?;
         for oid in loose {
-            if !exclude.contains(&oid) {
+            if !exclude.contains(&oid) && !packed_any.contains(&oid) {
                 oids.push(oid);
             }
         }

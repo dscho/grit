@@ -5477,7 +5477,10 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             }
             commands::notes::run_from_argv(rest)
         }
-        "pack-objects" => commands::pack_objects::run(parse_cmd_args(subcmd, rest)),
+        "pack-objects" => {
+            let rest = commands::pack_objects::preprocess_argv(rest);
+            commands::pack_objects::run(parse_cmd_args(subcmd, &rest))
+        }
         "pkt-line" => {
             let sub = rest.first().map(|s| s.as_str()).unwrap_or("");
             match sub {
