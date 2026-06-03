@@ -4798,7 +4798,13 @@ fn merge_abort() -> Result<()> {
             .context("building merge-abort index")?;
     crate::commands::reset::preserve_index_cache_flags_from(&old_index, &mut new_index);
     if repo.work_tree.is_some() {
-        crate::commands::reset::checkout_merge_reset_worktree(&repo, &old_index, &mut new_index)?;
+        crate::commands::reset::checkout_merge_reset_worktree(
+            &repo,
+            &old_index,
+            &mut new_index,
+            false,
+            false,
+        )?;
     }
     if let Some(wt) = repo.work_tree.as_deref() {
         grit_lib::diff::refresh_index_stat_content_verified(&mut new_index, wt);
