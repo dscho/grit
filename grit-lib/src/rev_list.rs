@@ -5493,7 +5493,13 @@ fn collect_tree_objects_filtered(
             skip_tree: false,
         },
         Some(f) => {
-            if explicit_root && !filter_provided {
+            if explicit_root && matches!(f, ObjectFilter::TreeDepth(0)) {
+                ListFilterBits {
+                    mark_seen: true,
+                    do_show: true,
+                    skip_tree: true,
+                }
+            } else if explicit_root && !filter_provided {
                 ListFilterBits {
                     mark_seen: true,
                     do_show: true,

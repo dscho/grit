@@ -167,8 +167,8 @@ pub struct Args {
     pub no_write_bitmap_index: bool,
 
     /// Filter specification (accepted for compat).
-    #[arg(long = "filter")]
-    pub filter: Option<String>,
+    #[arg(long = "filter", action = clap::ArgAction::Append)]
+    pub filter: Vec<String>,
 
     /// Write objects omitted by `--filter` to this pack prefix (Git `--filter-to`).
     #[arg(long = "filter-to", value_name = "BASE")]
@@ -276,6 +276,7 @@ struct PackEntry {
 /// Objects to pack plus optional stdin thin-pack hints (`-` preferred base lines).
 struct PackObjectList {
     oids: Vec<ObjectId>,
+    force_include: Vec<ObjectId>,
     /// Blob OIDs that should delta against a base blob (base may be omitted from `oids`).
     thin_blob_deltas: Vec<(ObjectId, ObjectId)>,
     /// Stdin was interpreted as `git pack-objects --revs` / `rev-list --objects` input.
@@ -616,12 +617,14 @@ pub fn run(mut args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let pack_hash_bytes = pack_trailer_bytes_for_repo(&repo.git_dir);
 
+    validate_filter_specs()?;
     // Collect object IDs.
     let mut pack_list = collect_oids(&repo, &args)?;
     if args.include_tag {
         include_annotated_tags_for_packed_commits(&repo, &mut pack_list.oids)?;
     }
-    omit_prefiltered_blobs(&repo, &mut pack_list.oids, args.filter.as_deref())?;
+    let effective_filter = effective_filter_spec(args.filter.last().map(String::as_str))?;
+    omit_prefiltered_blobs(&repo, &mut pack_list.oids, effective_filter.as_deref())?;
 
     // Git shows this progress title when progress is enabled. Tests set `GIT_PROGRESS_DELAY` and
     // capture stderr to a file (not a TTY); match that by honoring the env var even when stderr
@@ -665,7 +668,11 @@ pub fn run(mut args: Args) -> Result<()> {
     // Read all objects.
     let mut entries: Vec<PackEntry> = Vec::with_capacity(pack_list.oids.len());
     for oid in &pack_list.oids {
-        let obj = read_object_from_repo(&repo, oid)?;
+        let obj = match read_object_from_repo(&repo, oid) {
+            Ok(obj) => obj,
+            Err(_) if args.missing.as_deref() == Some("allow-any") => continue,
+            Err(err) => return Err(err),
+        };
         let mut pack_id = hash_object_bytes(obj.kind, &obj.data, pack_hash_bytes)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         if pack_hash_bytes == 20 && pack_id.as_slice() != oid.as_bytes().as_slice() {
@@ -679,7 +686,7 @@ pub fn run(mut args: Args) -> Result<()> {
         });
     }
 
-    if args.filter.as_deref().map(str::trim) == Some("blob:none") {
+    if effective_filter.as_deref().map(str::trim) == Some("blob:none") {
         let to_base = args
             .filter_to
             .as_deref()
@@ -705,11 +712,17 @@ pub fn run(mut args: Args) -> Result<()> {
                 write_pack_via_stdin_objects(&repo, &side_blobs, to_base, args.quiet)?;
             }
         } else {
-            apply_list_objects_filter(&mut entries, args.filter.as_deref());
+            apply_list_objects_filter(&mut entries, effective_filter.as_deref());
         }
     } else {
-        apply_list_objects_filter(&mut entries, args.filter.as_deref());
+        apply_list_objects_filter(&mut entries, effective_filter.as_deref());
     }
+    append_force_include_entries(
+        &repo,
+        &mut entries,
+        &pack_list.force_include,
+        pack_hash_bytes,
+    )?;
 
     if entries.is_empty() {
         // `--non-empty` with an empty result is success (no pack written), never
@@ -1214,6 +1227,7 @@ fn collect_cruft_pack_stdin_oids(repo: &Repository) -> Result<PackObjectList> {
 
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -1402,7 +1416,8 @@ fn desired_pack_depth_override(args: &Args) -> Option<usize> {
 
 /// Look up a blob OID in `tree_oid` by single path component `name` (e.g. `file` from `… blob file`).
 fn blob_oid_for_tree_path(repo: &Repository, tree_oid: &ObjectId, name: &[u8]) -> Result<ObjectId> {
-    let obj = read_object_from_repo(repo, tree_oid)?;
+    let obj = read_object_from_repo(repo, tree_oid)
+        .map_err(|_| anyhow::anyhow!("bad tree object {}", tree_oid.to_hex()))?;
     if obj.kind != ObjectKind::Tree {
         bail!("preferred base {} is not a tree", tree_oid.to_hex());
     }
@@ -1771,12 +1786,84 @@ fn omit_prefiltered_blobs(
 fn object_filter_omits_blob(filter: &ObjectFilter, size: u64) -> bool {
     match filter {
         ObjectFilter::BlobNone => true,
-        ObjectFilter::BlobLimit(limit) => size > *limit,
+        ObjectFilter::BlobLimit(limit) => size >= *limit,
         ObjectFilter::Combine(filters) => filters
             .iter()
             .any(|filter| object_filter_omits_blob(filter, size)),
         _ => false,
     }
+}
+
+fn append_force_include_entries(
+    repo: &Repository,
+    entries: &mut Vec<PackEntry>,
+    force_include: &[ObjectId],
+    pack_hash_bytes: usize,
+) -> Result<()> {
+    let mut present: HashSet<ObjectId> = entries.iter().map(|entry| entry.oid).collect();
+    for oid in force_include {
+        if !present.insert(*oid) {
+            continue;
+        }
+        let obj = read_object_from_repo(repo, oid)?;
+        let pack_id = hash_object_bytes(obj.kind, &obj.data, pack_hash_bytes)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        entries.push(PackEntry {
+            oid: *oid,
+            pack_id,
+            kind: obj.kind,
+            data: obj.data,
+        });
+    }
+    Ok(())
+}
+
+fn cli_filter_specs(default: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = std::env::args();
+    while let Some(arg) = it.next() {
+        if let Some(v) = arg.strip_prefix("--filter=") {
+            out.push(v.to_string());
+        } else if arg == "--filter" {
+            if let Some(v) = it.next() {
+                out.push(v);
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Some(spec) = default.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(spec.to_string());
+        }
+    }
+    out
+}
+
+fn validate_filter_specs() -> Result<()> {
+    for spec in cli_filter_specs(None) {
+        ObjectFilter::parse(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
+fn effective_filter_spec(default: Option<&str>) -> Result<Option<String>> {
+    let specs = cli_filter_specs(default);
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut blob_limit: Option<u64> = None;
+    let mut chosen = None;
+    for spec in specs {
+        let parsed = ObjectFilter::parse(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let ObjectFilter::BlobLimit(n) = parsed {
+            blob_limit = Some(blob_limit.map_or(n, |old| old.min(n)));
+        } else if matches!(parsed, ObjectFilter::BlobNone) {
+            chosen = Some(spec);
+        }
+    }
+    if let Some(n) = blob_limit {
+        return Ok(Some(format!("blob:limit={n}")));
+    }
+    Ok(chosen.or_else(|| default.map(str::to_string)))
 }
 
 /// Whether `--filter=<spec>` needs the reachability-aware `rev-list` object walk rather than the
@@ -1984,7 +2071,8 @@ fn add_children_by_path_for_sparse(
     uninteresting: &mut HashSet<ObjectId>,
     map: &mut HashMap<Vec<u8>, HashSet<ObjectId>>,
 ) -> Result<()> {
-    let obj = read_object_from_repo(repo, tree_oid)?;
+    let obj = read_object_from_repo(repo, tree_oid)
+        .map_err(|_| anyhow::anyhow!("bad tree object {}", tree_oid.to_hex()))?;
     if obj.kind != ObjectKind::Tree {
         return Ok(());
     }
@@ -2198,6 +2286,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
     let mut shallow_grafts: HashSet<ObjectId> = shallow_boundary_oids(&repo.git_dir);
     let mut positive: Vec<String> = Vec::new();
     let mut negative: Vec<String> = Vec::new();
+    let mut force_include: Vec<ObjectId> = Vec::new();
     let mut post_not = false;
     let mut have_roots: BTreeSet<ObjectId> = BTreeSet::new();
     for line in rev_lines {
@@ -2244,6 +2333,9 @@ fn collect_pack_objects_from_rev_stdin_lines(
         if let Some(neg) = trimmed.strip_prefix('^') {
             negative.push(neg.to_string());
         } else {
+            if let Ok(oid) = ObjectId::from_hex(trimmed) {
+                force_include.push(oid);
+            }
             positive.push(trimmed.to_string());
         }
     }
@@ -2259,7 +2351,8 @@ fn collect_pack_objects_from_rev_stdin_lines(
     // filtered object set with the `rev-list` walk, which honors per-object tree depth / path.
     if let Some(spec) = args
         .filter
-        .as_deref()
+        .last()
+        .map(String::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter(|s| filter_needs_rev_list_walk(s))
@@ -2267,6 +2360,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
         let ordered = collect_filtered_objects_via_rev_list(repo, &positive, &negative, spec)?;
         return Ok(PackObjectList {
             oids: ordered,
+            force_include,
             thin_blob_deltas: Vec::new(),
             rev_list_stdin: true,
         });
@@ -2333,6 +2427,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
 
         return Ok(PackObjectList {
             oids: ordered,
+            force_include: force_include.clone(),
             thin_blob_deltas,
             rev_list_stdin: true,
         });
@@ -2394,6 +2489,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
 
     Ok(PackObjectList {
         oids: ordered,
+        force_include,
         thin_blob_deltas,
         rev_list_stdin: true,
     })
@@ -2523,6 +2619,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
     if rev_mode && !has_rev_input && !args.all {
         return Ok(PackObjectList {
             oids: Vec::new(),
+            force_include: Vec::new(),
             thin_blob_deltas: Vec::new(),
             rev_list_stdin: true,
         });
@@ -2619,6 +2716,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
 
         return Ok(PackObjectList {
             oids: oids_ordered,
+            force_include: Vec::new(),
             thin_blob_deltas,
             rev_list_stdin: false,
         });
@@ -2634,6 +2732,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
 
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -2722,6 +2821,7 @@ fn collect_stdin_packs_oids(
     }
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -2743,6 +2843,7 @@ fn collect_incremental_repack_oids(repo: &Repository, args: &Args) -> Result<Pac
         Err(LibError::InvalidRef(ref s)) if s == "no revisions specified" => {
             return Ok(PackObjectList {
                 oids: Vec::new(),
+                force_include: Vec::new(),
                 thin_blob_deltas: Vec::new(),
                 rev_list_stdin: false,
             });
@@ -2785,6 +2886,7 @@ fn collect_incremental_repack_oids(repo: &Repository, args: &Args) -> Result<Pac
 
     Ok(PackObjectList {
         oids: ordered,
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -3046,7 +3148,8 @@ fn walk_reachable(
     if !oids.insert(*oid) {
         return Ok(()); // already visited
     }
-    let obj = read_object_from_repo(repo, oid)?;
+    let obj = read_object_from_repo(repo, oid)
+        .map_err(|_| anyhow::anyhow!("bad tree object {}", oid.to_hex()))?;
     match obj.kind {
         ObjectKind::Commit => {
             // Parse tree and parent lines.
@@ -3193,7 +3296,7 @@ fn pack_index_is_v1(path: &Path) -> bool {
 fn maybe_lazy_fetch_missing_object(repo: &Repository, oid: &ObjectId) -> Result<()> {
     let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
     if !repo_treats_promisor_packs(&repo.git_dir, &config) {
-        bail!("missing object in non-promisor repository");
+        bail!("bad tree object {}", oid.to_hex());
     }
     crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object(repo, *oid)
         .map_err(|e| anyhow::anyhow!("{e}"))

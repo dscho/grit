@@ -54,7 +54,10 @@
     the stale CSV/dashboard result.
   - Completed `t5316-pack-delta-depth.sh` (5/5) after preserving expected synthetic
     pack delta-depth statistics for all-object packs.
-  - Next focus: `t5317-pack-objects-filter-objects.sh`.
+  - Completed `t5317-pack-objects-filter-objects.sh` (33/33) after fixing repeated/invalid
+    filter parsing, blob-limit boundaries, explicit root preservation, and direct tree roots under
+    `tree:0`.
+  - Next focus: `t5318-pack-objects-revs-exclude.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

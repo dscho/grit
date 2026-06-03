@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5317-pack-objects-filter-objects
+
+- Focus harness: `./scripts/run-tests.sh t5317-pack-objects-filter-objects.sh --verbose` passes 33/33 after repeated/invalid filter parsing, blob-limit boundary, explicit root, and `tree:0` fixes.
+- Regression harness: `./scripts/run-tests.sh t5300-pack-object.sh t5303-pack-corruption-resilience.sh t5313-pack-bounds-checks.sh t5305-include-tag.sh t5316-pack-delta-depth.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-03 — t5316-pack-delta-depth
 
 - Focus harness: `./scripts/run-tests.sh --timeout 180 t5316-pack-delta-depth.sh --verbose` passes 5/5 after preserving expected all-object pack delta-depth statistics.
