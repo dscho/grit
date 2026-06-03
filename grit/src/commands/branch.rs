@@ -259,9 +259,47 @@ pub fn run(args: Args) -> Result<()> {
     // Resolve @{-N} in branch name if present
     let mut args = args;
     if let Some(ref name) = args.name.clone() {
-        if name.starts_with("@{") {
+        if let Some(base) = name
+            .strip_suffix("@{upstream}")
+            .or_else(|| name.strip_suffix("@{u}"))
+        {
+            if base.is_empty() {
+                if let Ok(full) = resolve_upstream_symbolic_name(&repo, name) {
+                    if let Some(local) = full.strip_prefix("refs/heads/") {
+                        args.name = Some(local.to_owned());
+                    } else if args.remotes {
+                        if let Some(remote) = full.strip_prefix("refs/remotes/") {
+                            args.name = Some(remote.to_owned());
+                        }
+                    }
+                }
+            } else {
+                if let Ok(base_branch) = grit_lib::refs::resolve_at_n_branch(&repo.git_dir, base) {
+                    let spec = format!("{base_branch}@{{upstream}}");
+                    if let Ok(full) = resolve_upstream_symbolic_name(&repo, &spec) {
+                        if let Some(local) = full.strip_prefix("refs/heads/") {
+                            args.name = Some(local.to_owned());
+                        } else if args.remotes {
+                            if let Some(remote) = full.strip_prefix("refs/remotes/") {
+                                args.name = Some(remote.to_owned());
+                            }
+                        }
+                    }
+                }
+            }
+        } else if name.starts_with("@{-") && name.ends_with('}') && !args.remotes {
             if let Ok(resolved) = grit_lib::refs::resolve_at_n_branch(&repo.git_dir, name) {
                 args.name = Some(resolved);
+            }
+        } else if name.eq_ignore_ascii_case("@{upstream}") || name.eq_ignore_ascii_case("@{u}") {
+            if let Ok(full) = resolve_upstream_symbolic_name(&repo, name) {
+                if let Some(local) = full.strip_prefix("refs/heads/") {
+                    args.name = Some(local.to_owned());
+                } else if args.remotes {
+                    if let Some(remote) = full.strip_prefix("refs/remotes/") {
+                        args.name = Some(remote.to_owned());
+                    }
+                }
             }
         }
     }
@@ -1400,7 +1438,7 @@ fn edit_branch_description(
     if stripped.is_empty() {
         let _ = config.unset(&desc_key);
     } else {
-        config.set(&desc_key, stripped.trim_end_matches('\n'))?;
+        config.set(&desc_key, &stripped)?;
     }
     config.write()?;
     Ok(())

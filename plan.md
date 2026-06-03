@@ -50,8 +50,12 @@
     verbose worktree output expectations.
   - Completed: `t3206-branch-advanced.sh` (29/29) after restoring its synthetic fixture to use the
     `master` initial branch it expects throughout the file.
-  - Current focus: `t3204-branch-name-interpretation.sh` (16 total, 11 passed, 5 failing), next in
-    the branch/refs/range-diff/pack-refs group.
+  - Completed: `t3204-branch-name-interpretation.sh` (16/16) after resolving `@{upstream}` and
+    compound `@{-N}@{upstream}` branch arguments in create/delete/upstream modes, preserving branch
+    description trailing blank lines, and keeping `branch -r -D @{-N}` from deleting a same-named
+    remote-tracking branch.
+  - Current focus: `t3210-pack-refs.sh` (29 total, 27 passed, 2 failing), final file in the
+    branch/refs/range-diff/pack-refs group.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
