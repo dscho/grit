@@ -5445,7 +5445,12 @@ fn run_reflog_walk(
     mailmap: &MailmapTable,
 ) -> Result<()> {
     let rev_specs: Vec<String> = if args.revisions.is_empty() {
-        vec!["HEAD".to_string()]
+        // Bare `--reflog`/`--walk-reflogs` walks every ref's reflog plus HEAD.
+        let mut refs = grit_lib::reflog::list_reflog_refs(&repo.git_dir).unwrap_or_default();
+        if refs.is_empty() {
+            refs.push("HEAD".to_string());
+        }
+        refs
     } else {
         args.revisions.clone()
     };
