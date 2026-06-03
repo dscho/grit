@@ -1,3 +1,7 @@
+## 2026-06-03 — t10450-status-porcelain-staged
+
+- Focus harness: `./scripts/run-tests.sh t10450-status-porcelain-staged.sh --verbose` passes 35/35 after using porcelain branch output mode for branch-header assertions and aligning expectations with `main`.
+
 ## 2026-06-03 — t10630-symbolic-ref-chain-extra
 
 - Focus harness: `./scripts/run-tests.sh t10630-symbolic-ref-chain-extra.sh --verbose` passes 35/35 after aligning symbolic-ref branch expectations with the `main` default branch.
