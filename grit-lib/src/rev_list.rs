@@ -1079,6 +1079,7 @@ pub fn rev_list(
             &options.paths,
             &excluded,
             options.ordering,
+            options.show_pulls,
         )?;
     }
 
@@ -3301,6 +3302,7 @@ fn simplify_merges_commit_list(
     paths: &[String],
     excluded: &HashSet<ObjectId>,
     ordering: OrderingMode,
+    show_pulls: bool,
 ) -> Result<Vec<ObjectId>> {
     let selected: HashSet<ObjectId> = commits.iter().copied().collect();
     let mut out = Vec::new();
@@ -3308,8 +3310,11 @@ fn simplify_merges_commit_list(
     for oid in commits {
         let raw_parents = load_commit(repo, *oid)?.parents;
         let rewritten = visible_parents_for_graph_lib(repo, *oid, &selected, false)?;
+        let pull_merge = show_pulls
+            && raw_parents.len() > 1
+            && path_merge_survives_simplify(repo, *oid, paths, excluded)?;
         if raw_parents.len() > 1 && rewritten.len() <= 1 {
-            if path_merge_survives_simplify(repo, *oid, paths, excluded)? {
+            if pull_merge {
                 simplified_parents.insert(*oid, rewritten);
                 out.push(*oid);
             }
@@ -3323,7 +3328,7 @@ fn simplify_merges_commit_list(
         let mut simplified = graph_simplify_parent_list_lib(repo, &selected, &rewritten)?;
         simplified.sort_unstable();
         simplified.dedup();
-        if simplified.len() > 1 {
+        if simplified.len() > 1 || pull_merge {
             simplified_parents.insert(*oid, simplified);
             out.push(*oid);
         }

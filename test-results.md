@@ -1315,3 +1315,10 @@ Updated: 2026-06-01
   `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6012 simplify-merges show-pulls focus: after preserving pull merges during simplify-merges even
+  when parent simplification collapses them to one rewritten edge, the direct verbose run advances
+  through test 39 and `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 38/42 to
+  39/42 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check
+  -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
