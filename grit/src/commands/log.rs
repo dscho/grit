@@ -823,7 +823,7 @@ fn log_wants_patch_hunks(args: &Args, info: &CommitInfo, git_dir: &Path) -> Resu
         return Ok(false);
     }
     let is_merge = info.parents.len() > 1;
-    let patch = args.patch || args.patch_u;
+    let patch = args.patch || args.patch_u || args.patch_with_stat;
     if !patch {
         return Ok(false);
     }
@@ -11054,16 +11054,18 @@ fn write_commit_diff_body(
     // `--cc -p --stat` on a merge: even when the dense combined diff is empty,
     // Git still prints the first-parent diffstat (t4066).
     let merge_stat_from_first_parent =
-        combined_style && !args.stat.is_empty() && !entries.is_empty();
+        combined_style && (!args.stat.is_empty() || args.patch_with_stat) && !entries.is_empty();
     if list_raw_name.is_empty() && list_patch.is_empty() && !merge_stat_from_first_parent {
         return Ok(());
     }
     let has_patch = show_patch && !list_patch.is_empty();
+    // `--patch-with-stat` shows a diffstat even though `--stat` was not given explicitly.
+    let wants_stat = !args.stat.is_empty() || args.patch_with_stat;
 
     // Builtin pretty formats (medium/short/full/fuller/raw) print a blank line between
     // the commit message and the diff body (git log-tree.c). `--stat`/`--name-status`
     // emit their own leading separator below, so only prefix it for the raw/patch cases.
-    if leading_blank && args.stat.is_empty() && !args.name_only && !args.name_status {
+    if leading_blank && !wants_stat && !args.name_only && !args.name_status {
         writeln!(out)?;
     }
 
@@ -11074,7 +11076,7 @@ fn write_commit_diff_body(
         writeln!(out)?;
     }
 
-    if !args.stat.is_empty() {
+    if wants_stat {
         if has_patch {
             writeln!(out, "---")?;
         } else {
