@@ -552,6 +552,14 @@ pub fn run(mut args: Args) -> Result<()> {
         crate::precompose::precompose_diff_tree_argv(&mut args.args);
     }
     let opts = parse_options(&repo, &args.args)?;
+    if opts.max_depth.is_some()
+        && opts
+            .pathspecs
+            .iter()
+            .any(|p| grit_lib::pathspec::has_glob_chars(p))
+    {
+        bail!("fatal: max-depth cannot be used with wildcard pathspecs");
+    }
     if opts.merge_base && opts.stdin_mode {
         bail!("fatal: options '--merge-base' and '--stdin' cannot be used together");
     }
@@ -1249,54 +1257,96 @@ fn filter_max_depth(
     }
     let max_depth = max_depth as usize;
 
-    // For each entry, find the matching pathspec and compute relative depth.
-    // Depth 0 means the entry is directly in the pathspec root.
-    let prefix_depth = if pathspecs.is_empty() {
-        0usize
-    } else {
-        // Use the longest (most specific) matching prefix for each entry.
-        // For simplicity, use the minimum prefix depth across all pathspecs.
-        pathspecs
-            .iter()
-            .map(|p| {
-                let p = p.strip_suffix('/').unwrap_or(p);
-                if p.is_empty() {
-                    0
-                } else {
-                    p.split('/').count()
-                }
-            })
-            .min()
-            .unwrap_or(0)
-    };
-
-    // Maximum number of path components allowed in output.
-    let allowed_components = if prefix_depth > 0 {
-        prefix_depth + max_depth
-    } else {
-        max_depth + 1
-    };
+    // Normalize pathspecs (strip trailing '/') and sort so the longest match can
+    // be found first, mirroring git's reverse-sorted scan in check_recursion_depth.
+    let specs: Vec<String> = pathspecs
+        .iter()
+        .map(|p| p.strip_suffix('/').unwrap_or(p).to_owned())
+        .filter(|p| !p.is_empty())
+        .collect();
 
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
     for entry in entries {
-        let path = entry.path();
-        let components: Vec<&str> = path.split('/').collect();
-
-        if components.len() <= allowed_components {
-            result.push(entry);
-        } else {
-            // Truncate to allowed_components
-            let truncated: String = components[..allowed_components].join("/");
-            if seen.insert(truncated.clone()) {
-                let mut collapsed = entry;
-                collapsed.old_path = Some(truncated.clone());
-                collapsed.new_path = Some(truncated);
-                result.push(collapsed);
+        let path = entry.path().to_owned();
+        // Find the deepest directory-prefix of `path` that git would refuse to
+        // recurse into; if found, the entry collapses to that directory name.
+        match collapse_boundary(&path, &specs, max_depth) {
+            None => result.push(entry),
+            Some(dir) => {
+                if seen.insert(dir.clone()) {
+                    let mut collapsed = entry;
+                    collapsed.old_path = Some(dir.clone());
+                    collapsed.new_path = Some(dir);
+                    result.push(collapsed);
+                }
             }
         }
     }
     result
+}
+
+/// Returns true if every '/'-separated component boundary in `rel` keeps the
+/// running depth within `max_depth`, mirroring git's within_depth() starting
+/// from `start_depth`.
+fn within_depth(rel: &str, start_depth: usize, max_depth: usize) -> bool {
+    let mut depth = start_depth;
+    for b in rel.bytes() {
+        if b == b'/' {
+            depth += 1;
+            if depth > max_depth {
+                return false;
+            }
+        }
+    }
+    depth <= max_depth
+}
+
+/// Mirror of git's check_recursion_depth for a directory path `name`: returns
+/// true if git would recurse into this directory under the given pathspecs.
+fn check_recursion_depth(name: &str, specs: &[String], max_depth: usize) -> bool {
+    if specs.is_empty() {
+        return within_depth(name, 1, max_depth);
+    }
+    // Reverse-sorted scan: longest matching pathspec first.
+    let mut sorted: Vec<&String> = specs.iter().collect();
+    sorted.sort();
+    for item in sorted.iter().rev() {
+        let item = item.as_str();
+        if name.len() >= item.len() {
+            if is_dir_prefix(name, item) {
+                // Git does NOT strip the boundary '/'; the leading slash of the
+                // remainder counts as a depth increment (within_depth start=1).
+                let rel = &name[item.len()..];
+                return within_depth(rel, 1, max_depth);
+            }
+        } else if is_dir_prefix(item, name) {
+            // name is a prefix of the pathspec: must always recurse.
+            return true;
+        }
+    }
+    false
+}
+
+/// True iff `dir` is a leading directory of `path` (or equal).
+fn is_dir_prefix(path: &str, dir: &str) -> bool {
+    path.starts_with(dir) && (path.len() == dir.len() || path.as_bytes()[dir.len()] == b'/')
+}
+
+/// Walk the ancestor directories of a blob `path`; if git would stop recursing
+/// at some directory, return that directory name (the collapse target).
+fn collapse_boundary(path: &str, specs: &[String], max_depth: usize) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut idx = 0;
+    while let Some(rel) = bytes[idx..].iter().position(|&b| b == b'/') {
+        let end = idx + rel;
+        let dir = &path[..end];
+        if !check_recursion_depth(dir, specs, max_depth) {
+            return Some(dir.to_owned());
+        }
+        idx = end + 1;
+    }
+    None
 }
 
 /// Non-recursive tree diff: only top-level entries.
