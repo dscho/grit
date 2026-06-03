@@ -1,3 +1,10 @@
+## 2026-06-03 — t3206-branch-advanced
+
+- Focus harness: `./scripts/run-tests.sh t3206-branch-advanced.sh` passes 29/29 after the
+  synthetic fixture explicitly requests its expected `master` initial branch.
+- Adjacent verification: `./scripts/run-tests.sh t3206-branch-advanced.sh t3200-branch.sh
+  t3203-branch-output.sh` all pass.
+
 ## 2026-06-03 — t3203-branch-output
 
 - Focus harness: `./scripts/run-tests.sh t3203-branch-output.sh` passes 41/41 after detached HEAD

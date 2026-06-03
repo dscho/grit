@@ -48,8 +48,10 @@
   - Completed: `t3203-branch-output.sh` (41/41) after detached-HEAD descriptions prefer matching
     tag names over raw OID labels, which fixed tag-detach display, sorting, formatting, color, and
     verbose worktree output expectations.
-  - Current focus: `t3206-branch-advanced.sh` (29 total, 18 passed, 11 failing), next in the
-    branch/refs/range-diff/pack-refs group.
+  - Completed: `t3206-branch-advanced.sh` (29/29) after restoring its synthetic fixture to use the
+    `master` initial branch it expects throughout the file.
+  - Current focus: `t3204-branch-name-interpretation.sh` (16 total, 11 passed, 5 failing), next in
+    the branch/refs/range-diff/pack-refs group.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
