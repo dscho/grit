@@ -1,3 +1,7 @@
+## 2026-06-03 — t10560-switch-create-detach
+
+- Focus harness: `./scripts/run-tests.sh t10560-switch-create-detach.sh --verbose` passes 28/28 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t12920/t12930 rev-parse
 
 - Focus harness: `./scripts/run-tests.sh t12920-rev-parse-parseopt.sh t12930-rev-parse-since-until.sh --verbose` passes 33/33 for both files after wrapping setup blocks and switching synthetic `master` branch references to `main`.
