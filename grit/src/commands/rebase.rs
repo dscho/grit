@@ -5536,16 +5536,18 @@ fn cherry_pick_for_rebase(
     };
 
     let (mut merged_index, merge_conflict_files) = if ws_fix_rule.is_none() {
+        let picked_parent_oid = commit
+            .parents
+            .first()
+            .copied()
+            .unwrap_or_else(ObjectId::zero);
         let tree_merge = merge_trees_for_single_cherry_pick(
             repo,
             base_tree_oid,
             head_tree_oid,
             commit_tree_oid,
             commit_oid,
-            commit
-                .parents
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("cherry-pick of root commit not supported"))?,
+            &picked_parent_oid,
             &head_oid,
             MergeFavor::None,
         )?;
@@ -5828,7 +5830,11 @@ fn cherry_pick_for_rebase(
     );
     let commit_data = CommitData {
         tree: tree_oid,
-        parents: vec![head_oid],
+        parents: if head_at_empty_tree {
+            Vec::new()
+        } else {
+            vec![head_oid]
+        },
         author,
         committer,
         author_raw,

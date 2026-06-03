@@ -1372,3 +1372,10 @@ Updated: 2026-06-01
   `cargo check -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`,
   `cargo clippy --fix --allow-dirty` (existing warning backlog remains and unrelated auto-fixes
   were reverted), and `cargo test -p grit-lib --lib`.
+- t6000 root rebase focus: after allowing non-interactive `rebase --force-rebase --root` to replay
+  the first root commit with no parent, the direct debug run passes 23/23 and
+  `./scripts/run-tests.sh t6000-rev-list-misc.sh` records 23/23 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted), and
+  `cargo test -p grit-lib --lib`.
