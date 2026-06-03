@@ -180,7 +180,13 @@ pub struct Args {
     pub no_column: bool,
 
     /// Abbreviation length for object names.
-    #[arg(long = "abbrev", value_name = "N", num_args = 0..=1, default_missing_value = "7")]
+    #[arg(
+        long = "abbrev",
+        value_name = "N",
+        num_args = 0..=1,
+        default_missing_value = "7",
+        require_equals = true
+    )]
     pub abbrev: Option<String>,
 
     /// Don't abbreviate.
@@ -380,6 +386,15 @@ fn detached_head_description(repo: &Repository, head: &HeadState) -> Result<Stri
         bail!("detached_head_description: not detached");
     };
     let git_dir = &repo.git_dir;
+    let wt = wt_status_get_state(git_dir, head, true)?;
+    if wt.rebase_interactive_in_progress || wt.rebase_in_progress {
+        if let Some(branch) = wt.rebase_branch {
+            return Ok(format!("(no branch, rebasing {branch})"));
+        }
+        let original = rebase_original_head_label(git_dir)
+            .unwrap_or_else(|| oid.to_hex().chars().take(7).collect::<String>());
+        return Ok(format!("(no branch, rebasing detached HEAD {original})"));
+    }
     let state_dir = grit_lib::refs::common_dir(git_dir).unwrap_or_else(|| git_dir.clone());
     if state_dir.join("BISECT_LOG").exists() {
         let start = fs::read_to_string(state_dir.join("BISECT_START"))
@@ -395,7 +410,6 @@ fn detached_head_description(repo: &Repository, head: &HeadState) -> Result<Stri
         };
         return Ok(format!("(no branch, bisect started on {label})"));
     }
-    let wt = wt_status_get_state(git_dir, head, true)?;
     if let Some(label) = wt.detached_from {
         if wt.detached_at {
             return Ok(format!("(HEAD detached at {label})"));
@@ -404,6 +418,17 @@ fn detached_head_description(repo: &Repository, head: &HeadState) -> Result<Stri
     }
     let abbrev: String = oid.to_hex().chars().take(7).collect();
     Ok(format!("(HEAD detached at {abbrev})"))
+}
+
+fn rebase_original_head_label(git_dir: &Path) -> Option<String> {
+    for rel in ["rebase-merge/orig-head", "rebase-apply/orig-head"] {
+        if let Ok(raw) = fs::read_to_string(git_dir.join(rel)) {
+            if let Ok(oid) = ObjectId::from_hex(raw.trim()) {
+                return Some(oid.to_hex().chars().take(7).collect());
+            }
+        }
+    }
+    None
 }
 
 fn shorten_symref_target(git_dir: &Path, target: &str) -> Option<String> {
@@ -1741,6 +1766,12 @@ fn create_branch(
                 "fatal: cannot set up tracking information; starting point '{sp}' is not a branch"
             );
         }
+        if track_is_explicit(args) && !tracking_start_point_is_branch(repo, sp) {
+            eprintln!(
+                "fatal: cannot set up tracking information; starting point '{sp}' is not a branch"
+            );
+            std::process::exit(128);
+        }
     }
 
     let should_create_reflog = args.create_reflog || should_log_ref_updates(repo);
@@ -1906,6 +1937,8 @@ fn create_branch(
     if let Some(sp) = start_point {
         let remote_ref = if sp.starts_with("refs/remotes/") {
             Some(sp.to_string())
+        } else if sp.starts_with("remotes/") {
+            Some(format!("refs/{sp}"))
         } else if grit_lib::refs::resolve_ref(&repo.git_dir, &format!("refs/remotes/{sp}")).is_ok()
         {
             Some(format!("refs/remotes/{sp}"))
@@ -1915,8 +1948,11 @@ fn create_branch(
         // `--track=inherit` (or `branch.autoSetupMerge=inherit` for an untracked create) copies the
         // start point's own `branch.<sp>.remote` / `.merge` config verbatim onto the new branch
         // (Git `inherit_tracking`). Handle it before the regular DWIM tracking path. (t3200 164/165)
+        let auto_setup_merge = branch_auto_setup_merge(repo);
         let inherit_requested = args.track.as_deref() == Some("inherit")
-            || (args.track.is_none() && !args.no_track && autosetupmerge_is_inherit(repo));
+            || (args.track.is_none()
+                && !args.no_track
+                && matches!(auto_setup_merge, AutoSetupMerge::Inherit));
         if inherit_requested {
             if let Some(bare) = symbolic_full_name(repo, sp)
                 .and_then(|f| f.strip_prefix("refs/heads/").map(str::to_owned))
@@ -1933,16 +1969,39 @@ fn create_branch(
             return Ok(());
         }
 
-        let want_tracking = args.track.is_some() || (!args.no_track && remote_ref.is_some());
+        if args.track.is_none()
+            && !args.no_track
+            && remote_ref.is_none()
+            && matches!(
+                auto_setup_merge,
+                AutoSetupMerge::True | AutoSetupMerge::Always | AutoSetupMerge::Simple
+            )
+        {
+            if let Some(full) =
+                symbolic_full_name(repo, sp).filter(|f| f.starts_with("refs/heads/"))
+            {
+                let remotes = fetch_remotes_mapping_to_ref(repo, &full);
+                if remotes.len() > 1 {
+                    print_ambiguous_tracking_advice(&full, &remotes);
+                    std::process::exit(128);
+                }
+            }
+        }
+
+        let want_tracking = args.track.is_some()
+            || (!args.no_track
+                && automatic_tracking_wanted(repo, name, remote_ref.as_deref(), auto_setup_merge));
         if want_tracking {
             // Resolve the tracking pair (remote, merge-ref). `.` denotes a local-branch upstream.
             let pair: Option<(String, String)> = if let Some(rref) = remote_ref.as_deref() {
-                let stripped = rref.strip_prefix("refs/remotes/").unwrap_or(rref);
-                stripped.find('/').map(|slash| {
-                    (
-                        stripped[..slash].to_owned(),
-                        format!("refs/heads/{}", &stripped[slash + 1..]),
-                    )
+                tracking_pair_for_remote_ref(repo, rref).or_else(|| {
+                    let stripped = rref.strip_prefix("refs/remotes/").unwrap_or(rref);
+                    stripped.find('/').map(|slash| {
+                        (
+                            stripped[..slash].to_owned(),
+                            format!("refs/heads/{}", &stripped[slash + 1..]),
+                        )
+                    })
                 })
             } else if args.track.is_some() {
                 if let Ok(full) = resolve_upstream_symbolic_name(repo, sp) {
@@ -1974,7 +2033,7 @@ fn create_branch(
             // untracked branch (t3200 87, 98).
             if track_is_explicit(args) {
                 let resolves_to_branch = if let Some(rref) = remote_ref.as_deref() {
-                    grit_lib::branch_tracking::remote_tracking_ref_is_mapped(repo, rref)
+                    tracking_pair_for_remote_ref(repo, rref).is_some()
                 } else {
                     symbolic_full_name(repo, sp)
                         .map(|f| {
@@ -2064,13 +2123,196 @@ fn track_is_explicit(args: &Args) -> bool {
     matches!(args.track.as_deref(), Some("direct") | Some("override"))
 }
 
-/// True when `branch.autoSetupMerge` is set to `inherit`.
-fn autosetupmerge_is_inherit(repo: &Repository) -> bool {
-    ConfigSet::load(Some(&repo.git_dir), true)
+fn tracking_start_point_is_branch(repo: &Repository, start_point: &str) -> bool {
+    if grit_lib::refs::resolve_ref(&repo.git_dir, &format!("refs/heads/{start_point}")).is_ok() {
+        return true;
+    }
+    let remote_ref = if start_point.starts_with("refs/remotes/") {
+        Some(start_point.to_owned())
+    } else if start_point.starts_with("remotes/") {
+        Some(format!("refs/{start_point}"))
+    } else if grit_lib::refs::resolve_ref(&repo.git_dir, &format!("refs/remotes/{start_point}"))
+        .is_ok()
+    {
+        Some(format!("refs/remotes/{start_point}"))
+    } else {
+        symbolic_full_name(repo, start_point).filter(|f| f.starts_with("refs/remotes/"))
+    };
+    remote_ref
+        .as_deref()
+        .is_some_and(|rref| tracking_pair_for_remote_ref(repo, rref).is_some())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoSetupMerge {
+    False,
+    True,
+    Always,
+    Inherit,
+    Simple,
+}
+
+fn branch_auto_setup_merge(repo: &Repository) -> AutoSetupMerge {
+    match ConfigSet::load(Some(&repo.git_dir), true)
         .ok()
         .and_then(|c| c.get("branch.autosetupmerge"))
-        .map(|v| v.eq_ignore_ascii_case("inherit"))
-        .unwrap_or(false)
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("false" | "no" | "0" | "never") => AutoSetupMerge::False,
+        Some("always") => AutoSetupMerge::Always,
+        Some("inherit") => AutoSetupMerge::Inherit,
+        Some("simple") => AutoSetupMerge::Simple,
+        _ => AutoSetupMerge::True,
+    }
+}
+
+fn automatic_tracking_wanted(
+    repo: &Repository,
+    new_branch: &str,
+    remote_ref: Option<&str>,
+    mode: AutoSetupMerge,
+) -> bool {
+    match mode {
+        AutoSetupMerge::False | AutoSetupMerge::Inherit => false,
+        AutoSetupMerge::True | AutoSetupMerge::Always => remote_ref.is_some(),
+        AutoSetupMerge::Simple => {
+            remote_ref.is_some_and(|rref| simple_autosetupmerge_matches(repo, new_branch, rref))
+        }
+    }
+}
+
+fn simple_autosetupmerge_matches(repo: &Repository, new_branch: &str, remote_ref: &str) -> bool {
+    let Some(remote_tail) = remote_ref.strip_prefix("refs/remotes/") else {
+        return false;
+    };
+    let Some((_, branch_tail)) = remote_tail.split_once('/') else {
+        return false;
+    };
+    new_branch == branch_tail && remote_tracking_ref_maps_head(repo, remote_ref)
+}
+
+fn remote_tracking_ref_maps_head(repo: &Repository, tracking_ref: &str) -> bool {
+    let Ok(config) = ConfigSet::load(Some(&repo.git_dir), true) else {
+        return false;
+    };
+    config.entries().iter().any(|entry| {
+        let Some(rest) = entry.key.strip_prefix("remote.") else {
+            return false;
+        };
+        if !rest.ends_with(".fetch") {
+            return false;
+        }
+        let Some(spec) = entry.value.as_deref() else {
+            return false;
+        };
+        fetch_refspec_maps_head_to_tracking(spec, tracking_ref)
+    })
+}
+
+fn tracking_pair_for_remote_ref(repo: &Repository, tracking_ref: &str) -> Option<(String, String)> {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).ok()?;
+    for entry in config.entries() {
+        let Some(rest) = entry.key.strip_prefix("remote.") else {
+            continue;
+        };
+        let Some(remote) = rest.strip_suffix(".fetch") else {
+            continue;
+        };
+        let Some(spec) = entry.value.as_deref() else {
+            continue;
+        };
+        if let Some(merge_ref) = fetch_refspec_source_for_tracking(spec, tracking_ref) {
+            return Some((remote.to_owned(), merge_ref));
+        }
+    }
+    None
+}
+
+fn fetch_refspec_source_for_tracking(spec: &str, tracking_ref: &str) -> Option<String> {
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    let (src, dst) = spec.split_once(':')?;
+    let src = src.trim();
+    let dst = dst.trim();
+    if let Some(dst_prefix) = dst.strip_suffix('*') {
+        if !tracking_ref.starts_with(dst_prefix) || tracking_ref.len() <= dst_prefix.len() {
+            return None;
+        }
+        let suffix = &tracking_ref[dst_prefix.len()..];
+        let src_prefix = src.strip_suffix('*')?;
+        return Some(format!("{src_prefix}{suffix}"));
+    }
+    (dst == tracking_ref).then(|| src.to_owned())
+}
+
+fn fetch_refspec_maps_head_to_tracking(spec: &str, tracking_ref: &str) -> bool {
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    let Some((src, dst)) = spec.split_once(':') else {
+        return false;
+    };
+    let src = src.trim();
+    let dst = dst.trim();
+    if !src.starts_with("refs/heads/") {
+        return false;
+    }
+    if let Some(prefix) = dst.strip_suffix('*') {
+        tracking_ref.starts_with(prefix) && tracking_ref.len() > prefix.len()
+    } else {
+        dst == tracking_ref
+    }
+}
+
+fn fetch_remotes_mapping_to_ref(repo: &Repository, target_ref: &str) -> Vec<String> {
+    let Ok(config) = ConfigSet::load(Some(&repo.git_dir), true) else {
+        return Vec::new();
+    };
+    let mut remotes = Vec::new();
+    for entry in config.entries() {
+        let Some(rest) = entry.key.strip_prefix("remote.") else {
+            continue;
+        };
+        let Some(remote) = rest.strip_suffix(".fetch") else {
+            continue;
+        };
+        let Some(spec) = entry.value.as_deref() else {
+            continue;
+        };
+        if fetch_refspec_dst_matches(spec, target_ref) {
+            remotes.push(remote.to_owned());
+        }
+    }
+    remotes.sort();
+    remotes.dedup();
+    remotes
+}
+
+fn fetch_refspec_dst_matches(spec: &str, target_ref: &str) -> bool {
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    let Some((_src, dst)) = spec.split_once(':') else {
+        return false;
+    };
+    let dst = dst.trim();
+    if let Some(prefix) = dst.strip_suffix('*') {
+        target_ref.starts_with(prefix) && target_ref.len() > prefix.len()
+    } else {
+        dst == target_ref
+    }
+}
+
+fn print_ambiguous_tracking_advice(target_ref: &str, remotes: &[String]) {
+    eprintln!("fatal: not tracking: ambiguous information for ref '{target_ref}'");
+    eprintln!("hint: There are multiple remotes whose fetch refspecs map to the remote");
+    eprintln!("hint: tracking ref '{target_ref}':");
+    for remote in remotes {
+        eprintln!("hint:   {remote}");
+    }
+    eprintln!("hint:");
+    eprintln!("hint: This is typically a configuration error.");
+    eprintln!("hint:");
+    eprintln!("hint: To support setting up tracking branches, ensure that");
+    eprintln!("hint: different remotes' fetch refspecs map into different");
+    eprintln!("hint: tracking namespaces.");
 }
 
 /// The `(remote, merge)` tracking config of `branch_short`, read verbatim from
@@ -2236,13 +2478,13 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
     let branch_oid = grit_lib::refs::resolve_ref(&repo.git_dir, &refname)
         .map_err(|_| anyhow::anyhow!("branch '{name}' not found."))?;
 
-    // For -d (not -D), check if branch is merged into HEAD. When HEAD is unborn/orphan (no commit),
-    // the branch cannot be shown merged, so Git requires `-D` (t3200 42/43).
+    // For -d (not -D), check if the branch is merged into its configured upstream when it has
+    // one; otherwise check HEAD. This matters on unborn/orphan HEADs: a branch with an upstream
+    // that already contains it can still be deleted, while a branch without such a base cannot.
     if args.delete && !args.force_delete {
-        let merged = match head.oid() {
-            Some(head_oid) => is_ancestor(repo, branch_oid, *head_oid).unwrap_or(false),
-            None => false,
-        };
+        let merged = branch_delete_base_oid(repo, &name, head)
+            .map(|base_oid| is_ancestor(repo, branch_oid, base_oid).unwrap_or(false))
+            .unwrap_or(false);
         if !merged {
             bail!(
                 "error: the branch '{}' is not fully merged.\nIf you are sure you want to delete it, run 'git branch -D {}'",
@@ -2280,6 +2522,21 @@ fn delete_branch(repo: &Repository, head: &HeadState, args: &Args, name_input: &
     }
 
     Ok(())
+}
+
+fn branch_delete_base_oid(
+    repo: &Repository,
+    branch_name: &str,
+    head: &HeadState,
+) -> Option<ObjectId> {
+    if let Some(upstream_ref) =
+        grit_lib::branch_tracking::upstream_tracking_full_ref(repo, branch_name)
+    {
+        if let Ok(oid) = grit_lib::refs::resolve_ref(&repo.git_dir, &upstream_ref) {
+            return Some(oid);
+        }
+    }
+    head.oid().copied()
 }
 
 /// Remove the entire `[branch "<name>"]` config section (used after deleting a branch).
@@ -2346,6 +2603,7 @@ fn rename_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
         return Ok(());
     }
 
+    let force = args.force_rename || args.force;
     let old_ref = format!("refs/heads/{old_name}");
     let new_ref = format!("refs/heads/{new_name}");
 
@@ -2375,15 +2633,26 @@ fn rename_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
         rename_branch_config(repo, old_name, new_name)?;
         return Ok(());
     } else if branch_ref_is_unborn_across_worktrees(repo, &old_ref)? {
-        eprintln!("fatal: no commit on branch '{old_name}' yet");
-        std::process::exit(128);
+        if !force && grit_lib::refs::resolve_ref(&repo.git_dir, &new_ref).is_ok() {
+            bail!("A branch named '{new_name}' already exists.");
+        }
+        if let Some(conflict) = ref_namespace_conflict_excluding(repo, &new_ref, Some(&old_ref)) {
+            eprintln!("error: '{conflict}' exists; cannot create '{new_ref}'");
+            bail!("fatal: branch rename failed");
+        }
+        let head_update_failed = update_worktree_heads(repo, old_name, new_name)?;
+        rename_branch_config(repo, old_name, new_name)?;
+        if head_update_failed {
+            eprintln!("fatal: branch renamed to {new_name}, but HEAD is not updated");
+            std::process::exit(128);
+        }
+        return Ok(());
     } else {
         eprintln!("fatal: no branch named '{old_name}'");
         std::process::exit(128);
     };
 
     // Check if new name already exists (unless force; -M or -m -f)
-    let force = args.force_rename || args.force;
     if !force && grit_lib::refs::resolve_ref(&repo.git_dir, &new_ref).is_ok() {
         bail!("A branch named '{new_name}' already exists.");
     }
@@ -2585,29 +2854,32 @@ fn worktree_rebasing_or_bisecting_branch(
 ///
 /// Returns `Ok(true)` when at least one worktree HEAD could not be updated.
 fn update_worktree_heads(repo: &Repository, old_name: &str, new_name: &str) -> Result<bool> {
-    let worktrees_dir =
-        grit_lib::refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
-    let worktrees_dir = worktrees_dir.join("worktrees");
+    let common = grit_lib::refs::common_dir(&repo.git_dir).unwrap_or_else(|| repo.git_dir.clone());
     let expected = format!("ref: refs/heads/{old_name}");
     let mut any_failed = false;
-    if let Ok(entries) = fs::read_dir(&worktrees_dir) {
+
+    let mut admin_dirs = vec![common.clone()];
+    if let Ok(entries) = fs::read_dir(common.join("worktrees")) {
         for entry in entries.flatten() {
-            let wt_dir = entry.path();
-            let head_path = wt_dir.join("HEAD");
-            if let Ok(content) = fs::read_to_string(&head_path) {
-                if content.trim() != expected {
-                    continue;
-                }
-                // A pre-existing HEAD.lock means another process holds the ref lock; we cannot
-                // update this worktree's HEAD. Skip it and signal overall failure.
-                if wt_dir.join("HEAD.lock").exists() {
-                    any_failed = true;
-                    continue;
-                }
-                let new_content = format!("ref: refs/heads/{new_name}\n");
-                if fs::write(&head_path, new_content).is_err() {
-                    any_failed = true;
-                }
+            admin_dirs.push(entry.path());
+        }
+    }
+
+    for wt_dir in admin_dirs {
+        let head_path = wt_dir.join("HEAD");
+        if let Ok(content) = fs::read_to_string(&head_path) {
+            if content.trim() != expected {
+                continue;
+            }
+            // A pre-existing HEAD.lock means another process holds the ref lock; we cannot update
+            // this worktree's HEAD. Skip it and signal overall failure.
+            if wt_dir.join("HEAD.lock").exists() {
+                any_failed = true;
+                continue;
+            }
+            let new_content = format!("ref: refs/heads/{new_name}\n");
+            if fs::write(&head_path, new_content).is_err() {
+                any_failed = true;
             }
         }
     }
@@ -2852,40 +3124,74 @@ fn copy_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
         }
     }
 
-    // Copy config section
+    copy_branch_config(repo, src_name, dst_name)?;
+
+    Ok(())
+}
+
+fn copy_branch_config(repo: &Repository, src_name: &str, dst_name: &str) -> Result<()> {
     let config_path = repo.git_dir.join("config");
-    if let Ok(content) = fs::read_to_string(&config_path) {
-        let old_section = format!("[branch \"{src_name}\"]");
-        let new_section = format!("[branch \"{dst_name}\"]");
-        if content.contains(&old_section) {
-            // Extract the section and duplicate it
-            let mut result = content.clone();
-            let mut section_text = String::new();
-            let mut in_section = false;
-            for line in content.lines() {
-                if line.trim() == old_section.trim() {
-                    in_section = true;
-                    section_text.push_str(&new_section);
-                    section_text.push('\n');
-                    continue;
-                }
-                if in_section {
-                    if line.starts_with('[') {
-                        in_section = false;
-                    } else {
-                        section_text.push_str(line);
-                        section_text.push('\n');
-                    }
-                }
-            }
-            if !section_text.is_empty() {
-                result.push('\n');
-                result.push_str(&section_text);
-                let _ = fs::write(&config_path, result);
-            }
-        }
+    let Ok(content) = fs::read_to_string(&config_path) else {
+        return Ok(());
+    };
+    let old_section = format!("[branch \"{src_name}\"]");
+    let new_section = format!("[branch \"{dst_name}\"]");
+    if !content.contains(&old_section) {
+        return Ok(());
     }
 
+    let mut out = String::new();
+    let mut duplicate: Option<(Vec<String>, Vec<String>)> = None;
+    for line in content.lines() {
+        if line.trim() == old_section {
+            out.push_str(line);
+            out.push('\n');
+            duplicate = Some((vec![new_section.clone()], Vec::new()));
+            continue;
+        }
+
+        if line.starts_with('[') {
+            if let Some((block, trailing)) = duplicate.take() {
+                for dup_line in block {
+                    out.push_str(&dup_line);
+                    out.push('\n');
+                }
+                for trailing_line in trailing {
+                    out.push_str(&trailing_line);
+                    out.push('\n');
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if let Some((block, trailing)) = duplicate.as_mut() {
+            // Top-level comments and blank lines between sections are leading material for the
+            // following section in Git's config writer. Keep them in place before inserting the
+            // copied branch section, and then repeat them before the following original section.
+            let is_top_level_comment =
+                line.starts_with(';') || line.starts_with('#') || line.trim().is_empty();
+            if is_top_level_comment {
+                trailing.push(line.to_owned());
+            } else {
+                block.push(line.to_owned());
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if let Some((block, trailing)) = duplicate.take() {
+        for dup_line in block {
+            out.push_str(&dup_line);
+            out.push('\n');
+        }
+        for trailing_line in trailing {
+            out.push_str(&trailing_line);
+            out.push('\n');
+        }
+    }
+    fs::write(config_path, out)?;
     Ok(())
 }
 

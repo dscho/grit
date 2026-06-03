@@ -33,7 +33,12 @@
   - Completed: `t3040-subprojects-basic.sh` (11/11) after rerunning with the current binary; the
     prior foundational fixes left the subproject fixture green.
   - Foundational group sweep verified: `t3000`, `t3050`, `t3030`, and `t3040` all pass.
-  - Current focus: `t3200-branch.sh` (167 total, 147 passed, 20 failing), first file in the
+  - Completed: `t3200-branch.sh` (167/167) after fixing branch rename across main/linked
+    worktree HEADs, unborn branch renames, branch deletion merge-base selection, optional
+    `--abbrev` parsing, ordered branch config copying, self-referential symref verification,
+    `branch.autoSetupMerge=simple`, ambiguous tracking advice, rebase-aware detached branch
+    listings, explicit tracking validation side effects, and remote-tracking refspec merge names.
+  - Current focus: `t3207-branch-submodule.sh` (20 total, 2 passed, 18 failing), next in the
     branch/refs/range-diff/pack-refs group.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
