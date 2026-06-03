@@ -1,3 +1,7 @@
+## 2026-06-03 — t12350-config-worktree-scope
+
+- Focus harness: `./scripts/run-tests.sh t12350-config-worktree-scope.sh --verbose` passes 33/33 after wrapping the setup `cd repo` in a subshell and correcting the synthetic `--worktree` expectations to match Git's fallback to local config without `extensions.worktreeConfig`.
+
 ## 2026-06-02 — t1 config kickoff
 
 - Focus harness: `./scripts/run-tests.sh t1300-config.sh --verbose` improved from 287/497 to 442/497 after config compatibility fixes for bare-key regexp output, empty boolean values, `GIT_CONFIG`, `--null`, stdin-write rejection, old-style dotted subsection handling, section rename/remove behavior, negative numeric config writes, expiry-date parsing, path diagnostics, color default/error handling, alias global-option expansion, quote-aware `GIT_CONFIG_PARAMETERS`, validated `GIT_CONFIG_COUNT`, `--config-env` keys containing equals, config diagnostic wording, legacy `--edit`, malformed key rejection, URL section-only matching, and origin/scope prefixes for config output, `-c` validation for empty keys/core.bare booleans, scoped include behavior, get-subcommand origin/scope flags, and type option/list filtering semantics, suffixed boolean parsing, typed default diagnostics, and system/global/local config scope behavior, and invalid mergeoptions parsing, and blob origin/scope config output. Remaining failures are tracked under the t1 family work.
