@@ -4049,7 +4049,7 @@ pub fn run(mut args: Args) -> Result<()> {
     validate_log_pickaxe_options(&repo, &args)?;
 
     if let Some(ref fmt) = args.format {
-        let resolved = resolve_pretty_alias_with_config(fmt, &repo);
+        let resolved = resolve_pretty_alias_checked(fmt, &repo)?;
         if resolved != *fmt {
             args.format = Some(resolved);
         }
@@ -4181,7 +4181,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Resolve pretty format aliases from config
     if let Some(ref fmt) = args.format {
-        let resolved = resolve_pretty_alias_with_config(fmt, &repo);
+        let resolved = resolve_pretty_alias_checked(fmt, &repo)?;
         if resolved != *fmt {
             args.format = Some(resolved);
         }
@@ -8075,6 +8075,113 @@ fn format_commit(
 }
 
 /// Apply a format string with placeholders like %H, %h, %s, %an, %ae, etc.
+/// Expand the `%xNN`, `%n`, `%t`, `%%` escapes that appear in trailer
+/// separator values (Git's `format_trailer_match` / `strbuf_expand`).
+fn expand_trailer_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('x') => {
+                chars.next();
+                let mut hx = String::new();
+                for _ in 0..2 {
+                    if let Some(&d) = chars.peek() {
+                        if d.is_ascii_hexdigit() {
+                            hx.push(d);
+                            chars.next();
+                        }
+                    }
+                }
+                if let Ok(b) = u8::from_str_radix(&hx, 16) {
+                    out.push(b as char);
+                }
+            }
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            _ => out.push('%'),
+        }
+    }
+    out
+}
+
+/// Parse the option string of a `%(trailers...)` placeholder (the part after
+/// `trailers`, beginning with an optional `:`). Returns `None` on an invalid
+/// option so the caller can emit the placeholder literally (matching Git).
+fn parse_trailers_opts(rest: &str) -> Option<grit_lib::commit_trailers::TrailerOpts> {
+    use grit_lib::commit_trailers::TrailerOpts;
+    let mut opts = TrailerOpts::default();
+    let body = match rest.strip_prefix(':') {
+        Some(b) => b,
+        None => {
+            // `%(trailers)` with no colon: default options.
+            if rest.is_empty() {
+                return Some(opts);
+            }
+            // e.g. `%(trailersfoo)` — not a valid placeholder.
+            return None;
+        }
+    };
+    if body.is_empty() {
+        return Some(opts);
+    }
+    let mut explicit_only: Option<bool> = None;
+    let mut has_key_filter = false;
+    for tok in body.split(',') {
+        let (name, value) = match tok.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (tok, None),
+        };
+        let truthy = |v: Option<&str>| -> bool {
+            matches!(
+                v,
+                None | Some("yes") | Some("true") | Some("on") | Some("1") | Some("")
+            )
+        };
+        match name {
+            "only" => explicit_only = Some(truthy(value)),
+            "unfold" => opts.unfold = truthy(value),
+            "keyonly" => opts.keyonly = truthy(value),
+            "valueonly" => opts.valueonly = truthy(value),
+            "key" => {
+                let v = value?; // `key` without value is an error.
+                let mut k = v.to_owned();
+                // A trailing `:` on the key is tolerated (test 75).
+                if let Some(stripped) = k.strip_suffix(':') {
+                    k = stripped.to_owned();
+                }
+                opts.filter_keys.push(k);
+                has_key_filter = true;
+            }
+            "separator" => {
+                opts.separator = expand_trailer_value(value.unwrap_or(""));
+            }
+            "key_value_separator" => {
+                opts.key_value_separator = expand_trailer_value(value.unwrap_or(""));
+            }
+            _ => return None,
+        }
+    }
+    // Git: a key filter turns on only_trailers unless overridden by an explicit
+    // only=no.
+    opts.only_trailers = explicit_only.unwrap_or(has_key_filter);
+    Some(opts)
+}
+
 fn apply_format_string(
     template: &str,
     oid: &ObjectId,
@@ -8115,29 +8222,89 @@ fn apply_format_string(
         trunc: Trunc,
         absolute: bool,
     }
+    // Git-style display width of a single character: control characters render
+    // with zero columns, wide characters with two, everything else with one.
+    fn char_display_width(c: char) -> usize {
+        let cp = c as u32;
+        if cp < 0x20 || cp == 0x7f {
+            0
+        } else {
+            1
+        }
+    }
+    fn display_width(s: &str) -> usize {
+        s.chars().map(char_display_width).sum()
+    }
     fn apply_col(spec: &ColSpec, s: &str) -> String {
-        let char_len = s.chars().count();
+        let char_len = display_width(s);
         if char_len > spec.width {
+            // Truncation operates on display columns; leading zero-width control
+            // characters are preserved and do not count toward the budget.
             match spec.trunc {
                 Trunc::None => s.to_owned(),
                 Trunc::Trunc => {
-                    let mut out: String = s.chars().take(spec.width.saturating_sub(2)).collect();
+                    let budget = spec.width.saturating_sub(2);
+                    let mut out = String::new();
+                    let mut used = 0usize;
+                    for c in s.chars() {
+                        let w = char_display_width(c);
+                        if used + w > budget {
+                            break;
+                        }
+                        out.push(c);
+                        used += w;
+                    }
                     out.push_str("..");
                     out
                 }
                 Trunc::LTrunc => {
-                    let skip = char_len - spec.width + 2;
+                    // Skip from the left until the remaining display width fits.
+                    let target = spec.width.saturating_sub(2);
+                    let chars: Vec<char> = s.chars().collect();
+                    // Find the smallest suffix whose display width <= target.
+                    let mut idx = chars.len();
+                    let mut acc = 0usize;
+                    while idx > 0 {
+                        let w = char_display_width(chars[idx - 1]);
+                        if acc + w > target {
+                            break;
+                        }
+                        acc += w;
+                        idx -= 1;
+                    }
                     let mut out = String::from("..");
-                    out.extend(s.chars().skip(skip));
+                    out.extend(chars[idx..].iter());
                     out
                 }
                 Trunc::MTrunc => {
                     let keep = spec.width.saturating_sub(2);
-                    let left = keep / 2;
-                    let right = keep - left;
-                    let mut out: String = s.chars().take(left).collect();
+                    let left_budget = keep / 2;
+                    let right_budget = keep - left_budget;
+                    let chars: Vec<char> = s.chars().collect();
+                    let mut out = String::new();
+                    let mut used = 0usize;
+                    let mut li = 0usize;
+                    while li < chars.len() {
+                        let w = char_display_width(chars[li]);
+                        if used + w > left_budget {
+                            break;
+                        }
+                        out.push(chars[li]);
+                        used += w;
+                        li += 1;
+                    }
                     out.push_str("..");
-                    out.extend(s.chars().skip(char_len - right));
+                    let mut ri = chars.len();
+                    let mut racc = 0usize;
+                    while ri > li {
+                        let w = char_display_width(chars[ri - 1]);
+                        if racc + w > right_budget {
+                            break;
+                        }
+                        racc += w;
+                        ri -= 1;
+                    }
+                    out.extend(chars[ri..].iter());
                     out
                 }
             }
@@ -8234,9 +8401,12 @@ fn apply_format_string(
         } else {
             Trunc::None
         };
-        if chars.peek() == Some(&')') {
-            chars.next();
+        // A valid directive must be terminated by `)`. If it is missing, Git
+        // treats the whole `%<(...` run as a literal; signal that with None.
+        if chars.peek() != Some(&')') {
+            return None;
         }
+        chars.next();
         Some(ColSpec {
             width,
             align,
@@ -8251,31 +8421,67 @@ fn apply_format_string(
 
     while let Some(ch) = chars.next() {
         if ch == '%' {
-            // Check alignment directives
+            // Check alignment directives. Parse against a clone so a malformed
+            // directive (e.g. a missing `)`) can be re-emitted literally without
+            // having consumed any input (Git pretty.c behavior).
             if chars.peek() == Some(&'<') {
-                chars.next();
-                if let Some(spec) = parse_col_spec(&mut chars, Align::Left) {
+                let mut probe = chars.clone();
+                probe.next(); // consume '<'
+                if let Some(spec) = parse_col_spec(&mut probe, Align::Left) {
+                    chars = probe;
                     pending_col = Some(spec);
+                } else {
+                    result.push('%');
                 }
                 continue;
             }
             if chars.peek() == Some(&'>') {
-                chars.next();
-                if chars.peek() == Some(&'<') {
-                    chars.next();
-                    if let Some(spec) = parse_col_spec(&mut chars, Align::Center) {
-                        pending_col = Some(spec);
-                    }
-                } else if chars.peek() == Some(&'>') {
-                    chars.next();
-                    if let Some(spec) = parse_col_spec(&mut chars, Align::Right) {
-                        pending_col = Some(spec);
-                    }
-                } else if let Some(spec) = parse_col_spec(&mut chars, Align::Right) {
+                let mut probe = chars.clone();
+                probe.next(); // consume '>'
+                let parsed = if probe.peek() == Some(&'<') {
+                    probe.next();
+                    parse_col_spec(&mut probe, Align::Center)
+                } else if probe.peek() == Some(&'>') {
+                    probe.next();
+                    parse_col_spec(&mut probe, Align::Right)
+                } else {
+                    parse_col_spec(&mut probe, Align::Right)
+                };
+                if let Some(spec) = parsed {
+                    chars = probe;
                     pending_col = Some(spec);
+                } else {
+                    result.push('%');
                 }
                 continue;
             }
+
+            // Add/space/del magic: %+<placeholder>, % <placeholder>, %-<placeholder>.
+            // The magic conditionally adjusts whitespace around the next
+            // placeholder's output (Git pretty.c add_lf/add_sp/del_lf).
+            #[derive(Clone, Copy, PartialEq)]
+            enum Magic {
+                None,
+                AddLf,
+                AddSp,
+                DelLf,
+            }
+            let magic = match chars.peek() {
+                Some('+') => {
+                    chars.next();
+                    Magic::AddLf
+                }
+                Some(' ') => {
+                    chars.next();
+                    Magic::AddSp
+                }
+                Some('-') => {
+                    chars.next();
+                    Magic::DelLf
+                }
+                _ => Magic::None,
+            };
+            let magic_start = result.len();
 
             let col_start = if pending_col.is_some() {
                 result.len()
@@ -8389,6 +8595,10 @@ fn apply_format_string(
                             chars.next();
                             result.push_str(&format_date_with_mode(&info.author, Some("relative")));
                         }
+                        Some('h') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&info.author, Some("human")));
+                        }
                         _ => result.push_str("%a"),
                     }
                 }
@@ -8469,6 +8679,10 @@ fn apply_format_string(
                                 &info.committer,
                                 Some("relative"),
                             ));
+                        }
+                        Some('h') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&info.committer, Some("human")));
                         }
                         _ => result.push_str("%c"),
                     }
@@ -8724,7 +8938,70 @@ fn apply_format_string(
                         result.push('%');
                     }
                 }
+                Some('(') => {
+                    // Extended placeholders: %(trailers:...), %(describe:...),
+                    // %(decorate:...). Capture the balanced `(...)` payload.
+                    let mut look = chars.clone();
+                    look.next(); // consume '('
+                    let mut inner = String::new();
+                    let mut closed = false;
+                    for c in look.by_ref() {
+                        if c == ')' {
+                            closed = true;
+                            break;
+                        }
+                        inner.push(c);
+                    }
+                    if !closed {
+                        // Malformed: emit literally.
+                        result.push('%');
+                    } else if let Some(rest) = inner.strip_prefix("trailers") {
+                        // Advance the real iterator past `(...)`.
+                        chars = look;
+                        if let Some(opts) = parse_trailers_opts(rest) {
+                            let formatted =
+                                grit_lib::commit_trailers::format_trailers(&info.message, &opts);
+                            result.push_str(&formatted);
+                        } else {
+                            // Invalid option (e.g. `key` without value): emit literally.
+                            result.push_str(&format!("%({inner})"));
+                        }
+                    } else {
+                        // Unhandled extended placeholder (describe/decorate): emit literally.
+                        result.push('%');
+                    }
+                }
                 _ => result.push('%'),
+            }
+            // Apply add/space/del magic to the just-produced placeholder output.
+            if magic != Magic::None {
+                let produced_empty = result.len() == magic_start;
+                match magic {
+                    Magic::AddLf => {
+                        if !produced_empty {
+                            result.insert(magic_start, '\n');
+                        }
+                    }
+                    Magic::AddSp => {
+                        if !produced_empty {
+                            result.insert(magic_start, ' ');
+                        }
+                    }
+                    Magic::DelLf => {
+                        if !produced_empty {
+                            // Remove a run of trailing newlines that immediately
+                            // precede this placeholder's output.
+                            let mut cut = magic_start;
+                            while cut > 0 && result.as_bytes()[cut - 1] == b'\n' {
+                                cut -= 1;
+                            }
+                            if cut < magic_start {
+                                result.replace_range(cut..magic_start, "");
+                            }
+                        }
+                    }
+                    Magic::None => {}
+                }
             }
             // Apply pending column formatting
             if let Some(spec) = pending_col.take() {
@@ -8733,7 +9010,7 @@ fn apply_format_string(
                 if spec.absolute {
                     // Absolute column: pad from start of current line to target column
                     let line_start = result.rfind('\n').map(|p| p + 1).unwrap_or(0);
-                    let current_col = result[line_start..].chars().count();
+                    let current_col = display_width(&result[line_start..]);
                     let target_width = spec.width.saturating_sub(current_col);
                     let mut adjusted_spec = ColSpec {
                         width: target_width,
@@ -8742,8 +9019,8 @@ fn apply_format_string(
                         absolute: false,
                     };
                     // For absolute positioning, ensure minimum width matches the value length
-                    if target_width < added.chars().count() {
-                        adjusted_spec.width = added.chars().count();
+                    if target_width < display_width(&added) {
+                        adjusted_spec.width = display_width(&added);
                     }
                     result.push_str(&apply_col(&adjusted_spec, &added));
                 } else {
@@ -10811,33 +11088,62 @@ pub(crate) fn resolve_pretty_alias_with_config(fmt: &str, repo: &Repository) -> 
         return fmt.to_string();
     }
 
-    // Try to resolve from config, with loop detection
+    match resolve_pretty_alias_checked(fmt, repo) {
+        Ok(v) => v,
+        // Fall back to the original string for non-fatal callers (e.g. show).
+        Err(_) => fmt.to_string(),
+    }
+}
+
+/// Like [`resolve_pretty_alias_with_config`] but returns an error (matching
+/// Git's `fatal: invalid --pretty format`) when the name resolves to neither a
+/// builtin, a `format:`/`tformat:` string, an existing `pretty.<name>` alias,
+/// nor an inline format (containing `%`); also errors on an alias cycle.
+pub(crate) fn resolve_pretty_alias_checked(fmt: &str, repo: &Repository) -> Result<String> {
+    match fmt {
+        "oneline" | "short" | "medium" | "full" | "fuller" | "reference" | "email" | "raw"
+        | "mboxrd" => return Ok(fmt.to_string()),
+        _ => {}
+    }
+    if fmt.starts_with("format:") || fmt.starts_with("tformat:") {
+        return Ok(fmt.to_string());
+    }
+
     let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
     let mut visited = std::collections::HashSet::new();
     let mut current = fmt.to_string();
 
     loop {
-        if visited.contains(&current) {
-            return current;
+        if !visited.insert(current.clone()) {
+            // Cycle among aliases.
+            return Err(anyhow::anyhow!("invalid --pretty format: {fmt}"));
         }
-        visited.insert(current.clone());
 
-        let key = format!("pretty.{}", current);
+        let key = format!("pretty.{current}");
         if let Some(value) = config.get(&key) {
             match value.as_str() {
                 "oneline" | "short" | "medium" | "full" | "fuller" | "reference" | "email"
                 | "raw" | "mboxrd" => {
-                    return value;
+                    return Ok(value);
                 }
                 v if v.starts_with("format:") || v.starts_with("tformat:") => {
-                    return value;
+                    return Ok(value);
                 }
                 _ => {
                     current = value;
                 }
             }
+        } else if current.contains('%') {
+            // An inline format string (implicit tformat): not an alias.
+            return Ok(current);
+        } else if current == fmt {
+            // The user-supplied name is not a builtin, not an alias, and has no
+            // format placeholder: Git rejects it.
+            return Err(anyhow::anyhow!("invalid --pretty format: {fmt}"));
         } else {
-            return current;
+            // A previous alias resolved to a terminal name that is itself
+            // neither a builtin nor a known alias: fatal.
+            return Err(anyhow::anyhow!("invalid --pretty format: {current}"));
         }
     }
 }
