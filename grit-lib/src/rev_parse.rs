@@ -849,7 +849,7 @@ pub fn split_triple_dot_range(spec: &str) -> Option<(&str, &str)> {
 /// Like [`resolve_revision`], but does not treat a bare filename as an index path
 /// (matches `git rev-parse` / plumbing, where `file.txt` stays ambiguous).
 pub fn resolve_revision_without_index_dwim(repo: &Repository, spec: &str) -> Result<ObjectId> {
-    resolve_revision_impl(repo, spec, false, false, true, false, false, false, true)
+    resolve_revision_impl(repo, spec, false, false, true, false, false, false, false)
 }
 
 /// Resolve a revision string to an object ID.

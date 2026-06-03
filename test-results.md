@@ -1,3 +1,14 @@
+## 2026-06-03 — t3207-branch-submodule
+
+- Focus harness: `./scripts/run-tests.sh t3207-branch-submodule.sh` passes 20/20 after adding
+  recursive branch propagation into active initialized submodules and restoring the upstream test
+  cleanup structure.
+- Adjacent verification: `./scripts/run-tests.sh t3200-branch.sh t3201-branch-contains.sh
+  t3202-show-branch.sh` passes; `t3203-branch-output.sh` remains at its pre-existing 30/41 for a
+  later focused pass.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t1300-config --config-env partial
 
 - Focus harness improved from 366/497 to 372/497 after adding global `--config-env` support, including keys containing `=`. Remaining failures are broader config parsing/formatting/type edge cases.

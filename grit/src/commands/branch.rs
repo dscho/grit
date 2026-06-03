@@ -10,9 +10,10 @@ use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::diff::zero_oid;
+use grit_lib::index::MODE_GITLINK;
 use grit_lib::merge_base::count_symmetric_ahead_behind;
 use grit_lib::merge_base::is_ancestor;
-use grit_lib::objects::{parse_commit, parse_tag, ObjectId, ObjectKind};
+use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse::{
@@ -130,6 +131,10 @@ pub struct Args {
     /// Do not set up tracking.
     #[arg(long = "no-track")]
     pub no_track: bool,
+
+    /// Propagate branch creation into active submodules.
+    #[arg(long = "recurse-submodules")]
+    pub recurse_submodules: bool,
 
     /// Show the current branch name.
     #[arg(long = "show-current")]
@@ -339,6 +344,10 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     if args.delete || args.force_delete {
+        if args.recurse_submodules {
+            eprintln!("fatal: --recurse-submodules can only be used to create branches");
+            std::process::exit(128);
+        }
         return delete_branches(&repo, &head, &args);
     }
 
@@ -360,6 +369,15 @@ pub fn run(args: Args) -> Result<()> {
         {
             // Reject invalid branch names (Git `check_branch_ref` / `die` + advice.refSyntax hint).
             validate_new_branch_name_or_die(&repo, name);
+            if branch_creation_recurse_submodules(&repo, &args) {
+                return create_branch_recursing_submodules(
+                    &repo,
+                    &head,
+                    name,
+                    args.start_point.as_deref(),
+                    &args,
+                );
+            }
             return create_branch(&repo, &head, name, args.start_point.as_deref(), &args);
         }
     }
@@ -1664,6 +1682,349 @@ fn format_branch(
     expand_branch_format(&ctx, fmt, omit_empty).map_err(|e| match e {
         BranchFormatError::Fatal(m) => BranchListError::FormatFatal(m),
     })
+}
+
+fn branch_creation_recurse_submodules(repo: &Repository, args: &Args) -> bool {
+    if args.recurse_submodules {
+        return true;
+    }
+    if args.delete
+        || args.force_delete
+        || args.rename
+        || args.force_rename
+        || args.copy
+        || args.force_copy
+    {
+        return false;
+    }
+    ConfigSet::load(Some(&repo.git_dir), true)
+        .ok()
+        .and_then(|cfg| {
+            cfg.get_bool("submodule.recurse")
+                .or_else(|| cfg.get_bool("submodule.Recurse"))
+                .and_then(|r| r.ok())
+        })
+        .unwrap_or(false)
+}
+
+fn create_branch_recursing_submodules(
+    repo: &Repository,
+    head: &HeadState,
+    name: &str,
+    start_point: Option<&str>,
+    args: &Args,
+) -> Result<()> {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let propagate = config
+        .get_bool("submodule.propagatebranches")
+        .or_else(|| config.get_bool("submodule.propagateBranches"));
+    if propagate != Some(Ok(true)) {
+        eprintln!(
+            "fatal: branch with --recurse-submodules can only be used if submodule.propagateBranches is enabled"
+        );
+        std::process::exit(128);
+    }
+    let start_oid = match start_point {
+        Some(rev) => {
+            resolve_revision(repo, rev).with_context(|| format!("resolving start point {rev}"))?
+        }
+        None => *head
+            .oid()
+            .ok_or_else(|| anyhow::anyhow!("not a valid object name: 'HEAD'"))?,
+    };
+    let submodules = collect_branch_submodules(repo, start_oid)?;
+    if !args.force
+        && grit_lib::refs::resolve_ref(&repo.git_dir, &format!("refs/heads/{name}")).ok()
+            == Some(start_oid)
+        && submodules
+            .iter()
+            .all(|sub| submodule_branch_matches_recursive(&sub.repo, name, sub.commit_oid))
+    {
+        return Ok(());
+    }
+    for sub in &submodules {
+        preflight_submodule_branch(&sub.repo, name, args.force)?;
+    }
+    create_branch(repo, head, name, start_point, args)?;
+    for sub in &submodules {
+        if let Err(err) =
+            create_submodule_branch_recursive(&sub.repo, name, sub.commit_oid, start_point, args)
+        {
+            rollback_recurse_branch(repo, name);
+            rollback_submodule_branches(&submodules, name);
+            return Err(err);
+        }
+    }
+    Ok(())
+}
+
+fn rollback_recurse_branch(repo: &Repository, name: &str) {
+    let refname = format!("refs/heads/{name}");
+    let _ = grit_lib::refs::delete_ref(&repo.git_dir, &refname);
+}
+
+fn rollback_submodule_branches(submodules: &[BranchSubmodule], name: &str) {
+    for sub in submodules {
+        rollback_recurse_branch(&sub.repo, name);
+        if let Ok(nested) = collect_branch_submodules(&sub.repo, sub.commit_oid) {
+            rollback_submodule_branches(&nested, name);
+        }
+    }
+}
+
+fn submodule_branch_matches_recursive(repo: &Repository, name: &str, commit_oid: ObjectId) -> bool {
+    let refname = format!("refs/heads/{name}");
+    if grit_lib::refs::resolve_ref(&repo.git_dir, &refname).ok() != Some(commit_oid) {
+        return false;
+    }
+    collect_branch_submodules(repo, commit_oid)
+        .map(|subs| {
+            subs.into_iter()
+                .all(|sub| submodule_branch_matches_recursive(&sub.repo, name, sub.commit_oid))
+        })
+        .unwrap_or(false)
+}
+
+struct BranchSubmodule {
+    repo: Repository,
+    commit_oid: ObjectId,
+}
+
+fn preflight_submodule_branch(repo: &Repository, name: &str, force: bool) -> Result<()> {
+    let refname = format!("refs/heads/{name}");
+    if !force && grit_lib::refs::resolve_ref(&repo.git_dir, &refname).is_ok() {
+        bail!(
+            "submodule '{}': fatal: a branch named '{name}' already exists",
+            submodule_display_path(repo)
+        );
+    }
+    Ok(())
+}
+
+fn submodule_display_path(repo: &Repository) -> String {
+    repo.work_tree
+        .as_deref()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "submodule".to_owned())
+}
+
+fn create_submodule_branch_recursive(
+    repo: &Repository,
+    name: &str,
+    commit_oid: ObjectId,
+    start_point: Option<&str>,
+    args: &Args,
+) -> Result<()> {
+    let refname = format!("refs/heads/{name}");
+    grit_lib::refs::write_ref(&repo.git_dir, &refname, &commit_oid)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    configure_submodule_tracking(repo, name, start_point, args);
+    let nested = collect_branch_submodules(repo, commit_oid)?;
+    for sub in &nested {
+        preflight_submodule_branch(&sub.repo, name, args.force)?;
+    }
+    for sub in nested {
+        create_submodule_branch_recursive(&sub.repo, name, sub.commit_oid, start_point, args)?;
+    }
+    Ok(())
+}
+
+fn configure_submodule_tracking(
+    repo: &Repository,
+    name: &str,
+    start_point: Option<&str>,
+    args: &Args,
+) {
+    if args.no_track {
+        return;
+    }
+    if args.track.as_deref() == Some("inherit") {
+        if let Some(sp) = start_point {
+            if let Some((remote, merge_ref)) = inherited_tracking(repo, sp) {
+                let _ = write_branch_tracking_config(repo, name, &remote, &merge_ref);
+            }
+        }
+        return;
+    }
+    let Some(sp) = start_point else {
+        return;
+    };
+    let auto = branch_auto_setup_merge(repo);
+    let explicit = track_is_explicit(args);
+    if explicit || matches!(auto, AutoSetupMerge::Always) {
+        if grit_lib::refs::resolve_ref(&repo.git_dir, &format!("refs/heads/{sp}")).is_ok() {
+            let _ = write_branch_tracking_config(repo, name, ".", &format!("refs/heads/{sp}"));
+            return;
+        }
+    }
+    if explicit || args.track.is_none() {
+        if let Some((remote, merge_ref)) = submodule_remote_tracking_pair(repo, sp) {
+            let _ = write_branch_tracking_config(repo, name, &remote, &merge_ref);
+        }
+    }
+}
+
+fn submodule_remote_tracking_pair(repo: &Repository, sp: &str) -> Option<(String, String)> {
+    let remote_ref = if sp.starts_with("refs/remotes/") {
+        sp.to_owned()
+    } else if sp.starts_with("remotes/") {
+        format!("refs/{sp}")
+    } else {
+        format!("refs/remotes/{sp}")
+    };
+    tracking_pair_for_remote_ref(repo, &remote_ref)
+}
+
+fn collect_branch_submodules(
+    repo: &Repository,
+    commit_oid: ObjectId,
+) -> Result<Vec<BranchSubmodule>> {
+    let Some(work_tree) = repo.work_tree.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let gitlinks = gitlinks_for_commit(repo, commit_oid)?;
+    let modules = gitmodules_for_commit(repo, commit_oid)?;
+    let mut out = Vec::new();
+    for (path, oid) in gitlinks {
+        let Some(name) = modules.get(&path) else {
+            continue;
+        };
+        if !branch_submodule_is_active(&config, name, &path) {
+            continue;
+        }
+        let sub_wt = work_tree.join(&path);
+        let dot_git = sub_wt.join(".git");
+        let Ok(git_dir) = grit_lib::repo::resolve_dot_git(&dot_git) else {
+            bail!("fatal: submodule '{path}': unable to find submodule");
+        };
+        let sub_repo = Repository::open(&git_dir, Some(&sub_wt))
+            .map_err(|_| anyhow::anyhow!("fatal: submodule '{path}': unable to find submodule"))?;
+        out.push(BranchSubmodule {
+            repo: sub_repo,
+            commit_oid: oid,
+        });
+    }
+    Ok(out)
+}
+
+fn branch_submodule_is_active(config: &ConfigSet, name: &str, path: &str) -> bool {
+    let active_key = format!("submodule.{name}.active");
+    if let Some(res) = config.get_bool(&active_key) {
+        return res.unwrap_or(false);
+    }
+    let patterns = config.get_all("submodule.active");
+    if !patterns.is_empty() {
+        return patterns
+            .iter()
+            .any(|pattern| grit_lib::pathspec::pathspec_matches(pattern, path));
+    }
+    true
+}
+
+fn commit_tree_oid(repo: &Repository, oid: ObjectId) -> Result<ObjectId> {
+    let obj = repo.odb.read(&oid)?;
+    match obj.kind {
+        ObjectKind::Commit => Ok(parse_commit(&obj.data)?.tree),
+        ObjectKind::Tree => Ok(oid),
+        _ => bail!("object {oid} is not a commit or tree"),
+    }
+}
+
+fn gitlinks_for_commit(repo: &Repository, commit_oid: ObjectId) -> Result<Vec<(String, ObjectId)>> {
+    let tree_oid = commit_tree_oid(repo, commit_oid)?;
+    let mut out = Vec::new();
+    collect_gitlinks_from_tree(repo, tree_oid, "", &mut out)?;
+    Ok(out)
+}
+
+fn collect_gitlinks_from_tree(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    prefix: &str,
+    out: &mut Vec<(String, ObjectId)>,
+) -> Result<()> {
+    let obj = repo.odb.read(&tree_oid)?;
+    if obj.kind != ObjectKind::Tree {
+        return Ok(());
+    }
+    for entry in parse_tree(&obj.data)? {
+        let name = String::from_utf8_lossy(&entry.name);
+        let path = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.mode == MODE_GITLINK {
+            out.push((path, entry.oid));
+        } else if entry.mode == 0o040000 {
+            collect_gitlinks_from_tree(repo, entry.oid, &path, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn gitmodules_for_commit(
+    repo: &Repository,
+    commit_oid: ObjectId,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let tree_oid = commit_tree_oid(repo, commit_oid)?;
+    let Some(blob) = tree_blob_at_path(repo, tree_oid, ".gitmodules")? else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    let obj = repo.odb.read(&blob)?;
+    let content = String::from_utf8_lossy(&obj.data);
+    let parsed = ConfigFile::parse(Path::new(".gitmodules"), &content, ConfigScope::Local)?;
+    let mut by_name: std::collections::BTreeMap<String, (Option<String>, Option<String>)> =
+        std::collections::BTreeMap::new();
+    for entry in parsed.entries {
+        let Some(rest) = entry.key.strip_prefix("submodule.") else {
+            continue;
+        };
+        let Some(dot) = rest.rfind('.') else {
+            continue;
+        };
+        let slot = by_name.entry(rest[..dot].to_owned()).or_default();
+        match &rest[dot + 1..] {
+            "path" => slot.0 = entry.value,
+            "url" => slot.1 = entry.value,
+            _ => {}
+        }
+    }
+    Ok(by_name
+        .into_iter()
+        .filter_map(|(name, (path, url))| {
+            url?;
+            path.map(|p| (p.trim_end_matches('/').replace('\\', "/"), name))
+        })
+        .collect())
+}
+
+fn tree_blob_at_path(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    path: &str,
+) -> Result<Option<ObjectId>> {
+    let mut current = tree_oid;
+    let mut parts = path.split('/').peekable();
+    while let Some(part) = parts.next() {
+        let obj = repo.odb.read(&current)?;
+        if obj.kind != ObjectKind::Tree {
+            return Ok(None);
+        }
+        let Some(entry) = parse_tree(&obj.data)?
+            .into_iter()
+            .find(|e| e.name == part.as_bytes())
+        else {
+            return Ok(None);
+        };
+        if parts.peek().is_none() {
+            return Ok(Some(entry.oid));
+        }
+        current = entry.oid;
+    }
+    Ok(None)
 }
 
 /// Create a new branch.
