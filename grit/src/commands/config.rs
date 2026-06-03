@@ -663,6 +663,7 @@ fn cmd_get(
 ) -> Result<()> {
     let config = load_config(args, git_dir, ConfigReadIncludeMode::Lookup)?;
     let terminator = if args.null_terminated { '\0' } else { '\n' };
+    let cwd = std::env::current_dir().ok();
 
     // Handle --url for URL matching (subcommand interface)
     if let Some(ref url) = get_args.url {
@@ -710,13 +711,14 @@ fn cmd_get(
         for entry in matches {
             let bare_boolean = entry.value.is_none();
             let want_bool_text = regexp_type_requests_bool_output(args);
+            let prefix = config_entry_prefix(args, entry, cwd.as_deref());
             if args.name_only {
-                print!("{}{}", entry.key, terminator);
+                print!("{}{}{}", prefix, entry.key, terminator);
             } else if get_args.show_names {
                 // Bare keys are boolean true; Git prints only the key unless a bool type is requested
                 // (t1300-config: get-regexp variable with no value vs get-regexp --bool).
                 if bare_boolean && !want_bool_text {
-                    print!("{}{}", entry.key, terminator);
+                    print!("{}{}{}", prefix, entry.key, terminator);
                 } else {
                     let val = entry.value.as_deref().unwrap_or("true");
                     let val = format_typed_value(args, Some(&entry.key), val)?;
@@ -815,15 +817,36 @@ fn cmd_get(
         std::process::exit(1);
     }
 
-    match config.get(&get_args.key) {
-        Some(val) => {
+    let canon = grit_lib::config::canonical_key(&get_args.key).ok();
+    let entry = canon.as_deref().and_then(|canon| {
+        config
+            .entries()
+            .iter()
+            .rev()
+            .find(|entry| entry.key == canon)
+    });
+    match entry.and_then(|entry| {
+        entry
+            .value
+            .clone()
+            .or_else(|| Some("true".to_owned()))
+            .map(|v| (entry, v))
+    }) {
+        Some((entry, val)) => {
             let val = format_typed_value(args, Some(&get_args.key), &val)?;
-            print!("{val}{terminator}");
+            let prefix = config_entry_prefix(args, entry, cwd.as_deref());
+            print!("{prefix}{val}{terminator}");
             Ok(())
         }
         None => {
             if let Some(ref default) = get_args.default {
                 let val = format_default_value(args, default)?;
+                if args.show_origin {
+                    print!("command line:	");
+                }
+                if args.show_scope {
+                    print!("command	");
+                }
                 print_default_value(args, &val, terminator);
                 return Ok(());
             }
@@ -933,31 +956,66 @@ fn cmd_unset(
     Ok(())
 }
 
+fn config_origin_prefix(entry: &grit_lib::config::ConfigEntry, cwd: Option<&Path>) -> String {
+    if entry.scope == ConfigScope::Command {
+        return "command line:\t".to_owned();
+    }
+    let Some(file) = entry.file.as_deref() else {
+        return if entry.scope == ConfigScope::Command {
+            "command line:\t".to_owned()
+        } else {
+            String::new()
+        };
+    };
+    if file == Path::new("-") {
+        return "standard input:\t".to_owned();
+    }
+    if file.to_string_lossy().starts_with(':') {
+        return "command line:\t".to_owned();
+    }
+    let display_path = if entry.scope == ConfigScope::Global {
+        file.display().to_string()
+    } else if let Some(cwd) = cwd {
+        file.strip_prefix(cwd)
+            .map(|rel| rel.display().to_string())
+            .unwrap_or_else(|_| file.display().to_string())
+    } else {
+        file.display().to_string()
+    };
+    format!("file:{}\t", quote_origin_path(&display_path))
+}
+
+fn quote_origin_path(path: &str) -> String {
+    if path.contains('"') || path.contains(' ') || path.contains('\t') {
+        let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        path.to_owned()
+    }
+}
+
+fn config_entry_prefix(
+    args: &Args,
+    entry: &grit_lib::config::ConfigEntry,
+    cwd: Option<&Path>,
+) -> String {
+    let mut prefix = String::new();
+    if args.show_scope {
+        prefix.push_str(&format!("{}\t", entry.scope));
+    }
+    if args.show_origin {
+        prefix.push_str(&config_origin_prefix(entry, cwd));
+    }
+    prefix
+}
+
 fn cmd_list(args: &Args, git_dir: Option<&Path>) -> Result<()> {
     let config = load_config(args, git_dir, ConfigReadIncludeMode::List)?;
     let terminator = if args.null_terminated { '\0' } else { '\n' };
     let cwd = std::env::current_dir().ok();
 
     for entry in config.entries() {
-        let mut prefix = String::new();
-        if args.show_scope {
-            prefix.push_str(&format!("{}\t", entry.scope));
-        }
-        if args.show_origin {
-            if let Some(ref file) = entry.file {
-                // Use relative path if possible (matches git behavior)
-                let display_path = if let Some(ref cwd) = cwd {
-                    if let Ok(rel) = file.strip_prefix(cwd) {
-                        rel.display().to_string()
-                    } else {
-                        file.display().to_string()
-                    }
-                } else {
-                    file.display().to_string()
-                };
-                prefix.push_str(&format!("file:{}\t", display_path));
-            }
-        }
+        let prefix = config_entry_prefix(args, entry, cwd.as_deref());
         if args.name_only {
             print!("{}{}{}", prefix, entry.key, terminator);
         } else if args.null_terminated {
