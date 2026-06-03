@@ -343,7 +343,8 @@ pub fn run(args: Args) -> Result<()> {
         && grit_lib::precompose_config::filesystem_nfd_nfc_aliases(&repo.git_dir);
     let quote_fully = config.quote_path_fully();
     let index_path = resolved_env_index_path(&repo);
-    let mut index = if args.sparse {
+    let needs_worktree_detail = args.modified || args.deleted;
+    let mut index = if args.sparse && !needs_worktree_detail {
         grit_lib::index::Index::load(&index_path).context("loading index")?
     } else {
         repo.load_index_at(&index_path).context("loading index")?

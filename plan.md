@@ -35,6 +35,9 @@
     - `t1013-read-tree-submodule.sh` passes 68/68 after recursive gitlink removal/replacement uses
       submodule-aware untracked checks, ignored-file gitlink creation is allowed, and non-recursive
       gitlink-to-file replacement fails atomically before checkout.
+    - `t1092-sparse-checkout-compatibility.sh` in progress; improved from 61/106 to 62/106 by
+      expanding the in-memory index for `ls-files --sparse --modified/--deleted` worktree-detail
+      checks while preserving raw sparse-index display for normal `--sparse`.
   - Execution log: `logs/2026-06-03_0000-t1-family.md`.
 
 ---

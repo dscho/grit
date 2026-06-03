@@ -32,6 +32,11 @@
   using submodule-aware untracked checks, ignored-file gitlink creation was allowed, and
   non-recursive gitlink-to-file replacement now fails before checkout. Regression run with `t1001`,
   `t1002`, `t1004`, `t1011`, and `t1013` passes all five files.
+- Group 1 sparse compatibility: `./scripts/run-tests.sh --timeout 120 --verbose
+  t10410-ls-files-nul-output.sh t10710-ls-files-deduplicate.sh
+  t1092-sparse-checkout-compatibility.sh` passes both ls-files regression files and improves
+  `t1092` to 62/106 by expanding the in-memory index for `ls-files --sparse --modified/--deleted`
+  worktree-detail checks.
 
 # Test Results
 
