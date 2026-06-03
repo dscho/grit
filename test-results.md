@@ -23,6 +23,10 @@
   t1004-read-tree-m-u-wf.sh` passes 17/17 after directory/file conflict detection stopped
   flagging the file side when it is unchanged from the merge base. Regression run with `t1001`,
   `t1002`, `t1004`, and `t6434-merge-recursive-rename-options.sh` passes all four files.
+- Group 1 sparse read-tree checkout output: `./scripts/run-tests.sh --timeout 120 --verbose
+  t1011-read-tree-sparse-checkout.sh` passes 23/23 after `checkout -q` began suppressing
+  leaving-detached-HEAD messages while still allowing sparse-checkout warnings. Regression run with
+  `t1001`, `t1002`, `t1004`, `t1011`, and `t2020-checkout-detach.sh` passes all five files.
 
 # Test Results
 
