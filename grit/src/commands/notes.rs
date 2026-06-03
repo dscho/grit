@@ -1138,8 +1138,8 @@ fn add_note(
                 &entries,
                 "Notes removed by 'git notes add'",
             )?;
-            eprintln!("Removing note for object {hex}");
         }
+        eprintln!("Removing note for object {hex}");
         return Ok(());
     }
     let note_oid = if let Some(reuse) = reuse_message.filter(|_| only_minus_c && !stripspace) {
