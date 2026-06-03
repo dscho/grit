@@ -136,6 +136,8 @@ pub fn run(mut args: Args) -> Result<()> {
         first_parent: args.first_parent,
         diff_algorithm: args.diff_algorithm,
         minimal: args.minimal,
+        indent_heuristic: false,
+        no_indent_heuristic: false,
         textconv: args.textconv,
         no_textconv: args.no_textconv,
         contents: args.contents,

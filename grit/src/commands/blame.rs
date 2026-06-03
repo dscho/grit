@@ -141,6 +141,14 @@ pub struct Args {
     #[arg(long = "minimal")]
     pub minimal: bool,
 
+    /// Use the indent heuristic when diffing parent/child file versions.
+    #[arg(long = "indent-heuristic", overrides_with = "no_indent_heuristic")]
+    pub indent_heuristic: bool,
+
+    /// Disable the indent heuristic.
+    #[arg(long = "no-indent-heuristic", overrides_with = "indent_heuristic")]
+    pub no_indent_heuristic: bool,
+
     /// Blame transformed (textconv) content.
     #[arg(long = "textconv")]
     pub textconv: bool,
@@ -1930,33 +1938,46 @@ fn build_line_map(
     old_joined.push('\n');
     let mut new_joined = new.join("\n");
     new_joined.push('\n');
-    let diff = TextDiff::configure()
-        .algorithm(diff_algorithm.to_similar())
-        .diff_lines(&old_joined, &new_joined);
+
+    // `--indent-heuristic` / `diff.indentHeuristic` shifts ambiguous add/delete
+    // runs like Git's xdiff, which changes which lines blame attributes (t4061).
+    let ops = grit_lib::diff_indent_heuristic::diff_lines_ops_compacted(
+        &old_joined,
+        &new_joined,
+        diff_algorithm.to_similar(),
+        blame_indent_heuristic_enabled(),
+    );
 
     let mut result = vec![None; new.len()];
-    let mut old_idx: usize = 0;
-    let mut new_idx: usize = 0;
-
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            ChangeTag::Equal => {
-                if new_idx < result.len() {
-                    result[new_idx] = Some(old_idx);
+    for op in ops {
+        if let similar::DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = op
+        {
+            for k in 0..len {
+                if new_index + k < result.len() {
+                    result[new_index + k] = Some(old_index + k);
                 }
-                old_idx += 1;
-                new_idx += 1;
-            }
-            ChangeTag::Delete => {
-                old_idx += 1;
-            }
-            ChangeTag::Insert => {
-                new_idx += 1;
             }
         }
     }
 
     result
+}
+
+/// Whether the indent heuristic is enabled for this blame run
+/// (`--indent-heuristic` / `--no-indent-heuristic` / `diff.indentHeuristic`).
+static BLAME_INDENT_HEURISTIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn blame_indent_heuristic_enabled() -> bool {
+    BLAME_INDENT_HEURISTIC.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_blame_indent_heuristic(enabled: bool) {
+    BLAME_INDENT_HEURISTIC.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn build_fuzzy_line_map(
@@ -2313,6 +2334,16 @@ pub fn run(mut args: Args) -> Result<()> {
         diff_algorithm = parse_diff_algorithm_name(name)
             .ok_or_else(|| anyhow::anyhow!("invalid --diff-algorithm: {name}"))?;
     }
+
+    // Indent heuristic: CLI flags override `diff.indentHeuristic` (t4061).
+    let mut indent_heuristic = config_bool(&config, "diff.indentHeuristic");
+    if args.indent_heuristic {
+        indent_heuristic = true;
+    }
+    if args.no_indent_heuristic {
+        indent_heuristic = false;
+    }
+    set_blame_indent_heuristic(indent_heuristic);
 
     let mut normalized_positional = Vec::new();
     normalize_detection_args(&args.copy_detection, &mut normalized_positional);

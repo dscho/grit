@@ -62,15 +62,95 @@ fn histogram_unified_body_raw(
     context_lines: usize,
     inter_hunk_context: usize,
 ) -> String {
-    use imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
+    use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
+    use std::fmt::Write as _;
 
     let input = InternedInput::new(old_content, new_content);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
-    let mut config = UnifiedDiffConfig::default();
-    config.context_len(imara_context_len_for_git(context_lines, inter_hunk_context));
-    let printer = BasicLineDiffPrinter(&input.interner);
-    diff.unified_diff(&printer, config, &input).to_string()
+
+    // Assemble hunks ourselves: imara's `UnifiedDiff` printer starts the first
+    // hunk's context at line 0 whenever the first change is within
+    // `2 * context_len` of the file start, emitting more leading context than
+    // its own header claims (t4061), and its gap threshold cannot express
+    // Git's odd `2 * U + inter_hunk_context` fuse limits (t4032).
+    let hunks: Vec<Hunk> = diff.hunks().collect();
+    if hunks.is_empty() {
+        return String::new();
+    }
+
+    let ctx = context_lines.min(u32::MAX as usize) as u32;
+    let max_gap = (2usize.saturating_mul(context_lines))
+        .saturating_add(inter_hunk_context)
+        .min(u32::MAX as usize) as u32;
+    let before_len = input.before.len() as u32;
+    let after_len = input.after.len() as u32;
+
+    // Fuse hunks whose unchanged gap is at most `max_gap` (Git xdl_get_hunk).
+    let mut groups: Vec<&[Hunk]> = Vec::new();
+    let mut group_start = 0usize;
+    for i in 1..hunks.len() {
+        if hunks[i].before.start - hunks[i - 1].before.end > max_gap {
+            groups.push(&hunks[group_start..i]);
+            group_start = i;
+        }
+    }
+    groups.push(&hunks[group_start..]);
+
+    fn push_line(out: &mut String, prefix: char, text: &str) {
+        out.push(prefix);
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    // Git hunk header range: 1-based start (the preceding line when the range
+    // is empty) with the `,count` part omitted when the count is exactly 1.
+    fn fmt_side(start: u32, count: u32) -> String {
+        let shown_start = if count == 0 { start } else { start + 1 };
+        if count == 1 {
+            format!("{shown_start}")
+        } else {
+            format!("{shown_start},{count}")
+        }
+    }
+
+    let mut out = String::new();
+    for group in groups {
+        let first = &group[0];
+        let last = &group[group.len() - 1];
+        let b_start = first.before.start.saturating_sub(ctx);
+        let a_start = first.after.start.saturating_sub(ctx);
+        let b_end = (last.before.end.saturating_add(ctx)).min(before_len);
+        let a_end = (last.after.end.saturating_add(ctx)).min(after_len);
+
+        let _ = writeln!(
+            out,
+            "@@ -{} +{} @@",
+            fmt_side(b_start, b_end - b_start),
+            fmt_side(a_start, a_end - a_start)
+        );
+
+        let mut pos = b_start;
+        for hunk in group {
+            for &token in &input.before[pos as usize..hunk.before.start as usize] {
+                push_line(&mut out, ' ', input.interner[token]);
+            }
+            for &token in &input.before[hunk.before.start as usize..hunk.before.end as usize] {
+                push_line(&mut out, '-', input.interner[token]);
+            }
+            for &token in &input.after[hunk.after.start as usize..hunk.after.end as usize] {
+                push_line(&mut out, '+', input.interner[token]);
+            }
+            pos = hunk.before.end;
+        }
+        for &token in &input.before[pos as usize..b_end as usize] {
+            push_line(&mut out, ' ', input.interner[token]);
+        }
+    }
+
+    out
 }
 
 /// Unified diff hunks for Git's histogram algorithm (no `---` / `+++` lines).
