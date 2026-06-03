@@ -840,7 +840,15 @@ fn load_blob_content(repo: &Repository, spec: &str) -> Result<Vec<u8>> {
     Ok(obj.data)
 }
 
-fn ordered_note_fragments_from_argv(repo: &Repository) -> Result<Option<Vec<String>>> {
+fn ordered_note_fragments_from_argv(
+    repo: &Repository,
+    add_newline_to_multiple_messages: bool,
+) -> Result<Option<Vec<String>>> {
+    enum Fragment {
+        Message(String),
+        Other(String),
+    }
+
     let argv: Vec<String> = std::env::args().collect();
     let Some(notes_pos) = argv.iter().position(|a| a == "notes") else {
         return Ok(None);
@@ -861,7 +869,7 @@ fn ordered_note_fragments_from_argv(repo: &Repository) -> Result<Option<Vec<Stri
         match arg.as_str() {
             "-m" | "--message" => {
                 if let Some(v) = argv.get(i + 1) {
-                    out.push(v.clone());
+                    out.push(Fragment::Message(v.clone()));
                     saw_fragment = true;
                     i += 2;
                     continue;
@@ -869,7 +877,7 @@ fn ordered_note_fragments_from_argv(repo: &Repository) -> Result<Option<Vec<Stri
             }
             "-F" | "--file" => {
                 if let Some(v) = argv.get(i + 1) {
-                    out.push(read_note_file(&PathBuf::from(v))?);
+                    out.push(Fragment::Other(read_note_file(&PathBuf::from(v))?));
                     saw_fragment = true;
                     i += 2;
                     continue;
@@ -877,7 +885,9 @@ fn ordered_note_fragments_from_argv(repo: &Repository) -> Result<Option<Vec<Stri
             }
             "-C" | "--reuse-message" | "-c" | "--reedit-message" => {
                 if let Some(v) = argv.get(i + 1) {
-                    out.push(String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned());
+                    out.push(Fragment::Other(
+                        String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned(),
+                    ));
                     saw_fragment = true;
                     i += 2;
                     continue;
@@ -886,33 +896,55 @@ fn ordered_note_fragments_from_argv(repo: &Repository) -> Result<Option<Vec<Stri
             _ => {}
         }
         if let Some(v) = arg.strip_prefix("--message=") {
-            out.push(v.to_owned());
+            out.push(Fragment::Message(v.to_owned()));
             saw_fragment = true;
         } else if let Some(v) = arg.strip_prefix("--file=") {
-            out.push(read_note_file(&PathBuf::from(v))?);
+            out.push(Fragment::Other(read_note_file(&PathBuf::from(v))?));
             saw_fragment = true;
         } else if let Some(v) = arg.strip_prefix("--reuse-message=") {
-            out.push(String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned());
+            out.push(Fragment::Other(
+                String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned(),
+            ));
             saw_fragment = true;
         } else if let Some(v) = arg.strip_prefix("--reedit-message=") {
-            out.push(String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned());
+            out.push(Fragment::Other(
+                String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned(),
+            ));
             saw_fragment = true;
         } else if arg.starts_with("-m") && arg.len() > 2 {
-            out.push(arg[2..].to_owned());
+            out.push(Fragment::Message(arg[2..].to_owned()));
             saw_fragment = true;
         } else if arg.starts_with("-F") && arg.len() > 2 {
-            out.push(read_note_file(&PathBuf::from(&arg[2..]))?);
+            out.push(Fragment::Other(read_note_file(&PathBuf::from(&arg[2..]))?));
             saw_fragment = true;
         } else if arg.starts_with("-C") && arg.len() > 2 {
-            out.push(String::from_utf8_lossy(&load_blob_content(repo, &arg[2..])?).into_owned());
+            out.push(Fragment::Other(
+                String::from_utf8_lossy(&load_blob_content(repo, &arg[2..])?).into_owned(),
+            ));
             saw_fragment = true;
         } else if arg.starts_with("-c") && arg.len() > 2 {
-            out.push(String::from_utf8_lossy(&load_blob_content(repo, &arg[2..])?).into_owned());
+            out.push(Fragment::Other(
+                String::from_utf8_lossy(&load_blob_content(repo, &arg[2..])?).into_owned(),
+            ));
             saw_fragment = true;
         }
         i += 1;
     }
-    Ok(saw_fragment.then_some(out))
+    if !saw_fragment {
+        return Ok(None);
+    }
+    let multi = out.len() > 1;
+    Ok(Some(
+        out.into_iter()
+            .map(|fragment| match fragment {
+                Fragment::Message(mut value) if add_newline_to_multiple_messages && multi => {
+                    value.push('\n');
+                    value
+                }
+                Fragment::Message(value) | Fragment::Other(value) => value,
+            })
+            .collect(),
+    ))
 }
 
 /// Launch the editor on a temporary file and return its contents.
@@ -968,7 +1000,9 @@ fn add_note(
         .find(|e| note_object_name(&e.path).as_deref() == Some(hex.as_str()))
         .and_then(|e| repo.odb.read(&e.oid).ok())
         .map(|obj| String::from_utf8_lossy(&obj.data).to_string());
-    let parts: Vec<String> = if let Some(ordered) = ordered_note_fragments_from_argv(repo)? {
+    let parts: Vec<String> = if let Some(ordered) =
+        ordered_note_fragments_from_argv(repo, no_stripspace && separator.is_none())?
+    {
         ordered
     } else {
         let mut parts = Vec::new();
@@ -1101,7 +1135,9 @@ Please use 'git notes add -f -m/-F/-c/-C' instead."
         .and_then(|e| repo.odb.read(&e.oid).ok())
         .map(|obj| String::from_utf8_lossy(&obj.data).to_string());
     let note_exists = existing.is_some();
-    let mut parts: Vec<String> = if let Some(ordered) = ordered_note_fragments_from_argv(repo)? {
+    let mut parts: Vec<String> = if let Some(ordered) =
+        ordered_note_fragments_from_argv(repo, no_stripspace && separator.is_none())?
+    {
         ordered
     } else {
         let mut parts = Vec::new();
