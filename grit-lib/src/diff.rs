@@ -3700,10 +3700,12 @@ fn extract_function_context(
     let start_line: usize = start_str.parse().ok()?;
 
     // Parse the old line count; "@@ -<start>,<count> ..." (no comma means count 1).
-    let old_count: usize = if let Some(comma) = rest.find(',') {
-        let after = &rest[comma + 1..];
-        let end = after.find([' ', '\t']).unwrap_or(after.len());
-        after[..end].parse().unwrap_or(1)
+    // Only look for the comma inside the old-range token itself — searching the
+    // whole remainder would pick up the comma from the new side (e.g. "+0,0").
+    let old_token_end = rest.find([' ', '\t']).unwrap_or(rest.len());
+    let old_token = &rest[..old_token_end];
+    let old_count: usize = if let Some(comma) = old_token.find(',') {
+        old_token[comma + 1..].parse().unwrap_or(1)
     } else {
         1
     };
