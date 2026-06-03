@@ -1,3 +1,7 @@
+## 2026-06-03 — t11410-rev-list-first-parent
+
+- Focus harness: `./scripts/run-tests.sh t11410-rev-list-first-parent.sh --verbose` passes 31/31 after aligning merge-history setup and branch assertions with the `main` default branch.
+
 ## 2026-06-03 — t10610-show-ref-dereference-extra
 
 - Focus harness: `./scripts/run-tests.sh t10610-show-ref-dereference-extra.sh --verbose` passes 40/40 after aligning show-ref branch patterns and verification refs with `main`.
