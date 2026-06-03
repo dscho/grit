@@ -1076,6 +1076,7 @@ pub fn rev_list(
             &ordered,
             &options.paths,
             &excluded,
+            &effective_ancestry_path_bottoms,
             options.ordering,
             options.show_pulls,
         )?;
@@ -3440,6 +3441,7 @@ fn simplify_merges_commit_list(
     commits: &[ObjectId],
     paths: &[String],
     excluded: &HashSet<ObjectId>,
+    ancestry_path_bottoms: &[ObjectId],
     ordering: OrderingMode,
     show_pulls: bool,
 ) -> Result<Vec<ObjectId>> {
@@ -3449,14 +3451,13 @@ fn simplify_merges_commit_list(
     for oid in commits {
         let raw_parents = load_commit(repo, *oid)?.parents;
         let rewritten = visible_parents_for_graph_lib(repo, *oid, &selected, false)?;
+        let path_survives =
+            path_merge_survives_simplify(repo, *oid, paths, excluded, ancestry_path_bottoms)?;
         let pull_merge = show_pulls
             && raw_parents.len() > 1
-            && path_merge_survives_simplify(repo, *oid, paths, excluded)?;
+            && path_merge_survives_simplify(repo, *oid, paths, excluded, &[])?;
         if raw_parents.len() > 1 && rewritten.len() <= 1 {
-            if rewritten.is_empty()
-                || pull_merge
-                || path_merge_survives_simplify(repo, *oid, paths, excluded)?
-            {
+            if rewritten.is_empty() || pull_merge || path_survives {
                 simplified_parents.insert(*oid, rewritten);
                 out.push(*oid);
             }
@@ -3543,6 +3544,7 @@ fn path_merge_survives_simplify(
     oid: ObjectId,
     paths: &[String],
     excluded: &HashSet<ObjectId>,
+    ancestry_path_bottoms: &[ObjectId],
 ) -> Result<bool> {
     if paths.is_empty() {
         return Ok(false);
@@ -3556,12 +3558,14 @@ fn path_merge_survives_simplify(
     let mut treesame_parents = 0usize;
     let mut first_parent_differs = false;
     let mut differing_parent_is_excluded = false;
+    let mut differing_parent_oids = Vec::new();
     for (nth, parent_oid) in commit.parents.iter().enumerate() {
         let parent = load_commit(repo, *parent_oid)?;
         let parent_map: HashMap<String, ObjectId> =
             flatten_tree(repo, parent.tree, "")?.into_iter().collect();
         let differs = path_differs_for_specs(&commit_map, &parent_map, paths);
         if differs {
+            differing_parent_oids.push(*parent_oid);
             if nth == 0 {
                 first_parent_differs = true;
             }
@@ -3572,7 +3576,21 @@ fn path_merge_survives_simplify(
             treesame_parents += 1;
         }
     }
-    Ok(treesame_parents == 1 && (first_parent_differs || differing_parent_is_excluded))
+    if treesame_parents != 1 {
+        return Ok(false);
+    }
+    if first_parent_differs || differing_parent_is_excluded {
+        return Ok(true);
+    }
+    if !ancestry_path_bottoms.is_empty() {
+        let mut graph = CommitGraph::new(repo, false);
+        return treesame_parent_is_on_ancestry_bottom_side(
+            &mut graph,
+            &differing_parent_oids,
+            ancestry_path_bottoms,
+        );
+    }
+    Ok(false)
 }
 
 fn graph_simplify_parent_list_lib(
@@ -3825,6 +3843,7 @@ fn limit_to_ancestry(
     bottoms: &[ObjectId],
 ) -> Result<()> {
     let mut keep = HashSet::new();
+
     for &bottom in bottoms {
         let ancestors = walk_closure(graph, &[bottom])?;
         keep.extend(
@@ -3833,18 +3852,34 @@ fn limit_to_ancestry(
                 .copied()
                 .filter(|oid| selected.contains(oid)),
         );
+    }
 
+    let mut descendants: HashSet<ObjectId> = bottoms.iter().copied().collect();
+    loop {
+        let mut made_progress = false;
         for &candidate in selected.iter() {
-            if candidate == bottom {
-                keep.insert(candidate);
+            if descendants.contains(&candidate) {
                 continue;
             }
-            let closure = walk_closure(graph, &[candidate])?;
-            if closure.contains(&bottom) {
-                keep.insert(candidate);
+
+            let parents = graph.parents_of(candidate)?;
+            if parents.iter().any(|parent| descendants.contains(parent)) {
+                descendants.insert(candidate);
+                made_progress = true;
             }
         }
+
+        if !made_progress {
+            break;
+        }
     }
+
+    keep.extend(
+        descendants
+            .iter()
+            .copied()
+            .filter(|oid| selected.contains(oid)),
+    );
     selected.retain(|oid| keep.contains(oid));
     Ok(())
 }
@@ -3995,12 +4030,20 @@ fn commit_touches_paths(
 
     if ancestry_path
         && !ancestry_path_bottoms.is_empty()
-        && (!parent_rewrite || treesame_parents != parents.len())
-        && treesame_parent_is_on_ancestry_bottom_side(
-            graph,
-            &treesame_parent_oids,
-            ancestry_path_bottoms,
-        )?
+        && if parent_rewrite {
+            treesame_parents != parents.len()
+                && treesame_parent_is_ancestry_bottom_or_ancestor(
+                    graph,
+                    &treesame_parent_oids,
+                    ancestry_path_bottoms,
+                )?
+        } else {
+            treesame_parent_is_on_ancestry_bottom_side(
+                graph,
+                &treesame_parent_oids,
+                ancestry_path_bottoms,
+            )?
+        }
     {
         return Ok(sparse);
     }
@@ -4031,6 +4074,16 @@ fn commit_touches_paths(
             return Ok(true);
         }
         if treesame_parents == 1 {
+            if ancestry_path
+                && !ancestry_path_bottoms.is_empty()
+                && treesame_parent_is_on_ancestry_bottom_side(
+                    graph,
+                    &differing_parent_oids,
+                    ancestry_path_bottoms,
+                )?
+            {
+                return Ok(true);
+            }
             return Ok(first_parent_differs
                 || differing_parent_oids
                     .iter()
@@ -4047,6 +4100,29 @@ fn commit_touches_paths(
 }
 
 fn treesame_parent_is_on_ancestry_bottom_side(
+    graph: &mut CommitGraph<'_>,
+    treesame_parents: &[ObjectId],
+    bottoms: &[ObjectId],
+) -> Result<bool> {
+    if treesame_parents.is_empty() {
+        return Ok(false);
+    }
+    let treesame: HashSet<ObjectId> = treesame_parents.iter().copied().collect();
+    for bottom in bottoms {
+        if treesame.contains(bottom) {
+            return Ok(true);
+        }
+        for parent in treesame_parents {
+            let parent_closure = walk_closure(graph, &[*parent])?;
+            if parent_closure.contains(bottom) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn treesame_parent_is_ancestry_bottom_or_ancestor(
     graph: &mut CommitGraph<'_>,
     treesame_parents: &[ObjectId],
     bottoms: &[ObjectId],

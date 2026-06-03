@@ -1394,3 +1394,13 @@ Updated: 2026-06-01
   grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
   --fix --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted),
   and `cargo test -p grit-lib --lib`.
+- t6019 ancestry-path completion: after limiting ancestry descendant propagation to the selected
+  range, passing ancestry bottoms through symmetric `git log`, preserving/pruning path-limited
+  ancestry-side merges, and accepting `checkout -b <name> <start> --`, the direct debug run passes
+  all 18 tests and `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh` records 18/18 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing
+  warning backlog remains and unrelated auto-fixes were reverted), and
+  `cargo test -p grit-lib --lib`. Adjacent official harnesses
+  `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh t6012-rev-list-simplify.sh
+  t6111-rev-list-treesame.sh` pass 18/18, 42/42, and 65/65 after the final TREESAME helper split.

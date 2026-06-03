@@ -8263,6 +8263,14 @@ fn run_symmetric_log(
         left_right: true,
         left_only: args.left_only,
         right_only: args.right_only,
+        ancestry_path: args.ancestry_path,
+        ancestry_path_bottoms: args
+            .ancestry_path_bottoms
+            .iter()
+            .map(|bottom| {
+                resolve_revision_as_commit(repo, bottom.as_str()).map_err(anyhow::Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?,
         symmetric_left: Some(lhs_oid),
         symmetric_right: Some(rhs_oid),
         boundary: args.boundary,
