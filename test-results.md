@@ -1,3 +1,7 @@
+## 2026-06-03 — t1800-ls-remote
+
+- Focus harness: `./scripts/run-tests.sh t1800-ls-remote.sh --verbose` passes 24/24 after correcting synthetic quiet-output assertions to avoid unsupported `test_must_fail test ...` usage.
+
 ## 2026-06-03 — t1450-fsck-flags
 
 - Focus harness: `./scripts/run-tests.sh t1450-fsck-flags.sh --verbose` passes 10/10 after correcting synthetic `fsck` dangling-output assertions to inspect stdout and using `--name-objects` in the intended coverage case.
