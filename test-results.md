@@ -1329,3 +1329,11 @@ Updated: 2026-06-01
   `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6012 final graph simplify focus: after preserving the simplified rev-list order for graph mode
+  and suppressing the extra post-remainder blank line for single-line graph pretty output, the
+  direct debug run passes all 42 tests and `./scripts/run-tests.sh t6012-rev-list-simplify.sh`
+  records 42/42 with refreshed `data/test-files.csv` plus dashboards. The nearby
+  `./scripts/run-tests.sh t6016-rev-list-graph-simplify-history.sh` harness improves from 2/12 to
+  4/12. Also ran `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog and known failed auto-fix diagnostics remain), and `cargo test -p grit-lib --lib`.

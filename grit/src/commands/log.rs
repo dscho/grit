@@ -1697,7 +1697,7 @@ fn write_graph_interleaved_commit_msg(
             writeln!(out)?;
         }
         graph_show_remainder_lines(out, line_prefix, graph)?;
-        if newline_terminated {
+        if newline_terminated && trimmed.contains('\n') {
             writeln!(out)?;
         }
     } else if !newline_terminated && !body.is_empty() {
@@ -2659,7 +2659,7 @@ fn run_graph_log(
         result.commits = simplified;
     }
 
-    if !combined_pathspecs.is_empty() && !args.full_history {
+    if !combined_pathspecs.is_empty() && !args.full_history && !args.simplify_merges {
         if args.sparse {
             let mut dense_options = options.clone();
             dense_options.sparse = false;
