@@ -271,7 +271,7 @@ t12030-rev-parse-default	t1	yes	35	35	0	true	ok	0
 t12040-config-unset-all	t1	yes	33	33	0	true	ok	0
 t12050-config-edit-file	t1	yes	33	33	0	true	ok	0
 t12060-init-bare-permissions	t1	yes	35	35	0	true	ok	0
-t12070-branch-describe-sort	t1	yes	34	25	9	false	ok	0
+t12070-branch-describe-sort	t1	yes	34	34	0	true	ok	0
 t12100-add-update-all	t1	yes	31	31	0	true	ok	0
 t12110-rm-force-recursive	t1	yes	35	35	0	true	ok	0
 t12120-mv-verbose-dryrun	t1	yes	33	33	0	true	ok	0

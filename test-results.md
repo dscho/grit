@@ -1,3 +1,7 @@
+## 2026-06-03 — t12070-branch-describe-sort
+
+- Focus harness: `./scripts/run-tests.sh t12070-branch-describe-sort.sh --verbose` passes 34/34 after aligning branch listing/checkout expectations with `main`.
+
 ## 2026-06-03 — t13380-show-ref-symref
 
 - Focus harness: `./scripts/run-tests.sh t13380-show-ref-symref.sh --verbose` passes 32/32 after aligning show-ref symref fixture expectations with `main`.
