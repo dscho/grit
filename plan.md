@@ -30,8 +30,11 @@
     unmerged conflict stages, while `-u` restricts output to unmerged entries.
   - Completed: `t3030-merge-recursive.sh` (26/26) by rejecting `read-tree -m` invocations with
     more than three trees, matching the documented command synopsis and merge forms.
-  - Current focus: `t3040-subprojects-basic.sh` (11 total, 10 passed, 1 failing), final file in
-    the foundational index/path group.
+  - Completed: `t3040-subprojects-basic.sh` (11/11) after rerunning with the current binary; the
+    prior foundational fixes left the subproject fixture green.
+  - Foundational group sweep verified: `t3000`, `t3050`, `t3030`, and `t3040` all pass.
+  - Current focus: `t3200-branch.sh` (167 total, 147 passed, 20 failing), first file in the
+    branch/refs/range-diff/pack-refs group.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
