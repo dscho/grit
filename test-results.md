@@ -1,3 +1,7 @@
+## 2026-06-03 — t13070/t13080 refs
+
+- Focus harness: `./scripts/run-tests.sh t13070-for-each-ref-points-at.sh t13080-show-ref-loose-packed.sh --verbose` passes 32/32 and 31/31 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t12780-show-ref-head-detached
 
 - Focus harness: `./scripts/run-tests.sh t12780-show-ref-head-detached.sh --verbose` passes 36/36 after switching synthetic `master` branch references to `main`.
