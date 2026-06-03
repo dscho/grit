@@ -568,6 +568,19 @@ fn parse_options(repo: &Repository, argv: &[String]) -> Result<Options> {
         i += 1;
     }
 
+    // `--cc` (dense combined) defaults to a combined *patch* when no other output
+    // format is requested. `-c` keeps the combined *raw* default. An explicit
+    // `--raw`/`--stat`/`--summary`/`--patch-with-*` request wins over this default.
+    if opts.combined_use_cc_word
+        && opts.format == OutputFormat::Raw
+        && !opts.raw_explicit
+        && !opts.summary
+        && !opts.patch_with_stat
+        && !opts.patch_with_raw
+    {
+        opts.format = OutputFormat::Patch;
+    }
+
     // Patch and stat imply recursion (Git shows nested file paths). `--name-only`
     // and `--name-status` follow plain `diff-tree` rules: top-level entries only
     // unless `-r` is given (see t4010-diff-pathspec).
@@ -1062,23 +1075,9 @@ fn run_one_commit(repo: &Repository, opts: &Options, out: &mut impl Write) -> Re
                 }
                 has_diff = any_diff;
             } else if commit.parents.len() > 1 {
-                let parent_tree = commit_tree(&repo.odb, &commit.parents[0])?;
-                let entries =
-                    diff_with_opts(&repo.odb, Some(&parent_tree), Some(&commit.tree), opts)?;
-                let filtered = filter_entries(&repo.odb, &repo, entries, opts)?;
-                has_diff = !filtered.is_empty();
-                if opts.check {
-                    let prepared =
-                        prepare_diff_tree_entries(&repo.odb, filtered, opts, Some(&parent_tree));
-                    run_diff_tree_whitespace_check(repo, &prepared, opts)?;
-                    return Ok(has_diff);
-                }
-                if !opts.quiet && (has_diff || opts.pretty.is_some()) {
-                    write_commit_header(out, &oid, &obj.data, opts, None)?;
-                    if !opts.suppress_diff {
-                        print_diff(out, repo, &filtered, opts, Some(&parent_tree))?;
-                    }
-                }
+                // A bare merge commit (no `-m`/`-c`/`--cc`/`--remerge-diff`) produces
+                // no output at all in `git diff-tree` — not even the commit header
+                // with `--pretty`/`-s`. Leave `has_diff` false and emit nothing.
             } else {
                 let parent_tree = commit_tree(&repo.odb, &commit.parents[0])?;
                 let entries =
