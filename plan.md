@@ -23,7 +23,10 @@
     `t5002`, `t5003`, and `t5004`.
   - Completed `t5150-request-pull.sh` (10/10) after adding request-pull behavior,
     tag push shorthand, and repairing the ported fixture setup variable scope.
-  - Next focus: `t5200-update-server-info.sh`.
+  - Verified `t5200-update-server-info.sh` (8/8); no code changes were needed beyond
+    refreshing the stale CSV/dashboard result.
+  - Request-pull/server-info group now passes.
+  - Next focus group: pack/index/unpack/prune plumbing, starting with `t5300-pack-object.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

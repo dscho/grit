@@ -1,4 +1,9 @@
 
+## 2026-06-03 — t5200-update-server-info
+
+- Focus harness: `./scripts/run-tests.sh t5200-update-server-info.sh --verbose` passes 8/8; no code changes were required, only stale CSV/dashboard refresh.
+
+
 ## 2026-06-03 — t5150-request-pull
 
 - Focus harness: `./scripts/run-tests.sh t5150-request-pull.sh --verbose` passes 10/10 after adding request-pull behavior, tag push shorthand, and fixing the ported fixture setup variable scope.
