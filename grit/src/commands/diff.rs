@@ -2483,8 +2483,15 @@ pub fn run(mut args: Args) -> Result<()> {
         rev_idx += 1;
     }
     revs = extra_revs;
-    if revs.len() == 3 && args.name_only && !args.cached {
+    // `git diff <commit> <commit>...<commit>` (3+ commits) produces an N-way combined diff:
+    // the FIRST commit is the merge result, the rest are parents (builtin/diff.c
+    // `builtin_diff_combined`), and it defaults to the dense combined (`--cc`) format.
+    let auto_combined = revs.len() >= 3 && !args.cached && !want_combined_diff;
+    if revs.len() >= 3 && !args.cached {
         want_combined_diff = true;
+        if auto_combined {
+            combined_diff_dense = true;
+        }
     }
 
     let symmetric_tokens = revs.iter().filter(|r| is_symmetric_diff(r)).count();
@@ -2498,10 +2505,7 @@ pub fn run(mut args: Args) -> Result<()> {
     {
         bail!("usage: grit diff [<options>] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]");
     }
-    if revs.len() > 3
-        || (revs.len() > 2 && !want_combined_diff)
-        || (revs.len() == 3 && want_combined_diff && (args.cached || !args.name_only))
-    {
+    if revs.len() > 2 && !want_combined_diff {
         bail!("usage: grit diff [<options>] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]");
     }
 
@@ -2641,12 +2645,14 @@ pub fn run(mut args: Args) -> Result<()> {
         fn tree_oid_for_diff_spec(repo: &Repository, spec: &str) -> Result<ObjectId> {
             commit_or_tree_oid(repo, spec)
         }
-        let last_rev = revs
-            .last()
+        // The first revision is the merge result; the remaining ones are its parents
+        // (git's `first_non_parent` for `diff A B C...`).
+        let merge_rev = revs
+            .first()
             .ok_or_else(|| anyhow!("combined diff requires at least one revision"))?;
-        let merge_tree = tree_oid_for_diff_spec(&repo, last_rev)?;
+        let merge_tree = tree_oid_for_diff_spec(&repo, merge_rev)?;
         let mut parent_trees = Vec::with_capacity(revs.len() - 1);
-        for s in &revs[..revs.len() - 1] {
+        for s in &revs[1..] {
             parent_trees.push(tree_oid_for_diff_spec(&repo, s)?);
         }
         let walk = CombinedTreeDiffOptions {
