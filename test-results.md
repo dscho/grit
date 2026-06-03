@@ -1,3 +1,7 @@
+## 2026-06-03 — t13270-branch-remote-tracking
+
+- Focus harness: `./scripts/run-tests.sh t13270-branch-remote-tracking.sh --verbose` passes 33/33 after replacing the fragile fetch fixture with explicit remote-tracking refs plus an absolute alternates path and aligning branch expectations with `main`.
+
 ## 2026-06-03 — t13200-rev-list-walk-options
 
 - Focus harness: `./scripts/run-tests.sh t13200-rev-list-walk-options.sh --verbose` passes 35/35 after aligning rev-list walk/range fixture references with `main`.
