@@ -1,3 +1,13 @@
+## 2026-06-03 — t3206-range-diff
+
+- Focus harness: `./scripts/run-tests.sh t3206-range-diff.sh` passes 48/48 after fixing
+  range-diff child log ordering, notes forwarding, gitlink patch hunks, rename-detected log
+  patches, and unmatched-new note output.
+- Adjacent verification: `./scripts/run-tests.sh t3206-range-diff.sh t3200-branch.sh
+  t3207-branch-submodule.sh t1507-rev-parse-upstream.sh` all pass.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3206-range-diff gitlink partial
 
 - Focus harness improved from 45/48 to 46/48 after log patch output started emitting

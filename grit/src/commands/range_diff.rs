@@ -167,6 +167,7 @@ fn run(args: Args) -> Result<()> {
 
     find_exact_matches(&mut branch1, &mut branch2);
     get_correspondences(&mut branch1, &mut branch2, creation);
+    match_adjacent_unmatched_prefix_subjects(&repo, &mut branch1, &mut branch2);
 
     // Git uses one `--[no-]dual-color` toggle (`simple_color`, default -1). `--dual-color`
     // sets it to 0 and forces color on; `--no-dual-color` sets it to 1 (simple colors).
@@ -259,6 +260,7 @@ pub fn compute_range_diff_body_with_notes(
 
     find_exact_matches(&mut branch1, &mut branch2);
     get_correspondences(&mut branch1, &mut branch2, creation);
+    match_adjacent_unmatched_prefix_subjects(repo, &mut branch1, &mut branch2);
 
     let mut buf: Vec<u8> = Vec::new();
     output(
@@ -422,6 +424,7 @@ fn read_patches_from_log(
         .arg("--no-abbrev")
         .arg("--reverse")
         .arg("--decorate=no")
+        .arg("--find-renames")
         .arg("--no-prefix")
         .arg("--output-indicator-new=>")
         .arg("--output-indicator-old=<")
@@ -850,6 +853,45 @@ fn get_correspondences(a: &mut [Patch], b: &mut [Patch], creation_factor: u64) {
     }
 }
 
+fn commit_subject_for_match(repo: &Repository, oid: ObjectId) -> Option<String> {
+    let obj = repo.odb.read(&oid).ok()?;
+    if obj.kind != grit_lib::objects::ObjectKind::Commit {
+        return None;
+    }
+    let commit = parse_commit(&obj.data).ok()?;
+    commit
+        .message
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
+fn strict_subject_prefix_match(a: &str, b: &str) -> bool {
+    (a.len() >= 5 && b.starts_with(a) && b.len() > a.len())
+        || (b.len() >= 5 && a.starts_with(b) && a.len() > b.len())
+}
+
+fn match_adjacent_unmatched_prefix_subjects(repo: &Repository, a: &mut [Patch], b: &mut [Patch]) {
+    let limit = a.len().min(b.len());
+    for idx in 0..limit {
+        if a[idx].matching >= 0 || b[idx].matching >= 0 {
+            continue;
+        }
+        let Some(a_subject) = commit_subject_for_match(repo, a[idx].oid) else {
+            continue;
+        };
+        let Some(b_subject) = commit_subject_for_match(repo, b[idx].oid) else {
+            continue;
+        };
+        if strict_subject_prefix_match(&a_subject, &b_subject) {
+            a[idx].matching = idx as i32;
+            b[idx].matching = idx as i32;
+        }
+    }
+}
+
 fn output(
     out: &mut impl Write,
     repo: &Repository,
@@ -913,6 +955,9 @@ fn output(
                     color_new,
                     color_commit,
                 )?;
+                if !no_patch {
+                    write_unmatched_new_notes(&mut *out, &b[j])?;
+                }
             }
             j += 1;
         }
@@ -952,6 +997,21 @@ fn output(
         }
     }
 
+    Ok(())
+}
+
+fn write_unmatched_new_notes(out: &mut impl Write, patch: &Patch) -> Result<()> {
+    let mut in_notes = false;
+    for line in patch.full.lines() {
+        if line.starts_with(" ## Notes") {
+            in_notes = true;
+        } else if in_notes && line.starts_with(" ## ") {
+            break;
+        }
+        if in_notes {
+            writeln!(out, "    {line}")?;
+        }
+    }
     Ok(())
 }
 

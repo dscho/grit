@@ -10532,6 +10532,14 @@ fn write_commit_diff(
     }
 
     let mut entries = compute_commit_diff(odb, info)?;
+    if !args.no_renames && args.find_renames.is_some() {
+        let threshold = args
+            .find_renames
+            .as_deref()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(50);
+        entries = grit_lib::diff::detect_renames(odb, None, entries, threshold);
+    }
     if entries.is_empty() {
         return Ok(());
     }
