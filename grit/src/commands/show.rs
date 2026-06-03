@@ -1417,9 +1417,16 @@ fn show_commit(
                 }
                 _ => new_path.to_string(),
             };
+            // Abbreviated OIDs get a trailing `...` when GIT_PRINT_SHA1_ELLIPSIS=yes.
+            let ellipsis =
+                if std::env::var("GIT_PRINT_SHA1_ELLIPSIS").ok().as_deref() == Some("yes") {
+                    "..."
+                } else {
+                    ""
+                };
             writeln!(
                 out,
-                ":{} {} {} {} {status_str}\t{paths}",
+                ":{} {} {}{ellipsis} {}{ellipsis} {status_str}\t{paths}",
                 entry.old_mode,
                 entry.new_mode,
                 &entry.old_oid.to_hex()[..7],
