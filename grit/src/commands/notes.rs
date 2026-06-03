@@ -934,14 +934,26 @@ fn ordered_note_fragments_from_argv(
         return Ok(None);
     }
     let multi = out.len() > 1;
+    let mut previous_other = false;
     Ok(Some(
         out.into_iter()
             .map(|fragment| match fragment {
-                Fragment::Message(mut value) if add_newline_to_multiple_messages && multi => {
-                    value.push('\n');
+                Fragment::Message(mut value) => {
+                    if add_newline_to_multiple_messages && multi {
+                        value.push('\n');
+                    }
+                    previous_other = false;
                     value
                 }
-                Fragment::Message(value) | Fragment::Other(value) => value,
+                Fragment::Other(value) => {
+                    let value = if add_newline_to_multiple_messages && previous_other {
+                        format!("\n{value}")
+                    } else {
+                        value
+                    };
+                    previous_other = true;
+                    value
+                }
             })
             .collect(),
     ))
