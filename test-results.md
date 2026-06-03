@@ -1,3 +1,7 @@
+## 2026-06-03 — t12570-status-rename-copy
+
+- Focus harness: `./scripts/run-tests.sh t12570-status-rename-copy.sh --verbose` passes 38/38 after switching the porcelain branch-header expectation from `master` to `main`.
+
 ## 2026-06-03 — t10460-status-ahead-behind
 
 - Focus harness: `./scripts/run-tests.sh t10460-status-ahead-behind.sh --verbose` passes 5/5 after switching synthetic upstream/local branch expectations from `master` to `main`.
