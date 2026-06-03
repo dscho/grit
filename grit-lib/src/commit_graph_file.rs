@@ -707,13 +707,14 @@ pub fn bloom_filter_for_commit_write(
     tree_oid: ObjectId,
     settings: &BloomFilterSettings,
 ) -> crate::error::Result<(Vec<u8>, BloomBuildOutcome)> {
-    let (changed_paths_vec, raw_count) = if parents.len() == 1 {
-        let p = load_commit_tree(odb, parents[0])?;
+    // Git computes the changed-path filter against the *first* parent only,
+    // regardless of how many parents a commit has (see bloom.c:
+    // `diff_tree_oid(&c->parents->item->object.oid, ...)`).
+    let (changed_paths_vec, raw_count) = if let Some(first_parent) = parents.first() {
+        let p = load_commit_tree(odb, *first_parent)?;
         diff_changed_paths_for_bloom(odb, Some(p), tree_oid)?
-    } else if parents.is_empty() {
-        diff_changed_paths_for_bloom(odb, None, tree_oid)?
     } else {
-        return Ok((vec![0xff], BloomBuildOutcome::TruncatedLarge));
+        diff_changed_paths_for_bloom(odb, None, tree_oid)?
     };
     let set = collect_changed_paths_for_bloom(&changed_paths_vec);
     Ok(crate::bloom::build_bloom_filter_data(
