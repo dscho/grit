@@ -13,6 +13,15 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-03 — t3321-notes-stripspace partial
+
+- Focus harness improved from 2/27 to 18/27 after adding `git notes` `--stripspace` /
+  `--no-stripspace` support for add/append/edit message composition.
+- Related verification: `./scripts/run-tests.sh t3321-notes-stripspace.sh t3301-notes.sh
+  t3206-range-diff.sh` keeps `t3206` at 48/48, with `t3321` at 18/27 and `t3301` at 115/153.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes separator partial
 
 - Focus harness improved to 115/153 after default note fragment separation was changed to a

@@ -60,8 +60,10 @@
     `t3204`, `t3205`, `t3206-branch-advanced`, `t3206-range-diff`, `t3207`, `t3210`, and
     `t3211` all pass.
   - Current focus: `t3301-notes.sh` (153 total, 115 passed, 38 failing after fixing raw log
-    spacing, format-patch `--show-notes` forwarding, and default `-m`/`-F` separator handling),
-    first file in the notes group.
+    spacing, format-patch `--show-notes` forwarding, default `-m`/`-F` separator handling, and
+    wiring notes `--stripspace`/`--no-stripspace` support), first file in the notes group.
+  - Related progress: `t3321-notes-stripspace.sh` improved from 2/27 to 18/27 with the stripspace
+    support; it remains in the notes group queue.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

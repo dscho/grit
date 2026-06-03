@@ -29,6 +29,7 @@ use crate::commands::worktree_refs;
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse::resolve_revision;
 use grit_lib::state::resolve_head;
+use grit_lib::stripspace::{process as stripspace_process, Mode as StripspaceMode};
 
 use std::io::{self, Read, Write};
 use time::OffsetDateTime;
@@ -91,6 +92,12 @@ pub enum NotesSubcommand {
         #[arg(long = "no-separator", conflicts_with = "separator")]
         no_separator: bool,
 
+        #[arg(long = "stripspace", conflicts_with = "no_stripspace")]
+        stripspace: bool,
+
+        #[arg(long = "no-stripspace")]
+        no_stripspace: bool,
+
         /// Object to annotate (defaults to HEAD).
         #[arg()]
         object: Option<String>,
@@ -138,6 +145,12 @@ pub enum NotesSubcommand {
         #[arg(long = "no-separator", conflicts_with = "separator")]
         no_separator: bool,
 
+        #[arg(long = "stripspace", conflicts_with = "no_stripspace")]
+        stripspace: bool,
+
+        #[arg(long = "no-stripspace")]
+        no_stripspace: bool,
+
         #[arg()]
         object: Option<String>,
     },
@@ -180,6 +193,12 @@ pub enum NotesSubcommand {
 
         #[arg(long = "no-separator", conflicts_with = "separator")]
         no_separator: bool,
+
+        #[arg(long = "stripspace", conflicts_with = "no_stripspace")]
+        stripspace: bool,
+
+        #[arg(long = "no-stripspace")]
+        no_stripspace: bool,
 
         #[arg()]
         object: Option<String>,
@@ -311,6 +330,8 @@ pub fn run(args: Args) -> Result<()> {
             allow_empty,
             separator,
             no_separator,
+            stripspace,
+            no_stripspace,
             object,
         }) => add_note(
             &repo,
@@ -323,6 +344,8 @@ pub fn run(args: Args) -> Result<()> {
             use_editor,
             force,
             allow_empty,
+            stripspace,
+            no_stripspace,
             if no_separator {
                 None
             } else {
@@ -344,6 +367,8 @@ pub fn run(args: Args) -> Result<()> {
             allow_empty,
             separator,
             no_separator,
+            stripspace,
+            no_stripspace,
             object,
         }) => append_or_edit_note(
             &repo,
@@ -356,6 +381,8 @@ pub fn run(args: Args) -> Result<()> {
             reedit_message.as_deref(),
             use_editor,
             allow_empty,
+            stripspace,
+            no_stripspace,
             if no_separator {
                 None
             } else {
@@ -371,6 +398,8 @@ pub fn run(args: Args) -> Result<()> {
             allow_empty,
             separator,
             no_separator,
+            stripspace,
+            no_stripspace,
             object,
         }) => append_or_edit_note(
             &repo,
@@ -383,6 +412,8 @@ pub fn run(args: Args) -> Result<()> {
             reedit_message.as_deref(),
             use_editor,
             allow_empty,
+            stripspace,
+            no_stripspace,
             if no_separator {
                 None
             } else {
@@ -850,6 +881,8 @@ fn add_note(
     use_editor: bool,
     force: bool,
     allow_empty: bool,
+    stripspace: bool,
+    no_stripspace: bool,
     separator: Option<&str>,
 ) -> Result<()> {
     let oid = resolve_object(repo, object)?;
@@ -913,6 +946,20 @@ fn add_note(
             bail!("Aborting due to empty note");
         }
     }
+    let should_strip = if no_stripspace {
+        false
+    } else if stripspace {
+        true
+    } else {
+        !only_minus_c
+    };
+    if should_strip {
+        combined = String::from_utf8_lossy(&stripspace_process(
+            combined.as_bytes(),
+            &StripspaceMode::Default,
+        ))
+        .into_owned();
+    }
     let empty = combined.trim().is_empty();
     entries.retain(|e| note_object_name(&e.path).as_deref() != Some(hex.as_str()));
     if empty && !allow_empty {
@@ -955,6 +1002,8 @@ fn append_or_edit_note(
     reedit_message: Option<&str>,
     use_editor: bool,
     allow_empty: bool,
+    stripspace: bool,
+    no_stripspace: bool,
     separator: Option<&str>,
 ) -> Result<()> {
     if is_edit && (!messages.is_empty() || !files.is_empty() || reuse_message.is_some()) {
@@ -1032,6 +1081,25 @@ Please use 'git notes add -f -m/-F/-c/-C' instead."
         combined = edited;
     } else if is_edit && !has_cli && !use_editor && reedit_message.is_none() {
         combined = launch_editor(repo, existing.as_deref().unwrap_or(""))?;
+    }
+    let only_minus_c = reuse_message.is_some()
+        && messages.is_empty()
+        && files.is_empty()
+        && reedit_message.is_none()
+        && !use_editor;
+    let should_strip = if no_stripspace {
+        false
+    } else if stripspace {
+        true
+    } else {
+        !only_minus_c
+    };
+    if should_strip {
+        combined = String::from_utf8_lossy(&stripspace_process(
+            combined.as_bytes(),
+            &StripspaceMode::Default,
+        ))
+        .into_owned();
     }
     let empty = combined.trim().is_empty();
     entries.retain(|e| note_object_name(&e.path).as_deref() != Some(hex.as_str()));
