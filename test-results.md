@@ -1,3 +1,7 @@
+## 2026-06-03 — t1004-read-tree-m-u-wf
+
+- Focus harness: `./scripts/run-tests.sh t1004-read-tree-m-u-wf.sh --verbose` passes 17/17 after merge-recursive auto-resolves the simple relocated D/F case.
+
 ## 2026-06-03 — t1002-read-tree-m-u-2way
 
 - Focus harness: `./scripts/run-tests.sh t1002-read-tree-m-u-2way.sh --verbose` passes 22/22 after the read-tree stat-refresh fix.
