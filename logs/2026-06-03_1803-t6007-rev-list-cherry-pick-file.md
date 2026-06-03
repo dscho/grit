@@ -9,3 +9,9 @@
   plain `rev-list --count --left-right` print Git's two count columns instead of a third zero.
 - Direct verbose run and official harness `./scripts/run-tests.sh t6007-rev-list-cherry-pick-file.sh`
   improve from 6/23 to 8/23 and refresh `data/test-files.csv` plus dashboards.
+- Second increment: added path-limited patch-id computation for cherry equivalence, made
+  `--cherry-mark --left-right` preserve `<` / `>` for non-equivalent commits, made `--cherry`
+  behave as `--right-only --cherry-mark --no-merges`, and fixed cherry-mark count columns.
+- Direct verbose run reaches test 22 before the duplicate patch-id case fails; official harness
+  `./scripts/run-tests.sh t6007-rev-list-cherry-pick-file.sh` improves from 8/23 to 21/23 and
+  refreshes `data/test-files.csv` plus dashboards.

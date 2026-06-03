@@ -20,7 +20,7 @@ use crate::ignore::{parse_sparse_patterns_from_blob, path_in_sparse_checkout};
 use crate::index::Index;
 use crate::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use crate::pack;
-use crate::patch_ids::compute_patch_id;
+use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
 use crate::ref_exclusions::{git_namespace_prefix, strip_git_namespace, RefExclusions};
 use crate::reflog::{list_reflog_refs, read_reflog};
 use crate::refs;
@@ -457,6 +457,8 @@ pub struct RevListOptions {
     pub boundary: bool,
     /// Show left/right markers for symmetric diff.
     pub left_right: bool,
+    /// True when `--left-right` was explicitly requested by the caller.
+    pub left_right_explicit: bool,
     /// Filter to left-only commits in symmetric diff.
     pub left_only: bool,
     /// Filter to right-only commits in symmetric diff.
@@ -553,6 +555,7 @@ impl Default for RevListOptions {
             no_object_names: false,
             boundary: false,
             left_right: false,
+            left_right_explicit: false,
             left_only: false,
             right_only: false,
             cherry_mark: false,
@@ -1155,12 +1158,12 @@ pub fn rev_list(
         let mut by_patch: HashMap<ObjectId, ObjectId> = HashMap::new();
         if left_first {
             for oid in &left_commits {
-                if let Ok(Some(pid)) = compute_patch_id(&repo.odb, oid) {
+                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
                     by_patch.entry(pid).or_insert(*oid);
                 }
             }
             for oid in &right_commits {
-                if let Ok(Some(pid)) = compute_patch_id(&repo.odb, oid) {
+                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
                     if let Some(&other) = by_patch.get(&pid) {
                         cherry_equivalent.insert(*oid);
                         cherry_equivalent.insert(other);
@@ -1169,12 +1172,12 @@ pub fn rev_list(
             }
         } else {
             for oid in &right_commits {
-                if let Ok(Some(pid)) = compute_patch_id(&repo.odb, oid) {
+                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
                     by_patch.entry(pid).or_insert(*oid);
                 }
             }
             for oid in &left_commits {
-                if let Ok(Some(pid)) = compute_patch_id(&repo.odb, oid) {
+                if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
                     if let Some(&other) = by_patch.get(&pid) {
                         cherry_equivalent.insert(*oid);
                         cherry_equivalent.insert(other);
@@ -4007,6 +4010,18 @@ pub fn commit_visible_for_dense_pathspecs(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn compute_cherry_patch_id(
+    repo: &Repository,
+    oid: &ObjectId,
+    paths: &[String],
+) -> Result<Option<ObjectId>> {
+    if paths.is_empty() {
+        compute_patch_id(&repo.odb, oid)
+    } else {
+        compute_patch_id_for_paths(&repo.odb, oid, paths)
+    }
 }
 
 fn path_differs_for_specs(

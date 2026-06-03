@@ -500,20 +500,20 @@ pub fn run(args: Args) -> Result<()> {
                 "--sparse" => options.sparse = true,
                 "--dense" => { /* default behavior, no-op */ }
                 "--simplify-merges" => options.simplify_merges = true,
-                "--left-right" => options.left_right = true,
+                "--left-right" => {
+                    options.left_right = true;
+                    options.left_right_explicit = true;
+                }
                 "--left-only" => options.left_only = true,
                 "--right-only" => options.right_only = true,
-                "--cherry-mark" => {
-                    options.cherry_mark = true;
-                    options.left_right = true;
-                }
+                "--cherry-mark" => options.cherry_mark = true,
                 "--cherry-pick" => options.cherry_pick = true,
                 "--merges" => options.min_parents = Some(2),
                 "--no-merges" => options.max_parents = Some(1),
                 "--cherry" => {
-                    options.cherry_pick = true;
+                    options.cherry_mark = true;
                     options.right_only = true;
-                    options.left_right = true;
+                    options.max_parents = Some(1);
                 }
                 "-n" => {
                     let Some(value) = args.args.get(i + 1) else {
@@ -1153,17 +1153,19 @@ pub fn run(args: Args) -> Result<()> {
 
     if options.count {
         if options.left_right {
-            let left_count = result
-                .commits
-                .iter()
-                .filter(|oid| result.left_right_map.get(oid) == Some(&true))
-                .count();
-            let right_count = result
-                .commits
-                .iter()
-                .filter(|oid| result.left_right_map.get(oid) == Some(&false))
-                .count();
             if options.cherry_mark {
+                let left_count = result
+                    .commits
+                    .iter()
+                    .filter(|oid| !result.cherry_equivalent.contains(oid))
+                    .filter(|oid| result.left_right_map.get(oid) == Some(&true))
+                    .count();
+                let right_count = result
+                    .commits
+                    .iter()
+                    .filter(|oid| !result.cherry_equivalent.contains(oid))
+                    .filter(|oid| result.left_right_map.get(oid) == Some(&false))
+                    .count();
                 let equivalent_count = result
                     .commits
                     .iter()
@@ -1171,8 +1173,26 @@ pub fn run(args: Args) -> Result<()> {
                     .count();
                 println!("{left_count}\t{right_count}\t{equivalent_count}");
             } else {
+                let left_count = result
+                    .commits
+                    .iter()
+                    .filter(|oid| result.left_right_map.get(oid) == Some(&true))
+                    .count();
+                let right_count = result
+                    .commits
+                    .iter()
+                    .filter(|oid| result.left_right_map.get(oid) == Some(&false))
+                    .count();
                 println!("{left_count}\t{right_count}");
             }
+        } else if options.cherry_mark {
+            let equivalent_count = result
+                .commits
+                .iter()
+                .filter(|oid| result.cherry_equivalent.contains(oid))
+                .count();
+            let different_count = result.commits.len().saturating_sub(equivalent_count);
+            println!("{different_count}\t{equivalent_count}");
         } else {
             let mut total = result.commits.len();
             if options.objects {
@@ -1242,7 +1262,7 @@ pub fn run(args: Args) -> Result<()> {
         if options.cherry_mark {
             if result.cherry_equivalent.contains(oid) {
                 prefix = "=".to_owned();
-            } else if !prefix.is_empty() {
+            } else if !options.left_right_explicit {
                 prefix = "+".to_owned();
             }
         }

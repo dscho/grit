@@ -1225,3 +1225,10 @@ Updated: 2026-06-01
   grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6007 path-limited cherry focus: after computing patch-ids against path-limited diffs and
+  aligning `--cherry-mark`, `--cherry`, and cherry count marker semantics, the direct verbose run
+  reaches the duplicate patch-id case and `./scripts/run-tests.sh t6007-rev-list-cherry-pick-file.sh`
+  improves from 8/23 to 21/23 with refreshed `data/test-files.csv` plus dashboards. Also ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p
+  grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning backlog and known failed
+  auto-fix diagnostics remain), and `cargo test -p grit-lib --lib`.
