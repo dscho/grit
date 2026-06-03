@@ -331,7 +331,16 @@ pub fn run(mut args: Args) -> Result<()> {
         args.format = args.pretty.clone();
     }
 
-    let mut raw_objects = args.objects.clone();
+    // `--root` forces a root commit's diff against the empty tree even when
+    // `log.showroot=false`. It is not a real object, so strip it from the list.
+    let want_root = args.objects.iter().any(|s| s == "--root");
+    let mut raw_objects: Vec<String> = args
+        .objects
+        .iter()
+        .filter(|s| s.as_str() != "--root")
+        .cloned()
+        .collect();
+    args.objects = raw_objects.clone();
     while let Some(first) = raw_objects.first() {
         if first.len() > 1
             && first.starts_with('-')
@@ -492,6 +501,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 Some(&emit_opts),
                 None,
                 indent_heuristic,
+                want_root,
             )?;
             remerge_shown = true;
         }
@@ -547,6 +557,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     Some(parent_oid),
                     indent_heuristic,
+                    want_root,
                 )?;
                 shown = true;
             }
@@ -604,6 +615,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         None,
                         None,
                         indent_heuristic,
+                        want_root,
                     )?;
                     shown = true;
                 }
@@ -638,6 +650,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 None,
                 None,
                 indent_heuristic,
+                want_root,
             )?;
             shown = true;
         }
@@ -668,6 +681,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     None,
                     indent_heuristic,
+                    want_root,
                 )?;
             }
             ObjectKind::Tag => {
@@ -879,6 +893,7 @@ fn show_commit(
     remerge_emit_opts: Option<&crate::commands::remerge_diff::RemergeDiffOptions<'_>>,
     merge_from_parent: Option<ObjectId>,
     indent_heuristic: bool,
+    want_root: bool,
 ) -> Result<()> {
     let odb = &repo.odb;
     let commit = parse_commit(data).context("parsing commit")?;
@@ -978,6 +993,15 @@ fn show_commit(
         writeln!(out, "{}{} {}", &hex[..7], decoration, first_line)?;
         return Ok(());
     }
+
+    // A root commit with no diff to show (no `--root` and `log.showroot=false`) prints only
+    // the header/message — without the trailing blank that normally separates message and diff.
+    let root_diff_shown = !commit.parents.is_empty()
+        || want_root
+        || config
+            .get_bool("log.showroot")
+            .and_then(|r| r.ok())
+            .unwrap_or(true);
 
     let format = resolved_format.as_deref();
     match format {
@@ -1087,10 +1111,10 @@ fn show_commit(
                     for line in note_text.lines() {
                         writeln!(out, "    {line}")?;
                     }
-                } else {
+                } else if root_diff_shown {
                     writeln!(out)?;
                 }
-            } else {
+            } else if root_diff_shown {
                 writeln!(out)?;
             }
         }
@@ -1267,6 +1291,20 @@ fn show_commit(
             old_tree_oid,
             expand_typechange_entries_for_porcelain(diff_entries),
         )
+    };
+
+    // A root commit's diff against the empty tree is shown only when `--root` is given or
+    // `log.showroot` is true (git default). When `log.showroot=false` and `--root` is absent,
+    // `git show <root>` prints just the header/message.
+    let show_root = want_root
+        || config
+            .get_bool("log.showroot")
+            .and_then(|r| r.ok())
+            .unwrap_or(true);
+    let diff_entries = if commit.parents.is_empty() && !show_root {
+        Vec::new()
+    } else {
+        diff_entries
     };
 
     let is_merge = commit.parents.len() > 1;
@@ -1912,6 +1950,7 @@ fn show_tag(
                 None,
                 None,
                 indent_heuristic,
+                false,
             )?;
         }
         ObjectKind::Tag => {
