@@ -1,3 +1,7 @@
+## 2026-06-03 — t1050-large partial
+
+- Focus harness improved from 14/29 to 15/29 after `hash-object` rejects negative `core.bigFileThreshold` values with a bad numeric config diagnostic. Remaining failures require large-blob packfile behavior.
+
 ## 2026-06-03 — t1501-work-tree partial
 
 - Focus harness improved from 32/39 to 36/39 after `rev-parse --git-common-dir` uses the canonical common dir for admin gitdirs with `commondir`. Remaining failures are relative `GIT_WORK_TREE` diff and diff-index worktree behavior.
