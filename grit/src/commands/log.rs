@@ -781,6 +781,15 @@ fn merge_commit_wants_diff(args: &Args, git_dir: &Path) -> Result<bool> {
 }
 
 /// Whether `git log` should run diff machinery for a commit (false for merge + `off` unless only `-m` without patch — then still false).
+/// `log.showroot` config (git default: true). When false, a root commit's diff against the
+/// empty tree is suppressed unless `--root` is given.
+fn log_show_root_default(git_dir: &Path) -> bool {
+    ConfigSet::load(Some(git_dir), true)
+        .ok()
+        .and_then(|c| c.get_bool("log.showroot").and_then(|r| r.ok()))
+        .unwrap_or(true)
+}
+
 fn log_commit_needs_diff_output(args: &Args, info: &CommitInfo, git_dir: &Path) -> Result<bool> {
     let wants_diff = args.patch
         || args.patch_u
@@ -793,6 +802,12 @@ fn log_commit_needs_diff_output(args: &Args, info: &CommitInfo, git_dir: &Path) 
         || args.remerge_diff
         || args.patch_with_stat;
     if !wants_diff {
+        return Ok(false);
+    }
+    // A root commit (no parents) produces a diff against the empty tree only when
+    // `show_root_diff` is set: that is `--root`, or the default `log.showroot=true`
+    // (log-tree.c). When `log.showroot=false` and `--root` is absent, suppress it.
+    if info.parents.is_empty() && !args.root && !log_show_root_default(git_dir) {
         return Ok(false);
     }
     let is_merge = info.parents.len() > 1;
@@ -839,6 +854,23 @@ fn merge_diff_is_dense_combined(args: &Args, is_merge: bool, git_dir: &Path) -> 
 }
 
 /// Whether log should emit one diff per parent (`separate` / `-m` default).
+/// Whether the per-commit header is emitted by the diff machinery (once per parent, each
+/// `(from <parent>)`) rather than once by the caller. True only for separate (`-m`) merges
+/// that actually produce diff output.
+fn log_commit_uses_per_parent_header(
+    args: &Args,
+    info: &CommitInfo,
+    git_dir: &Path,
+) -> Result<bool> {
+    if info.parents.len() <= 1 {
+        return Ok(false);
+    }
+    if !log_commit_needs_diff_output(args, info, git_dir)? {
+        return Ok(false);
+    }
+    merge_diff_is_separate(args, true, git_dir)
+}
+
 fn merge_diff_is_separate(args: &Args, is_merge: bool, git_dir: &Path) -> Result<bool> {
     if !is_merge {
         return Ok(false);
@@ -2514,6 +2546,8 @@ fn run_rev_list_log(
             writeln!(out)?;
         }
 
+        let per_parent_header = log_commit_uses_per_parent_header(args, &info, &repo.git_dir)?;
+        if !per_parent_header {
         format_commit(
             &mut out,
             &oid,
@@ -2533,6 +2567,7 @@ fn run_rev_list_log(
             None,
             None,
         )?;
+        }
 
         if show_diff {
             write_commit_diff(
@@ -4973,6 +5008,9 @@ pub fn run(mut args: Args) -> Result<()> {
             } else {
                 None
             };
+            let per_parent_header =
+                log_commit_uses_per_parent_header(&args, &commit_data, &repo.git_dir)?;
+            if !per_parent_header {
             format_commit(
                 &mut out,
                 &oid,
@@ -4992,6 +5030,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 None,
                 source_for_oneline,
             )?;
+            }
 
             if show_diff {
                 write_commit_diff(
@@ -5179,6 +5218,9 @@ pub fn run(mut args: Args) -> Result<()> {
             } else {
                 None
             };
+            let per_parent_header =
+                log_commit_uses_per_parent_header(&args, commit_data, &repo.git_dir)?;
+            if !per_parent_header {
             format_commit(
                 &mut out,
                 oid,
@@ -5198,6 +5240,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 None,
                 source_for_oneline,
             )?;
+            }
 
             if show_diff {
                 write_commit_diff(
@@ -5512,6 +5555,9 @@ pub fn run_no_walk(
         if blank_separator && i > 0 {
             writeln!(out)?;
         }
+        let per_parent_header =
+            log_commit_uses_per_parent_header(args, commit_data, &repo.git_dir)?;
+        if !per_parent_header {
         format_commit(
             &mut out,
             oid,
@@ -5531,6 +5577,7 @@ pub fn run_no_walk(
             None,
             None,
         )?;
+        }
         if show_diff {
             write_commit_diff(
                 &mut out,
@@ -8369,10 +8416,18 @@ fn format_commit(
         parse_abbrev(&args.abbrev)
     };
     let display_parents = parent_line_override.unwrap_or(info.parents.as_slice());
+    // The `(from <parent>)` marker uses the same abbreviation as the commit hash itself:
+    // full hex for the multi-line formats (which print the full `commit <hex>`), abbreviated
+    // only under `--abbrev-commit`/`--oneline`.
+    let from_uses_abbrev = args.abbrev_commit || log_uses_builtin_oneline(args);
     let merge_suffix = merge_from_parent
         .map(|p| {
             let h = p.to_hex();
-            format!(" (from {})", &h[..abbrev_len.min(h.len())])
+            if from_uses_abbrev {
+                format!(" (from {})", &h[..abbrev_len.min(h.len())])
+            } else {
+                format!(" (from {h})")
+            }
         })
         .unwrap_or_default();
     let et = args.expand_tabs_in_log;
@@ -10819,6 +10874,7 @@ fn write_commit_diff(
     let log_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if separate {
+        let mut shown_parent = 0usize;
         for (i, parent_oid) in info.parents.iter().enumerate() {
             let mut entries = compute_commit_diff_against_parent(odb, info, i)?;
             if entries.is_empty() {
@@ -10835,34 +10891,33 @@ fn write_commit_diff(
                 args.rotate_to.as_deref(),
                 args.skip_to.as_deref(),
             )?;
-            // First parent: the main `format_commit` was already printed; only extra headers
-            // repeat the commit with `(from <parent>)` for parents 2+ (matches Git).
-            if i > 0 {
-                // Separator blank line before each repeated commit header (git's
-                // `shown_one`), then `format_commit` re-prints the header+message.
-                if leading_blank {
-                    writeln!(out)?;
-                }
-                format_commit(
-                    out,
-                    commit_oid,
-                    info,
-                    args,
-                    use_mailmap,
-                    mailmap,
-                    decorations,
-                    use_color,
-                    decoration_paint,
-                    head_for_decor,
-                    notes_cache,
-                    odb,
-                    None,
-                    false,
-                    None,
-                    Some(parent_oid),
-                    None,
-                )?;
+            // In separate (`-m`) mode git re-prints the commit header for EVERY parent,
+            // each tagged `(from <parent>)`. The caller suppresses its plain header in this
+            // mode (see `log_commit_uses_per_parent_header`), so we print all of them here,
+            // separated by a blank line (git's `shown_one`).
+            if shown_parent > 0 && leading_blank {
+                writeln!(out)?;
             }
+            shown_parent += 1;
+            format_commit(
+                out,
+                commit_oid,
+                info,
+                args,
+                use_mailmap,
+                mailmap,
+                decorations,
+                use_color,
+                decoration_paint,
+                head_for_decor,
+                notes_cache,
+                odb,
+                None,
+                false,
+                None,
+                Some(parent_oid),
+                None,
+            )?;
             write_commit_diff_body(
                 out,
                 odb,
