@@ -2459,6 +2459,9 @@ pub fn run(mut args: Args) -> Result<()> {
                 "-W" | "--function-context" => {
                     args.function_context = true;
                 }
+                // `git diff` is always recursive; `-r` / `-t` are accepted as no-ops for
+                // compatibility with diff-tree-style invocations.
+                "-r" | "-t" => {}
                 s if s.starts_with("--") => {
                     return Err(anyhow::Error::new(ExplicitExit {
                         code: 129,
