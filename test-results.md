@@ -1,3 +1,7 @@
+## 2026-06-03 — t1507-rev-parse-upstream
+
+- Focus harness: `./scripts/run-tests.sh t1507-rev-parse-upstream.sh --verbose` passes 29/29 after `branch -t` accepts upstream-resolved remote-tracking refs as valid branch start points.
+
 ## 2026-06-03 — t1508-at-combinations
 
 - Focus harness: `./scripts/run-tests.sh t1508-at-combinations.sh --verbose` passes 35/35 after reflog selectors handle empty logs for `@{0}` and one-entry logs for `@{1}` consistently with Git.
