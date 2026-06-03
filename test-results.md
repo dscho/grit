@@ -1,3 +1,7 @@
+## 2026-06-03 — t1508-at-combinations
+
+- Focus harness: `./scripts/run-tests.sh t1508-at-combinations.sh --verbose` passes 35/35 after reflog selectors handle empty logs for `@{0}` and one-entry logs for `@{1}` consistently with Git.
+
 ## 2026-06-03 — t1504-revision-range
 
 - Focus harness: `./scripts/run-tests.sh t1504-revision-range.sh --verbose` passes 28/28 after aligning synthetic branch-name expectations with the `main` default branch.
