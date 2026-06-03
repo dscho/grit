@@ -89,3 +89,10 @@
   `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` reports 79/82 passing and
   regenerated `data/test-files.csv` plus dashboards.
 - Remaining real failure: `13e`. `9g` and `12h` remain expected failures.
+- Disabled directory rename detection while folding recursive virtual merge bases, matching the
+  `13e` expectation that the virtual base should keep `a/x` so the outer merge takes `b/x`.
+- Current release harness refresh: after `cargo build --release -p grit-cli`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` reports 80/82 passing,
+  0 real failures, and regenerated `data/test-files.csv` plus dashboards.
+- `t6423-merge-rename-directories.sh` is complete by harness accounting; `9g` and `12h` remain
+  expected failures.

@@ -1577,7 +1577,7 @@ pub(crate) fn create_virtual_merge_base(
             false,
             false,
             false,
-            MergeDirectoryRenamesMode::FromConfig,
+            MergeDirectoryRenamesMode::Disabled,
             MergeRenameOptions::from_config(repo),
             None,
             true,

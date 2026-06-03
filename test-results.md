@@ -580,3 +580,8 @@ Updated: 2026-06-01
   `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 79/82 and
   refreshed `data/test-files.csv` plus dashboards. Remaining real failure is `13e`; `9g` and
   `12h` remain expected failures.
+- t6423 merge directory-rename focus: after disabling directory rename detection while folding
+  recursive virtual merge bases and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 80/82 with
+  0 real failures and refreshed `data/test-files.csv` plus dashboards. The remaining `9g` and
+  `12h` cases are expected failures.
