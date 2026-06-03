@@ -458,6 +458,14 @@ pub fn run(args: Args) -> Result<()> {
                 "--end-of-options" => end_of_options = true,
                 "--objects" => options.objects = true,
                 "--objects-edge" | "--objects-edge-aggressive" => options.objects = true,
+                "--indexed-objects" => {
+                    options.objects = true;
+                    if not_mode {
+                        options.exclude_indexed_objects = true;
+                    } else {
+                        options.include_indexed_objects = true;
+                    }
+                }
                 "--use-bitmap-index" => use_bitmap_index = true,
                 "--test-bitmap" => test_bitmap = true,
                 "--unpacked" => unpacked_only = true,

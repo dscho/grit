@@ -1351,3 +1351,10 @@ Updated: 2026-06-01
   grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6000 indexed objects focus: after accepting `--indexed-objects`, collecting index blobs plus
+  valid child cache-tree nodes, and honoring `--not --indexed-objects` for object exclusions, the
+  direct debug run advances through test 13 and `./scripts/run-tests.sh
+  t6000-rev-list-misc.sh` improves from 15/23 to 17/23 with refreshed `data/test-files.csv` plus
+  dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog remains and unrelated auto-fixes were reverted), and `cargo test -p grit-lib --lib`.

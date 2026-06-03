@@ -17,7 +17,7 @@ use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::ident::{committer_unix_seconds_for_ordering, parse_signature_times};
 use crate::ignore::{parse_sparse_patterns_from_blob, path_in_sparse_checkout};
-use crate::index::Index;
+use crate::index::{CacheTreeNode, Index, MODE_GITLINK, MODE_TREE};
 use crate::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use crate::pack;
 use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
@@ -523,8 +523,10 @@ pub struct RevListOptions {
     pub since_cutoff: Option<i64>,
     /// Include OIDs from all reflogs as extra commit tips (`git pack-objects --reflog`).
     pub include_reflog_entries: bool,
-    /// Include blob OIDs from the index as object roots (`git pack-objects --indexed-objects`).
+    /// Include index blobs and valid cache-tree nodes as object roots (`--indexed-objects`).
     pub include_indexed_objects: bool,
+    /// Exclude index blobs and valid cache-tree nodes as object roots (`--not --indexed-objects`).
+    pub exclude_indexed_objects: bool,
     /// When true with pathspecs, consult commit-graph Bloom filters (matches `core.commitGraph`).
     pub use_commit_graph_bloom: bool,
     /// `commitGraph.readChangedPaths` (default true).
@@ -588,6 +590,7 @@ impl Default for RevListOptions {
             since_cutoff: None,
             include_reflog_entries: false,
             include_indexed_objects: false,
+            exclude_indexed_objects: false,
             use_commit_graph_bloom: false,
             commit_graph_read_changed_paths: true,
             commit_graph_changed_paths_version: -1,
@@ -817,33 +820,28 @@ pub fn rev_list(
         include.extend(reflog_commit_tips(repo)?);
     }
 
-    let mut index_blob_roots: Vec<RootObject> = Vec::new();
-    if options.objects && options.include_indexed_objects && repo.work_tree.is_some() {
-        let index_path = repo.git_dir.join("index");
-        if index_path.is_file() {
-            let idx = Index::load(&index_path)?;
-            for e in &idx.entries {
-                if e.stage() != 0 {
-                    continue;
-                }
-                let path_str = String::from_utf8_lossy(&e.path).into_owned();
-                index_blob_roots.push(RootObject {
-                    oid: e.oid,
-                    input: format!(":{path_str}"),
-                    expected_kind: Some(ExpectedObjectKind::Blob),
-                    root_path: Some(path_str),
-                    wrap_with_tag: None,
-                });
-            }
-        }
-    }
+    let index_object_roots = if options.objects
+        && (options.include_indexed_objects || options.exclude_indexed_objects)
+    {
+        indexed_object_roots(repo)?
+    } else {
+        Vec::new()
+    };
 
-    let object_roots = if index_blob_roots.is_empty() {
+    let object_roots = if !options.include_indexed_objects || index_object_roots.is_empty() {
         object_roots
     } else {
         let mut merged = object_roots;
-        merged.extend(index_blob_roots);
+        merged.extend(index_object_roots.iter().cloned());
         merged
+    };
+    let negative_object_roots = if options.exclude_indexed_objects && !index_object_roots.is_empty()
+    {
+        let mut merged = negative_object_roots;
+        merged.extend(index_object_roots);
+        merged
+    } else {
+        negative_object_roots
     };
 
     if include.is_empty() && object_roots.is_empty() {
@@ -2598,6 +2596,67 @@ struct RootObject {
     root_path: Option<String>,
     /// When the user named an annotated tag, the tag object to emit before walking [`Self::oid`].
     wrap_with_tag: Option<ObjectId>,
+}
+
+fn indexed_object_roots(repo: &Repository) -> Result<Vec<RootObject>> {
+    let Some(_) = &repo.work_tree else {
+        return Ok(Vec::new());
+    };
+    let index_path = repo.git_dir.join("index");
+    if !index_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let idx = Index::load(&index_path)?;
+    let mut roots = Vec::new();
+    for e in &idx.entries {
+        if e.stage() != 0 || e.mode == MODE_GITLINK || e.mode == MODE_TREE {
+            continue;
+        }
+        let path_str = String::from_utf8_lossy(&e.path).into_owned();
+        roots.push(RootObject {
+            oid: e.oid,
+            input: format!(":{path_str}"),
+            expected_kind: Some(ExpectedObjectKind::Blob),
+            root_path: Some(path_str),
+            wrap_with_tag: None,
+        });
+    }
+
+    if let Some(cache_tree) = &idx.cache_tree {
+        push_index_cache_tree_child_roots(&mut roots, cache_tree, "");
+    }
+
+    Ok(roots)
+}
+
+fn push_index_cache_tree_child_roots(
+    roots: &mut Vec<RootObject>,
+    node: &CacheTreeNode,
+    parent_path: &str,
+) {
+    for child in &node.children {
+        let name = String::from_utf8_lossy(&child.name);
+        let path = if parent_path.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+
+        if child.entry_count >= 0 {
+            if let Some(oid) = child.oid {
+                roots.push(RootObject {
+                    oid,
+                    input: format!(":{path}"),
+                    expected_kind: Some(ExpectedObjectKind::Tree),
+                    root_path: Some(path.clone()),
+                    wrap_with_tag: None,
+                });
+            }
+        }
+
+        push_index_cache_tree_child_roots(roots, child, &path);
+    }
 }
 
 fn object_walk_print_commit_line(
@@ -5983,10 +6042,11 @@ fn collect_root_object(
             )?;
         }
         ObjectKind::Tree => {
+            let root_path = root.root_path.as_deref().unwrap_or("");
             collect_tree_objects_filtered(
                 repo,
                 root.oid,
-                "",
+                root_path,
                 0,
                 true,
                 None,
