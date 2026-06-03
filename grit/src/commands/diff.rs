@@ -9166,9 +9166,16 @@ fn write_stat(
 /// Format a rename/copy path for numstat: `{old_quoted}\t{new_quoted}` or
 /// `{old_quoted} => {new_quoted}` depending on format.
 fn format_rename_display(old: &str, new: &str, quote_path_fully: bool) -> String {
+    // Git pprint_rename: when either side needs C-style quoting there is no
+    // `{a => b}` common-prefix compaction; each side is quoted independently
+    // (t4016: `"with\tHT" => Rpathname with SP.1`).
+    let old_q = grit_lib::quote_path::quote_c_style(old, quote_path_fully);
+    let new_q = grit_lib::quote_path::quote_c_style(new, quote_path_fully);
+    if old_q != old || new_q != new {
+        return format!("{old_q} => {new_q}");
+    }
     // Use the pretty-print format with common prefix/suffix like c/{b/a => d/e}
-    let pretty = grit_lib::diff::format_rename_path(old, new);
-    grit_lib::quote_path::quote_c_style(&pretty, quote_path_fully)
+    grit_lib::diff::format_rename_path(old, new)
 }
 
 /// Write machine-readable numstat output: `{insertions}\t{deletions}\t{path}`.
