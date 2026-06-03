@@ -2097,6 +2097,10 @@ fn extract_log_cli_revision_specs(
         if !after_end_of_options && rev.starts_with('-') && !rev.starts_with('^') {
             continue;
         }
+        if !after_end_of_options && is_symmetric_diff(rev) {
+            revision_specs.push(rev.clone());
+            continue;
+        }
         if let Some(stripped) = rev.strip_prefix('^') {
             match resolve_revision_as_commit(repo, stripped) {
                 Ok(_) => revision_specs.push(rev.clone()),
@@ -2170,9 +2174,27 @@ fn run_rev_list_log(
     let (revision_specs, implied_pathspecs) =
         extract_log_cli_revision_specs(repo, args, &merged_argv)?;
 
-    let (mut positive_specs, negative_specs, stdin_all_refs, stdin_paths) =
-        collect_revision_specs_with_stdin(&repo.git_dir, &revision_specs, args.read_stdin)
-            .map_err(|e| anyhow::anyhow!("failed to parse revision arguments: {e}"))?;
+    let mut symmetric_left: Option<String> = None;
+    let mut symmetric_right: Option<String> = None;
+    let mut processed_revision_specs = Vec::new();
+    for spec in &revision_specs {
+        if is_symmetric_diff(spec) {
+            if let Some((lhs, rhs)) = split_symmetric_diff(spec) {
+                symmetric_left = Some(lhs);
+                symmetric_right = Some(rhs);
+            }
+        } else {
+            processed_revision_specs.push(spec.clone());
+        }
+    }
+
+    let (mut positive_specs, mut negative_specs, stdin_all_refs, stdin_paths) =
+        collect_revision_specs_with_stdin(
+            &repo.git_dir,
+            &processed_revision_specs,
+            args.read_stdin,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to parse revision arguments: {e}"))?;
 
     let mut combined_pathspecs = pathspecs_after_dashdash(&merged_argv, &args.pathspecs);
     combined_pathspecs.extend(implied_pathspecs);
@@ -2232,6 +2254,27 @@ fn run_rev_list_log(
     }
     if args.merges {
         options.min_parents = Some(2);
+    }
+
+    if let (Some(lhs), Some(rhs)) = (symmetric_left.as_deref(), symmetric_right.as_deref()) {
+        let lhs_spec = if lhs.is_empty() { "HEAD" } else { lhs };
+        let rhs_spec = if rhs.is_empty() { "HEAD" } else { rhs };
+        let lhs_tip = resolve_revision_for_range_end(repo, lhs_spec)
+            .with_context(|| format!("bad revision '{lhs_spec}'"))?;
+        let rhs_tip = resolve_revision_for_range_end(repo, rhs_spec)
+            .with_context(|| format!("bad revision '{rhs_spec}'"))?;
+        let lhs_oid = peel_to_commit_for_merge_base(repo, lhs_tip)?;
+        let rhs_oid = peel_to_commit_for_merge_base(repo, rhs_tip)?;
+        let bases = merge_bases(repo, lhs_oid, rhs_oid, args.first_parent)
+            .context("failed to compute merge bases for symmetric range")?;
+        positive_specs.push(lhs_spec.to_owned());
+        positive_specs.push(rhs_spec.to_owned());
+        negative_specs.extend(bases.into_iter().map(|base| base.to_hex()));
+        options.symmetric_left = Some(lhs_oid);
+        options.symmetric_right = Some(rhs_oid);
+        options.left_right = args.left_right;
+        options.left_only = args.left_only;
+        options.right_only = args.right_only;
     }
 
     if positive_specs.is_empty() && !options.all_refs {
@@ -4145,7 +4188,11 @@ pub fn run(mut args: Args) -> Result<()> {
         .iter()
         .any(|r| r != "--" && is_symmetric_diff(r))
     {
-        return run_symmetric_log(&repo, &args, patch_context, use_mailmap, &mailmap);
+        let merged_argv = merge_log_revision_argv(&repo, &args)?;
+        let has_pathspecs = !pathspecs_after_dashdash(&merged_argv, &args.pathspecs).is_empty();
+        if !has_pathspecs {
+            return run_symmetric_log(&repo, &args, patch_context, use_mailmap, &mailmap);
+        }
     }
     validate_pathspec_scope(&repo, &args.pathspecs)?;
     let mut implied_pathspecs: Vec<String> = Vec::new();

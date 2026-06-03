@@ -609,3 +609,7 @@ Updated: 2026-06-01
   path, hydrating raw revision-walk flags placed after revision tokens, and making full-history
   selection aware of parent rewriting, `./scripts/run-tests.sh t6111-rev-list-treesame.sh
   --verbose` improves to 42/65 and refreshed `data/test-files.csv` plus dashboards.
+- t6111 symmetric path focus: after routing path-limited `git log A...B -- <path>` through the
+  rev-list-backed log path and expanding it as `A B ^merge-base(A,B)`, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 43/65 and refreshed `data/test-files.csv`
+  plus dashboards.
