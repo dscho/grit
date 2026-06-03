@@ -946,7 +946,7 @@ pub fn run(mut args: Args) -> Result<()> {
         .unwrap_or_default();
 
     // Message-Id chain state for threading.
-    let mut thread = ThreadState::new(thread_mode, opts.in_reply_to.clone());
+    let mut thread = ThreadState::new(thread_mode, opts.in_reply_to.clone(), want_cover);
 
     // Collect output into a buffer (for --output single-file or stdout).
     let mut single_buf = String::new();
@@ -3008,14 +3008,17 @@ struct ThreadState {
     explicit_irt: Option<String>,
     /// Message-Ids generated so far, indexed by sequence number (0-based; cover=0 when present).
     ids: Vec<String>,
+    /// Whether a cover letter occupies seq 0 (affects the shallow thread root).
+    has_cover: bool,
 }
 
 impl ThreadState {
-    fn new(mode: ThreadMode, in_reply_to: Option<String>) -> Self {
+    fn new(mode: ThreadMode, in_reply_to: Option<String>, has_cover: bool) -> Self {
         ThreadState {
             mode,
             explicit_irt: in_reply_to.map(|s| strip_angles(&s).to_string()),
             ids: Vec::new(),
+            has_cover,
         }
     }
 
@@ -3026,10 +3029,12 @@ impl ThreadState {
         if matches!(self.mode, ThreadMode::None) {
             return String::new();
         }
-        // Use the commit OID when available, else a synthetic id, to keep ids unique & stable.
-        let id = if let Some((oid, commit)) =
-            commits.get(seq.saturating_sub(if self.cover_present() { 1 } else { 0 }))
-        {
+        // The cover letter (seq 0 when present) gets a synthetic id; each patch maps to its commit
+        // by `seq - cover_offset`.
+        let cover_offset = if self.cover_present() { 1 } else { 0 };
+        let id = if self.cover_present() && seq == 0 {
+            "cover.git-send-email-grit-0@example.com".to_string()
+        } else if let Some((oid, commit)) = commits.get(seq - cover_offset) {
             let ts = commit_author_timestamp(commit);
             format!("{ts}-{}-git-send-email-grit@example.com", oid.to_hex())
         } else {
@@ -3044,8 +3049,7 @@ impl ThreadState {
 
     fn cover_present(&self) -> bool {
         // The cover letter, when present, always occupies seq 0.
-        // We cannot know here directly; rely on ids[0] being filled first.
-        false
+        self.has_cover
     }
 
     /// In-Reply-To value for sequence `seq` (the bare id, no angles).
@@ -3055,7 +3059,15 @@ impl ThreadState {
             ThreadMode::Shallow => {
                 if seq == 0 {
                     self.explicit_irt.as_deref()
+                } else if self.has_cover {
+                    // Patches reply to the cover letter (seq 0).
+                    self.ids.first().map(|s| s.as_str())
+                } else if let Some(ref e) = self.explicit_irt {
+                    // No cover letter: the in-reply-to anchor is the thread root, so every patch
+                    // replies to it directly.
+                    Some(e.as_str())
                 } else {
+                    // No cover and no anchor: patches reply to the first patch.
                     self.ids.first().map(|s| s.as_str())
                 }
             }
@@ -3082,7 +3094,11 @@ impl ThreadState {
                 if let Some(ref e) = self.explicit_irt {
                     refs.push(e.clone());
                 }
-                if seq > 0 {
+                // The first patch references only the anchor (its parent). Subsequent patches add
+                // the thread root: the cover letter (seq 0) when present, otherwise -- when there is
+                // no anchor -- the first patch. With an anchor and no cover, the anchor is the root
+                // and is already the sole reference.
+                if seq > 0 && (self.has_cover || self.explicit_irt.is_none()) {
                     if let Some(first) = self.ids.first() {
                         refs.push(first.clone());
                     }
