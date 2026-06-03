@@ -2853,6 +2853,18 @@ pub(crate) fn apply_globals(opts: &GlobalOpts) -> Result<()> {
         std::env::set_var("GIT_NAMESPACE", ns);
     }
     if !opts.config_overrides.is_empty() {
+        for kv in &opts.config_overrides {
+            if kv.is_empty() {
+                bail!("empty config key");
+            }
+            if let Some((key, value)) = kv.split_once('=') {
+                if key.eq_ignore_ascii_case("core.bare") {
+                    grit_lib::config::parse_bool(value).map_err(|_| {
+                        anyhow::anyhow!("bad boolean config value '{value}' for 'core.bare'")
+                    })?;
+                }
+            }
+        }
         if opts.config_overrides.iter().any(|kv| {
             let lower = kv.to_ascii_lowercase();
             kv.contains('\n') || lower.contains("%0a")
