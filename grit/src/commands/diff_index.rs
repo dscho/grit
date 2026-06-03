@@ -2210,97 +2210,49 @@ fn write_submodule_log_commit_lines(
     if old_commit == z || new_commit == z {
         return Ok(());
     }
+    // Mirror Git's `print_submodule_diff_summary` (submodule.c): a single first-parent,
+    // left-right symmetric walk of `old...new` with the merge bases excluded, emitting
+    // commits in commit-date order (newest first). Left (old) side prints `<`, right (new)
+    // side prints `>`. This interleaves the two sides exactly like Git rather than grouping.
+    let _ = (fast_forward, fast_backward);
     let mut opts = RevListOptions::default();
     opts.first_parent = true;
-    if fast_forward {
-        let Ok(res) = rev_list(
-            sub_repo,
-            &[new_commit.to_hex()],
-            &[old_commit.to_hex()],
-            &opts,
-        ) else {
-            return Ok(());
+    opts.left_right = true;
+    opts.symmetric_left = Some(old_commit);
+    opts.symmetric_right = Some(new_commit);
+
+    let bases = merge_bases(sub_repo, old_commit, new_commit, true).unwrap_or_default();
+    let negatives: Vec<String> = bases.iter().map(ObjectId::to_hex).collect();
+
+    let Ok(res) = rev_list(
+        sub_repo,
+        &[old_commit.to_hex(), new_commit.to_hex()],
+        &negatives,
+        &opts,
+    ) else {
+        return Ok(());
+    };
+    for oid in &res.commits {
+        // Skip the merge bases / shared spine (only commits unique to one side are shown).
+        let is_left = match res.left_right_map.get(oid) {
+            Some(&v) => v,
+            None => continue,
         };
-        for oid in res.commits.iter().rev() {
-            let Ok(obj) = sub_repo.odb.read(oid) else {
-                continue;
-            };
-            if obj.kind != ObjectKind::Commit {
-                continue;
-            }
-            let Ok(c) = parse_commit(&obj.data) else {
-                continue;
-            };
-            let subject = submodule_commit_subject_line(&c);
+        let Ok(obj) = sub_repo.odb.read(oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        let Ok(c) = parse_commit(&obj.data) else {
+            continue;
+        };
+        let subject = submodule_commit_subject_line(&c);
+        if is_left {
+            writeln!(out, "  < {subject}")?;
+        } else {
             writeln!(out, "  > {subject}")?;
         }
-        return Ok(());
-    }
-    if fast_backward {
-        let Ok(res) = rev_list(
-            sub_repo,
-            &[old_commit.to_hex()],
-            &[new_commit.to_hex()],
-            &opts,
-        ) else {
-            return Ok(());
-        };
-        for oid in res.commits.iter().rev() {
-            let Ok(obj) = sub_repo.odb.read(oid) else {
-                continue;
-            };
-            if obj.kind != ObjectKind::Commit {
-                continue;
-            }
-            let Ok(c) = parse_commit(&obj.data) else {
-                continue;
-            };
-            let subject = submodule_commit_subject_line(&c);
-            writeln!(out, "  < {subject}")?;
-        }
-        return Ok(());
-    }
-    let Ok(fwd) = rev_list(
-        sub_repo,
-        &[new_commit.to_hex()],
-        &[old_commit.to_hex()],
-        &opts,
-    ) else {
-        return Ok(());
-    };
-    let Ok(bwd) = rev_list(
-        sub_repo,
-        &[old_commit.to_hex()],
-        &[new_commit.to_hex()],
-        &opts,
-    ) else {
-        return Ok(());
-    };
-    for oid in fwd.commits.iter().rev() {
-        let Ok(obj) = sub_repo.odb.read(oid) else {
-            continue;
-        };
-        if obj.kind != ObjectKind::Commit {
-            continue;
-        }
-        let Ok(c) = parse_commit(&obj.data) else {
-            continue;
-        };
-        let subject = submodule_commit_subject_line(&c);
-        writeln!(out, "  > {subject}")?;
-    }
-    for oid in bwd.commits.iter().rev() {
-        let Ok(obj) = sub_repo.odb.read(oid) else {
-            continue;
-        };
-        if obj.kind != ObjectKind::Commit {
-            continue;
-        }
-        let Ok(c) = parse_commit(&obj.data) else {
-            continue;
-        };
-        let subject = submodule_commit_subject_line(&c);
-        writeln!(out, "  < {subject}")?;
     }
     Ok(())
 }
