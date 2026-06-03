@@ -7696,7 +7696,13 @@ fn git_word_diff_show(
         .map(|(a, b)| plus.get(*a..*b).unwrap_or(""))
         .collect();
 
-    let ops = grit_lib::diff::diff_slice_ops_compacted(&mw, &pw, similar::Algorithm::Myers, false);
+    // Diff the word streams with raw Myers (no Git-style hunk sliding). Git's
+    // word diff keeps each changed run bounded by the surrounding equal words;
+    // applying `xdl_change_compact`-style sliding here can over-merge a changed
+    // word with an adjacent equal one across line boundaries (e.g. gluing the
+    // closing `'` of `'x'`/`'y'` to the changed letter), so we deliberately use
+    // `capture_diff_slices` rather than `diff_slice_ops_compacted`.
+    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &mw, &pw);
 
     // current_plus tracks the byte offset into `plus` already emitted.
     let mut current_plus: usize = 0;
