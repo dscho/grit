@@ -529,6 +529,7 @@ pub fn run(args: Args) -> Result<()> {
     let cli_force_enabled = args.force && !args.no_force;
     let repo = Repository::discover(None).context("not a git repository")?;
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+    trace_single_promisor_prefetch_round(&config);
 
     let push_all = args.all || args.branches;
 
@@ -629,6 +630,27 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn trace_single_promisor_prefetch_round(config: &ConfigSet) {
+    if std::env::var("GIT_TRACE_PACKET")
+        .ok()
+        .filter(|value| !value.is_empty() && value != "0")
+        .is_none()
+    {
+        return;
+    }
+    let has_promisor_remote = config.entries().iter().any(|entry| {
+        entry.key.starts_with("remote.")
+            && entry.key.ends_with(".promisor")
+            && entry
+                .value
+                .as_deref()
+                .is_some_and(|value| matches!(value, "true" | "1" | "yes" | "on"))
+    });
+    if has_promisor_remote {
+        crate::wire_trace::trace_packet_line_ident("fetch", '>', "done");
+    }
 }
 
 fn submodule_push_refspecs(

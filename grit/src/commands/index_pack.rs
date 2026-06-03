@@ -326,12 +326,8 @@ pub fn run(args: Args) -> Result<()> {
             }
             fs::write(&pack_out, &pack_bytes)?;
             if let Some(ref reason) = args.keep {
-                let keep_name = pack_out
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|n| format!("{n}.{reason}"))
-                    .unwrap_or_else(|| format!("pack-{pack_hash}.pack.{reason}"));
-                fs::write(pack_dir.join(keep_name), b"")?;
+                let keep_name = format!("pack-{pack_hash}.keep");
+                fs::write(pack_dir.join(keep_name), reason.as_bytes())?;
             }
             (pack_out, idx_out)
         }

@@ -26,7 +26,9 @@
   - Verified `t5200-update-server-info.sh` (8/8); no code changes were needed beyond
     refreshing the stale CSV/dashboard result.
   - Request-pull/server-info group now passes.
-  - Next focus group: pack/index/unpack/prune plumbing, starting with `t5300-pack-object.sh`.
+  - Completed `t5300-pack-object.sh` (63/63) after fixing pack-objects stdin parsing,
+    pack option edge cases, index-pack keep files, and promisor prefetch trace behavior.
+  - Next focus: `t5300-unpack-objects.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

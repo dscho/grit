@@ -1,4 +1,9 @@
 
+## 2026-06-03 — t5300-pack-object
+
+- Focus harness: `./scripts/run-tests.sh t5300-pack-object.sh --verbose` passes 63/63 after pack-objects stdin parsing, option edge-case, index-pack keep-file, and promisor prefetch trace fixes.
+
+
 ## 2026-06-03 — t5200-update-server-info
 
 - Focus harness: `./scripts/run-tests.sh t5200-update-server-info.sh --verbose` passes 8/8; no code changes were required, only stale CSV/dashboard refresh.

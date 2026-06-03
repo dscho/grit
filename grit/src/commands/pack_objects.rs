@@ -564,6 +564,9 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.stdin_disambiguation {
         bail!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
     }
+    if !args.extra.is_empty() {
+        bail!("fatal: bad arguments to pack-objects");
+    }
 
     if let Some(v) = args.name_hash_version {
         if v == 0 || v == 3 {
@@ -776,8 +779,10 @@ pub fn run(mut args: Args) -> Result<()> {
         }
         z
     };
-    let window_reuse_only =
-        args.window == Some(0) || window_zero_cli || window_zero_extra || window_zero_cfg;
+    let window_reuse_only = args.window.is_some_and(|w| w <= 0)
+        || window_zero_cli
+        || window_zero_extra
+        || window_zero_cfg;
 
     if args.all && args.incremental && args.unpacked && window_reuse_only {
         order_incremental_commits_first_parent_chain(&repo, &mut entries)?;
@@ -2115,7 +2120,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
     for line in rev_lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            continue;
+            break;
         }
         if args.shallow {
             if let Some(hex) = trimmed.strip_prefix("--shallow ") {
@@ -2157,6 +2162,12 @@ fn collect_pack_objects_from_rev_stdin_lines(
             negative.push(neg.to_string());
         } else {
             positive.push(trimmed.to_string());
+        }
+    }
+
+    for pos in &positive {
+        if ObjectId::from_hex(pos).is_err() && resolve_revision(repo, pos).is_err() {
+            bail!("fatal: bad revision '{pos}'");
         }
     }
 
@@ -2556,6 +2567,17 @@ fn collect_stdin_packs_oids(
     stdin_lines: &[String],
 ) -> Result<PackObjectList> {
     let pack_dir = repo.odb.objects_dir().join("pack");
+    let mut missing_specs: Vec<String> = stdin_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix('^').unwrap_or(s).trim().to_string())
+        .filter(|s| pack_index_path_for_stdin_pack_spec(&pack_dir, s).is_err())
+        .collect();
+    if !missing_specs.is_empty() {
+        missing_specs.sort();
+        bail!("fatal: could not find pack '{}'", missing_specs[0]);
+    }
     let mut oids: BTreeSet<ObjectId> = BTreeSet::new();
     let mut exclude: HashSet<ObjectId> = HashSet::new();
     for trimmed in stdin_lines
