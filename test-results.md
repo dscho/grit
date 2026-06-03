@@ -613,3 +613,7 @@ Updated: 2026-06-01
   rev-list-backed log path and expanding it as `A B ^merge-base(A,B)`, `./scripts/run-tests.sh
   t6111-rev-list-treesame.sh --verbose` improves to 43/65 and refreshed `data/test-files.csv`
   plus dashboards.
+- t6111 path parent rewrite focus: after making path-limited log parent output follow TREESAME
+  parents through omitted commits and use excluded range closures as boundary parents,
+  `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to 51/65 and refreshed
+  `data/test-files.csv` plus dashboards.

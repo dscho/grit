@@ -2337,6 +2337,11 @@ fn run_rev_list_log(
     } else {
         HashSet::new()
     };
+    let excluded_for_parent_rewrite = if rewrite_path_limited_parents {
+        excluded_revision_closure(repo, &negative_specs)?
+    } else {
+        HashSet::new()
+    };
     let first_parent_through_omitted =
         !args.full_history && !args.ancestry_path && !args.simplify_merges;
     for oid in result.commits {
@@ -2379,14 +2384,26 @@ fn run_rev_list_log(
         }
 
         let parent_override = if rewrite_path_limited_parents {
-            Some(visible_parents_for_graph(
-                repo,
-                oid,
-                &included_for_parent_rewrite,
-                args.first_parent,
-                first_parent_through_omitted,
-                args.simplify_merges,
-            )?)
+            if args.first_parent {
+                Some(visible_parents_for_graph(
+                    repo,
+                    oid,
+                    &included_for_parent_rewrite,
+                    args.first_parent,
+                    first_parent_through_omitted,
+                    args.simplify_merges,
+                )?)
+            } else {
+                Some(visible_parents_for_path_limited_log(
+                    repo,
+                    oid,
+                    &included_for_parent_rewrite,
+                    &excluded_for_parent_rewrite,
+                    &combined_pathspecs,
+                    args.first_parent,
+                    args.simplify_merges,
+                )?)
+            }
         } else {
             None
         };
@@ -2986,6 +3003,134 @@ fn visible_parents_for_graph(
     let mut dedup = HashSet::new();
     out.retain(|parent| dedup.insert(*parent));
     Ok(out)
+}
+
+fn visible_parents_for_path_limited_log(
+    repo: &Repository,
+    oid: ObjectId,
+    included: &HashSet<ObjectId>,
+    boundary: &HashSet<ObjectId>,
+    pathspecs: &[String],
+    first_parent_only: bool,
+    simplify_merge_parents: bool,
+) -> Result<Vec<ObjectId>> {
+    let mut direct = load_raw_parents(repo, oid)?;
+    if first_parent_only && direct.len() > 1 {
+        direct.truncate(1);
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for parent in direct {
+        collect_visible_path_limited_parent(
+            repo,
+            parent,
+            included,
+            boundary,
+            pathspecs,
+            first_parent_only,
+            &mut seen,
+            &mut out,
+        )?;
+    }
+    if simplify_merge_parents && out.len() > 1 {
+        let mut graph_included = included.clone();
+        graph_included.extend(boundary.iter().copied());
+        let simplified = graph_simplify_parent_list(repo, &graph_included, &out)?;
+        let keep: HashSet<ObjectId> = simplified.into_iter().collect();
+        out.retain(|parent| keep.contains(parent));
+    }
+    let mut dedup = HashSet::new();
+    out.retain(|parent| dedup.insert(*parent));
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_visible_path_limited_parent(
+    repo: &Repository,
+    candidate: ObjectId,
+    included: &HashSet<ObjectId>,
+    boundary: &HashSet<ObjectId>,
+    pathspecs: &[String],
+    first_parent_only: bool,
+    seen: &mut HashSet<ObjectId>,
+    out: &mut Vec<ObjectId>,
+) -> Result<()> {
+    if !seen.insert(candidate) {
+        return Ok(());
+    }
+    if included.contains(&candidate) || boundary.contains(&candidate) {
+        out.push(candidate);
+        return Ok(());
+    }
+
+    let mut parents = load_raw_parents(repo, candidate)?;
+    if parents.is_empty() {
+        return Ok(());
+    }
+    if first_parent_only && parents.len() > 1 {
+        parents.truncate(1);
+    } else if let Some(parent) =
+        first_treesame_parent_for_paths(repo, candidate, &parents, pathspecs)?
+    {
+        parents = vec![parent];
+    }
+
+    for parent in parents {
+        collect_visible_path_limited_parent(
+            repo,
+            parent,
+            included,
+            boundary,
+            pathspecs,
+            first_parent_only,
+            seen,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+fn first_treesame_parent_for_paths(
+    repo: &Repository,
+    oid: ObjectId,
+    parents: &[ObjectId],
+    pathspecs: &[String],
+) -> Result<Option<ObjectId>> {
+    if pathspecs.is_empty() {
+        return Ok(None);
+    }
+    let obj = repo.odb.read(&oid)?;
+    let commit = parse_commit(&obj.data)?;
+    for parent_oid in parents {
+        let parent_obj = repo.odb.read(parent_oid)?;
+        let parent = parse_commit(&parent_obj.data)?;
+        let entries = diff_trees(&repo.odb, Some(&parent.tree), Some(&commit.tree), "")?;
+        let differs = entries
+            .iter()
+            .any(|entry| path_matches(entry.path(), pathspecs));
+        if !differs {
+            return Ok(Some(*parent_oid));
+        }
+    }
+    Ok(None)
+}
+
+fn excluded_revision_closure(
+    repo: &Repository,
+    negative_specs: &[String],
+) -> Result<HashSet<ObjectId>> {
+    let mut closure = HashSet::new();
+    let mut stack = Vec::new();
+    for spec in negative_specs {
+        stack.push(resolve_revision_as_commit(repo, spec)?);
+    }
+    while let Some(oid) = stack.pop() {
+        if !closure.insert(oid) {
+            continue;
+        }
+        stack.extend(load_raw_parents(repo, oid)?);
+    }
+    Ok(closure)
 }
 
 fn collect_visible_parent_for_graph(
