@@ -210,7 +210,7 @@ t11040-diff-tree-combined	t1	yes	35	35	0	true	ok	0
 t11140-config-get-regexp	t1	yes	36	36	0	true	ok	0
 t11150-config-default-value	t1	yes	33	33	0	true	ok	0
 t11160-init-template-hooks	t1	yes	36	36	0	true	ok	0
-t11170-branch-track-inherit	t1	yes	40	25	15	false	ok	0
+t11170-branch-track-inherit	t1	yes	40	40	0	true	ok	0
 t11180-tag-sign-verify	t1	yes	36	36	0	true	ok	0
 t11260-cherry-pick-abort-continue	t1	yes	34	34	0	true	ok	0
 t11270-for-each-ref-merged	t1	yes	35	35	0	true	ok	0

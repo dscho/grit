@@ -1,3 +1,7 @@
+## 2026-06-03 — t11170-branch-track-inherit
+
+- Focus harness: `./scripts/run-tests.sh t11170-branch-track-inherit.sh --verbose` passes 40/40 after switching synthetic `master` branch references to `main` and matching branch rename missing-branch wording.
+
 ## 2026-06-03 — t13330-switch-reflog-entry
 
 - Focus harness: `./scripts/run-tests.sh t13330-switch-reflog-entry.sh --verbose` passes 30/30 after switching synthetic `master` branch references to `main`.
