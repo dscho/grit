@@ -1245,3 +1245,10 @@ Updated: 2026-06-01
   `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6120 describe selection/options focus: after matching Git's describe candidate commit-count
+  selection, describe-name rev parsing fallback, inverse describe options, exact annotated
+  `--contains` formatting, and renamed annotated-tag behavior, the direct verbose run reaches
+  `describe --dirty HEAD` and `./scripts/run-tests.sh t6120-describe.sh` improves from 54/103 to
+  86/105 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check
+  -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog remains), and `cargo test -p grit-lib --lib`.

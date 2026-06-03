@@ -1944,27 +1944,40 @@ fn try_resolve_describe_name(repo: &Repository, spec: &str) -> Result<Option<Obj
         return Ok(None);
     }
     let hex_lower = hex_abbrev.to_ascii_lowercase();
-    let tag_oid = match refs::resolve_ref(&repo.git_dir, &format!("refs/tags/{tag_name}"))
-        .or_else(|_| refs::resolve_ref(&repo.git_dir, tag_name))
-    {
-        Ok(o) => o,
-        Err(_) => return Ok(None),
-    };
-    let tag_commit = peel_to_commit_for_merge_base(repo, tag_oid)?;
-    let mut candidates: Vec<ObjectId> = find_abbrev_matches(repo, &hex_lower)?
+    let mut commit_candidates: Vec<ObjectId> = find_abbrev_matches(repo, &hex_lower)?
         .into_iter()
         .filter(|oid| {
             repo.odb
                 .read(oid)
-                .map(|o| o.kind == ObjectKind::Commit)
-                .unwrap_or(false)
-                && describe_generation_count(repo, *oid, tag_commit).ok() == Some(gen)
+                .is_ok_and(|o| o.kind == ObjectKind::Commit)
         })
         .collect();
-    candidates.sort_by_key(|o| o.to_hex());
-    match candidates.len() {
+    commit_candidates.sort_by_key(|o| o.to_hex());
+    commit_candidates.dedup();
+
+    if let Ok(tag_oid) = refs::resolve_ref(&repo.git_dir, &format!("refs/tags/{tag_name}"))
+        .or_else(|_| refs::resolve_ref(&repo.git_dir, tag_name))
+    {
+        let tag_commit = peel_to_commit_for_merge_base(repo, tag_oid)?;
+        let mut strict_candidates = commit_candidates
+            .iter()
+            .copied()
+            .filter(|oid| describe_generation_count(repo, *oid, tag_commit).ok() == Some(gen))
+            .collect::<Vec<_>>();
+        strict_candidates.sort_by_key(|o| o.to_hex());
+        if strict_candidates.len() == 1 {
+            return Ok(Some(strict_candidates[0]));
+        }
+        if strict_candidates.len() > 1 {
+            return Err(Error::InvalidRef(format!(
+                "short object ID {hex_abbrev} is ambiguous"
+            )));
+        }
+    }
+
+    match commit_candidates.len() {
         0 => Err(Error::ObjectNotFound(spec.to_owned())),
-        1 => Ok(Some(candidates[0])),
+        1 => Ok(Some(commit_candidates[0])),
         _ => Err(Error::InvalidRef(format!(
             "short object ID {hex_abbrev} is ambiguous"
         ))),
