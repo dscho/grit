@@ -440,6 +440,8 @@ struct PatchOptions {
     relative: Option<String>,
     /// `--zero-commit`: use an all-zero object name on the `From` line.
     zero_commit: bool,
+    /// `-p`/`--patch` given without any stat option: suppress the per-patch diffstat block.
+    suppress_stat: bool,
 }
 
 pub fn run(mut args: Args) -> Result<()> {
@@ -881,6 +883,8 @@ pub fn run(mut args: Args) -> Result<()> {
         mboxrd,
         relative,
         zero_commit: args.zero_commit,
+        // `-p`/`--patch` suppresses the diffstat (unless an explicit stat form is requested).
+        suppress_stat: args.patch && args.stat.is_none() && !args.numstat && !args.shortstat,
     };
 
     let mut log_output_encoding = config
@@ -1710,8 +1714,10 @@ fn format_single_patch(
 
     // Build stat + full diff into separate string
     let mut diff_text = String::new();
-    diff_text.push_str(&diffstat_for_patch_entries(odb, &diff_entries, opts)?);
-    diff_text.push('\n');
+    if !opts.suppress_stat {
+        diff_text.push_str(&diffstat_for_patch_entries(odb, &diff_entries, opts)?);
+        diff_text.push('\n');
+    }
 
     for entry in &diff_entries {
         let old_path = entry.old_path.as_deref().unwrap_or("/dev/null");
@@ -1943,7 +1949,13 @@ fn format_single_patch(
             out.push('\n');
         }
 
-        out.push_str("---\n");
+        if opts.suppress_stat {
+            // `-p` with no stat: git omits the `---` separator and the diffstat, emitting a blank
+            // line before the raw diff instead.
+            out.push('\n');
+        } else {
+            out.push_str("---\n");
+        }
         out.push_str(&diff_text);
     }
 
@@ -2813,10 +2825,9 @@ fn build_patch_subject(
     };
     if tag.is_empty() {
         subject_line.to_string()
-    } else if subject_line.is_empty() {
-        // An empty subject must not leave a trailing space after the tag.
-        tag
     } else {
+        // Git always joins the tag and subject with a single space, so an empty subject yields
+        // a trailing space after the tag (`Subject: [PATCH] `).
         format!("{tag} {subject_line}")
     }
 }
