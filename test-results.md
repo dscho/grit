@@ -1,3 +1,7 @@
+## 2026-06-03 — t1422-show-ref-exists and t1462-refs-exists
+
+- Focus harnesses: `./scripts/run-tests.sh t1422-show-ref-exists.sh --verbose` and `./scripts/run-tests.sh t1462-refs-exists.sh --verbose` both pass 12/12 after isolating the shared setup and using absolute repo paths in `show-ref-exists-tests.sh`.
+
 ## 2026-06-03 — t12540-diff-tree-cherry
 
 - Focus harness: `./scripts/run-tests.sh t12540-diff-tree-cherry.sh --verbose` passes 33/33 after aligning diff-tree/cherry fixture branch references with `main`.
