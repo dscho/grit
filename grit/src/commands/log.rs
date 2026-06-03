@@ -7210,9 +7210,8 @@ fn collect_log_display_note_refs_unconditional(repo: &Repository) -> Vec<(String
         out.push((header, refname.to_string()));
     };
 
-    push_ref(&default_ref);
     match std::env::var("GIT_NOTES_DISPLAY_REF") {
-        Ok(s) if !s.is_empty() => {
+        Ok(s) => {
             for pat in s.split(':') {
                 let pat = pat.trim();
                 if pat.is_empty() {
@@ -7225,8 +7224,8 @@ fn collect_log_display_note_refs_unconditional(repo: &Repository) -> Vec<(String
                 }
             }
         }
-        Ok(_) => {}
         Err(_) => {
+            push_ref(&default_ref);
             for pat in cfg.get_all("notes.displayRef") {
                 let pat = pat.trim();
                 if pat.is_empty() {
@@ -7284,9 +7283,8 @@ fn collect_log_display_note_refs(repo: &Repository) -> Vec<(String, String)> {
     let load_default_block = use_default_notes > 0
         || (use_default_notes == -1 && std::env::var("GIT_GRIT_LOG_NOTES_CLI").is_err());
     if load_default_block {
-        push_ref(&default_ref);
         match std::env::var("GIT_NOTES_DISPLAY_REF") {
-            Ok(s) if !s.is_empty() => {
+            Ok(s) => {
                 for pat in s.split(':') {
                     let pat = pat.trim();
                     if pat.is_empty() {
@@ -7299,8 +7297,8 @@ fn collect_log_display_note_refs(repo: &Repository) -> Vec<(String, String)> {
                     }
                 }
             }
-            Ok(_) => {}
             Err(_) => {
+                push_ref(&default_ref);
                 for pat in cfg.get_all("notes.displayRef") {
                     let pat = pat.trim();
                     if pat.is_empty() {
