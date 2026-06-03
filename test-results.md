@@ -1,3 +1,7 @@
+## 2026-06-03 — t10300-for-each-ref-count-pattern
+
+- Focus harness: `./scripts/run-tests.sh t10300-for-each-ref-count-pattern.sh --verbose` passes 36/36 with existing fixes.
+
 ## 2026-06-03 — t12570-status-rename-copy
 
 - Focus harness: `./scripts/run-tests.sh t12570-status-rename-copy.sh --verbose` passes 38/38 after switching the porcelain branch-header expectation from `master` to `main`.
