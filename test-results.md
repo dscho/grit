@@ -1,3 +1,7 @@
+## 2026-06-03 — t11970-status-ignored-tracked
+
+- Focus harness: `./scripts/run-tests.sh t11970-status-ignored-tracked.sh --verbose` passes 32/32 after using branch output mode for the porcelain branch-header check and aligning branch-name expectations with `main`.
+
 ## 2026-06-03 — t10750-status-deleted-renamed
 
 - Focus harness: `./scripts/run-tests.sh t10750-status-deleted-renamed.sh --verbose` passes 40/40 after aligning branch header expectations with the `main` default branch.
