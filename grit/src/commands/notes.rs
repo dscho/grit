@@ -1142,7 +1142,7 @@ fn add_note(
                 eprintln!("Removing note for object {hex}");
                 return Ok(());
             }
-            bail!("Aborting due to empty note");
+            return Ok(());
         }
     }
     let should_strip = if no_stripspace {

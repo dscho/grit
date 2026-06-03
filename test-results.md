@@ -1360,3 +1360,13 @@ Updated: 2026-06-01
   `t3301` at 152/153.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-03 — t3301-notes complete
+
+- Focus harness completed at 153/153 after empty editor-created `notes add` content became a
+  successful no-op when no note exists.
+- Related verification: `./scripts/run-tests.sh t3301-notes.sh t3321-notes-stripspace.sh
+  t9260-log-oneline-format.sh` passed all three files (`t3301` 153/153, `t3321` 27/27, `t9260`
+  33/33).
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
