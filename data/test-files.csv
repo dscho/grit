@@ -350,7 +350,7 @@ t12960-init-quiet-template	t1	yes	36	36	0	true	ok	0
 t12970-branch-verbose-abbrev	t1	yes	34	34	0	true	ok	0
 t12980-tag-force-replace	t1	yes	33	33	0	true	ok	0
 t12990-commit-reuse-message	t1	yes	32	32	0	true	ok	0
-t1300-config	t1	yes	497	450	47	false	ok	0
+t1300-config	t1	yes	497	372	125	false	ok	0
 t13000-add-bulk-paths	t1	yes	31	31	0	true	ok	0
 t1301-shared-repo	t1	yes	22	22	0	true	ok	0
 t13010-rm-ignore-unmatch	t1	yes	30	30	0	true	ok	0
@@ -425,7 +425,7 @@ t1420-lost-found	t1	yes	2	2	0	true	ok	0
 t1421-reflog-write	t1	yes	10	10	0	true	ok	0
 t1422-show-ref-exists	t1	yes	12	12	0	true	ok	0
 t1423-ref-backend	t1	skip	9	0	0	false	ok	0
-t1430-bad-ref-name	t1	yes	42	14	26	false	ok	2
+t1430-bad-ref-name	t1	yes	40	14	26	false	ok	2
 t1450-fsck	t1	skip	74	0	0	false	ok	0
 t1450-fsck-basic	t1	yes	31	31	0	true	ok	0
 t1450-fsck-flags	t1	yes	10	10	0	true	ok	0

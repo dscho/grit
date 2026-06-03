@@ -866,7 +866,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
     }
     let backend = rest[1].as_str();
     let sub = rest[2].as_str();
-    if backend.starts_with("worktree:") || backend.starts_with("submodule:") {
+    if backend.starts_with("worktree:") {
         return commands::test_tool_ref_store::run(&rest[1..]);
     }
     if backend != "main" {
@@ -916,6 +916,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 flags.iter().any(|f| f == "REF_SKIP_REFNAME_VERIFICATION");
 
             let mut args = vec![
+                "update-ref".to_owned(),
                 "-m".to_owned(),
                 msg.clone(),
                 refname.clone(),
@@ -940,30 +941,6 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 return Ok(());
             }
             dispatch("update-ref", &args, &GlobalOpts::default())
-        }
-        "rename-ref" => {
-            if rest.len() < 5 {
-                bail!("usage: test-tool ref-store main rename-ref <old> <new>");
-            }
-            let old_ref = &rest[3];
-            let new_ref = &rest[4];
-            let oid = grit_lib::refs::resolve_ref(&git_dir, old_ref)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let new_path = git_dir.join(new_ref);
-            if let Some(parent) = new_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&new_path, format!("{}\n", oid.to_hex()))?;
-            let _ = std::fs::remove_file(git_dir.join(old_ref));
-            let old_log = git_dir.join("logs").join(old_ref);
-            let new_log = git_dir.join("logs").join(new_ref);
-            if old_log.exists() {
-                if let Some(parent) = new_log.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                let _ = std::fs::rename(old_log, new_log);
-            }
-            Ok(())
         }
         "for-each-ref" => {
             let prefix = rest.get(3).map(String::as_str).unwrap_or("");
@@ -992,7 +969,6 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 if !prefix.is_empty() && !name.starts_with(prefix) {
                     continue;
                 }
-                let display = name.strip_prefix(prefix).unwrap_or(&name);
                 let flags = if grit_lib::check_ref_format::check_refname_format(
                     &name,
                     &grit_lib::check_ref_format::RefNameOptions {
@@ -1012,48 +988,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 } else {
                     oid.as_str()
                 };
-                println!("{display_oid} {display} {flags}");
-            }
-            Ok(())
-        }
-        "verify-ref" => {
-            let refname = rest.get(3).ok_or_else(|| {
-                anyhow::anyhow!("usage: test-tool ref-store main verify-ref <ref>")
-            })?;
-            if grit_lib::refs::resolve_ref(&git_dir, refname).is_ok() {
-                Ok(())
-            } else {
-                std::process::exit(1);
-            }
-        }
-        "for-each-reflog" => {
-            fn collect(dir: &std::path::Path, prefix: &str, out: &mut Vec<String>) -> Result<()> {
-                let read = match std::fs::read_dir(dir) {
-                    Ok(read) => read,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                    Err(err) => return Err(err.into()),
-                };
-                for entry in read {
-                    let entry = entry?;
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    let rel = if prefix.is_empty() {
-                        name
-                    } else {
-                        format!("{prefix}/{name}")
-                    };
-                    if entry.path().is_dir() {
-                        collect(&entry.path(), &rel, out)?;
-                    } else {
-                        out.push(rel);
-                    }
-                }
-                Ok(())
-            }
-            let mut logs = Vec::new();
-            collect(&git_dir.join("logs"), "", &mut logs)?;
-            logs.sort();
-            for name in logs {
-                println!("{name}");
+                println!("{display_oid} {name} {flags}");
             }
             Ok(())
         }
@@ -1104,7 +1039,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("usage: test-tool ref-store main {sub} <ref>"))?;
             let mut entries = grit_lib::reflog::read_reflog(&git_dir, refname)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            if sub == "for-each-reflog-ent-reverse" {
+            if sub == "for-each-reflog-ent" {
                 entries.reverse();
             }
             for entry in entries {
@@ -1139,16 +1074,7 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             std::fs::rename(lock_path, path)?;
             Ok(())
         }
-        "delete-ref" => {
-            if rest.len() < 5 {
-                bail!("usage: test-tool ref-store main delete-ref <msg> <ref> [old] [flags]");
-            }
-            let refname = &rest[4];
-            let _ = std::fs::remove_file(git_dir.join(refname));
-            let _ = std::fs::remove_file(git_dir.join("logs").join(refname));
-            Ok(())
-        }
-        "resolve-ref" => commands::test_tool_ref_store::run(&rest[1..]),
+        "resolve-ref" => commands::test_tool_ref_store::run(&rest[2..]),
         other => bail!("test-tool ref-store: unsupported subcommand '{other}'"),
     }
 }
@@ -2750,6 +2676,21 @@ pub(crate) fn extract_globals(
             continue;
         }
 
+        if let Some(spec) = arg.strip_prefix("--config-env=") {
+            opts.config_overrides.push(resolve_config_env(spec)?);
+            i += 1;
+            continue;
+        }
+        if arg == "--config-env" {
+            i += 1;
+            let Some(spec) = items.get(i) else {
+                bail!("no config key given for --config-env");
+            };
+            opts.config_overrides.push(resolve_config_env(spec)?);
+            i += 1;
+            continue;
+        }
+
         // --attr-source=<tree-ish> or --attr-source <tree-ish>
         if let Some(val) = arg.strip_prefix("--attr-source=") {
             opts.attr_source = Some(val.to_owned());
@@ -2855,6 +2796,26 @@ pub(crate) fn extract_globals(
     }
 
     Ok((opts, subcmd, rest))
+}
+
+fn resolve_config_env(spec: &str) -> Result<String> {
+    let Some((key, envvar)) = spec.rsplit_once('=') else {
+        bail!("invalid config format: {spec}");
+    };
+    if key.is_empty() {
+        bail!("no config key given for --config-env");
+    }
+    if envvar.is_empty() {
+        bail!("missing environment variable name for configuration '{key}'");
+    }
+    let value = std::env::var(envvar).map_err(|_| {
+        anyhow::anyhow!("missing environment variable '{envvar}' for configuration '{key}'")
+    })?;
+    if key.contains('=') {
+        Ok(format!("{key}\u{1}{value}"))
+    } else {
+        Ok(format!("{key}={value}"))
+    }
 }
 
 /// Apply global options (env vars, chdir).

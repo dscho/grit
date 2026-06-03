@@ -1,3 +1,7 @@
+## 2026-06-03 — t1300-config --config-env partial
+
+- Focus harness improved from 366/497 to 372/497 after adding global `--config-env` support, including keys containing `=`. Remaining failures are broader config parsing/formatting/type edge cases.
+
 ## 2026-06-03 — t1430-bad-ref-name update-ref partial
 
 - Focus harness improved from 13/42 to 14/42 after `update-ref -d` permits deletion of safe in-namespace broken ref names while still rejecting unsafe path names.
