@@ -377,6 +377,16 @@ pub fn write_diffstat_block(
         }
     }
 
+    // `--stat-count` only truncates the per-file lines; the summary still
+    // covers every entry (t4049).
+    for f in &files[limit..] {
+        if f.is_binary {
+            continue;
+        }
+        total_ins = total_ins.saturating_add(f.insertions);
+        total_del = total_del.saturating_add(f.deletions);
+    }
+
     let files_changed = files.len();
     let mut summary = if opts.line_prefix.is_empty() {
         format!(
