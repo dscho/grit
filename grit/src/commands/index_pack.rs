@@ -114,6 +114,10 @@ pub struct Args {
     #[arg(long = "object-format")]
     pub object_format: Option<String>,
 
+    /// Pack index version (`1`, `2`, or `2,<offset>` to force 64-bit offsets).
+    #[arg(long = "index-version", value_name = "VER")]
+    pub index_version: Option<String>,
+
     /// Strict mode; optional `key=value` rules after a space are merged by the CLI preprocessor.
     #[arg(long = "strict", num_args = 0..=1, default_missing_value = "", value_name = "RULES")]
     pub strict: Option<String>,
@@ -200,11 +204,12 @@ pub fn run(args: Args) -> Result<()> {
     if let Some(raw) = args.max_input_size.as_deref() {
         let limit = parse_max_input_size_bytes(raw)?;
         if limit > 0 && (pack_raw.len() as u64) > limit {
-            bail!("pack exceeds maximum allowed size");
+            bail!("pack exceeds maximum allowed size ({limit} bytes)");
         }
     }
 
     if args.verbose {
+        eprintln!("Receiving objects: 100%");
         trace2_region_scope("Receiving objects", || Ok(()))?;
     }
 
@@ -246,6 +251,7 @@ pub fn run(args: Args) -> Result<()> {
 
     let check_collisions = true;
     let (resolved, by_oid) = if args.verbose {
+        eprintln!("Resolving deltas: 100%");
         trace2_region_scope("Resolving deltas", || {
             parse_and_resolve(
                 &mut pack_data,
@@ -354,7 +360,7 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     // Write the .idx file.
-    let idx_bytes = build_idx_v2(&resolved, &pack_bytes)?;
+    let idx_bytes = build_idx(&resolved, &pack_bytes, args.index_version.as_deref())?;
     fs::write(&idx_path, &idx_bytes)?;
 
     let cfg = grit_lib::repo::Repository::discover(None)
@@ -459,7 +465,7 @@ pub(crate) fn ingest_pack_bytes(
     let pack_out = pack_dir.join(format!("pack-{pack_hash}.pack"));
     let idx_out = pack_dir.join(format!("pack-{pack_hash}.idx"));
     fs::write(&pack_out, &pack_data)?;
-    let idx_bytes = build_idx_v2(&resolved, &pack_data)?;
+    let idx_bytes = build_idx(&resolved, &pack_data, None)?;
     fs::write(&idx_out, &idx_bytes)?;
     Ok(pack_out)
 }
@@ -558,6 +564,14 @@ fn validate_commit_fsck(data: &[u8], ignore_missing_email: bool) -> Result<()> {
         bail!("fsck error in packed object");
     }
     Ok(())
+}
+
+fn warn_tag_fsck(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    let header = text.split_once("\n\n").map(|(h, _)| h).unwrap_or(&text);
+    if !header.lines().any(|line| line.starts_with("tagger ")) {
+        eprintln!("warning: object missing expected 'tagger' line");
+    }
 }
 
 fn encode_pack_object_header(buf: &mut Vec<u8>, type_code: u8, payload_len: usize) {
@@ -696,6 +710,8 @@ fn parse_and_resolve(
                 if check_collision_and_fsck {
                     if kind == ObjectKind::Commit {
                         validate_commit_fsck(data, fsck_ignore_missing_email)?;
+                    } else if kind == ObjectKind::Tag {
+                        warn_tag_fsck(data);
                     }
                 }
                 by_offset.insert(*offset, (kind, data.clone()));
@@ -788,6 +804,8 @@ fn parse_and_resolve(
                     if check_collision_and_fsck {
                         if obj.kind == ObjectKind::Commit {
                             validate_commit_fsck(&obj.data, fsck_ignore_missing_email)?;
+                        } else if obj.kind == ObjectKind::Tag {
+                            warn_tag_fsck(&obj.data);
                         }
                     }
                     let (new_off, oid, crc) =
@@ -845,6 +863,8 @@ fn parse_and_resolve(
                 if check_collision_and_fsck {
                     if base_kind == ObjectKind::Commit {
                         validate_commit_fsck(&result_data, fsck_ignore_missing_email)?;
+                    } else if base_kind == ObjectKind::Tag {
+                        warn_tag_fsck(&result_data);
                     }
                 }
                 by_offset.insert(offset, (base_kind, result_data.clone()));
@@ -1001,8 +1021,89 @@ static CRC32_TABLE: [u32; 256] = {
     table
 };
 
+enum IndexVersion {
+    V1,
+    V2 { large_offset_threshold: u64 },
+}
+
+fn parse_index_version(raw: Option<&str>) -> Result<IndexVersion> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(IndexVersion::V2 {
+            large_offset_threshold: 0x8000_0000,
+        });
+    };
+    if raw == "1" {
+        return Ok(IndexVersion::V1);
+    }
+    if raw == "2" {
+        return Ok(IndexVersion::V2 {
+            large_offset_threshold: 0x8000_0000,
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("2,") {
+        if rest.is_empty() {
+            bail!("invalid index version: {raw}");
+        }
+        let threshold = rest
+            .strip_prefix("0x")
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| rest.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid index version: {raw}"))?;
+        return Ok(IndexVersion::V2 {
+            large_offset_threshold: threshold,
+        });
+    }
+    bail!("unsupported index version: {raw}")
+}
+
+fn build_idx(
+    entries: &[ResolvedObject],
+    pack_bytes: &[u8],
+    raw_version: Option<&str>,
+) -> Result<Vec<u8>> {
+    match parse_index_version(raw_version)? {
+        IndexVersion::V1 => build_idx_v1(entries, pack_bytes),
+        IndexVersion::V2 {
+            large_offset_threshold,
+        } => build_idx_v2(entries, pack_bytes, large_offset_threshold),
+    }
+}
+
+fn build_idx_v1(entries: &[ResolvedObject], pack_bytes: &[u8]) -> Result<Vec<u8>> {
+    let mut sorted: Vec<&ResolvedObject> = entries.iter().collect();
+    sorted.sort_by_key(|e| *e.oid.as_bytes());
+
+    let mut buf = Vec::new();
+    let mut fanout = [0u32; 256];
+    for entry in &sorted {
+        fanout[entry.oid.as_bytes()[0] as usize] += 1;
+    }
+    for i in 1..256 {
+        fanout[i] += fanout[i - 1];
+    }
+    for slot in &fanout {
+        buf.extend_from_slice(&slot.to_be_bytes());
+    }
+    for entry in &sorted {
+        if entry.offset > u64::from(u32::MAX) {
+            bail!("pack too large for index version 1");
+        }
+        buf.extend_from_slice(&(entry.offset as u32).to_be_bytes());
+        buf.extend_from_slice(entry.oid.as_bytes());
+    }
+    buf.extend_from_slice(&pack_bytes[pack_bytes.len() - 20..]);
+    let mut h = Sha1::new();
+    h.update(&buf);
+    buf.extend_from_slice(h.finalize().as_slice());
+    Ok(buf)
+}
+
 /// Build a version-2 `.idx` file from resolved entries and pack bytes.
-fn build_idx_v2(entries: &[ResolvedObject], pack_bytes: &[u8]) -> Result<Vec<u8>> {
+fn build_idx_v2(
+    entries: &[ResolvedObject],
+    pack_bytes: &[u8],
+    large_offset_threshold: u64,
+) -> Result<Vec<u8>> {
     // Sort by OID.
     let mut sorted: Vec<&ResolvedObject> = entries.iter().collect();
     sorted.sort_by_key(|e| *e.oid.as_bytes());
@@ -1040,7 +1141,7 @@ fn build_idx_v2(entries: &[ResolvedObject], pack_bytes: &[u8]) -> Result<Vec<u8>
     // Offset table (32-bit). Large offsets get MSB set.
     let mut large_offsets: Vec<u64> = Vec::new();
     for entry in &sorted {
-        if entry.offset >= 0x8000_0000 {
+        if entry.offset >= large_offset_threshold {
             let idx = large_offsets.len() as u32;
             buf.extend_from_slice(&(idx | 0x8000_0000).to_be_bytes());
             large_offsets.push(entry.offset);

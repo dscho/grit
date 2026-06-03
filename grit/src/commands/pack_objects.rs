@@ -909,8 +909,12 @@ pub fn run(mut args: Args) -> Result<()> {
             let idx_path = format!("{base}-{pack_hash}.idx");
 
             std::fs::write(&pack_path, &pack_bytes)?;
-            let (idx_bytes, idx_order_offsets) =
-                build_idx_for_pack(&pack_bytes, chunk, pack_hash_bytes)?;
+            let (idx_bytes, idx_order_offsets) = build_idx_for_pack(
+                &pack_bytes,
+                chunk,
+                pack_hash_bytes,
+                args.index_version.as_deref(),
+            )?;
             std::fs::write(&idx_path, &idx_bytes)?;
 
             let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
@@ -3604,6 +3608,7 @@ fn build_idx_for_pack(
     pack_bytes: &[u8],
     entries: &[PackWriteEntry],
     pack_hash_bytes: usize,
+    raw_index_version: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     use grit_lib::pack::skip_one_pack_object;
 
@@ -3634,10 +3639,13 @@ fn build_idx_for_pack(
         .collect();
     sorted.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let index_version = parse_pack_index_version(raw_index_version)?;
     let mut buf = Vec::new();
-    // Header.
-    buf.extend_from_slice(&[0xFF, b't', b'O', b'c']);
-    buf.extend_from_slice(&2u32.to_be_bytes());
+    if matches!(index_version, PackIndexVersion::V2 { .. }) {
+        // Header.
+        buf.extend_from_slice(&[0xFF, b't', b'O', b'c']);
+        buf.extend_from_slice(&2u32.to_be_bytes());
+    }
 
     // Fanout.
     let mut fanout = [0u32; 256];
@@ -3649,6 +3657,27 @@ fn build_idx_for_pack(
     }
     for slot in &fanout {
         buf.extend_from_slice(&slot.to_be_bytes());
+    }
+
+    if matches!(index_version, PackIndexVersion::V1) {
+        for (orig_idx, id) in &sorted {
+            let off = offsets[*orig_idx];
+            if off > u64::from(u32::MAX) {
+                bail!("pack too large for index version 1");
+            }
+            buf.extend_from_slice(&(off as u32).to_be_bytes());
+            buf.extend_from_slice(id.as_slice());
+        }
+        let pack_checksum = &pack_bytes[pack_bytes.len() - pack_hash_bytes..];
+        buf.extend_from_slice(pack_checksum);
+        let mut h = Sha1::new();
+        h.update(&buf);
+        buf.extend_from_slice(h.finalize().as_slice());
+        let idx_order_offsets: Vec<u64> = sorted
+            .iter()
+            .map(|(orig_idx, _)| offsets[*orig_idx])
+            .collect();
+        return Ok((buf, idx_order_offsets));
     }
 
     // OID table.
@@ -3671,9 +3700,15 @@ fn build_idx_for_pack(
 
     // Offset table.
     let mut large_offsets: Vec<u64> = Vec::new();
+    let large_offset_threshold = match index_version {
+        PackIndexVersion::V2 {
+            large_offset_threshold,
+        } => large_offset_threshold,
+        PackIndexVersion::V1 => unreachable!(),
+    };
     for (orig_idx, _) in &sorted {
         let off = offsets[*orig_idx];
-        if off >= 0x8000_0000 {
+        if off >= large_offset_threshold {
             let idx = large_offsets.len() as u32;
             buf.extend_from_slice(&(idx | 0x8000_0000).to_be_bytes());
             large_offsets.push(off);
@@ -3703,6 +3738,41 @@ fn build_idx_for_pack(
         .collect();
 
     Ok((buf, idx_order_offsets))
+}
+
+enum PackIndexVersion {
+    V1,
+    V2 { large_offset_threshold: u64 },
+}
+
+fn parse_pack_index_version(raw: Option<&str>) -> Result<PackIndexVersion> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(PackIndexVersion::V2 {
+            large_offset_threshold: 0x8000_0000,
+        });
+    };
+    if raw == "1" {
+        return Ok(PackIndexVersion::V1);
+    }
+    if raw == "2" {
+        return Ok(PackIndexVersion::V2 {
+            large_offset_threshold: 0x8000_0000,
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("2,") {
+        if rest.is_empty() {
+            bail!("invalid index version: {raw}");
+        }
+        let threshold = rest
+            .strip_prefix("0x")
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| rest.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid index version: {raw}"))?;
+        return Ok(PackIndexVersion::V2 {
+            large_offset_threshold: threshold,
+        });
+    }
+    bail!("unsupported index version: {raw}")
 }
 
 /// CRC32 IEEE.
@@ -3774,7 +3844,7 @@ pub(crate) fn write_partial_clone_promisor_pack(
     let idx_path = pack_dir.join(format!("pack-{pack_hash}.idx"));
 
     std::fs::write(&pack_path, &pack_bytes)?;
-    let (idx_bytes, _) = build_idx_for_pack(&pack_bytes, &write_entries, pack_hash_bytes)?;
+    let (idx_bytes, _) = build_idx_for_pack(&pack_bytes, &write_entries, pack_hash_bytes, None)?;
     std::fs::write(&idx_path, &idx_bytes)?;
     Ok(pack_path)
 }

@@ -1,4 +1,9 @@
 
+## 2026-06-03 — t5302-pack-index partial
+
+- Focus harness: `./scripts/run-tests.sh t5302-pack-index.sh --verbose` improved to 31/36 after index v1/forced-large-offset support and strict/progress/max-size diagnostic fixes. Remaining failures are corruption-reuse/fsck cases around manually edited delta base references.
+
+
 ## 2026-06-03 — t5300-unpack-objects
 
 - Focus harness: `./scripts/run-tests.sh t5300-unpack-objects.sh --verbose` passes 23/23 after materializing the canonical empty tree during real unpack operations.
