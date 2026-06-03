@@ -1003,6 +1003,7 @@ pub fn rev_list(
     // `--full-history` walks keep rev-list order (`t6012` full-history path expectations).
     let path_needs_graph_reorder = !options.paths.is_empty()
         && options.path_graph_reorder
+        && !options.simplify_merges
         && (!options.full_history || options.sparse);
     if path_needs_graph_reorder && !ordered.is_empty() {
         if options.sparse {
@@ -3527,10 +3528,9 @@ fn commit_touches_paths(
         }
         if treesame_parents == 1 {
             return Ok(first_parent_differs
-                || (parent_rewrite
-                    && differing_parent_oids
-                        .iter()
-                        .any(|parent| excluded.contains(parent))));
+                || differing_parent_oids
+                    .iter()
+                    .any(|parent| excluded.contains(parent)));
         }
         return Ok(differs_any || sparse);
     }

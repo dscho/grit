@@ -3030,18 +3030,12 @@ fn visible_parents_for_path_limited_log(
             boundary,
             pathspecs,
             first_parent_only,
+            simplify_merge_parents,
             preserve_direct_single_parent,
             true,
             &mut seen,
             &mut out,
         )?;
-    }
-    if simplify_merge_parents && out.len() > 1 {
-        let mut graph_included = included.clone();
-        graph_included.extend(boundary.iter().copied());
-        let simplified = graph_simplify_parent_list(repo, &graph_included, &out)?;
-        let keep: HashSet<ObjectId> = simplified.into_iter().collect();
-        out.retain(|parent| keep.contains(parent));
     }
     let mut dedup = HashSet::new();
     out.retain(|parent| dedup.insert(*parent));
@@ -3056,6 +3050,7 @@ fn collect_visible_path_limited_parent(
     boundary: &HashSet<ObjectId>,
     pathspecs: &[String],
     first_parent_only: bool,
+    simplify_merge_parents: bool,
     preserve_direct_single_parent: bool,
     direct_parent: bool,
     seen: &mut HashSet<ObjectId>,
@@ -3079,9 +3074,13 @@ fn collect_visible_path_limited_parent(
     }
     if first_parent_only && parents.len() > 1 {
         parents.truncate(1);
-    } else if let Some(parent) =
-        first_treesame_parent_for_paths(repo, candidate, &parents, pathspecs)?
-    {
+    } else if let Some(parent) = treesame_parent_for_path_rewrite(
+        repo,
+        candidate,
+        &parents,
+        pathspecs,
+        simplify_merge_parents,
+    )? {
         parents = vec![parent];
     }
 
@@ -3093,6 +3092,7 @@ fn collect_visible_path_limited_parent(
             boundary,
             pathspecs,
             first_parent_only,
+            simplify_merge_parents,
             preserve_direct_single_parent,
             false,
             seen,
@@ -3102,17 +3102,19 @@ fn collect_visible_path_limited_parent(
     Ok(())
 }
 
-fn first_treesame_parent_for_paths(
+fn treesame_parent_for_path_rewrite(
     repo: &Repository,
     oid: ObjectId,
     parents: &[ObjectId],
     pathspecs: &[String],
+    prefer_last_when_all_treesame: bool,
 ) -> Result<Option<ObjectId>> {
     if pathspecs.is_empty() {
         return Ok(None);
     }
     let obj = repo.odb.read(&oid)?;
     let commit = parse_commit(&obj.data)?;
+    let mut treesame = Vec::new();
     for parent_oid in parents {
         let parent_obj = repo.odb.read(parent_oid)?;
         let parent = parse_commit(&parent_obj.data)?;
@@ -3121,10 +3123,13 @@ fn first_treesame_parent_for_paths(
             .iter()
             .any(|entry| path_matches(entry.path(), pathspecs));
         if !differs {
-            return Ok(Some(*parent_oid));
+            treesame.push(*parent_oid);
         }
     }
-    Ok(None)
+    if prefer_last_when_all_treesame && treesame.len() == parents.len() {
+        return Ok(treesame.last().copied());
+    }
+    Ok(treesame.first().copied())
 }
 
 fn excluded_revision_closure(

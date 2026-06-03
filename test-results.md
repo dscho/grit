@@ -628,3 +628,7 @@ Updated: 2026-06-01
 - t6111 simplify selection focus: after retaining path-significant one-TREESAME merges for
   `--simplify-merges`, `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to
   57/65 and refreshed `data/test-files.csv` plus dashboards.
+- t6111 simplify parent/order focus: after preserving simplify-merges ordering and rewritten
+  parent choices for all-TREESAME and odd merges, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 64/65 and refreshed `data/test-files.csv`
+  plus dashboards.
