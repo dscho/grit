@@ -961,10 +961,11 @@ fn cherry_pick_one_commit(
         _ => ConflictStyle::Merge,
     };
 
+    let base_entries = tree_to_map(tree_to_index_entries(repo, &parent_tree_oid, "")?);
+    let ours_entries = tree_to_map(tree_to_index_entries(repo, &ours_tree_oid, "")?);
+    let theirs_entries = tree_to_map(tree_to_index_entries(repo, &commit_tree_oid, "")?);
+
     if let Some(wt) = repo.work_tree.as_deref() {
-        let base_entries = tree_to_map(tree_to_index_entries(repo, &parent_tree_oid, "")?);
-        let ours_entries = tree_to_map(tree_to_index_entries(repo, &ours_tree_oid, "")?);
-        let theirs_entries = tree_to_map(tree_to_index_entries(repo, &commit_tree_oid, "")?);
         bail_if_df_merge_would_remove_cwd(wt, &base_entries, &ours_entries, &theirs_entries)?;
     }
 
@@ -997,6 +998,14 @@ fn cherry_pick_one_commit(
         index: merged.index,
         conflict_content: merged.conflict_content,
     };
+
+    apply_transitive_file_location_conflicts(
+        &base_entries,
+        &ours_entries,
+        &theirs_entries,
+        &mut merge_result.index,
+        label_theirs.as_str(),
+    );
 
     let has_conflicts = merge_result.index.entries.iter().any(|e| e.stage() != 0);
 
@@ -2589,6 +2598,167 @@ pub(crate) fn bail_if_df_merge_would_remove_cwd(
 
 fn same_blob(a: &IndexEntry, b: &IndexEntry) -> bool {
     a.oid == b.oid && a.mode == b.mode
+}
+
+fn parent_dir(path: &[u8]) -> Vec<u8> {
+    path.iter()
+        .rposition(|b| *b == b'/')
+        .map_or_else(Vec::new, |pos| path[..pos].to_vec())
+}
+
+fn remap_path_by_directory_renames(
+    path: &[u8],
+    dir_renames: &HashMap<Vec<u8>, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    let mut best: Option<(&Vec<u8>, &Vec<u8>)> = None;
+    for (old_dir, new_dir) in dir_renames {
+        let matches = if old_dir.is_empty() {
+            !path.contains(&b'/')
+        } else {
+            path.len() > old_dir.len()
+                && path.starts_with(old_dir)
+                && path.get(old_dir.len()) == Some(&b'/')
+        };
+        if !matches {
+            continue;
+        }
+        if best.is_none_or(|(best_old, _)| old_dir.len() > best_old.len()) {
+            best = Some((old_dir, new_dir));
+        }
+    }
+
+    let (old_dir, new_dir) = best?;
+    let suffix = if old_dir.is_empty() {
+        path
+    } else {
+        &path[old_dir.len() + 1..]
+    };
+    let mut remapped = new_dir.clone();
+    if !remapped.is_empty() && !suffix.is_empty() {
+        remapped.push(b'/');
+    }
+    remapped.extend_from_slice(suffix);
+    Some(remapped)
+}
+
+fn same_blob_renames(
+    base: &HashMap<Vec<u8>, IndexEntry>,
+    side: &HashMap<Vec<u8>, IndexEntry>,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let added: Vec<(&Vec<u8>, &IndexEntry)> = side
+        .iter()
+        .filter(|(path, _)| !base.contains_key(*path))
+        .collect();
+    let mut renames = Vec::new();
+    for (old_path, base_entry) in base.iter().filter(|(path, _)| !side.contains_key(*path)) {
+        if let Some((new_path, _)) = added
+            .iter()
+            .find(|(_, side_entry)| same_blob(base_entry, side_entry))
+        {
+            renames.push((old_path.clone(), (*new_path).clone()));
+        }
+    }
+    renames
+}
+
+fn directory_renames_from_file_renames(
+    renames: &[(Vec<u8>, Vec<u8>)],
+) -> HashMap<Vec<u8>, Vec<u8>> {
+    let mut counts: HashMap<Vec<u8>, HashMap<Vec<u8>, usize>> = HashMap::new();
+    for (old_path, new_path) in renames {
+        let old_dir = parent_dir(old_path);
+        let new_dir = parent_dir(new_path);
+        if old_dir == new_dir {
+            continue;
+        }
+        *counts
+            .entry(old_dir)
+            .or_default()
+            .entry(new_dir)
+            .or_default() += 1;
+    }
+
+    let mut dir_renames = HashMap::new();
+    for (old_dir, destinations) in counts {
+        let mut best: Option<(Vec<u8>, usize)> = None;
+        let mut tied = false;
+        for (new_dir, count) in destinations {
+            match best {
+                None => {
+                    best = Some((new_dir, count));
+                    tied = false;
+                }
+                Some((_, best_count)) if count > best_count => {
+                    best = Some((new_dir, count));
+                    tied = false;
+                }
+                Some((_, best_count)) if count == best_count => {
+                    tied = true;
+                }
+                _ => {}
+            }
+        }
+        if !tied {
+            if let Some((new_dir, _)) = best {
+                dir_renames.insert(old_dir, new_dir);
+            }
+        }
+    }
+    dir_renames
+}
+
+fn stage_entry_at(index: &mut Index, path: &[u8], src: &IndexEntry, stage: u8) {
+    let mut entry = src.clone();
+    entry.path = path.to_vec();
+    entry.flags = (path.len().min(0x0FFF) as u16) | ((stage as u16) << 12);
+    index.entries.push(entry);
+}
+
+fn path_has_unmerged_entry(index: &Index, path: &[u8]) -> bool {
+    index
+        .entries
+        .iter()
+        .any(|entry| entry.path == path && entry.stage() != 0)
+}
+
+fn apply_transitive_file_location_conflicts(
+    base: &HashMap<Vec<u8>, IndexEntry>,
+    ours: &HashMap<Vec<u8>, IndexEntry>,
+    theirs: &HashMap<Vec<u8>, IndexEntry>,
+    index: &mut Index,
+    theirs_label: &str,
+) {
+    let ours_dir_renames = directory_renames_from_file_renames(&same_blob_renames(base, ours));
+    if ours_dir_renames.is_empty() {
+        return;
+    }
+
+    for (old_path, new_path) in same_blob_renames(base, theirs) {
+        if ours.contains_key(&old_path) || path_has_unmerged_entry(index, &old_path) {
+            continue;
+        }
+        let Some(remapped) = remap_path_by_directory_renames(&new_path, &ours_dir_renames) else {
+            continue;
+        };
+        if remapped != old_path {
+            continue;
+        }
+        let (Some(base_entry), Some(theirs_entry)) = (base.get(&old_path), theirs.get(&new_path))
+        else {
+            continue;
+        };
+
+        index.remove(&old_path);
+        stage_entry_at(index, &old_path, base_entry, 1);
+        stage_entry_at(index, &old_path, theirs_entry, 3);
+
+        let old_s = String::from_utf8_lossy(&old_path);
+        let new_s = String::from_utf8_lossy(&new_path);
+        println!(
+            "CONFLICT (file location): {old_s} renamed to {new_s} in {theirs_label}, inside a directory that was renamed in HEAD, suggesting it should perhaps be moved to {old_s}."
+        );
+    }
+    index.sort();
 }
 
 /// Check if two blobs have the same content modulo a trailing newline.

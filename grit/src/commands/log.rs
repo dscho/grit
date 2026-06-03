@@ -1879,6 +1879,25 @@ fn hydrate_log_options_from_raw_argv(args: &mut Args) {
             }
         }
 
+        match arg.as_str() {
+            "--topo-order" => args.topo_order = true,
+            "--date-order" => args.date_order = true,
+            "--author-date-order" => args.author_date_order = true,
+            "--first-parent" => args.first_parent = true,
+            "--full-history" => args.full_history = true,
+            "--simplify-merges" => args.simplify_merges = true,
+            "--ancestry-path" => args.ancestry_path = true,
+            "--sparse" => args.sparse = true,
+            "--parents" => args.show_parents = true,
+            _ => {}
+        }
+        if let Some(rest) = arg.strip_prefix("--ancestry-path=") {
+            args.ancestry_path = true;
+            if !rest.is_empty() {
+                args.ancestry_path_bottom = Some(rest.to_owned());
+            }
+        }
+
         i += 1;
     }
 }
@@ -2090,6 +2109,12 @@ fn pathspecs_after_dashdash(merged_argv: &[String], clap_pathspecs: &[String]) -
     }
 }
 
+fn log_parent_format_requested(args: &Args) -> bool {
+    args.format
+        .as_deref()
+        .is_some_and(|fmt| fmt.contains("%P") || fmt.contains("%p"))
+}
+
 /// Collect revision argument strings from `git log` argv (before `--stdin`), matching the
 /// revision vs pathspec disambiguation used for graph output.
 fn extract_log_cli_revision_specs(
@@ -2115,6 +2140,10 @@ fn extract_log_cli_revision_specs(
             continue;
         }
         if !after_end_of_options && rev.starts_with('-') && !rev.starts_with('^') {
+            continue;
+        }
+        if !after_end_of_options && is_symmetric_diff(rev) {
+            revision_specs.push(rev.clone());
             continue;
         }
         if let Some(stripped) = rev.strip_prefix('^') {
@@ -2209,9 +2238,27 @@ fn run_rev_list_log(
     let (revision_specs, implied_pathspecs) =
         extract_log_cli_revision_specs(repo, args, &merged_argv)?;
 
-    let (mut positive_specs, negative_specs, stdin_all_refs, stdin_paths) =
-        collect_revision_specs_with_stdin(&repo.git_dir, &revision_specs, args.read_stdin)
-            .map_err(|e| anyhow::anyhow!("failed to parse revision arguments: {e}"))?;
+    let mut symmetric_left: Option<String> = None;
+    let mut symmetric_right: Option<String> = None;
+    let mut processed_revision_specs = Vec::new();
+    for spec in &revision_specs {
+        if is_symmetric_diff(spec) {
+            if let Some((lhs, rhs)) = split_symmetric_diff(spec) {
+                symmetric_left = Some(lhs);
+                symmetric_right = Some(rhs);
+            }
+        } else {
+            processed_revision_specs.push(spec.clone());
+        }
+    }
+
+    let (mut positive_specs, mut negative_specs, stdin_all_refs, stdin_paths) =
+        collect_revision_specs_with_stdin(
+            &repo.git_dir,
+            &processed_revision_specs,
+            args.read_stdin,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to parse revision arguments: {e}"))?;
 
     let mut combined_pathspecs = pathspecs_after_dashdash(&merged_argv, &args.pathspecs);
     combined_pathspecs.extend(implied_pathspecs);
@@ -2264,6 +2311,7 @@ fn run_rev_list_log(
         reverse: args.reverse,
         boundary: args.boundary,
         full_history: args.full_history,
+        parent_rewrite: args.show_parents || log_parent_format_requested(args),
         sparse: args.sparse,
         simplify_merges: args.simplify_merges,
         show_pulls: args.show_pulls,
@@ -2281,6 +2329,27 @@ fn run_rev_list_log(
     }
     if args.merges {
         options.min_parents = Some(2);
+    }
+
+    if let (Some(lhs), Some(rhs)) = (symmetric_left.as_deref(), symmetric_right.as_deref()) {
+        let lhs_spec = if lhs.is_empty() { "HEAD" } else { lhs };
+        let rhs_spec = if rhs.is_empty() { "HEAD" } else { rhs };
+        let lhs_tip = resolve_revision_for_range_end(repo, lhs_spec)
+            .with_context(|| format!("bad revision '{lhs_spec}'"))?;
+        let rhs_tip = resolve_revision_for_range_end(repo, rhs_spec)
+            .with_context(|| format!("bad revision '{rhs_spec}'"))?;
+        let lhs_oid = peel_to_commit_for_merge_base(repo, lhs_tip)?;
+        let rhs_oid = peel_to_commit_for_merge_base(repo, rhs_tip)?;
+        let bases = merge_bases(repo, lhs_oid, rhs_oid, args.first_parent)
+            .context("failed to compute merge bases for symmetric range")?;
+        positive_specs.push(lhs_spec.to_owned());
+        positive_specs.push(rhs_spec.to_owned());
+        negative_specs.extend(bases.into_iter().map(|base| base.to_hex()));
+        options.symmetric_left = Some(lhs_oid);
+        options.symmetric_right = Some(rhs_oid);
+        options.left_right = args.left_right;
+        options.left_only = args.left_only;
+        options.right_only = args.right_only;
     }
 
     if positive_specs.is_empty() && !options.all_refs {
@@ -2335,6 +2404,21 @@ fn run_rev_list_log(
         || args.patch_with_stat;
 
     let mut shown = 0usize;
+    let parent_format_requested = log_parent_format_requested(args);
+    let rewrite_path_limited_parents =
+        !combined_pathspecs.is_empty() && (args.show_parents || parent_format_requested);
+    let included_for_parent_rewrite: HashSet<ObjectId> = if rewrite_path_limited_parents {
+        result.commits.iter().copied().collect()
+    } else {
+        HashSet::new()
+    };
+    let excluded_for_parent_rewrite = if rewrite_path_limited_parents {
+        excluded_revision_closure(repo, &negative_specs)?
+    } else {
+        HashSet::new()
+    };
+    let first_parent_through_omitted =
+        !args.full_history && !args.ancestry_path && !args.simplify_merges;
     for oid in result.commits {
         let obj = repo.odb.read(&oid)?;
         let commit = parse_commit(&obj.data)?;
@@ -2374,6 +2458,32 @@ fn run_rev_list_log(
             continue;
         }
 
+        let parent_override = if rewrite_path_limited_parents {
+            if args.first_parent {
+                Some(visible_parents_for_graph(
+                    repo,
+                    oid,
+                    &included_for_parent_rewrite,
+                    args.first_parent,
+                    first_parent_through_omitted,
+                    args.simplify_merges,
+                )?)
+            } else {
+                Some(visible_parents_for_path_limited_log(
+                    repo,
+                    oid,
+                    &included_for_parent_rewrite,
+                    &excluded_for_parent_rewrite,
+                    &combined_pathspecs,
+                    args.first_parent,
+                    args.simplify_merges,
+                    args.ancestry_path,
+                )?)
+            }
+        } else {
+            None
+        };
+
         if is_format_separator && shown > 0 {
             if args.null_terminator {
                 write!(out, "\0")?;
@@ -2395,7 +2505,7 @@ fn run_rev_list_log(
             &head_state,
             &mut notes_cache,
             &repo.odb,
-            None,
+            parent_override.as_deref(),
             false,
             None,
             None,
@@ -2498,6 +2608,7 @@ fn run_graph_log(
         reverse: args.reverse,
         boundary: args.boundary,
         full_history: args.full_history,
+        parent_rewrite: args.show_parents || log_parent_format_requested(&args),
         sparse: args.sparse,
         simplify_merges: args.simplify_merges,
         show_pulls: args.show_pulls,
@@ -2968,6 +3079,150 @@ fn visible_parents_for_graph(
     let mut dedup = HashSet::new();
     out.retain(|parent| dedup.insert(*parent));
     Ok(out)
+}
+
+fn visible_parents_for_path_limited_log(
+    repo: &Repository,
+    oid: ObjectId,
+    included: &HashSet<ObjectId>,
+    boundary: &HashSet<ObjectId>,
+    pathspecs: &[String],
+    first_parent_only: bool,
+    simplify_merge_parents: bool,
+    preserve_direct_single_parent: bool,
+) -> Result<Vec<ObjectId>> {
+    let mut direct = load_raw_parents(repo, oid)?;
+    if first_parent_only && direct.len() > 1 {
+        direct.truncate(1);
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for parent in direct {
+        collect_visible_path_limited_parent(
+            repo,
+            parent,
+            included,
+            boundary,
+            pathspecs,
+            first_parent_only,
+            simplify_merge_parents,
+            preserve_direct_single_parent,
+            true,
+            &mut seen,
+            &mut out,
+        )?;
+    }
+    let mut dedup = HashSet::new();
+    out.retain(|parent| dedup.insert(*parent));
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_visible_path_limited_parent(
+    repo: &Repository,
+    candidate: ObjectId,
+    included: &HashSet<ObjectId>,
+    boundary: &HashSet<ObjectId>,
+    pathspecs: &[String],
+    first_parent_only: bool,
+    simplify_merge_parents: bool,
+    preserve_direct_single_parent: bool,
+    direct_parent: bool,
+    seen: &mut HashSet<ObjectId>,
+    out: &mut Vec<ObjectId>,
+) -> Result<()> {
+    if !seen.insert(candidate) {
+        return Ok(());
+    }
+    if included.contains(&candidate) || boundary.contains(&candidate) {
+        out.push(candidate);
+        return Ok(());
+    }
+
+    let mut parents = load_raw_parents(repo, candidate)?;
+    if parents.is_empty() {
+        return Ok(());
+    }
+    if direct_parent && preserve_direct_single_parent && parents.len() == 1 {
+        out.push(candidate);
+        return Ok(());
+    }
+    if first_parent_only && parents.len() > 1 {
+        parents.truncate(1);
+    } else if let Some(parent) = treesame_parent_for_path_rewrite(
+        repo,
+        candidate,
+        &parents,
+        pathspecs,
+        simplify_merge_parents,
+    )? {
+        parents = vec![parent];
+    }
+
+    for parent in parents {
+        collect_visible_path_limited_parent(
+            repo,
+            parent,
+            included,
+            boundary,
+            pathspecs,
+            first_parent_only,
+            simplify_merge_parents,
+            preserve_direct_single_parent,
+            false,
+            seen,
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+fn treesame_parent_for_path_rewrite(
+    repo: &Repository,
+    oid: ObjectId,
+    parents: &[ObjectId],
+    pathspecs: &[String],
+    prefer_last_when_all_treesame: bool,
+) -> Result<Option<ObjectId>> {
+    if pathspecs.is_empty() {
+        return Ok(None);
+    }
+    let obj = repo.odb.read(&oid)?;
+    let commit = parse_commit(&obj.data)?;
+    let mut treesame = Vec::new();
+    for parent_oid in parents {
+        let parent_obj = repo.odb.read(parent_oid)?;
+        let parent = parse_commit(&parent_obj.data)?;
+        let entries = diff_trees(&repo.odb, Some(&parent.tree), Some(&commit.tree), "")?;
+        let differs = entries
+            .iter()
+            .any(|entry| path_matches(entry.path(), pathspecs));
+        if !differs {
+            treesame.push(*parent_oid);
+        }
+    }
+    if prefer_last_when_all_treesame && treesame.len() == parents.len() {
+        return Ok(treesame.last().copied());
+    }
+    Ok(treesame.first().copied())
+}
+
+fn excluded_revision_closure(
+    repo: &Repository,
+    negative_specs: &[String],
+) -> Result<HashSet<ObjectId>> {
+    let mut closure = HashSet::new();
+    let mut stack = Vec::new();
+    for spec in negative_specs {
+        stack.push(resolve_revision_as_commit(repo, spec)?);
+    }
+    while let Some(oid) = stack.pop() {
+        if !closure.insert(oid) {
+            continue;
+        }
+        stack.extend(load_raw_parents(repo, oid)?);
+    }
+    Ok(closure)
 }
 
 fn collect_visible_parent_for_graph(
@@ -4229,7 +4484,11 @@ pub fn run(mut args: Args) -> Result<()> {
         .iter()
         .any(|r| r != "--" && is_symmetric_diff(r))
     {
-        return run_symmetric_log(&repo, &args, patch_context, use_mailmap, &mailmap);
+        let merged_argv = merge_log_revision_argv(&repo, &args)?;
+        let has_pathspecs = !pathspecs_after_dashdash(&merged_argv, &args.pathspecs).is_empty();
+        if !has_pathspecs {
+            return run_symmetric_log(&repo, &args, patch_context, use_mailmap, &mailmap);
+        }
     }
     validate_pathspec_scope(&repo, &args.pathspecs)?;
     let mut implied_pathspecs: Vec<String> = Vec::new();
@@ -4334,7 +4593,9 @@ pub fn run(mut args: Args) -> Result<()> {
         return run_graph_log(&repo, &args, patch_context, use_mailmap, &mailmap);
     }
 
-    let effective_for_rev_list = resolve_effective_pathspecs(&repo, &args.pathspecs)?;
+    let merged_argv_for_walk_probe = merge_log_revision_argv(&repo, &args)?;
+    let probe_pathspecs = pathspecs_after_dashdash(&merged_argv_for_walk_probe, &args.pathspecs);
+    let effective_for_rev_list = resolve_effective_pathspecs(&repo, &probe_pathspecs)?;
     let wants_rev_list_walk = !args.follow
         && args.branches.is_none()
         && !args.source

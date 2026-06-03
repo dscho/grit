@@ -1039,8 +1039,8 @@ t5815-submodule-protos	t5	yes	8	8	0	true	ok	0
 t5900-repo-selection	t5	yes	8	4	4	false	ok	0
 t6000-rev-list-misc	t6	yes	23	9	14	false	ok	0
 t6001-rev-list-graft	t6	yes	14	10	4	false	ok	0
-t6002-rev-list-bisect	t6	yes	53	4	49	false	ok	0
-t6003-rev-list-topo-order	t6	yes	36	22	14	false	ok	0
+t6002-rev-list-bisect	t6	yes	53	53	0	true	ok	0
+t6003-rev-list-topo-order	t6	yes	36	23	13	false	ok	0
 t6004-rev-list-path-optim	t6	yes	7	7	0	true	ok	0
 t6005-rev-list-count	t6	yes	6	6	0	true	ok	0
 t6006-rev-list-format	t6	yes	80	58	22	false	ok	0
@@ -1057,11 +1057,11 @@ t6014-rev-list-all	t6	yes	4	4	0	true	ok	0
 t6015-rev-list-show-all-parents	t6	yes	38	32	6	false	ok	0
 t6016-rev-list-graph-simplify-history	t6	yes	12	2	10	false	ok	0
 t6017-rev-list-stdin	t6	yes	37	37	0	true	ok	0
-t6018-rev-list-glob	t6	yes	95	35	60	false	ok	0
+t6018-rev-list-glob	t6	yes	95	95	0	true	ok	0
 t6019-rev-list-ancestry-path	t6	yes	18	5	13	false	ok	0
 t6020-bundle-misc	t6	yes	37	13	24	false	ok	0
-t6021-rev-list-exclude-hidden	t6	yes	62	1	61	false	ok	0
-t6022-rev-list-missing	t6	yes	40	16	24	false	ok	0
+t6021-rev-list-exclude-hidden	t6	yes	62	62	0	true	ok	0
+t6022-rev-list-missing	t6	yes	40	40	0	true	ok	0
 t6030-bisect-porcelain	t6	yes	96	85	11	false	ok	0
 t6040-tracking-info	t6	yes	44	44	0	true	ok	0
 t6041-bisect-submodule	t6	yes	14	7	7	false	ok	0
@@ -1071,7 +1071,7 @@ t6100-rev-list-in-order	t6	yes	3	3	0	true	ok	0
 t6101-rev-parse-parents	t6	yes	38	35	3	false	ok	0
 t6102-rev-list-unexpected-objects	t6	yes	22	22	0	true	ok	0
 t6110-rev-list-sparse	t6	yes	2	2	0	true	ok	0
-t6111-rev-list-treesame	t6	yes	65	19	46	false	ok	0
+t6111-rev-list-treesame	t6	yes	65	65	0	true	ok	0
 t6112-rev-list-filters-objects	t6	yes	54	53	1	false	ok	0
 t6113-rev-list-bitmap-filters	t6	yes	14	14	0	true	ok	0
 t6114-keep-packs	t6	yes	3	3	0	true	ok	0
@@ -1119,7 +1119,7 @@ t6418-merge-text-auto	t6	yes	11	7	4	false	ok	0
 t6419-merge-ignorecase	t6	yes	0	0	0	false	ok	0
 t6421-merge-partial-clone	t6	yes	3	0	3	false	ok	0
 t6422-merge-rename-corner-cases	t6	yes	20	11	9	false	ok	6
-t6423-merge-rename-directories	t6	yes	80	29	51	false	ok	2
+t6423-merge-rename-directories	t6	yes	80	80	0	true	ok	2
 t6424-merge-unrelated-index-changes	t6	yes	19	18	1	false	ok	0
 t6425-merge-rename-delete	t6	yes	1	1	0	true	ok	0
 t6426-merge-skip-unneeded-updates	t6	yes	13	13	0	true	ok	0
@@ -1138,11 +1138,11 @@ t6435-merge-sparse	t6	yes	6	6	0	true	ok	0
 t6435-merge-sparse-directory	t6	yes	2	1	1	false	ok	0
 t6436-merge-overwrite	t6	yes	18	12	6	false	ok	0
 t6437-submodule-merge	t6	yes	22	22	0	true	ok	0
-t6438-submodule-directory-file-conflicts	t6	yes	56	23	33	false	ok	0
+t6438-submodule-directory-file-conflicts	t6	yes	56	56	0	true	ok	0
 t6439-merge-co-error-msgs	t6	yes	6	4	2	false	ok	0
 t6500-gc	t6	yes	35	34	1	false	ok	0
 t6501-freshen-objects	t6	yes	42	36	6	false	ok	0
-t6600-test-reach	t6	yes	47	16	31	false	ok	0
+t6600-test-reach	t6	yes	47	47	0	true	ok	0
 t6601-path-walk	t6	yes	15	15	0	true	ok	0
 t6700-tree-depth	t6	yes	10	10	0	true	ok	0
 t7001-mv	t7	yes	54	51	3	false	ok	0

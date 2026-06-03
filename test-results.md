@@ -518,6 +518,74 @@
 
 # Test Results
 
+Updated: 2026-06-03
+- t6 plan artifact: created `t6-plan.md` grouping current t6 rows by dependency/topic and claimed
+  `t6021-rev-list-exclude-hidden.sh` first as the highest-failing t6 row.
+- t6600 reachability focus: `./scripts/run-tests.sh t6600-test-reach.sh --verbose` improves from
+  16/47 to 40/47 after adding the `test-tool reach` helper operations for ref_newer,
+  merge-base membership, descendant checks, merge-base listing, head reduction, reachability
+  subsets, and first-parent branch-base selection.
+- t6600 `is-base` focus: `./scripts/run-tests.sh t6600-test-reach.sh --verbose` improves from
+  40/47 to 43/47 after moving first-parent branch-base selection into `grit-lib::merge_base` and
+  using it for `for-each-ref` `%(is-base)` output and sorting.
+- t6600 multi-base merged focus: `./scripts/run-tests.sh t6600-test-reach.sh --verbose` improves
+  from 43/47 to 44/47 after preserving all `for-each-ref --merged` bases and filtering refs
+  reachable from any base.
+- t6600 maximal-only focus: `./scripts/run-tests.sh t6600-test-reach.sh --verbose` improves from
+  44/47 to 46/47 after parsing `rev-list --maximal-only` and pruning commits reachable from another
+  selected commit in the revision range.
+- t6600 symmetric topo completion: `./scripts/run-tests.sh t6600-test-reach.sh
+  t6003-rev-list-topo-order.sh t6111-rev-list-treesame.sh --verbose` passes `t6600` at 47/47,
+  keeps `t6111` at 65/65, and leaves adjacent `t6003` at its existing 23/36.
+- t6022 missing-object completion: direct debug `cd tests && sh t6022-rev-list-missing.sh` and
+  official `./scripts/run-tests.sh t6022-rev-list-missing.sh` now pass 40/40 after
+  missing-tolerant commit/object walks, parent-closure subtraction in segmented `--objects` output,
+  negative tree/blob object-root subtraction, object-aware `rev:path` roots, and
+  `--missing=print-info`/`-z` output.
+- Verification for this increment: `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo clippy --fix --allow-dirty`, `cargo build --release -p grit-cli`,
+  `cargo test -p grit-lib --lib` (238/238), and the focused harness ran. Clippy completed with the
+  existing warning backlog and failed auto-fixes in unrelated files; unrelated auto-fixes were not
+  kept.
+- Build unblock: `cargo build --release -p grit-cli` initially failed because `merge --abort`
+  still called `checkout_merge_reset_worktree` with its old three-argument signature; the caller
+  now passes explicit non-recursive submodule flags and release builds complete.
+- t6 hidden-ref focus: direct `cd tests && sh t6021-rev-list-exclude-hidden.sh -v` passed 62/62
+  after adding `rev-list` CLI support for `--exclude-hidden`/`--exclude`, exclusion-aware physical
+  `--all`/`--glob` expansion, empty pseudo-ref expansion success, namespace stripping, duplicate
+  `--exclude-hidden` errors, and incompatibility errors for branches/tags/remotes.
+- Harness refresh: `./scripts/run-tests.sh t6021-rev-list-exclude-hidden.sh --verbose` passes
+  62/62 and regenerated `data/test-files.csv` plus dashboards.
+- t6 ref-glob focus: direct `cd tests && sh t6018-rev-list-glob.sh -v` and harness
+  `./scripts/run-tests.sh t6018-rev-list-glob.sh --verbose` both pass 95/95 after extending
+  pseudo-ref glob/exclude behavior across `rev-list`, `rev-parse`, and `shortlog`.
+- Verification for this increment: `cargo check -p grit-cli` and `cargo build --release -p
+  grit-cli` passed with the existing warning backlog.
+- t6 rev-list bisection focus: direct `cd tests && sh t6002-rev-list-bisect.sh -v` and harness
+  `./scripts/run-tests.sh t6002-rev-list-bisect.sh --verbose` both pass 53/53 after adding
+  `rev-list --bisect`, `--bisect-vars`, `--bisect-all`, bisect-ref defaulting, and
+  `rev-parse --bisect` object output.
+- Verification for this increment: `cargo fmt`, `cargo check -p grit-cli`, and
+  `cargo build --release -p grit-cli` passed with the existing warning backlog.
+- Next claimed t6 target: `t6423-merge-rename-directories.sh`.
+- t6 merge directory-rename focus: `./scripts/run-tests.sh t6423-merge-rename-directories.sh
+  --verbose` improved from 29/82 to 33/82 after path-qualified labels for directory-rename
+  add/add conflicts, majority destination selection for split directory renames, and tied split
+  conflict reporting.
+- Continued t6423 focus: the same harness now reports 36/82 after disabling directory rename
+  application when the source directory still exists on both sides of the merge.
+- Continued t6423 focus: `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose`
+  now reports 40/82 after handling blocked implicit directory renames for same-side path
+  collisions and descendants, preserving pre-directory-rename labels for transitive
+  rename/rename cases, and avoiding duplicate same-target rename conflict staging.
+- Continued t6423 focus: `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose`
+  now reports 42/82 after suppressing doubly-transitive directory rename application,
+  relocating D/F rename/delete stages, preserving explicit `:N:path^0` index-path parsing, and
+  writing plain modify/delete survivor blobs to the worktree.
+- Verification for this increment: `cargo fmt`, `cargo check -p grit-cli`, and
+  `cargo build --release -p grit-cli` passed with the existing warning backlog; `cargo test -p
+  grit-lib --lib` passed 238/238 after the rev-list bisection library change.
+
 Updated: 2026-06-02
 - t6 for-each-ref focus: `TZ=UTC ./scripts/run-tests.sh t6300-for-each-ref.sh` passes 429/429
   after ref-filter atom/sort/trailer/signature support, recursive tag peeling, and tag
@@ -1029,3 +1097,80 @@ Updated: 2026-06-01
   warnings; `cargo clippy --fix --allow-dirty` completed with the existing warning backlog and its
   unrelated `config.rs`/`filter_process.rs` auto-fixes were reverted; `cargo test -p grit-lib --lib`
   passed 238/238.
+- t6423 merge directory-rename focus: after rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 75/82 and
+  refreshed `data/test-files.csv` plus dashboards. Remaining real failures are `12i2`, `12l` in
+  both directions, `12n`, and `13e`; `9g` and `12h` remain expected failures.
+- t6423 merge directory-rename focus: after preserving pure additions under nested mutual
+  directory renames and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 77/82 and
+  refreshed `data/test-files.csv` plus dashboards. Remaining real failures are `12i2`, `12n`, and
+  `13e`; `9g` and `12h` remain expected failures.
+- Checkpoint verification: `cargo fmt` ran; `cargo build -p grit-cli` passed with existing
+  warnings; `cargo clippy --fix --allow-dirty` completed but still reports the existing warning
+  backlog and unrelated auto-fixes were reverted; `cargo test -p grit-lib --lib` passed 238/238.
+- t6423 merge directory-rename focus: after carrying rename-to-self content-conflict state out of
+  directory-rename application and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 78/82 and
+  refreshed `data/test-files.csv` plus dashboards. Remaining real failures are `12n` and `13e`;
+  `9g` and `12h` remain expected failures.
+- t6423 merge directory-rename focus: after detecting cherry-pick transitive file-location
+  conflicts that rename back to the deleted source path and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 79/82 and
+  refreshed `data/test-files.csv` plus dashboards. Remaining real failure is `13e`; `9g` and
+  `12h` remain expected failures.
+- t6423 merge directory-rename focus: after disabling directory rename detection while folding
+  recursive virtual merge bases and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` now reports 80/82 with
+  0 real failures and refreshed `data/test-files.csv` plus dashboards. The remaining `9g` and
+  `12h` cases are expected failures.
+- t6438 submodule directory/file conflict focus: initial official refresh for the claimed file,
+  `./scripts/run-tests.sh t6438-submodule-directory-file-conflicts.sh --verbose`, reports 39/56
+  and refreshed `data/test-files.csv` plus dashboards.
+- t6438 submodule replacement focus: after aborting merges that would replace checked-out
+  submodules with regular files/directories and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6438-submodule-directory-file-conflicts.sh --verbose` reports 55/56
+  and refreshed `data/test-files.csv` plus dashboards. Remaining failure is `merge --no-ff`
+  replacing a directory with a submodule.
+- t6438 completion: after resolving no-ff directory-to-submodule merges where the directory side
+  matches the merge base and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6438-submodule-directory-file-conflicts.sh --verbose` passes 56/56 and
+  refreshed `data/test-files.csv` plus dashboards.
+- t6111 TREESAME focus: after making default dense path-limited traversal follow only one
+  TREESAME merge parent and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to 20/65 and refreshed
+  `data/test-files.csv` plus dashboards.
+- t6111 parent rewrite focus: after applying visible-parent rewriting to non-graph path-limited
+  parent output and rebuilding `target/release/grit`,
+  `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to 22/65 and refreshed
+  `data/test-files.csv` plus dashboards.
+- t6111 option/range TREESAME focus: after routing `--` pathspecs through the rev-list-backed log
+  path, hydrating raw revision-walk flags placed after revision tokens, and making full-history
+  selection aware of parent rewriting, `./scripts/run-tests.sh t6111-rev-list-treesame.sh
+  --verbose` improves to 42/65 and refreshed `data/test-files.csv` plus dashboards.
+- t6111 symmetric path focus: after routing path-limited `git log A...B -- <path>` through the
+  rev-list-backed log path and expanding it as `A B ^merge-base(A,B)`, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 43/65 and refreshed `data/test-files.csv`
+  plus dashboards.
+- t6111 path parent rewrite focus: after making path-limited log parent output follow TREESAME
+  parents through omitted commits and use excluded range closures as boundary parents,
+  `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to 51/65 and refreshed
+  `data/test-files.csv` plus dashboards.
+- t6111 ancestry bottom focus: after making path-limited `--ancestry-path` omit merges that are
+  TREESAME to the effective ancestry bottom side, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 54/65 and refreshed `data/test-files.csv`
+  plus dashboards.
+- t6111 ancestry parent-output focus: after preserving direct single-parent omissions and
+  all-TREESAME connectors in parent-output ancestry walks, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 56/65 and refreshed `data/test-files.csv`
+  plus dashboards.
+- t6111 simplify selection focus: after retaining path-significant one-TREESAME merges for
+  `--simplify-merges`, `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to
+  57/65 and refreshed `data/test-files.csv` plus dashboards.
+- t6111 simplify parent/order focus: after preserving simplify-merges ordering and rewritten
+  parent choices for all-TREESAME and odd merges, `./scripts/run-tests.sh
+  t6111-rev-list-treesame.sh --verbose` improves to 64/65 and refreshed `data/test-files.csv`
+  plus dashboards.
+- t6111 completion: after ordering adjacent direct-parent blocks for topo-order output,
+  `./scripts/run-tests.sh t6111-rev-list-treesame.sh t6003-rev-list-topo-order.sh --verbose`
+  passes `t6111` at 65/65 and refreshes adjacent `t6003` to 23/36.

@@ -31,12 +31,42 @@
     ignored broken/zero loose refs remove any preloaded entry from the refs list.
   - Completed rev-list bitmap filter file: `t6113-rev-list-bitmap-filters.sh` (14/14) after making
     `rev-list --objects --unpacked` emit the full object closure for unpacked commits.
-  - Next t6 work should continue with the remaining rev-list/revision traversal group unless a
-    higher-value dependency group is selected from the CSV.
+  - Completed hidden-ref exclusion file: `t6021-rev-list-exclude-hidden.sh` (62/62) after wiring
+    `rev-list` CLI parsing for `--exclude-hidden`/`--exclude`, applying exclusion-aware physical
+    pseudo-ref expansion, preserving Git's empty expansion behavior, and fixing a stale merge
+    reset-worktree caller that blocked release builds.
+  - Completed ref glob/exclude file: `t6018-rev-list-glob.sh` (95/95) after extending
+    pseudo-ref glob and exclude handling across `rev-list`, `rev-parse`, and `shortlog`.
+  - Completed rev-list bisection file: `t6002-rev-list-bisect.sh` (53/53) after adding
+    bisection midpoint selection, `--bisect-vars`, `--bisect-all`, bisect-ref defaults, and
+    `rev-parse --bisect` object output.
+  - Completed file: `t6423-merge-rename-directories.sh`, now 80/82 with 0 real failures; `9g`
+    and `12h` remain expected failures.
+  - Completed file: `t6438-submodule-directory-file-conflicts.sh` (56/56) after protecting
+    checked-out submodules during replacement merges and resolving no-ff directory-to-submodule
+    merges whose directory side matches the merge base.
+  - Completed file: `t6111-rev-list-treesame.sh` (65/65) after fixing path-limited TREESAME
+    traversal, parent rewriting, ancestry-bottom pruning, simplify-merges path rewriting, and
+    adjacent merge-parent topo ordering.
+  - Adjacent topo refresh: `t6003-rev-list-topo-order.sh` improved to 23/36.
+  - Completed rev-list/reachability file: `t6600-test-reach.sh` (47/47) after adding the upstream
+    `test-tool reach` helper operations, first-parent `%(is-base)` selection, multi-base
+    `for-each-ref --merged`, `rev-list --maximal-only`, and symmetric-difference topo ordering.
+  - Completed rev-list/missing-object file: `t6022-rev-list-missing.sh` (40/40) after
+    missing-tolerant traversal, segmented object parent-closure subtraction, negative tree/blob
+    object root subtraction, and `--missing=print-info`/`-z` output.
   - Execution logs: `logs/2026-06-02_1427-t6-for-each-ref.md`,
     `logs/2026-06-02_1655-t6200-fmt-merge-msg-extra.md`,
     `logs/2026-06-02_1710-t6040-tracking-info.md`,
-    `logs/2026-06-02_2000-t6113-rev-list-bitmap-filters.md`.
+    `logs/2026-06-02_2000-t6113-rev-list-bitmap-filters.md`,
+    `logs/2026-06-03_0754-t6021-rev-list-exclude-hidden.md`,
+    `logs/2026-06-03_0810-t6018-rev-list-glob.md`,
+    `logs/2026-06-03_0816-t6002-rev-list-bisect.md`,
+    `logs/2026-06-03_0824-t6423-merge-rename-directories.md`,
+    `logs/2026-06-03_1332-t6438-submodule-directory-file-conflicts.md`,
+    `logs/2026-06-03_1348-t6111-rev-list-treesame.md`,
+    `logs/2026-06-03_1519-t6600-test-reach.md`,
+    `logs/2026-06-03_1625-t6022-rev-list-missing.md`.
 
 ---
 

@@ -7,7 +7,9 @@ use grit_lib::error::Error as GustError;
 use grit_lib::git_date::show::{date_mode_release, parse_date_format, show_date};
 use grit_lib::git_date::tm::atoi_bytes;
 use grit_lib::mailmap::{load_mailmap_table, map_contact_table, parse_contact, MailmapTable};
-use grit_lib::merge_base::{ancestor_closure, count_symmetric_ahead_behind, is_ancestor};
+use grit_lib::merge_base::{
+    ancestor_closure, branch_base_for_tip, count_symmetric_ahead_behind, is_ancestor,
+};
 use grit_lib::objects::{
     parse_commit, parse_tag, tag_header_field, tag_object_line_oid, ObjectId, ObjectKind,
 };
@@ -21,7 +23,7 @@ use crate::porcelain_rev::{
     resolve_porcelain_points_at,
 };
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -209,8 +211,8 @@ struct Options {
     patterns: Vec<String>,
     exclude: Vec<String>,
     points_at: Option<String>,
-    merged: Option<Option<String>>,
-    no_merged: Option<Option<String>>,
+    merged: Vec<Option<String>>,
+    no_merged: Vec<Option<String>>,
     contains: Option<Option<String>>,
     no_contains: Option<Option<String>>,
     stdin: bool,
@@ -381,7 +383,7 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
             continue;
         }
         if let Some(value) = arg.strip_prefix("--merged=") {
-            opts.merged = Some(Some(value.to_owned()));
+            opts.merged.push(Some(value.to_owned()));
             i += 1;
             continue;
         }
@@ -389,18 +391,18 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
             i += 1;
             if let Some(value) = args.get(i) {
                 if !value.starts_with('-') {
-                    opts.merged = Some(Some(value.clone()));
+                    opts.merged.push(Some(value.clone()));
                     i += 1;
                 } else {
-                    opts.merged = Some(None);
+                    opts.merged.push(None);
                 }
             } else {
-                opts.merged = Some(None);
+                opts.merged.push(None);
             }
             continue;
         }
         if let Some(value) = arg.strip_prefix("--no-merged=") {
-            opts.no_merged = Some(Some(value.to_owned()));
+            opts.no_merged.push(Some(value.to_owned()));
             i += 1;
             continue;
         }
@@ -408,13 +410,13 @@ fn parse_args(args: Vec<String>, inv: ForEachRefInvocation) -> Result<Options> {
             i += 1;
             if let Some(value) = args.get(i) {
                 if !value.starts_with('-') {
-                    opts.no_merged = Some(Some(value.clone()));
+                    opts.no_merged.push(Some(value.clone()));
                     i += 1;
                 } else {
-                    opts.no_merged = Some(None);
+                    opts.no_merged.push(None);
                 }
             } else {
-                opts.no_merged = Some(None);
+                opts.no_merged.push(None);
             }
             continue;
         }
@@ -797,25 +799,28 @@ fn apply_filters(repo: &Repository, opts: &Options, refs: &mut Vec<RefEntry>) ->
         });
     }
 
-    let merged_base = resolve_optional_merged_commitish(repo, opts.merged.as_ref())?;
-    let no_merged_base = resolve_optional_merged_commitish(repo, opts.no_merged.as_ref())?;
-    if let Some(base) = merged_base {
+    let merged_bases = resolve_optional_merged_commitishes(repo, &opts.merged)?;
+    let no_merged_bases = resolve_optional_merged_commitishes(repo, &opts.no_merged)?;
+    if !merged_bases.is_empty() {
         refs.retain(|entry| {
-            entry
-                .oid
-                .and_then(|oid| peel_to_commit(repo, oid).ok())
-                .and_then(|oid| is_ancestor(repo, oid, base).ok())
-                .unwrap_or(false)
+            let Some(oid) = entry.oid.and_then(|oid| peel_to_commit(repo, oid).ok()) else {
+                return false;
+            };
+            merged_bases
+                .iter()
+                .copied()
+                .any(|base| is_ancestor(repo, oid, base).unwrap_or(false))
         });
     }
-    if let Some(base) = no_merged_base {
+    if !no_merged_bases.is_empty() {
         refs.retain(|entry| {
-            entry
-                .oid
-                .and_then(|oid| peel_to_commit(repo, oid).ok())
-                .and_then(|oid| is_ancestor(repo, oid, base).ok())
-                .map(|merged| !merged)
-                .unwrap_or(false)
+            let Some(oid) = entry.oid.and_then(|oid| peel_to_commit(repo, oid).ok()) else {
+                return false;
+            };
+            !no_merged_bases
+                .iter()
+                .copied()
+                .any(|base| is_ancestor(repo, oid, base).unwrap_or(false))
         });
     }
 
@@ -844,15 +849,16 @@ fn apply_filters(repo: &Repository, opts: &Options, refs: &mut Vec<RefEntry>) ->
     Ok(())
 }
 
-fn resolve_optional_merged_commitish(
+fn resolve_optional_merged_commitishes(
     repo: &Repository,
-    raw: Option<&Option<String>>,
-) -> Result<Option<ObjectId>> {
-    match raw {
-        None => Ok(None),
-        Some(Some(spec)) => Ok(Some(resolve_porcelain_merged_commit(repo, spec)?)),
-        Some(None) => Ok(Some(resolve_porcelain_merged_commit(repo, "HEAD")?)),
+    raw: &[Option<String>],
+) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for item in raw {
+        let spec = item.as_deref().unwrap_or("HEAD");
+        out.push(resolve_porcelain_merged_commit(repo, spec)?);
     }
+    Ok(out)
 }
 
 fn resolve_optional_contains_commitish(
@@ -1242,37 +1248,27 @@ fn compute_is_base_winners(
     targets: &[String],
 ) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    let mut seen_blob_error = false;
+    let mut seen_bad_tag_error = false;
+    let candidates: Vec<(&str, ObjectId)> = refs
+        .iter()
+        .filter_map(|entry| {
+            commit_for_is_base(repo, entry, &mut seen_blob_error, &mut seen_bad_tag_error)
+                .map(|oid| (entry.name.as_str(), oid))
+        })
+        .collect();
+    let base_oids: Vec<ObjectId> = candidates.iter().map(|(_, oid)| *oid).collect();
+
     for target in targets {
         let Ok(target_oid) =
             resolve_revision(repo, target).and_then(|oid| peel_to_commit(repo, oid))
         else {
             continue;
         };
-        let mut seen_blob_error = false;
-        let mut seen_bad_tag_error = false;
-        let mut best: Option<(&str, usize)> = None;
-        for entry in refs {
-            let Some(commit_oid) =
-                commit_for_is_base(repo, entry, &mut seen_blob_error, &mut seen_bad_tag_error)
-            else {
-                continue;
-            };
-            let Some(distance) = commit_distance_to_ancestor(repo, commit_oid, target_oid) else {
-                continue;
-            };
-            let replace = match best {
-                None => true,
-                Some((best_name, best_distance)) => {
-                    distance < best_distance
-                        || (distance == best_distance && entry.name.as_str() < best_name)
-                }
-            };
-            if replace {
-                best = Some((&entry.name, distance));
+        if let Ok(Some(candidate_index)) = branch_base_for_tip(repo, target_oid, &base_oids) {
+            if let Some((name, _)) = candidates.get(candidate_index) {
+                out.insert(target.clone(), (*name).to_owned());
             }
-        }
-        if let Some((name, _)) = best {
-            out.insert(target.clone(), name.to_owned());
         }
     }
     out
@@ -1349,30 +1345,6 @@ fn commit_for_is_base(
             _ => return None,
         }
     }
-}
-
-fn commit_distance_to_ancestor(
-    repo: &Repository,
-    start: ObjectId,
-    ancestor: ObjectId,
-) -> Option<usize> {
-    let mut seen = HashSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back((start, 0usize));
-    while let Some((oid, distance)) = queue.pop_front() {
-        if !seen.insert(oid) {
-            continue;
-        }
-        if oid == ancestor {
-            return Some(distance);
-        }
-        let object = repo.read_replaced(&oid).ok()?;
-        let commit = parse_commit(&object.data).ok()?;
-        for parent in commit.parents {
-            queue.push_back((parent, distance + 1));
-        }
-    }
-    None
 }
 
 fn quote_output(s: &str, style: Option<QuoteStyle>) -> String {
