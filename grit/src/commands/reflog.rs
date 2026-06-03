@@ -300,6 +300,8 @@ fn run_show(args: ShowArgs) -> Result<()> {
         raw: false,
         all: false,
         branches: None,
+        tags: None,
+        remotes: None,
         exclude_promisor_objects: false,
         follow: false,
         diff_filter_parts: Vec::new(),

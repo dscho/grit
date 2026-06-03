@@ -287,6 +287,14 @@ pub struct Args {
     #[arg(long = "branches", num_args = 0..=1, default_missing_value = "")]
     pub branches: Option<String>,
 
+    /// Include tag refs (refs/tags/) in the revision walk, optionally limited to a glob.
+    #[arg(long = "tags", num_args = 0..=1, default_missing_value = "")]
+    pub tags: Option<String>,
+
+    /// Include remote-tracking refs (refs/remotes/) in the walk, optionally limited to a glob.
+    #[arg(long = "remotes", num_args = 0..=1, default_missing_value = "")]
+    pub remotes: Option<String>,
+
     /// Follow file renames (single file only).
     #[arg(long = "follow")]
     pub follow: bool,
@@ -4007,6 +4015,33 @@ fn emit_bloom_perf_line(stats: &BloomWalkStats, path: &str) {
 pub fn run(mut args: Args) -> Result<()> {
     hydrate_log_options_from_raw_argv(&mut args);
 
+    // `--tags`/`--remotes` are accepted as proper options (so they don't absorb
+    // following `--decorate` etc. via the hyphen-tolerant positional list); turn
+    // them back into the pseudo-ref tokens the revision expander understands.
+    {
+        let mut injected: Vec<String> = Vec::new();
+        if let Some(glob) = args.tags.take() {
+            injected.push(if glob.is_empty() {
+                "--tags".to_owned()
+            } else {
+                format!("--tags={glob}")
+            });
+        }
+        if let Some(glob) = args.remotes.take() {
+            injected.push(if glob.is_empty() {
+                "--remotes".to_owned()
+            } else {
+                format!("--remotes={glob}")
+            });
+        }
+        if !injected.is_empty() {
+            args.revisions.extend(injected.iter().cloned());
+            if !args.raw_argv_tail.is_empty() {
+                args.raw_argv_tail.extend(injected);
+            }
+        }
+    }
+
     let saw_bare_l = args.line_range.iter().any(|s| s.is_empty());
     args.line_range.retain(|s| !s.is_empty());
     if saw_bare_l && args.line_range.is_empty() {
@@ -5014,9 +5049,18 @@ pub fn run_no_walk(
             oids.push(*oid);
         }
     } else {
-        for rev in &args.revisions {
+        // Expand pseudo-refs (`--tags`, `--all`, `--branches`, `--remotes`,
+        // `--glob=`) into concrete revision tokens before resolving each.
+        let expanded = merge_log_revision_argv(repo, args)?;
+        let mut seen = HashSet::new();
+        for rev in &expanded {
+            if rev == "--" || rev.starts_with('^') {
+                continue;
+            }
             let oid = resolve_revision_as_commit(repo, rev)?;
-            oids.push(oid);
+            if seen.insert(oid) {
+                oids.push(oid);
+            }
         }
     }
 
