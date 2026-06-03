@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5302-show-index
+
+- Focus harness: `./scripts/run-tests.sh t5302-show-index.sh --verbose` passes 17/17 after pack reverse-index sidecar format compatibility and fixture verify-pack isolation fixes.
+- Regression harnesses: `./scripts/run-tests.sh t5302-pack-index.sh --verbose` passes 36/36 and `./scripts/run-tests.sh t5325-reverse-index.sh --verbose` passes 16/16.
+
+
 ## 2026-06-03 — t5302-pack-index
 
 - Focus harness: `./scripts/run-tests.sh t5302-pack-index.sh --verbose` passes 36/36 after index v1/forced-large-offset support, strict/progress/max-size diagnostics, and corruption-reuse behavior fixes.

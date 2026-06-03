@@ -16,7 +16,9 @@ use grit_lib::pack::{
     read_pack_index, read_packed_delta_dependency, slice_one_pack_object, PackIndex,
     PackedDeltaDependency,
 };
-use grit_lib::pack_rev::{build_pack_rev_bytes_from_index_order_offsets, rev_path_for_index};
+use grit_lib::pack_rev::{
+    build_pack_rev_bytes_from_index_order_offsets_and_checksum, rev_path_for_index,
+};
 use grit_lib::rev_list::{
     rev_list, shallow_boundary_oids, MissingAction, ObjectFilter, RevListOptions,
 };
@@ -923,7 +925,10 @@ pub fn run(mut args: Args) -> Result<()> {
             let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
             let idx_pb = Path::new(&idx_path);
             if cfg.pack_write_reverse_index_default() {
-                let rev_bytes = build_pack_rev_bytes_from_index_order_offsets(&idx_order_offsets);
+                let rev_bytes = build_pack_rev_bytes_from_index_order_offsets_and_checksum(
+                    &idx_order_offsets,
+                    &pack_bytes[pack_bytes.len() - pack_hash_bytes..],
+                );
                 std::fs::write(rev_path_for_index(idx_pb), rev_bytes)?;
             } else {
                 let _ = std::fs::remove_file(rev_path_for_index(idx_pb));

@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use grit_lib::odb::Odb;
 use grit_lib::pack::{read_pack_index, verify_pack_and_collect};
 use grit_lib::pack_rev::{
-    build_pack_rev_bytes_from_index_order_offsets, rev_path_for_index, verify_pack_rev_file,
+    build_pack_rev_bytes_from_index_order_offsets_and_checksum, rev_path_for_index,
+    verify_pack_rev_file,
 };
 use grit_lib::unpack_objects::{apply_delta, strict_verify_packed_references};
 
@@ -373,7 +374,11 @@ pub fn run(args: Args) -> Result<()> {
         let mut sorted_entries: Vec<&ResolvedObject> = resolved.iter().collect();
         sorted_entries.sort_by_key(|e| *e.oid.as_bytes());
         let idx_order_offsets: Vec<u64> = sorted_entries.iter().map(|e| e.offset).collect();
-        let rev_bytes = build_pack_rev_bytes_from_index_order_offsets(&idx_order_offsets);
+        let pack_hash_bytes = infer_pack_trailer_bytes(&pack_bytes)?;
+        let rev_bytes = build_pack_rev_bytes_from_index_order_offsets_and_checksum(
+            &idx_order_offsets,
+            &pack_bytes[pack_bytes.len() - pack_hash_bytes..],
+        );
         fs::write(&rev_path, rev_bytes)?;
     } else if rev_path.exists() {
         let _ = fs::remove_file(&rev_path);

@@ -33,7 +33,12 @@
   - Completed `t5302-pack-index.sh` (36/36) after adding index v1 / forced-large-offset
     support, strict/progress/max-size diagnostics, and corruption-reuse behavior for hand-edited
     delta base references.
-  - Next focus: `t5302-show-index.sh`.
+  - Completed `t5302-show-index.sh` (17/17) after fixing pack `.rev` sidecar format
+    compatibility and isolating the synthetic fixture real-`verify-pack` calls from harness
+    `GIT_EXEC_PATH`.
+  - Adjacent regression `t5325-reverse-index.sh` is now 16/16 after updating reverse-index
+    parsing/validation to the pack-checksum trailer format.
+  - Next focus: `t5303-pack-corruption-resilience.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
