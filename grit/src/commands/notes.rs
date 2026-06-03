@@ -1455,6 +1455,15 @@ struct RewriteCfg {
     combine: RewriteCombine,
 }
 
+fn expand_rewrite_ref(repo: &Repository, pattern: &str) -> Vec<String> {
+    if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
+        return grit_lib::refs::list_refs_glob(&repo.git_dir, pattern)
+            .map(|items| items.into_iter().map(|(name, _)| name).collect())
+            .unwrap_or_default();
+    }
+    vec![pattern.to_string()]
+}
+
 fn load_rewrite_cfg(repo: &Repository, cmd: &str) -> Result<Option<RewriteCfg>> {
     let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
     let key = format!("notes.rewrite.{cmd}");
@@ -1475,25 +1484,27 @@ fn load_rewrite_cfg(repo: &Repository, cmd: &str) -> Result<Option<RewriteCfg>> 
         for p in v.split(':') {
             let s = p.trim();
             if !s.is_empty() {
-                refs.push(s.to_string());
+                refs.extend(expand_rewrite_ref(repo, s));
             }
         }
     } else {
         for p in cfg.get_all("notes.rewriteRef") {
             let s = p.trim();
             if s.starts_with("refs/notes/") {
-                refs.push(s.to_string());
+                refs.extend(expand_rewrite_ref(repo, s));
             }
         }
         if refs.is_empty() {
             if let Some(s) = cfg.get("notes.rewriteRef") {
                 let s = s.trim();
                 if s.starts_with("refs/notes/") {
-                    refs.push(s.to_string());
+                    refs.extend(expand_rewrite_ref(repo, s));
                 }
             }
         }
     }
+    refs.sort();
+    refs.dedup();
     if !enabled || refs.is_empty() {
         return Ok(None);
     }
@@ -1618,7 +1629,7 @@ fn copy_notes(
                         format!("failed to resolve '{}' as a valid ref.", parts[1])
                     })?;
                     for (_refname, ent) in trees.iter_mut() {
-                        if apply_rewrite_copy(repo, ent, &from_oid, &to_oid, force, rcfg.combine)
+                        if apply_rewrite_copy(repo, ent, &from_oid, &to_oid, true, rcfg.combine)
                             .is_err()
                         {
                             eprintln!(
