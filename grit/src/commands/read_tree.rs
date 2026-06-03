@@ -326,6 +326,9 @@ pub fn run(args: Args) -> Result<()> {
                 recurse_submodules_effective,
                 true,
             )?;
+            if let Some(work_tree) = repo.work_tree.as_deref() {
+                grit_lib::diff::refresh_index_stat_content_verified(&mut new_index, work_tree);
+            }
         }
         if !dry_run {
             write_index_with_cache_tree(&repo, &index_path, &mut new_index)
@@ -449,6 +452,9 @@ pub fn run(args: Args) -> Result<()> {
             recurse_submodules_effective,
             false,
         )?;
+        if let Some(work_tree) = repo.work_tree.as_deref() {
+            grit_lib::diff::refresh_index_stat_content_verified(&mut new_index, work_tree);
+        }
     }
     if !dry_run {
         write_index_with_cache_tree(&repo, &index_path, &mut new_index).context("writing index")?;

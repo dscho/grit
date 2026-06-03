@@ -15,6 +15,10 @@
 - Group 1 read-tree foundation: `./scripts/run-tests.sh --timeout 120 --verbose
   t1001-read-tree-m-2way.sh` passes 29/29 with the current codebase and refreshed its previously
   stale CSV failure count.
+- Group 1 read-tree update foundation: `./scripts/run-tests.sh --timeout 120 --verbose
+  t1002-read-tree-m-u-2way.sh` passes 22/22 after `read-tree -u` began refreshing content-verified
+  index stat data after checkout. Regression run with `t1001-read-tree-m-2way.sh` and
+  `t1002-read-tree-m-u-2way.sh` passes both files (29/29, 22/22).
 
 # Test Results
 

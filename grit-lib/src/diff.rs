@@ -1294,8 +1294,8 @@ pub fn stat_matches(ie: &IndexEntry, meta: &fs::Metadata) -> bool {
 /// This mirrors Git's `refresh_index` / `refresh_cache_ent`: an entry is only marked clean (stat
 /// adopted from the worktree) after its content is re-verified against the index OID. A genuinely
 /// modified entry keeps its stale stat so `diff-files` / `status` continue to report it. Operations
-/// that rewrite the worktree (`status`, `reset --mixed`, `stash`) call this before writing the
-/// index so a subsequent `git diff-files` sees refreshed entries as clean.
+/// that rewrite or verify the worktree (`status`, `reset --mixed`, `read-tree -u`, `stash`) call
+/// this before writing the index so a subsequent `git diff-files` sees refreshed entries as clean.
 ///
 /// Gitlinks, sparse (`skip_worktree`), `assume_unchanged` and intent-to-add entries are skipped.
 /// The blob comparison is a raw-content hash, so a CRLF-smudged match is conservatively missed
