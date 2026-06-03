@@ -1,3 +1,7 @@
+## 2026-06-03 — t10460-status-ahead-behind
+
+- Focus harness: `./scripts/run-tests.sh t10460-status-ahead-behind.sh --verbose` passes 5/5 after switching synthetic upstream/local branch expectations from `master` to `main`.
+
 ## 2026-06-03 — t12590/t11400 log and rev-list
 
 - Focus harness: `./scripts/run-tests.sh t12590-log-format-tformat.sh t11400-rev-list-max-count.sh --verbose` now passes 33/33 for `t12590` with existing log fixes, and `t11400-rev-list-max-count.sh` passes 33/33 after switching synthetic `master` references to `main`.
