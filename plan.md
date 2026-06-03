@@ -22,8 +22,11 @@
     6. `rm`, `add`, and interactive patch: `t3701`, `t3600`, `t3700`, `t3702`.
     7. Stash/i18n/precompose/CRLF messages: `t3903`, `t3900`, `t3920`, `t3905`, `t3906`,
        `t3910`, `t3901`.
-  - Current focus: `t3000-ls-files-others.sh` (15 total, 11 passed, 4 failing), the largest
-    foundational index/path row.
+  - Completed: `t3000-ls-files-others.sh` (15/15) by making `ls-files --others` include the
+    active redirection target like Git and by teaching `--directory` pathspec collapse to preserve
+    file-level pathspec matches while still collapsing directory matches.
+  - Current focus: `t3050-ls-files-unmerged.sh` (23 total, 22 passed, 1 failing), next in the
+    foundational index/path group.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

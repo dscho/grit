@@ -530,7 +530,7 @@ t2406-worktree-repair	t2	yes	24	24	0	true	ok	0
 t2407-worktree-heads	t2	yes	12	11	1	false	ok	0
 t2500-untracked-overwriting	t2	yes	8	8	0	true	ok	2
 t2501-cwd-empty	t2	yes	24	24	0	true	ok	0
-t3000-ls-files-others	t3	yes	15	11	4	false	ok	0
+t3000-ls-files-others	t3	yes	15	15	0	true	ok	0
 t3001-ls-files-others-exclude	t3	yes	27	27	0	true	ok	0
 t3002-ls-files-dashpath	t3	yes	6	6	0	true	ok	0
 t3003-ls-files-exclude	t3	yes	7	7	0	true	ok	0
@@ -757,7 +757,7 @@ t4070-diff-pairs	t4	yes	7	6	1	false	ok	0
 t4070-diff-submodule	t4	yes	31	31	0	true	ok	0
 t4071-diff-empty-tree	t4	yes	32	29	3	false	ok	0
 t4071-diff-minimal	t4	yes	1	1	0	true	ok	0
-t4072-diff-max-depth	t4	yes	76	50	0	true	ok	0
+t4072-diff-max-depth	t4	yes	50	50	0	true	ok	0
 t4073-diff-stat-name-width	t4	yes	6	6	0	true	ok	0
 t4074-diff-shifted-matched-group	t4	yes	4	4	0	true	ok	0
 t4075-diff-full-index-abbrev	t4	yes	7	7	0	true	ok	0
@@ -824,7 +824,7 @@ t4203-log-diff-filter	t4	yes	7	6	1	false	ok	0
 t4203-mailmap	t4	yes	74	56	18	false	ok	0
 t4204-log-follow	t4	yes	5	5	0	true	ok	0
 t4204-patch-id	t4	yes	26	26	0	true	ok	0
-t4205-log-pretty-formats	t4	yes	125	106	17	false	ok	2
+t4205-log-pretty-formats	t4	yes	123	106	17	false	ok	2
 t4206-log-follow	t4	yes	26	9	17	false	ok	0
 t4206-log-follow-harder-copies	t4	yes	7	6	1	false	ok	0
 t4207-log-decoration	t4	yes	23	11	12	false	ok	0
