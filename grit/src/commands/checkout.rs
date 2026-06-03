@@ -3204,6 +3204,10 @@ fn switch_to_tree(
 }
 
 fn set_checkout_cache_tree(repo: &Repository, index: &mut Index) -> Result<()> {
+    if index.entries.iter().any(|entry| entry.oid.is_zero()) {
+        index.clear_cache_tree();
+        return Ok(());
+    }
     let cache_tree = build_cache_tree_from_index(&repo.odb, index)?;
     index.set_cache_tree(cache_tree);
     Ok(())
@@ -5755,9 +5759,6 @@ fn print_detached_checkout_leave_message(
     old_oid: ObjectId,
     new_oid: ObjectId,
 ) -> Result<()> {
-    if QUIET.with(std::cell::Cell::get) {
-        return Ok(());
-    }
     if old_oid == new_oid {
         return Ok(());
     }

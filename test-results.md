@@ -1,3 +1,7 @@
+## 2026-06-03 — t1700-split-index
+
+- Focus harness: `./scripts/run-tests.sh t1700-split-index.sh --verbose` passes 29/29 after checkout/reset index writers clear cache-tree extensions when entries contain null OIDs.
+
 ## 2026-06-03 — t13040-restore-quiet-progress
 
 - Focus harness: `./scripts/run-tests.sh t13040-restore-quiet-progress.sh --verbose` passes 30/30 after aligning the branch switch in the synthetic restore fixture with the `main` default branch.
