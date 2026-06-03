@@ -438,12 +438,15 @@ def generate_index(rows: list[dict[str, str]]) -> str:
         <div class="bar-bg"><div class="bar-fg {band}" style="width:{pc}%"></div></div>
         <span class="group-pct {band}">{pc}%</span>
       </div>
-      <div class="group-meta">
-        <span>{st["full"]}/{st["files"]} files</span>
-        <span>{n_skip} skipped</span>
-        <span>{tpass:,}/{ttot:,} tests</span>
-        <span>todo: {remaining:,} ({remaining_share}%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">{st["full"]}/{st["files"]} files · {tpass:,}/{ttot:,} tests · {n_skip} skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          {remaining:,} ({remaining_share}%)
+        </span>
+      </footer>
     </a>"""
 
     return f"""<!DOCTYPE html>
@@ -555,14 +558,16 @@ h1 {{ font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }}
 .group-grid {{
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.75rem;
+  gap: 0.6rem;
 }}
 .group-card {{
-  display: block;
+  display: flex;
+  flex-direction: column;
   background: #161b22;
   border: 1px solid #30363d;
   border-radius: 8px;
-  padding: 1rem 1.1rem;
+  padding: 0.78rem 0.9rem;
+  overflow: hidden;
   text-decoration: none;
   color: inherit;
   transition: border-color 0.15s;
@@ -572,8 +577,8 @@ h1 {{ font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }}
   display: flex;
   align-items: baseline;
   flex-wrap: nowrap;
-  gap: 0.5rem 0.75rem;
-  margin-bottom: 0.65rem;
+  gap: 0.45rem 0.65rem;
+  margin-bottom: 0.52rem;
   min-width: 0;
 }}
 .group-id {{ flex-shrink: 0; font-weight: 700; color: #58a6ff; font-size: 1rem; }}
@@ -586,32 +591,58 @@ h1 {{ font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }}
   text-overflow: ellipsis;
   white-space: nowrap;
 }}
-.group-meta {{
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.25rem 0.75rem;
-  font-size: 0.78rem;
-  color: #7d8590;
-}}
-.group-meta span {{ min-width: 0; }}
-.group-line2 {{ display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; min-width: 0; }}
+.group-line2 {{ display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.68rem; min-width: 0; }}
 .group-line2 .bar-bg {{ flex: 1 1 auto; min-width: 0; }}
-.bar-bg {{ background: #21262d; border-radius: 6px; height: 10px; overflow: hidden; border: 1px solid #30363d; }}
+.bar-bg {{ background: #1a2028; border-radius: 6px; height: 8px; overflow: hidden; border: 1px solid #27313d; }}
 .group-line2 .bar-fg {{ height: 100%; border-radius: 6px 0 0 6px; }}
 .group-pct {{ flex-shrink: 0; font-size: 0.8rem; font-weight: 600; }}
 .group-pct.pct-red {{ color: #f85149; }}
 .group-pct.pct-orange {{ color: #e3b341; }}
 .group-pct.pct-blue {{ color: #79c0ff; }}
 .group-pct.pct-green {{ color: #3fb950; }}
+.group-footer {{
+  margin-top: auto;
+  margin-right: -0.9rem;
+  margin-bottom: -0.78rem;
+  margin-left: -0.9rem;
+  padding: 0.52rem 0.9rem;
+  background: #0f141b;
+  border-top: 1px solid #27313d;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: #7d8590;
+}}
+.group-footer-main {{
+  flex: 1 1 auto;
+  min-width: 0;
+}}
+.group-footer-todo {{
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  color: #8b949e;
+}}
+.group-footer-icon {{
+  width: 0.86rem;
+  height: 0.86rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}}
 @media (max-width: 760px) {{
   body {{ padding: 1.25rem; }}
   .summary-big {{ grid-template-columns: 1fr; text-align: left; }}
   .summary-big-val {{ font-size: 1.8rem; }}
   .summary-meta {{ justify-content: flex-start; }}
   .group-grid {{ grid-template-columns: 1fr; }}
-}}
-@media (max-width: 480px) {{
-  .group-meta {{ grid-template-columns: 1fr; }}
 }}
 </style>
 </head>

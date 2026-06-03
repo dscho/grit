@@ -107,14 +107,16 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
 .group-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.75rem;
+  gap: 0.6rem;
 }
 .group-card {
-  display: block;
+  display: flex;
+  flex-direction: column;
   background: #161b22;
   border: 1px solid #30363d;
   border-radius: 8px;
-  padding: 1rem 1.1rem;
+  padding: 0.78rem 0.9rem;
+  overflow: hidden;
   text-decoration: none;
   color: inherit;
   transition: border-color 0.15s;
@@ -124,8 +126,8 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
   display: flex;
   align-items: baseline;
   flex-wrap: nowrap;
-  gap: 0.5rem 0.75rem;
-  margin-bottom: 0.65rem;
+  gap: 0.45rem 0.65rem;
+  margin-bottom: 0.52rem;
   min-width: 0;
 }
 .group-id { flex-shrink: 0; font-weight: 700; color: #58a6ff; font-size: 1rem; }
@@ -138,32 +140,58 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.group-meta {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0.25rem 0.75rem;
-  font-size: 0.78rem;
-  color: #7d8590;
-}
-.group-meta span { min-width: 0; }
-.group-line2 { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; min-width: 0; }
+.group-line2 { display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.68rem; min-width: 0; }
 .group-line2 .bar-bg { flex: 1 1 auto; min-width: 0; }
-.bar-bg { background: #21262d; border-radius: 6px; height: 10px; overflow: hidden; border: 1px solid #30363d; }
+.bar-bg { background: #1a2028; border-radius: 6px; height: 8px; overflow: hidden; border: 1px solid #27313d; }
 .group-line2 .bar-fg { height: 100%; border-radius: 6px 0 0 6px; }
 .group-pct { flex-shrink: 0; font-size: 0.8rem; font-weight: 600; }
 .group-pct.pct-red { color: #f85149; }
 .group-pct.pct-orange { color: #e3b341; }
 .group-pct.pct-blue { color: #79c0ff; }
 .group-pct.pct-green { color: #3fb950; }
+.group-footer {
+  margin-top: auto;
+  margin-right: -0.9rem;
+  margin-bottom: -0.78rem;
+  margin-left: -0.9rem;
+  padding: 0.52rem 0.9rem;
+  background: #0f141b;
+  border-top: 1px solid #27313d;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: #7d8590;
+}
+.group-footer-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.group-footer-todo {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex-shrink: 0;
+  color: #8b949e;
+}
+.group-footer-icon {
+  width: 0.86rem;
+  height: 0.86rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
 @media (max-width: 760px) {
   body { padding: 1.25rem; }
   .summary-big { grid-template-columns: 1fr; text-align: left; }
   .summary-big-val { font-size: 1.8rem; }
   .summary-meta { justify-content: flex-start; }
   .group-grid { grid-template-columns: 1fr; }
-}
-@media (max-width: 480px) {
-  .group-meta { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -213,12 +241,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:99.3%"></div></div>
         <span class="group-pct pct-green">99.3%</span>
       </div>
-      <div class="group-meta">
-        <span>66/70 files</span>
-        <span>15 skipped</span>
-        <span>2,790/2,811 tests</span>
-        <span>todo: 21 (0.3%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">66/70 files · 2,790/2,811 tests · 15 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          21 (0.3%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t1">
       <div class="group-line1">
@@ -229,12 +260,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:84.9%"></div></div>
         <span class="group-pct pct-green">84.9%</span>
       </div>
-      <div class="group-meta">
-        <span>234/368 files</span>
-        <span>8 skipped</span>
-        <span>10,805/12,727 tests</span>
-        <span>todo: 1,922 (30.9%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">234/368 files · 10,805/12,727 tests · 8 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          1,922 (30.9%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t2">
       <div class="group-line1">
@@ -245,12 +279,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:97.0%"></div></div>
         <span class="group-pct pct-green">97.0%</span>
       </div>
-      <div class="group-meta">
-        <span>63/70 files</span>
-        <span>0 skipped</span>
-        <span>1,213/1,250 tests</span>
-        <span>todo: 37 (0.6%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">63/70 files · 1,213/1,250 tests · 0 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          37 (0.6%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t3">
       <div class="group-line1">
@@ -261,12 +298,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:84.4%"></div></div>
         <span class="group-pct pct-green">84.4%</span>
       </div>
-      <div class="group-meta">
-        <span>72/141 files</span>
-        <span>2 skipped</span>
-        <span>4,485/5,316 tests</span>
-        <span>todo: 831 (13.4%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">72/141 files · 4,485/5,316 tests · 2 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          831 (13.4%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t4">
       <div class="group-line1">
@@ -277,12 +317,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-blue" style="width:71.7%"></div></div>
         <span class="group-pct pct-blue">71.7%</span>
       </div>
-      <div class="group-meta">
-        <span>64/126 files</span>
-        <span>54 skipped</span>
-        <span>2,712/3,781 tests</span>
-        <span>todo: 1,069 (17.2%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">64/126 files · 2,712/3,781 tests · 54 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          1,069 (17.2%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t5">
       <div class="group-line1">
@@ -293,12 +336,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-blue" style="width:66.3%"></div></div>
         <span class="group-pct pct-blue">66.3%</span>
       </div>
-      <div class="group-meta">
-        <span>68/170 files</span>
-        <span>14 skipped</span>
-        <span>2,368/3,572 tests</span>
-        <span>todo: 1,204 (19.4%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">68/170 files · 2,368/3,572 tests · 14 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          1,204 (19.4%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t6">
       <div class="group-line1">
@@ -309,12 +355,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-blue" style="width:73.2%"></div></div>
         <span class="group-pct pct-blue">73.2%</span>
       </div>
-      <div class="group-meta">
-        <span>51/105 files</span>
-        <span>3 skipped</span>
-        <span>2,061/2,816 tests</span>
-        <span>todo: 755 (12.1%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">51/105 files · 2,061/2,816 tests · 3 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          755 (12.1%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t7">
       <div class="group-line1">
@@ -325,12 +374,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:90.4%"></div></div>
         <span class="group-pct pct-green">90.4%</span>
       </div>
-      <div class="group-meta">
-        <span>92/131 files</span>
-        <span>6 skipped</span>
-        <span>3,389/3,748 tests</span>
-        <span>todo: 359 (5.8%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">92/131 files · 3,389/3,748 tests · 6 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          359 (5.8%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t8">
       <div class="group-line1">
@@ -341,12 +393,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:99.8%"></div></div>
         <span class="group-pct pct-green">99.8%</span>
       </div>
-      <div class="group-meta">
-        <span>99/105 files</span>
-        <span>0 skipped</span>
-        <span>3,109/3,116 tests</span>
-        <span>todo: 7 (0.1%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">99/105 files · 3,109/3,116 tests · 0 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          7 (0.1%)
+        </span>
+      </footer>
     </a>
     <a class="group-card" href="../testfiles.html?group=t9">
       <div class="group-line1">
@@ -357,12 +412,15 @@ h1 { font-size: 1.75rem; margin-bottom: 0.25rem; color: #f0f6fc; }
         <div class="bar-bg"><div class="bar-fg pct-green" style="width:99.7%"></div></div>
         <span class="group-pct pct-green">99.7%</span>
       </div>
-      <div class="group-meta">
-        <span>81/87 files</span>
-        <span>130 skipped</span>
-        <span>2,848/2,857 tests</span>
-        <span>todo: 9 (0.1%)</span>
-      </div>
+      <footer class="group-footer">
+        <span class="group-footer-main">81/87 files · 2,848/2,857 tests · 130 skipped</span>
+        <span class="group-footer-todo" aria-label="Remaining tests">
+          <svg class="group-footer-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 6h11M9 12h11M9 18h11M4 6l1 1 2-2M4 12l1 1 2-2M4 18l1 1 2-2"></path>
+          </svg>
+          9 (0.1%)
+        </span>
+      </footer>
     </a>
 </div>
 
