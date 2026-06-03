@@ -35,7 +35,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
 - [x] `t6000-rev-list-misc.sh` — 23/23 passing after completing path-limited object output,
   symmetric left/right ordering, indexed object roots/exclusions, raw `--header`, `-z` records,
   boundary incompatibility, and root replay for `rebase --force-rebase --root`.
-- [ ] `t6003-rev-list-topo-order.sh` — 23/36 passing, 13 failing.
+- [x] `t6003-rev-list-topo-order.sh` — 36/36 passing after matching Git's graph-order
+  `--topo-order` stack semantics and accepting raw numeric `--max-age` / `--min-age` cutoffs.
 - [ ] `t6019-rev-list-ancestry-path.sh` — 5/18 passing, 13 failing.
 - [ ] `t6137-rev-parse-misc.sh` — 23/34 passing, 11 failing.
 - [ ] `t6016-rev-list-graph-simplify-history.sh` — 4/12 passing, 8 failing.

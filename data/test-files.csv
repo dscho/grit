@@ -1040,7 +1040,7 @@ t5900-repo-selection	t5	yes	8	4	4	false	ok	0
 t6000-rev-list-misc	t6	yes	23	23	0	true	ok	0
 t6001-rev-list-graft	t6	yes	14	10	4	false	ok	0
 t6002-rev-list-bisect	t6	yes	53	53	0	true	ok	0
-t6003-rev-list-topo-order	t6	yes	36	23	13	false	ok	0
+t6003-rev-list-topo-order	t6	yes	36	36	0	true	ok	0
 t6004-rev-list-path-optim	t6	yes	7	7	0	true	ok	0
 t6005-rev-list-count	t6	yes	6	6	0	true	ok	0
 t6006-rev-list-format	t6	yes	80	80	0	true	ok	0

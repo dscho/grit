@@ -879,7 +879,7 @@ pub fn rev_list(
 
     let mut traversal_missing = Vec::new();
     let mut traversal_missing_seen = HashSet::new();
-    let (mut included, _discovery_order) = if include.is_empty() {
+    let (mut included, discovery_order) = if include.is_empty() {
         (HashSet::new(), Vec::new())
     } else if options.exclude_promisor_objects {
         walk_closure_ordered_excluding(&mut graph, &include, &excluded_promisor)?
@@ -1006,7 +1006,7 @@ pub fn rev_list(
                 date_order_walk(&mut graph, &included, author_dates)?
             }
         }
-        OrderingMode::Topo => topo_sort(&mut graph, &included, false)?,
+        OrderingMode::Topo => graph_order_topo_sort(&mut graph, &included, &discovery_order)?,
         OrderingMode::AuthorDateTopo => topo_sort(&mut graph, &included, true)?,
     };
 
@@ -3307,6 +3307,69 @@ fn topo_sort(
                         oid: parent,
                         date: graph.sort_key(parent, author_dates),
                     }));
+                }
+            }
+        }
+    }
+
+    reorder_adjacent_merge_parent_blocks(graph, &mut out)?;
+    Ok(out)
+}
+
+fn graph_order_topo_sort(
+    graph: &mut CommitGraph<'_>,
+    selected: &HashSet<ObjectId>,
+    discovery_order: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let mut child_count: HashMap<ObjectId, usize> = selected.iter().map(|&oid| (oid, 0)).collect();
+
+    for &oid in selected {
+        for parent in graph.parents_of(oid)? {
+            if !selected.contains(&parent) {
+                continue;
+            }
+            if let Some(count) = child_count.get_mut(&parent) {
+                *count += 1;
+            }
+        }
+    }
+
+    let discovery_rank: HashMap<ObjectId, usize> = discovery_order
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(rank, oid)| (oid, rank))
+        .collect();
+    let mut ready: Vec<ObjectId> = child_count
+        .iter()
+        .filter_map(|(&oid, &count)| (count == 0).then_some(oid))
+        .collect();
+
+    ready.sort_by(|&a, &b| {
+        graph
+            .committer_time(a)
+            .cmp(&graph.committer_time(b))
+            .then_with(|| {
+                discovery_rank
+                    .get(&b)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .cmp(&discovery_rank.get(&a).copied().unwrap_or(usize::MAX))
+            })
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut out = Vec::with_capacity(selected.len());
+    while let Some(oid) = ready.pop() {
+        out.push(oid);
+        for parent in graph.parents_of(oid)? {
+            if !selected.contains(&parent) {
+                continue;
+            }
+            if let Some(count) = child_count.get_mut(&parent) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ready.push(parent);
                 }
             }
         }

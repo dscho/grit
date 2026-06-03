@@ -855,25 +855,31 @@ pub fn run(args: Args) -> Result<()> {
                         }
                     }
                 }
-                "--until" | "--before" => {
+                "--until" | "--before" | "--min-age" => {
                     i += 1;
                     let Some(val) = args.args.get(i) else {
                         bail!("{arg} requires a date");
                     };
                     options.until_cutoff = Some(parse_rev_list_date(val)?);
                 }
-                _ if arg.starts_with("--until=") || arg.starts_with("--before=") => {
+                _ if arg.starts_with("--until=")
+                    || arg.starts_with("--before=")
+                    || arg.starts_with("--min-age=") =>
+                {
                     let val = arg.split_once('=').map(|(_, v)| v).unwrap_or_default();
                     options.until_cutoff = Some(parse_rev_list_date(val)?);
                 }
-                "--since" | "--after" => {
+                "--since" | "--after" | "--max-age" => {
                     i += 1;
                     let Some(val) = args.args.get(i) else {
                         bail!("{arg} requires a date");
                     };
                     options.since_cutoff = Some(parse_rev_list_date(val)?);
                 }
-                _ if arg.starts_with("--since=") || arg.starts_with("--after=") => {
+                _ if arg.starts_with("--since=")
+                    || arg.starts_with("--after=")
+                    || arg.starts_with("--max-age=") =>
+                {
                     let val = arg.split_once('=').map(|(_, v)| v).unwrap_or_default();
                     options.since_cutoff = Some(parse_rev_list_date(val)?);
                 }
@@ -1723,6 +1729,11 @@ fn parse_non_negative(text: &str, flag: &str) -> Result<usize> {
 
 fn parse_rev_list_date(s: &str) -> Result<i64> {
     let s = s.trim();
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s
+            .parse::<i64>()
+            .with_context(|| format!("invalid date: '{s}'"));
+    }
     let mut approx_err = 0;
     let approx = approxidate_careful(s, Some(&mut approx_err));
     if approx_err == 0 {

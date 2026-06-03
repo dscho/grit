@@ -1379,3 +1379,11 @@ Updated: 2026-06-01
   `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted), and
   `cargo test -p grit-lib --lib`.
+- t6003 topo-order focus: after matching Git's graph-order `--topo-order` LIFO stack semantics and
+  accepting raw numeric `--max-age` / `--min-age` cutoffs, the direct debug run passes 36/36 and
+  `./scripts/run-tests.sh t6003-rev-list-topo-order.sh` improves from 23/36 to 36/36 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `./scripts/run-tests.sh
+  t6012-rev-list-simplify.sh` to confirm the nearby simplify-merges topo path remains 42/42,
+  plus `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog remains and unrelated auto-fixes were reverted), and `cargo test -p grit-lib --lib`.
