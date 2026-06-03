@@ -1,3 +1,7 @@
+## 2026-06-03 — t10230-cherry-pick-range
+
+- Focus harness: `./scripts/run-tests.sh t10230-cherry-pick-range.sh --verbose` passes 31/31 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t11170-branch-track-inherit
 
 - Focus harness: `./scripts/run-tests.sh t11170-branch-track-inherit.sh --verbose` passes 40/40 after switching synthetic `master` branch references to `main` and matching branch rename missing-branch wording.
