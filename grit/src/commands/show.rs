@@ -2115,14 +2115,20 @@ fn apply_format_string(
                 }
                 Some('b') => {
                     chars.next();
-                    let body: String = info.message.lines().skip(2).collect::<Vec<_>>().join("\n");
-                    if expand_tabs_in_log > 0 {
-                        result.push_str(&grit_lib::tab_expand::expand_tabs_in_multiline_message(
-                            &body,
+                    let raw_body = info.message.lines().skip(2).collect::<Vec<_>>().join("\n");
+                    let body = if expand_tabs_in_log > 0 {
+                        grit_lib::tab_expand::expand_tabs_in_multiline_message(
+                            &raw_body,
                             expand_tabs_in_log,
-                        ));
+                        )
                     } else {
+                        raw_body
+                    };
+                    if !body.is_empty() {
                         result.push_str(&body);
+                        if !body.ends_with('\n') {
+                            result.push('\n');
+                        }
                     }
                 }
                 Some('n') => {

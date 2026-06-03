@@ -1193,3 +1193,7 @@ Updated: 2026-06-01
   `git show --pretty=format:`, `./scripts/run-tests.sh t6006-rev-list-format.sh` improves from
   65/80 to 68/80 and refreshed `data/test-files.csv` plus dashboards. Full workspace/harness
   sweeps were skipped for this narrow increment.
+- t6006 show body newline focus: after making non-empty `git show --pretty=format:%b` include the
+  trailing body newline, `./scripts/run-tests.sh t6006-rev-list-format.sh` improves from 68/80 to
+  70/80 and refreshed `data/test-files.csv` plus dashboards. Full workspace/harness sweeps were
+  skipped for this narrow increment.
