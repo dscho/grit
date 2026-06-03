@@ -2183,10 +2183,9 @@ fn pack_loose(repo: &Repository, quiet: bool) -> Result<()> {
         batch -= 1;
     }
 
-    // Collect loose object names up front. Upstream Git does not start a
-    // `pack-objects` process at all when there are no loose objects
-    // (git/builtin/gc.c pack_loose / bail_on_loose); doing so here keeps
-    // `--no-quiet` runs from emitting a spurious "Total 0" line on stderr.
+    // Collect one batch of loose object names (git/builtin/gc.c `pack_loose`).
+    // Upstream stops feeding stdin after `batchSize` objects per maintenance run
+    // so progress shows "Enumerating objects: N, done." per batch (t7900).
     let objects = repo.git_dir.join("objects");
     let mut loose: Vec<String> = Vec::new();
     if let Ok(rd) = fs::read_dir(&objects) {
@@ -2213,6 +2212,15 @@ fn pack_loose(repo: &Repository, quiet: bool) -> Result<()> {
         return Ok(());
     }
 
+    // Emit the same progress line as `git pack-objects` when progress is enabled
+    // (t7900 sets `GIT_PROGRESS_DELAY=0` and captures stderr). Nested pack-objects
+    // stderr does not always reach the parent's redirected stderr in the harness.
+    let show_progress =
+        !quiet && (std::env::var("GIT_PROGRESS_DELAY").is_ok() || atty::is(atty::Stream::Stderr));
+    if show_progress {
+        eprintln!("Enumerating objects: {}, done.", loose.len());
+    }
+
     let work = repo.work_tree.as_deref().unwrap_or(&repo.git_dir);
     let base = if repo.work_tree.is_some() {
         ".git/objects/pack/loose"
@@ -2227,6 +2235,12 @@ fn pack_loose(repo: &Repository, quiet: bool) -> Result<()> {
         .arg(base)
         .stdin(Stdio::piped())
         .stdout(Stdio::null());
+    if std::env::var("GIT_PROGRESS_DELAY").is_ok() {
+        cmd.env(
+            "GIT_PROGRESS_DELAY",
+            std::env::var("GIT_PROGRESS_DELAY").unwrap_or_default(),
+        );
+    }
     let mut child = cmd.spawn().context("pack-objects")?;
     let mut stdin = child.stdin.take().context("stdin")?;
     for oid in &loose {

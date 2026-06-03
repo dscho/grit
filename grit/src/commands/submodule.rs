@@ -1036,9 +1036,17 @@ fn get_default_remote_for_path_in_super(path: &str, super_work_tree: &Path) -> R
     let path_buf = Path::new(path);
     let abs_sub = if path_buf.is_absolute() {
         path_buf.to_path_buf()
+    } else if path_buf
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path_buf))
+            .unwrap_or_else(|_| super_work_tree.join(path_buf))
     } else {
         super_work_tree.join(path_buf)
     };
+    let abs_sub = abs_sub.canonicalize().unwrap_or(abs_sub);
     let work_tree = repo.work_tree.as_ref().context("bare repository")?;
     let sub_rel = match worktree_relative_posix(work_tree, &abs_sub) {
         Ok(s) => s,
@@ -4791,6 +4799,16 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
 
         let src_hex = oid_src.to_hex();
         let dst_hex = oid_dst.to_hex();
+
+        if src_gitlink && dst_gitlink {
+            let _ = submodule_fetch_gitlink_if_missing(
+                &grit_bin, work_tree, sm_path, &sub_path, &src_hex,
+            );
+            let _ = submodule_fetch_gitlink_if_missing(
+                &grit_bin, work_tree, sm_path, &sub_path, &dst_hex,
+            );
+        }
+
         let src_abbrev = short_oid_in_submodule(&grit_bin, &sub_path, &src_hex)
             .unwrap_or_else(|| src_hex.chars().take(7).collect());
         let dst_abbrev = short_oid_in_submodule(&grit_bin, &sub_path, &dst_hex)
@@ -4846,15 +4864,11 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
         let submodule_repo_exists = sub_path.join(".git").exists();
         let total_commits = if !submodule_repo_exists {
             -1
-        } else if !src_abbrev.is_empty() && !dst_abbrev.is_empty() {
+        } else if !src_hex.is_empty() && !dst_hex.is_empty() {
             if src_gitlink && dst_gitlink {
-                submodule_rev_list_count(
-                    &grit_bin,
-                    &sub_path,
-                    &format!("{src_abbrev}...{dst_abbrev}"),
-                )?
+                submodule_rev_list_count(&grit_bin, &sub_path, &format!("{src_hex}...{dst_hex}"))?
             } else {
-                submodule_rev_list_count(&grit_bin, &sub_path, &dst_abbrev)?
+                submodule_rev_list_count(&grit_bin, &sub_path, &dst_hex)?
             }
         } else {
             -1
@@ -4873,8 +4887,8 @@ fn run_summary(args: &SummaryArgs, _quiet: bool) -> Result<()> {
                 submodule_log_first_parent(
                     &grit_bin,
                     &sub_path,
-                    &src_abbrev,
-                    &dst_abbrev,
+                    &src_hex,
+                    &dst_hex,
                     summary_limit,
                 )?;
             } else if dst_gitlink {

@@ -14,34 +14,36 @@ pub struct Args {
     pub args: Vec<String>,
 }
 
-pub fn run(args: Args) -> Result<()> {
-    // Find the system git-filter-branch script.
-    // Try GIT_EXEC_PATH first, then well-known locations.
-    let exec_path = std::env::var("GIT_EXEC_PATH").ok().unwrap_or_else(|| {
-        // Check common locations for the git exec path
-        for candidate in &[
-            "/usr/lib/git-core",
-            "/usr/libexec/git-core",
-            "/usr/local/lib/git-core",
-            "/usr/local/libexec/git-core",
-        ] {
-            let p = std::path::Path::new(candidate).join("git-filter-branch");
-            if p.exists() {
-                return candidate.to_string();
-            }
-        }
-        "/usr/lib/git-core".to_string()
-    });
-
-    let script_path = std::path::Path::new(&exec_path).join("git-filter-branch");
-    if !script_path.exists() {
-        anyhow::bail!("cannot find git-filter-branch at {}", script_path.display());
+/// Resolve `git-filter-branch` and the exec-path directory used for helper scripts.
+fn resolve_filter_branch_script() -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exec_path) = std::env::var("GIT_EXEC_PATH") {
+        candidates.push(std::path::PathBuf::from(exec_path).join("git-filter-branch"));
     }
+    for dir in &[
+        "/usr/lib/git-core",
+        "/usr/libexec/git-core",
+        "/usr/local/lib/git-core",
+        "/usr/local/libexec/git-core",
+    ] {
+        candidates.push(std::path::Path::new(dir).join("git-filter-branch"));
+    }
+    for path in candidates {
+        if path.is_file() {
+            let exec_dir = path.parent().unwrap_or(path.as_path()).to_path_buf();
+            return Ok((path, exec_dir));
+        }
+    }
+    anyhow::bail!("cannot find git-filter-branch");
+}
+
+pub fn run(args: Args) -> Result<()> {
+    let (script_path, exec_path) = resolve_filter_branch_script()?;
 
     // Prepend the exec path to PATH so that `git-sh-setup` and other
     // shell helpers sourced by filter-branch can be found.
     let current_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{exec_path}:{current_path}");
+    let new_path = format!("{}:{current_path}", exec_path.display());
 
     let status = Command::new("bash")
         .arg(script_path)

@@ -61,7 +61,12 @@ pub(crate) fn resolve_git_editor(config: &ConfigSet, for_launch: bool) -> Option
     if let Some(e) = env_editor_candidate("EDITOR", for_launch) {
         return Some(e);
     }
-    if terminal_is_dumb || (!for_launch && !std::io::stdin().is_terminal()) {
+    if terminal_is_dumb {
+        return None;
+    }
+    // Upstream `git_editor()` always falls back to DEFAULT_EDITOR when the terminal
+    // is not dumb, even when stdin is not a TTY (`git var GIT_EDITOR`, t7005).
+    if for_launch && !std::io::stdin().is_terminal() {
         return None;
     }
     Some("vi".to_owned())

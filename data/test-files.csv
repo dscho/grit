@@ -1149,12 +1149,12 @@ t7001-mv	t7	yes	54	51	3	false	ok	0
 t7002-mv-sparse-checkout	t7	yes	22	22	0	true	ok	0
 t7003-filter-branch	t7	skip	48	0	0	false	ok	0
 t7004-tag	t7	skip	219	0	0	false	ok	0
-t7005-editor	t7	yes	11	10	1	false	ok	0
+t7005-editor	t7	yes	12	12	0	true	ok	0
 t7006-pager	t7	yes	109	109	0	true	ok	1
 t7007-show	t7	yes	18	18	0	true	ok	0
-t7008-filter-branch-null-sha1	t7	yes	6	5	1	false	ok	0
+t7008-filter-branch-null-sha1	t7	yes	6	6	0	true	ok	0
 t7008-show-stat-raw-name	t7	yes	21	21	0	true	ok	0
-t7010-setup	t7	yes	16	12	4	false	ok	0
+t7010-setup	t7	yes	16	16	0	true	ok	0
 t7011-skip-worktree-reading	t7	yes	15	15	0	true	ok	0
 t7012-skip-worktree-writing	t7	yes	11	11	0	true	ok	6
 t7020-commit-encoding	t7	yes	26	26	0	true	ok	0
@@ -1189,7 +1189,7 @@ t7106-reset-unborn-branch	t7	yes	7	6	1	false	ok	0
 t7107-reset-pathspec-file	t7	yes	11	1	10	false	ok	0
 t7110-reset-merge	t7	yes	21	21	0	true	ok	0
 t7110-reset-modes	t7	yes	20	20	0	true	ok	0
-t7111-reset-table	t7	yes	42	41	1	false	ok	0
+t7111-reset-table	t7	yes	42	42	0	true	ok	0
 t7112-reset-submodule	t7	yes	82	78	0	true	ok	0
 t7113-post-index-change-hook	t7	yes	4	1	3	false	ok	0
 t7201-co	t7	yes	46	46	0	true	ok	0
@@ -1218,7 +1218,7 @@ t7423-submodule-symlinks	t7	yes	6	6	0	true	ok	0
 t7424-submodule-mixed-ref-formats	t7	yes	7	7	0	true	ok	0
 t7425-submodule-gitdir-path-extension	t7	yes	23	23	0	true	ok	0
 t7426-submodule-get-default-remote	t7	yes	15	15	0	true	ok	0
-t7450-bad-git-dotfiles	t7	yes	50	49	1	false	ok	0
+t7450-bad-git-dotfiles	t7	yes	50	50	0	true	ok	0
 t7500-commit-template-squash-signoff	t7	yes	57	42	15	false	ok	0
 t7501-commit-basic	t7	yes	146	146	0	true	ok	0
 t7501-commit-basic-functionality	t7	yes	77	52	25	false	ok	0
@@ -1230,7 +1230,7 @@ t7505-prepare-commit-msg	t7	yes	30	30	0	true	ok	0
 t7505-prepare-commit-msg-hook	t7	yes	23	22	1	false	ok	0
 t7506-status-submodule	t7	yes	40	40	0	true	ok	0
 t7507-commit-verbose	t7	yes	45	10	35	false	ok	0
-t7508-status	t7	yes	126	121	5	false	ok	0
+t7508-status	t7	yes	126	125	1	false	ok	0
 t7509-commit-authorship	t7	yes	12	4	8	false	ok	0
 t7510-signed-commit	t7	yes	28	28	0	true	ok	0
 t7511-status-index	t7	yes	24	24	0	true	ok	0
@@ -1279,8 +1279,8 @@ t7814-grep-recurse-submodules	t7	yes	34	27	0	true	ok	7
 t7815-grep-binary	t7	yes	22	22	0	true	ok	0
 t7816-grep-binary-pattern	t7	yes	145	145	0	true	ok	0
 t7817-grep-sparse-checkout	t7	yes	8	8	0	true	ok	0
-t7818-grep-extended	t7	yes	11	8	3	false	ok	0
-t7900-maintenance	t7	yes	72	71	1	false	ok	0
+t7818-grep-extended	t7	yes	11	11	0	true	ok	0
+t7900-maintenance	t7	yes	72	72	0	true	ok	0
 t7901-stash-resolve-merge	t7	yes	7	7	0	true	ok	0
 t8001-annotate	t8	yes	117	117	0	true	ok	0
 t8002-blame	t8	yes	135	135	0	true	ok	0

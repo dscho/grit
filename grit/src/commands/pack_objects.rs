@@ -552,6 +552,9 @@ fn compute_midx_reused_entries(
 
 /// Run `grit pack-objects`.
 pub fn run(mut args: Args) -> Result<()> {
+    if args.no_quiet {
+        args.quiet = false;
+    }
     if let Some(fmt) = &args.object_format {
         if fmt != "sha1" {
             bail!("unsupported object format: {fmt}");

@@ -430,6 +430,7 @@ pub(crate) fn merge_trees_for_single_cherry_pick(
     picked_oid: &ObjectId,
     parent_oid: &ObjectId,
     head_oid: &ObjectId,
+    favor: MergeFavor,
 ) -> Result<ReplayTreeMergeResult> {
     let merge_renormalize = read_merge_renormalize(repo);
     let directory_renames = read_directory_renames(repo);
@@ -497,7 +498,7 @@ pub(crate) fn merge_trees_for_single_cherry_pick(
         &short_oid(*parent_oid),
         &head_oid.to_hex(),
         &picked_oid.to_hex(),
-        MergeFavor::None,
+        favor,
         None,
         merge_renormalize,
         false,

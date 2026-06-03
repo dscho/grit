@@ -99,6 +99,12 @@
   - Completed skipped audit: `t7424-submodule-mixed-ref-formats.sh` is restored to
     `in_scope=yes` and passes 7/7 after mixed files/reftable submodule clone/update handling was
     fixed; log: `logs/2026-06-02_2152-t7424-submodule-mixed-ref-formats.md`.
+  - Completed parallel t7 quick wins: `t7005-editor`, `t7008-filter-branch-null-sha1`,
+    `t7450-bad-git-dotfiles`, `t7818-grep-extended`, `t7900-maintenance`, `t7010-setup`,
+    `t7426-submodule-get-default-remote`, and `t7111-reset-table`; grouping log:
+    `logs/2026-06-02_t7-family-grouping.md`.
+  - Remaining non-submodule t7 work should continue from the current CSV, including
+    `t7505-prepare-commit-msg-hook` and larger worktree status/reset/commit/grep blockers.
   - Final sweep repair: `t7406-submodule-update.sh` is back to 70/70 after filtering the redundant
     successful `pull --rebase` stderr line from submodule rebase updates.
   - Final verification: `./scripts/run-tests.sh t7400-submodule-basic.sh t7401-submodule-summary.sh t7402-submodule-rebase.sh t7403-submodule-sync.sh t7406-submodule-update.sh t7407-submodule-foreach.sh t7408-submodule-reference.sh t7409-submodule-detached-work-tree.sh t7411-submodule-config.sh t7412-submodule-absorbgitdirs.sh t7413-submodule-is-active.sh t7414-submodule-mistakes.sh t7416-submodule-dash-url.sh t7417-submodule-path-url.sh t7418-submodule-sparse-gitmodules.sh t7419-submodule-set-branch.sh t7420-submodule-set-url.sh t7421-submodule-summary-add.sh t7422-submodule-output.sh t7423-submodule-symlinks.sh t7424-submodule-mixed-ref-formats.sh t7425-submodule-gitdir-path-extension.sh t7426-submodule-get-default-remote.sh t7506-status-submodule.sh t7814-grep-recurse-submodules.sh t7112-reset-submodule.sh` completed with every row at `failing=0`.
