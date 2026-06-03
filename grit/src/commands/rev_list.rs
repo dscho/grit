@@ -1240,7 +1240,7 @@ pub fn run(args: Args) -> Result<()> {
                         fmt.as_str(),
                         "oneline" | "short" | "medium" | "full" | "fuller" | "email" | "raw"
                     );
-                    if !no_commit_header && !is_oneline {
+                    if (!no_commit_header || is_named_format) && !is_oneline {
                         let mut header = format!("commit {prefix}{oid}");
                         if show_parents {
                             // Match Git: parent lines come from the commit object (and grafts), not
@@ -1265,7 +1265,7 @@ pub fn run(args: Args) -> Result<()> {
                         if !rendered.ends_with('\n') {
                             println!();
                         }
-                    } else {
+                    } else if !rendered.is_empty() {
                         println!("{rendered}");
                     }
                 }

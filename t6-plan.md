@@ -22,7 +22,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
 - [x] `t6022-rev-list-missing.sh` — 40/40 passing after tolerating missing
   commits/objects in non-error missing modes, subtracting negative tree/blob object roots, and
   adding `--missing=print-info` plus `-z` output.
-- [ ] `t6006-rev-list-format.sh` — 58/80 passing, 22 failing.
+- [~] `t6006-rev-list-format.sh` — 63/80 passing, 17 failing after `%e`,
+  empty custom-format line, and named pretty header fixes.
 - [ ] `t6007-rev-list-cherry-pick-file.sh` — 6/23 passing, 17 failing.
 - [ ] `t6012-rev-list-simplify.sh` — 26/42 passing, 16 failing.
 - [ ] `t6000-rev-list-misc.sh` — 9/23 passing, 14 failing.

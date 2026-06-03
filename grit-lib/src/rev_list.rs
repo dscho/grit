@@ -2407,6 +2407,9 @@ pub fn render_commit_with_color(
                     Some('e') => {
                         // Encoding
                         chars.next();
+                        if let Some(encoding) = &commit.encoding {
+                            target.push_str(encoding);
+                        }
                     }
                     Some('g') => {
                         // Reflog placeholders: %gD, %gd, %gs, %gn, %ge, etc.

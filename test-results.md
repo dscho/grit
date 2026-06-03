@@ -547,6 +547,12 @@ Updated: 2026-06-03
   `cargo test -p grit-lib --lib` (238/238), and the focused harness ran. Clippy completed with the
   existing warning backlog and failed auto-fixes in unrelated files; unrelated auto-fixes were not
   kept.
+- t6006 rev-list format focus: direct debug run and official
+  `./scripts/run-tests.sh t6006-rev-list-format.sh` improve from 58/80 to 63/80 after rendering
+  `%e`, suppressing empty custom-format output lines, and keeping commit headers for named pretty
+  formats under `--no-commit-header`.
+- Verification for this increment: `cargo fmt`, `cargo check -p grit-cli`, `cargo build --release
+  -p grit-cli`, and the focused harness ran with the existing warning backlog.
 - Build unblock: `cargo build --release -p grit-cli` initially failed because `merge --abort`
   still called `checkout_merge_reset_worktree` with its old three-argument signature; the caller
   now passes explicit non-recursive submodule flags and release builds complete.
