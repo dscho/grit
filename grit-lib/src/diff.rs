@@ -2643,7 +2643,7 @@ pub fn unified_diff_with_prefix_and_funcname_and_algorithm(
     }
 
     use crate::quote_path::format_diff_path_with_prefix;
-    use similar::{group_diff_ops, udiff::UnifiedDiffHunk, TextDiff};
+    use similar::{udiff::UnifiedDiffHunk, TextDiff};
 
     let diff = TextDiff::configure()
         .algorithm(algorithm)
@@ -2687,15 +2687,15 @@ pub fn unified_diff_with_prefix_and_funcname_and_algorithm(
 
     let old_lines: Vec<&str> = old_content.lines().collect();
 
-    // `similar::group_diff_ops` ends a hunk when an unchanged run has length > `2 * n`.
     // Git's xdiff merges adjacent changes while the gap between them in the old file is at most
-    // `2 * context_lines + inter_hunk_context` (see `xdl_get_hunk` in xemit.c). Match that by
-    // choosing `n` so `2 * n` equals that maximum merged gap (rounded up when the sum is odd).
+    // `2 * context_lines + inter_hunk_context` (see `xdl_get_hunk` in xemit.c).
+    // `similar::group_diff_ops` couples the split threshold and the displayed edge context to a
+    // single radius (split at `> 2n`), which over-merges when the gap limit is odd
+    // (t4032: `-U0 --inter-hunk-context=1` with 2 common lines must stay 2 hunks).
     let max_common_gap = context_lines
         .saturating_mul(2)
         .saturating_add(inter_hunk_context);
-    let group_radius = max_common_gap.div_ceil(2);
-    let op_groups = group_diff_ops(compacted_ops, group_radius);
+    let op_groups = group_diff_ops_gap(compacted_ops, context_lines, max_common_gap);
 
     for ops in op_groups {
         if ops.is_empty() {
@@ -2727,6 +2727,76 @@ pub fn unified_diff_with_prefix_and_funcname_and_algorithm(
     }
 
     output
+}
+
+/// Group diff ops into hunks like Git's `xdl_get_hunk`: two changes merge into one hunk while
+/// the run of unchanged lines between them is at most `max_common_gap`
+/// (`2 * context + inter_hunk_context`), and each hunk keeps at most `context` unchanged lines
+/// at its edges. Unlike `similar::group_diff_ops`, the split threshold is decoupled from the
+/// edge context so odd gap limits group exactly like Git.
+fn group_diff_ops_gap(
+    mut ops: Vec<similar::DiffOp>,
+    context: usize,
+    max_common_gap: usize,
+) -> Vec<Vec<similar::DiffOp>> {
+    use similar::DiffOp;
+    if ops.is_empty() {
+        return vec![];
+    }
+
+    let mut pending_group = Vec::new();
+    let mut rv = Vec::new();
+
+    if let Some(DiffOp::Equal {
+        old_index,
+        new_index,
+        len,
+    }) = ops.first_mut()
+    {
+        let offset = (*len).saturating_sub(context);
+        *old_index += offset;
+        *new_index += offset;
+        *len -= offset;
+    }
+
+    if let Some(DiffOp::Equal { len, .. }) = ops.last_mut() {
+        *len -= (*len).saturating_sub(context);
+    }
+
+    for op in ops.into_iter() {
+        if let DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = op
+        {
+            // End the current group and start a new one whenever the unchanged
+            // run is too long to fuse the surrounding changes.
+            if len > max_common_gap {
+                pending_group.push(DiffOp::Equal {
+                    old_index,
+                    new_index,
+                    len: context,
+                });
+                rv.push(pending_group);
+                let offset = len.saturating_sub(context);
+                pending_group = vec![DiffOp::Equal {
+                    old_index: old_index + offset,
+                    new_index: new_index + offset,
+                    len: len - offset,
+                }];
+                continue;
+            }
+        }
+        pending_group.push(op);
+    }
+
+    match &pending_group[..] {
+        &[] | &[similar::DiffOp::Equal { .. }] => {}
+        _ => rv.push(pending_group),
+    }
+
+    rv
 }
 
 /// `git diff -W`: expand each hunk to include full function bodies (see Git `xemit.c`).
