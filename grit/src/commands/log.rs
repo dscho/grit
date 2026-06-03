@@ -4138,6 +4138,7 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let repo = Repository::discover(None).context("not a git repository")?;
+    validate_notes_display_ref_config(&repo);
     if args.format.is_none() {
         args.format = args.pretty.clone();
     }
@@ -7166,6 +7167,7 @@ pub fn append_format_patch_notes(repo: &Repository, oid: &ObjectId, body: &str) 
 /// note display, this is unconditional (the caller opted in with `--notes`).
 pub fn notes_blocks_for_display(repo: &Repository) -> std::collections::HashMap<ObjectId, String> {
     use std::fmt::Write as _;
+    validate_notes_display_ref_config(repo);
     let mut blocks: std::collections::HashMap<ObjectId, String> = std::collections::HashMap::new();
     for (header, refname) in collect_log_display_note_refs_unconditional(repo) {
         let map = load_notes_map_for_ref(repo, &refname);
@@ -7182,6 +7184,18 @@ pub fn notes_blocks_for_display(repo: &Repository) -> std::collections::HashMap<
         }
     }
     blocks
+}
+
+pub fn validate_notes_display_ref_config(repo: &Repository) {
+    let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    if cfg
+        .get_all_raw("notes.displayRef")
+        .iter()
+        .any(Option::is_none)
+    {
+        eprintln!("fatal: invalid notes.displayRef");
+        std::process::exit(128);
+    }
 }
 
 /// Same ref enumeration as `collect_log_display_note_refs` but without the
