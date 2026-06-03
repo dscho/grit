@@ -439,7 +439,7 @@ t1501-work-tree	t1	yes	39	32	7	false	ok	0
 t1502-rev-parse-parseopt	t1	yes	37	37	0	true	ok	0
 t1503-rev-parse-verify	t1	yes	12	12	0	true	ok	0
 t1504-ceiling-dirs	t1	yes	44	44	0	true	ok	0
-t1504-revision-range	t1	yes	28	26	2	false	ok	0
+t1504-revision-range	t1	yes	28	28	0	true	ok	0
 t1505-rev-parse-last	t1	yes	7	7	0	true	ok	0
 t1506-rev-parse-diagnosis	t1	yes	30	30	0	true	ok	0
 t1507-rev-parse-upstream	t1	yes	29	27	2	false	ok	0

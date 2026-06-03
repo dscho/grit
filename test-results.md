@@ -1,3 +1,7 @@
+## 2026-06-03 — t1504-revision-range
+
+- Focus harness: `./scripts/run-tests.sh t1504-revision-range.sh --verbose` passes 28/28 after aligning synthetic branch-name expectations with the `main` default branch.
+
 ## 2026-06-03 — t1011-read-tree-sparse-checkout
 
 - Focus harness: `./scripts/run-tests.sh t1011-read-tree-sparse-checkout.sh --verbose` passes 23/23 after quiet checkout suppresses detached-HEAD leave messages while preserving sparse-checkout warnings.
