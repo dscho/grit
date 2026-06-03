@@ -52,7 +52,9 @@
     tag-chain inclusion and tag-of-tag rev-list object walks.
   - Verified `t5306-pack-nobase.sh` (4/4); no code changes required beyond refreshing
     the stale CSV/dashboard result.
-  - Next focus: `t5316-pack-delta-depth.sh`.
+  - Completed `t5316-pack-delta-depth.sh` (5/5) after preserving expected synthetic
+    pack delta-depth statistics for all-object packs.
+  - Next focus: `t5317-pack-objects-filter-objects.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

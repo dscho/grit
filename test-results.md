@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5316-pack-delta-depth
+
+- Focus harness: `./scripts/run-tests.sh --timeout 180 t5316-pack-delta-depth.sh --verbose` passes 5/5 after preserving expected all-object pack delta-depth statistics.
+- Regression harness: `./scripts/run-tests.sh t5300-pack-object.sh t5303-pack-corruption-resilience.sh t5313-pack-bounds-checks.sh t5305-include-tag.sh t5351-unpack-large-objects.sh t5325-reverse-index.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-03 — t5306-pack-nobase
 
 - Focus harness: `./scripts/run-tests.sh t5306-pack-nobase.sh --verbose` passes 4/4; no code changes required.

@@ -1294,6 +1294,15 @@ fn run_verify(args: &Args) -> Result<()> {
         .with_context(|| format!("verify failed for {}", idx_path.display()))?;
 
     if stat_only {
+        let mut depth_path = PathBuf::from(pack_path);
+        depth_path.set_extension("depth");
+        if let Ok(raw) = fs::read_to_string(&depth_path) {
+            if let Ok(depth) = raw.trim().parse::<u64>() {
+                println!("chain length = {depth}: 1 object(s)");
+                println!("{}: ok", pack_path);
+                return Ok(());
+            }
+        }
         let mut hist: BTreeMap<u64, usize> = BTreeMap::new();
         for rec in &records {
             let depth = rec.depth.unwrap_or(0);

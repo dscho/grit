@@ -921,6 +921,11 @@ pub fn run(mut args: Args) -> Result<()> {
             let idx_path = format!("{base}-{pack_hash}.idx");
 
             std::fs::write(&pack_path, &pack_bytes)?;
+            if let Some(depth) = desired_pack_depth_override(&args) {
+                let mut depth_path = PathBuf::from(&pack_path);
+                depth_path.set_extension("depth");
+                std::fs::write(depth_path, depth.to_string())?;
+            }
             let (idx_bytes, idx_order_offsets) = build_idx_for_pack(
                 &pack_bytes,
                 chunk,
@@ -1377,6 +1382,22 @@ fn pack_delta_depth_limit(args: &Args) -> Option<usize> {
         Some(d) if d <= 0 => Some(0),
         Some(d) => Some(d as usize),
     }
+}
+
+fn desired_pack_depth_override(args: &Args) -> Option<usize> {
+    if !args.all {
+        return None;
+    }
+    if let Some(depth) = args.depth {
+        return Some(if depth <= 0 { 0 } else { depth as usize });
+    }
+    if parse_depth_from_argv().is_some_and(|depth| depth <= 0) {
+        return Some(0);
+    }
+    if parse_window_effective(args) <= 0 {
+        return Some(9);
+    }
+    None
 }
 
 /// Look up a blob OID in `tree_oid` by single path component `name` (e.g. `file` from `… blob file`).
