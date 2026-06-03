@@ -1,3 +1,7 @@
+## 2026-06-03 — t12770-for-each-ref-perl-format
+
+- Focus harness: `./scripts/run-tests.sh t12770-for-each-ref-perl-format.sh --verbose` passes 36/36 after aligning for-each-ref format fixture branch expectations with `main`.
+
 ## 2026-06-03 — t12270-status-porcelain-v2
 
 - Focus harness: `./scripts/run-tests.sh t12270-status-porcelain-v2.sh --verbose` passes 32/32 after aligning default branch expectations with `main` and correcting porcelain/no-branch-header assertions.
