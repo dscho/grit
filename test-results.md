@@ -1380,3 +1380,9 @@ Updated: 2026-06-01
   all four files.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-03 — t3310-notes-merge-manual-resolve refresh
+
+- Harness refresh: `./scripts/run-tests.sh t3310-notes-merge-manual-resolve.sh` passed 22/22 with
+  the current notes merge and custom log formatting fixes.
+- No code changes were required for this fixture.
