@@ -1921,7 +1921,11 @@ fn print_combined_merge_output(
     };
     let want_stat = opts.format == OutputFormat::Stat
         || (opts.format == OutputFormat::Patch && opts.patch_with_stat);
-    let want_raw = opts.format == OutputFormat::Raw
+    // `--summary` without an explicit `--raw` suppresses the default combined raw
+    // output (matching the non-combined `--summary` behavior), so e.g.
+    // `diff-tree --cc --summary` shows only the summary lines.
+    let suppress_raw = opts.summary && !opts.raw_explicit;
+    let want_raw = (opts.format == OutputFormat::Raw && !suppress_raw)
         || (opts.format == OutputFormat::Patch && opts.patch_with_raw);
     let want_patch = opts.format == OutputFormat::Patch;
     let quote_fully = ConfigSet::load(Some(&repo.git_dir), true)
@@ -2454,7 +2458,7 @@ fn print_diff(
             }
         }
         OutputFormat::Patch => {
-            // --patch-with-stat: show stat before patch
+            // --patch-with-stat: show stat (then `--summary` lines) before patch
             if opts.patch_with_stat {
                 print_stat_summary(
                     out,
@@ -2464,6 +2468,9 @@ fn print_diff(
                     opts.compact_summary,
                     opts.shortstat,
                 )?;
+                if opts.summary {
+                    write_summary(out, entries)?;
+                }
                 writeln!(out)?;
             }
             // --patch-with-raw: show raw before patch
@@ -2475,6 +2482,12 @@ fn print_diff(
                         writeln!(out, "{}", format_raw(entry))?;
                     }
                 }
+                writeln!(out)?;
+            }
+            // Plain `-p --summary` (without `--patch-with-stat`) emits the summary
+            // lines between the header and the patch, followed by a blank line.
+            if opts.summary && !opts.patch_with_stat && summary_has_lines(entries) {
+                write_summary(out, entries)?;
                 writeln!(out)?;
             }
             for entry in entries {
@@ -2531,6 +2544,19 @@ fn abbrev_oid(hex: &str, abbrev: Option<usize>, full_index: bool) -> &str {
         let len = abbrev.unwrap_or(7).min(hex.len());
         &hex[..len]
     }
+}
+
+/// Whether `write_summary` would emit at least one line for these entries.
+fn summary_has_lines(entries: &[DiffEntry]) -> bool {
+    entries.iter().any(|entry| match entry.status {
+        DiffStatus::Added
+        | DiffStatus::Deleted
+        | DiffStatus::TypeChanged
+        | DiffStatus::Renamed
+        | DiffStatus::Copied => true,
+        DiffStatus::Modified => entry.old_mode != entry.new_mode,
+        _ => false,
+    })
 }
 
 /// Write human-readable `--summary` lines (create mode, delete mode, mode change, etc.)
