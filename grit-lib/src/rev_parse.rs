@@ -2510,7 +2510,21 @@ fn resolve_reflog_oid(
     refname_raw: &str,
     index_or_date: ReflogSelector,
 ) -> Result<ObjectId> {
-    let entries = read_reflog(&repo.git_dir, refname)?;
+    let mut entries = read_reflog(&repo.git_dir, refname)?;
+    if refname == "HEAD" {
+        if let ReflogSelector::Index(index) = index_or_date {
+            if index >= entries.len() {
+                if let Ok(Some(branch_ref)) = crate::refs::read_symbolic_ref(&repo.git_dir, "HEAD")
+                {
+                    if let Ok(branch_entries) = read_reflog(&repo.git_dir, &branch_ref) {
+                        if index < branch_entries.len() {
+                            entries = branch_entries;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let display = reflog_display_name(refname_raw, refname);
     match index_or_date {
         ReflogSelector::Index(index) => {

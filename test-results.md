@@ -1,3 +1,12 @@
+## 2026-06-03 — t3206-range-diff partial
+
+- Focus harness improved from 37/48 to 38/48 after `HEAD@{1}` falls back to the current branch
+  reflog when the HEAD reflog is too short, fixing the "no commits on one side" range-diff case.
+- Adjacent verification: `./scripts/run-tests.sh t1507-rev-parse-upstream.sh t3206-range-diff.sh`
+  kept `t1507` at 29/29 and `t3206` at 38/48.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty -p grit-cli` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3207-branch-submodule
 
 - Focus harness: `./scripts/run-tests.sh t3207-branch-submodule.sh` passes 20/20 after adding
