@@ -1,3 +1,7 @@
+## 2026-06-03 — t1001-read-tree-m-2way
+
+- Focus harness: `./scripts/run-tests.sh t1001-read-tree-m-2way.sh --verbose` passes 29/29 after refreshing verified stat cache for carried-forward read-tree indexes while preserving dirty initial tree loads.
+
 ## 2026-06-03 — t1509-root-work-tree
 
 - Marked out of scope (`in_scope=skip`) because the test explicitly requires writable `/`, `IKNOWWHATIAMDOING=YES`, and non-root execution; it is unsafe for the shared VM harness.
