@@ -1,3 +1,7 @@
+## 2026-06-03 — t11670-status-untracked-dirs
+
+- Focus harness: `./scripts/run-tests.sh t11670-status-untracked-dirs.sh --verbose` passes 37/37 after making setup tolerate environments without the synthetic `.bin` wrapper path and using an empty setup commit instead.
+
 ## 2026-06-03 — t11430-rev-parse-git-dir
 
 - Focus harness: `./scripts/run-tests.sh t11430-rev-parse-git-dir.sh --verbose` passes 35/35 after switching synthetic `master` branch references to `main`.

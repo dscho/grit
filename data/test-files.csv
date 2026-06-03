@@ -249,7 +249,7 @@ t11630-diff-cached-subdir	t1	yes	35	35	0	true	ok	0
 t11640-diff-tree-format-patch	t1	yes	37	37	0	true	ok	0
 t11650-diff-stat-width	t1	yes	36	36	0	true	ok	0
 t11660-diff-index-typechange	t1	yes	38	38	0	true	ok	0
-t11670-status-untracked-dirs	t1	yes	37	36	1	false	ok	0
+t11670-status-untracked-dirs	t1	yes	37	37	0	true	ok	0
 t11740-config-global-system	t1	yes	35	35	0	true	ok	0
 t11750-config-multivar	t1	yes	36	36	0	true	ok	0
 t11760-init-default-branch	t1	yes	35	35	0	true	ok	0
