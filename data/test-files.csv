@@ -146,7 +146,7 @@ t10460-status-ahead-behind	t1	yes	5	5	0	true	ok	0
 t10480-config-list-file	t1	yes	34	34	0	true	ok	0
 t10490-init-quiet-branch	t1	yes	32	32	0	true	ok	0
 t1050-large	t1	yes	29	14	15	false	ok	0
-t10500-branch-force-create	t1	yes	33	25	8	false	ok	0
+t10500-branch-force-create	t1	yes	33	33	0	true	ok	0
 t1051-large-conversion	t1	yes	12	12	0	true	ok	0
 t1051-unpack-file	t1	yes	12	12	0	true	ok	0
 t10510-tag-message-file	t1	yes	35	35	0	true	ok	0

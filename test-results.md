@@ -1,3 +1,7 @@
+## 2026-06-03 — t10500-branch-force-create
+
+- Focus harness: `./scripts/run-tests.sh t10500-branch-force-create.sh --verbose` passes 33/33 after aligning branch force/delete/list fixture expectations with `main`.
+
 ## 2026-06-03 — t13230-rev-parse-upstream
 
 - Focus harness: `./scripts/run-tests.sh t13230-rev-parse-upstream.sh --verbose` passes 35/35 after aligning rev-parse feature/main fixture references with `main`.
