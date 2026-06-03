@@ -1,5 +1,29 @@
 # PLAN.md — Current execution queue
 
+## Active task — t1 family 100% pass
+
+- [~] Make all current `t1` family tests fully pass. Work one dependency group at a time, choosing
+  one non-green file from `data/test-files.csv`, fixing the underlying Rust behavior, and
+  re-running that file until `failing=0` before moving to the next file.
+  - Dependency group order:
+    1. Harness/catalog anomalies (`t12280-log-shortlog-format`, `t1509-root-work-tree`).
+    2. Foundational read-tree/sparse/index/object behavior (`t1001`, `t1002`, `t1004`,
+       `t1011`, `t1013`, `t1092`, `t1020`, `t1050`, `t1700`, `t1007`, `t1016-*`).
+    3. Config/init/repository discovery (`t1300`, `t12350`, config quick wins, init/setup rows).
+    4. Refs/reflogs/ref-storage/for-each-ref (`t1400`, `t1410`, `t1422`, `t1430`, `t1461`,
+       `t1462`, `t1463`, skipped ref rows).
+    5. Revision parser/traversal/log/notes.
+    6. Branch/switch/tracking/reflog interaction.
+    7. Diff/status/index porcelain.
+    8. Commit/reset/mv/cherry-pick/sequencer.
+    9. Long tail plus skipped `t1` audit.
+  - Initial CSV state: 368 in-scope `t1` rows, 134 non-green in-scope rows, and 8 skipped rows.
+  - Current focus: Group 0, starting with `t12280-log-shortlog-format.sh` timeout / zero-count
+    anomaly.
+  - Execution log: `logs/2026-06-03_0000-t1-family.md`.
+
+---
+
 ## Active task — t6 family 100% pass
 
 - [~] Make current in-scope `t6` family tests fully pass. Work one dependency group at a time,
