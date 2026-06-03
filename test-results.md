@@ -1,3 +1,7 @@
+## 2026-06-03 — t12790-update-ref-stderr-msg
+
+- Focus harness: `./scripts/run-tests.sh t12790-update-ref-stderr-msg.sh --verbose` passes 33/33 after aligning synthetic default-branch references with `main`.
+
 ## 2026-06-03 — t12170-for-each-ref-count-limit
 
 - Focus harness: `./scripts/run-tests.sh t12170-for-each-ref-count-limit.sh --verbose` passes 33/33 after aligning branch ref/rev expectations with the `main` default branch.
