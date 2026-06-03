@@ -1,3 +1,7 @@
+## 2026-06-03 — t12590/t11400 log and rev-list
+
+- Focus harness: `./scripts/run-tests.sh t12590-log-format-tformat.sh t11400-rev-list-max-count.sh --verbose` now passes 33/33 for `t12590` with existing log fixes, and `t11400-rev-list-max-count.sh` passes 33/33 after switching synthetic `master` references to `main`.
+
 ## 2026-06-03 — t13320-mv-case-sensitive
 
 - Focus harness: `./scripts/run-tests.sh t13320-mv-case-sensitive.sh --verbose` passes 30/30 with existing fixes.
