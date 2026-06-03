@@ -8986,6 +8986,14 @@ fn write_shortstat(
     let mut files_changed = 0usize;
 
     for entry in entries {
+        // Binary files count as a changed file but contribute no line counts
+        // (t4012: `diff --shortstat` on binary change is "0 insertions, 0 deletions").
+        let old_raw = read_content_raw(odb, &entry.old_oid);
+        let new_raw = read_content_raw_or_worktree(odb, &entry.new_oid, work_tree, entry.path());
+        if is_binary(&old_raw) || is_binary(&new_raw) {
+            files_changed += 1;
+            continue;
+        }
         let (ins, del) = stat_ins_del_for_entry(
             odb,
             entry,
