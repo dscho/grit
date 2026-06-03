@@ -1,3 +1,7 @@
+## 2026-06-03 — t12620-rev-parse-resolve-ref
+
+- Focus harness: `./scripts/run-tests.sh t12620-rev-parse-resolve-ref.sh --verbose` passes 32/32 after aligning rev-parse branch reference expectations with `main`.
+
 ## 2026-06-03 — t1517-outside-repo
 
 - Focus harness: `./scripts/run-tests.sh t1517-outside-repo.sh --verbose` passes 191/191 after relaxing the usage grep to accept valid usage lines without requiring a space after the command name.
