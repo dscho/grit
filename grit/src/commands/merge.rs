@@ -8865,9 +8865,13 @@ fn apply_directory_file_conflicts(
                         auto_merge_paths.as_deref_mut(),
                     )? {
                         ContentMergeResult::Clean(merged_oid, mode) => {
+                            // The file is relocated to `path~SIDE` because the directory occupies
+                            // `path`; git records the unmerged stage-2 entry under the relocated
+                            // name (not bare `path`), matching `git ls-files -u` for the
+                            // rename/directory conflict (t6422 1a, t4069 file/directory).
                             index.remove(&path);
                             let mut merged_entry = file_entry.clone();
-                            merged_entry.path = path.clone();
+                            merged_entry.path = new_path_str.as_bytes().to_vec();
                             merged_entry.oid = merged_oid;
                             merged_entry.mode = mode;
                             stage_entry(index, &merged_entry, 2);
@@ -8908,12 +8912,18 @@ fn apply_directory_file_conflicts(
         }
 
         if merge_ort_style {
+            // merge-ort relocates the file to `path~SIDE` and records the unmerged
+            // entry under that relocated name (not `path`, which is occupied by the
+            // directory from the other side). `git add path~SIDE` then resolves it.
+            let relocated = new_path_str.as_bytes().to_vec();
             if let Some(be) = base.get(&path) {
-                stage_entry(index, be, 1);
+                let mut be_here = be.clone();
+                be_here.path = relocated.clone();
+                stage_entry(index, &be_here, 1);
             }
             let stage = if file_is_ours { 2u8 } else { 3u8 };
             let mut staged = file_entry.clone();
-            staged.path = path.clone();
+            staged.path = relocated;
             stage_entry(index, &staged, stage);
             if let Ok(obj) = repo.odb.read(&file_entry.oid) {
                 // Worktree path must avoid colliding with an existing directory at `path` (the other
