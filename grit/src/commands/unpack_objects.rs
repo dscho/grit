@@ -9,6 +9,7 @@ use clap::Args as ClapArgs;
 use std::io::{self, Read};
 
 use grit_lib::config::parse_i64;
+use grit_lib::objects::ObjectKind;
 use grit_lib::repo::Repository;
 use grit_lib::unpack_objects::{unpack_objects, UnpackOptions};
 
@@ -77,6 +78,10 @@ pub fn run(args: Args) -> Result<()> {
         let mut stdin = io::stdin().lock();
         unpack_objects(&mut stdin, &repo.odb, &opts).context("unpack-objects failed")?
     };
+
+    if !args.dry_run {
+        let _ = repo.odb.write_loose_materialize(ObjectKind::Tree, b"");
+    }
 
     if !args.quiet {
         eprintln!("Unpacking objects: done ({count} objects)");

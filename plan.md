@@ -28,7 +28,9 @@
   - Request-pull/server-info group now passes.
   - Completed `t5300-pack-object.sh` (63/63) after fixing pack-objects stdin parsing,
     pack option edge cases, index-pack keep files, and promisor prefetch trace behavior.
-  - Next focus: `t5300-unpack-objects.sh`.
+  - Completed `t5300-unpack-objects.sh` (23/23) after materializing the canonical
+    empty tree during real unpack operations.
+  - Next focus: `t5302-pack-index.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

@@ -1,4 +1,9 @@
 
+## 2026-06-03 — t5300-unpack-objects
+
+- Focus harness: `./scripts/run-tests.sh t5300-unpack-objects.sh --verbose` passes 23/23 after materializing the canonical empty tree during real unpack operations.
+
+
 ## 2026-06-03 — t5300-pack-object
 
 - Focus harness: `./scripts/run-tests.sh t5300-pack-object.sh --verbose` passes 63/63 after pack-objects stdin parsing, option edge-case, index-pack keep-file, and promisor prefetch trace fixes.
