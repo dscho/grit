@@ -81,3 +81,11 @@
   `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` reports 78/82 passing and
   regenerated `data/test-files.csv` plus dashboards.
 - Remaining real failures: `12n` and `13e`. `9g` and `12h` remain expected failures.
+- Added cherry-pick transitive file-location conflict handling for a picked-side rename into a
+  directory that HEAD renamed away, remapping the path back to the deleted source. This prints the
+  expected `CONFLICT (file location)` notice and stages base/theirs entries at the remapped path.
+  This flipped `12n` while preserving `12n2`.
+- Current release harness refresh: after `cargo build --release -p grit-cli`,
+  `./scripts/run-tests.sh t6423-merge-rename-directories.sh --verbose` reports 79/82 passing and
+  regenerated `data/test-files.csv` plus dashboards.
+- Remaining real failure: `13e`. `9g` and `12h` remain expected failures.

@@ -40,8 +40,8 @@
   - Completed rev-list bisection file: `t6002-rev-list-bisect.sh` (53/53) after adding
     bisection midpoint selection, `--bisect-vars`, `--bisect-all`, bisect-ref defaults, and
     `rev-parse --bisect` object output.
-  - Current claimed file: `t6423-merge-rename-directories.sh`, now 78/82. Remaining real
-    failures are `12n` and `13e`; `9g` and `12h` remain expected failures.
+  - Current claimed file: `t6423-merge-rename-directories.sh`, now 79/82. Remaining real
+    failure is `13e`; `9g` and `12h` remain expected failures.
   - Next t6 work should follow the highest-value remaining row from the grouped CSV unless a
     dependency-focused sequence is clearly more efficient.
   - Execution logs: `logs/2026-06-02_1427-t6-for-each-ref.md`,
