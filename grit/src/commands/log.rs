@@ -2157,7 +2157,17 @@ fn run_rev_list_log(
     let (core_commit_graph, cg_read_paths, cg_changed_ver) = load_bloom_walk_config(&repo.git_dir);
     let use_bloom = core_commit_graph
         && !combined_pathspecs.is_empty()
-        && grit_lib::pathspec::pathspecs_allow_bloom(&combined_pathspecs);
+        && grit_lib::pathspec::pathspecs_allow_bloom(&combined_pathspecs)
+        && !args.walk_reflogs;
+    let trace2_perf = std::env::var("GIT_TRACE2_PERF")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let bloom_stats: Option<BloomWalkStatsHandle> = if trace2_perf && use_bloom {
+        Some(Arc::new(Mutex::new(BloomWalkStats::default())))
+    } else {
+        None
+    };
+    let _bloom_perf_guard = bloom_stats.as_ref().map(|h| BloomPerfGuard(Arc::clone(h)));
 
     let ordering = if args.topo_order || args.simplify_merges {
         if args.author_date_order {
@@ -2198,6 +2208,7 @@ fn run_rev_list_log(
         use_commit_graph_bloom: use_bloom,
         commit_graph_read_changed_paths: cg_read_paths,
         commit_graph_changed_paths_version: cg_changed_ver,
+        bloom_stats: bloom_stats.clone(),
         ..RevListOptions::default()
     };
 
