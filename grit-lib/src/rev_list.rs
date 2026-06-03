@@ -984,6 +984,7 @@ pub fn rev_list(
                 options.parent_rewrite,
                 options.ancestry_path,
                 &effective_ancestry_path_bottoms,
+                &excluded,
                 bloom_chain.as_ref(),
                 read_changed,
                 bloom_version,
@@ -995,7 +996,7 @@ pub fn rev_list(
     }
 
     if !options.paths.is_empty() && options.simplify_merges && !ordered.is_empty() {
-        ordered = simplify_merges_commit_list(repo, &ordered)?;
+        ordered = simplify_merges_commit_list(repo, &ordered, &options.paths, &excluded)?;
     }
 
     // Git-style path-limited parent reordering (dense history and `--sparse` only). Pure
@@ -3036,7 +3037,12 @@ fn topo_sort(
     Ok(out)
 }
 
-fn simplify_merges_commit_list(repo: &Repository, commits: &[ObjectId]) -> Result<Vec<ObjectId>> {
+fn simplify_merges_commit_list(
+    repo: &Repository,
+    commits: &[ObjectId],
+    paths: &[String],
+    excluded: &HashSet<ObjectId>,
+) -> Result<Vec<ObjectId>> {
     let selected: HashSet<ObjectId> = commits.iter().copied().collect();
     let mut out = Vec::new();
     for oid in commits {
@@ -3047,6 +3053,9 @@ fn simplify_merges_commit_list(repo: &Repository, commits: &[ObjectId]) -> Resul
             .filter(|p| selected.contains(p))
             .collect();
         if raw_parents.len() > 1 && direct.len() <= 1 {
+            if path_merge_survives_simplify(repo, *oid, paths, excluded)? {
+                out.push(*oid);
+            }
             continue;
         }
         if direct.len() <= 1 {
@@ -3061,6 +3070,43 @@ fn simplify_merges_commit_list(repo: &Repository, commits: &[ObjectId]) -> Resul
         }
     }
     Ok(out)
+}
+
+fn path_merge_survives_simplify(
+    repo: &Repository,
+    oid: ObjectId,
+    paths: &[String],
+    excluded: &HashSet<ObjectId>,
+) -> Result<bool> {
+    if paths.is_empty() {
+        return Ok(false);
+    }
+    let commit = load_commit(repo, oid)?;
+    if commit.parents.len() <= 1 {
+        return Ok(false);
+    }
+    let commit_map: HashMap<String, ObjectId> =
+        flatten_tree(repo, commit.tree, "")?.into_iter().collect();
+    let mut treesame_parents = 0usize;
+    let mut first_parent_differs = false;
+    let mut differing_parent_is_excluded = false;
+    for (nth, parent_oid) in commit.parents.iter().enumerate() {
+        let parent = load_commit(repo, *parent_oid)?;
+        let parent_map: HashMap<String, ObjectId> =
+            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let differs = path_differs_for_specs(&commit_map, &parent_map, paths);
+        if differs {
+            if nth == 0 {
+                first_parent_differs = true;
+            }
+            if excluded.contains(parent_oid) {
+                differing_parent_is_excluded = true;
+            }
+        } else {
+            treesame_parents += 1;
+        }
+    }
+    Ok(treesame_parents == 1 && (first_parent_differs || differing_parent_is_excluded))
 }
 
 fn graph_simplify_parent_list_lib(
@@ -3355,6 +3401,7 @@ fn commit_touches_paths(
     parent_rewrite: bool,
     ancestry_path: bool,
     ancestry_path_bottoms: &[ObjectId],
+    excluded: &HashSet<ObjectId>,
     bloom_chain: Option<&CommitGraphChain>,
     read_changed_paths: bool,
     changed_paths_version: i32,
@@ -3425,6 +3472,7 @@ fn commit_touches_paths(
     // Merge commit: dense history omits the merge when exactly one parent is TREESAME.
     let mut treesame_parents = 0usize;
     let mut treesame_parent_oids = Vec::new();
+    let mut differing_parent_oids = Vec::new();
     let mut differs_any = false;
     let mut first_parent_differs = false;
     for (nth, parent_oid) in parents.iter().enumerate() {
@@ -3437,6 +3485,7 @@ fn commit_touches_paths(
         }
         if differs {
             differs_any = true;
+            differing_parent_oids.push(*parent_oid);
         } else {
             treesame_parents += 1;
             treesame_parent_oids.push(*parent_oid);
@@ -3477,7 +3526,11 @@ fn commit_touches_paths(
             return Ok(true);
         }
         if treesame_parents == 1 {
-            return Ok(false);
+            return Ok(first_parent_differs
+                || (parent_rewrite
+                    && differing_parent_oids
+                        .iter()
+                        .any(|parent| excluded.contains(parent))));
         }
         return Ok(differs_any || sparse);
     }

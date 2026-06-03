@@ -625,3 +625,6 @@ Updated: 2026-06-01
   all-TREESAME connectors in parent-output ancestry walks, `./scripts/run-tests.sh
   t6111-rev-list-treesame.sh --verbose` improves to 56/65 and refreshed `data/test-files.csv`
   plus dashboards.
+- t6111 simplify selection focus: after retaining path-significant one-TREESAME merges for
+  `--simplify-merges`, `./scripts/run-tests.sh t6111-rev-list-treesame.sh --verbose` improves to
+  57/65 and refreshed `data/test-files.csv` plus dashboards.
