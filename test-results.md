@@ -1,3 +1,7 @@
+## 2026-06-03 — t1308-config-set
+
+- Focus harness: `./scripts/run-tests.sh t1308-config-set.sh --verbose` passes 39/39 after making `test-tool config get_value` surface bad `.git/config` parse errors even when repository discovery aborts first.
+
 ## 2026-06-03 — t12060-init-bare-permissions
 
 - Focus harness: `./scripts/run-tests.sh t12060-init-bare-permissions.sh --verbose` passes 35/35 after correcting synthetic default-branch expectations to `main`.
