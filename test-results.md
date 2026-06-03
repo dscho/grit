@@ -1,3 +1,7 @@
+## 2026-06-03 — t10860-switch-force-create
+
+- Focus harness: `./scripts/run-tests.sh t10860-switch-force-create.sh --verbose` passes 30/30 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t13030-switch-quiet-verbose
 
 - Focus harness: `./scripts/run-tests.sh t13030-switch-quiet-verbose.sh --verbose` passes 30/30 after switching synthetic `master` branch references to `main`.
