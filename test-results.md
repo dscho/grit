@@ -1,3 +1,7 @@
+## 2026-06-03 — t12310-rev-list-simplify
+
+- Focus harness: `./scripts/run-tests.sh t12310-rev-list-simplify.sh --verbose` passes 32/32 after wrapping setup in a subshell and switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t12300-rev-list-merge-left-right
 
 - Focus harness: `./scripts/run-tests.sh t12300-rev-list-merge-left-right.sh --verbose` passes 33/33 after wrapping setup in a subshell and switching synthetic `master` branch references to `main`.
