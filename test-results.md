@@ -1,3 +1,7 @@
+## 2026-06-03 — t13320-mv-case-sensitive
+
+- Focus harness: `./scripts/run-tests.sh t13320-mv-case-sensitive.sh --verbose` passes 30/30 with existing fixes.
+
 ## 2026-06-03 — t12370-branch-list-format
 
 - Focus harness: `./scripts/run-tests.sh t12370-branch-list-format.sh t12670-branch-force-delete.sh --verbose` left `t12370-branch-list-format.sh` green at 34/34 after switching synthetic `master` references to `main`.
