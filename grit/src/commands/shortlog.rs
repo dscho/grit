@@ -398,8 +398,8 @@ struct Shortlog {
 
 struct Entry {
     key: String,
-    /// Oneline subjects, in commit-walk order (newest first as appended).
-    onelines: Vec<String>,
+    /// Oneline subjects (raw bytes), in commit-walk order (newest first as appended).
+    onelines: Vec<Vec<u8>>,
     count: usize,
 }
 
@@ -413,7 +413,7 @@ impl Shortlog {
         }
     }
 
-    fn insert_record(&mut self, key: String, oneline: &str) {
+    fn insert_record(&mut self, key: String, oneline: &[u8]) {
         let idx = match self.index.get(&key) {
             Some(&i) => i,
             None => {
@@ -440,8 +440,7 @@ impl Shortlog {
 /// Skips leading whitespace/blank lines, strips a leading `[PATCH...]` token, then
 /// folds the message lines (stopping at the first blank line) into a single line,
 /// joining with a space and stripping each line's trailing whitespace.
-fn format_subject(oneline: &str) -> String {
-    let bytes = oneline.as_bytes();
+fn format_subject(bytes: &[u8]) -> Vec<u8> {
     let mut p = 0usize;
 
     // Skip any leading whitespace, including any blank lines.
@@ -450,7 +449,7 @@ fn format_subject(oneline: &str) -> String {
     }
 
     // Strip a leading `[PATCH...]` token when its `]` precedes the line's newline.
-    if oneline[p..].starts_with("[PATCH") {
+    if bytes[p..].starts_with(b"[PATCH") {
         let rest = &bytes[p..];
         let eol = rest.iter().position(|&b| b == b'\n').unwrap_or(rest.len());
         if let Some(eob) = rest.iter().position(|&b| b == b']') {
@@ -465,7 +464,7 @@ fn format_subject(oneline: &str) -> String {
     }
 
     // format_subject(&subject, oneline, " ").
-    let mut out = String::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut first = true;
     while p < bytes.len() {
         // get_one_line: length up to and including '\n'.
@@ -488,10 +487,10 @@ fn format_subject(oneline: &str) -> String {
             break;
         }
         if !first {
-            out.push(' ');
+            out.push(b' ');
         }
         first = false;
-        out.push_str(&oneline[line_start..line_start + trimmed]);
+        out.extend_from_slice(&bytes[line_start..line_start + trimmed]);
     }
     out
 }
@@ -517,18 +516,12 @@ fn output(log: &mut Shortlog) -> Result<()> {
             for msg in entry.onelines.iter().rev() {
                 if log.opts.wrap_lines {
                     let mut wrapped: Vec<u8> = Vec::new();
-                    add_wrapped_text(
-                        &mut wrapped,
-                        msg.as_bytes(),
-                        log.opts.in1,
-                        log.opts.in2,
-                        log.opts.wrap,
-                    );
+                    add_wrapped_text(&mut wrapped, msg, log.opts.in1, log.opts.in2, log.opts.wrap);
                     buf.extend_from_slice(&wrapped);
                     buf.push(b'\n');
                 } else {
                     buf.extend_from_slice(b"      ");
-                    buf.extend_from_slice(msg.as_bytes());
+                    buf.extend_from_slice(msg);
                     buf.push(b'\n');
                 }
             }
@@ -611,11 +604,10 @@ fn build_specs(repo: &Repository, opts: &Options) -> Result<(Vec<String>, Vec<St
         if rev == "--" {
             continue;
         }
-        if let Some(neg) = rev.strip_prefix('^') {
-            negative.push(neg.to_owned());
-        } else {
-            positive.push(rev.clone());
-        }
+        // Expand range syntax (`A..B`, `A...B`) and `^A` into pos/neg specs.
+        let (pos, neg) = grit_lib::rev_list::split_revision_token(rev);
+        positive.extend(pos);
+        negative.extend(neg);
     }
 
     Ok((positive, negative))
@@ -659,10 +651,10 @@ fn add_commit(log: &mut Shortlog, oid: &ObjectId, commit: &CommitData, raw_body:
     } else {
         subject_bytes(&body_bytes)
     };
-    let oneline_str = if oneline.is_empty() && !log.opts.summary {
-        "<none>".to_owned()
+    let oneline_bytes: Vec<u8> = if oneline.is_empty() && !log.opts.summary {
+        b"<none>".to_vec()
     } else {
-        String::from_utf8_lossy(&oneline).into_owned()
+        oneline
     };
 
     let needs_dedup = log.opts.groups.len() > 1
@@ -700,7 +692,7 @@ fn add_commit(log: &mut Shortlog, oid: &ObjectId, commit: &CommitData, raw_body:
             if !dups.insert(mapped.clone()) {
                 continue;
             }
-            log.insert_record(mapped, &oneline_str);
+            log.insert_record(mapped, &oneline_bytes);
         }
     }
 
@@ -717,7 +709,7 @@ fn add_commit(log: &mut Shortlog, oid: &ObjectId, commit: &CommitData, raw_body:
             );
             let key = String::from_utf8_lossy(&key_bytes).into_owned();
             if !needs_dedup || dups.insert(key.clone()) {
-                log.insert_record(key, &oneline_str);
+                log.insert_record(key, &oneline_bytes);
             }
         }
     }
@@ -727,9 +719,9 @@ fn reencode_body(commit: &CommitData, raw_body: Vec<u8>) -> Vec<u8> {
     match &commit.encoding {
         Some(enc) if !enc.eq_ignore_ascii_case("utf-8") && !enc.eq_ignore_ascii_case("utf8") => {
             // Decode via the declared encoding and re-emit as UTF-8. When the
-            // encoding name is unresolvable (e.g. the test's "non-utf-8"), Git's
+            // encoding name is unknown (e.g. the test's "non-utf-8"), Git's
             // reencode is a no-op, so keep the raw bytes.
-            if grit_lib::commit_encoding::resolve(enc).is_some() {
+            if grit_lib::commit_encoding::is_known_encoding(enc) {
                 grit_lib::commit_encoding::decode_bytes(Some(enc), &raw_body).into_bytes()
             } else {
                 raw_body
@@ -814,7 +806,7 @@ fn read_from_stdin(stdin: &io::Stdin, log: &mut Shortlog) -> Result<()> {
         } else {
             oneline
         };
-        log.insert_record(mapped, &oneline_str);
+        log.insert_record(mapped, oneline_str.as_bytes());
     }
     Ok(())
 }
