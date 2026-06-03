@@ -23,7 +23,7 @@
     - `t1509-root-work-tree.sh` is marked `in_scope=skip` after audit confirmed it intentionally
       requires unsafe writable-root execution and emits a zero-test SKIP.
   - Current focus: Group 1 foundational read-tree/sparse/index/object behavior, starting with
-    `t1013-read-tree-submodule.sh`.
+    `t1092-sparse-checkout-compatibility.sh`.
   - Completed Group 1 files:
     - `t1001-read-tree-m-2way.sh` passes 29/29 after harness refresh; no Rust change needed.
     - `t1002-read-tree-m-u-2way.sh` passes 22/22 after refreshing content-verified index stat data
@@ -32,6 +32,9 @@
       reporting conflicts when the file side is unchanged from the merge base.
     - `t1011-read-tree-sparse-checkout.sh` passes 23/23 after `checkout -q` started suppressing
       leaving-detached-HEAD messages while preserving sparse-checkout warnings.
+    - `t1013-read-tree-submodule.sh` passes 68/68 after recursive gitlink removal/replacement uses
+      submodule-aware untracked checks, ignored-file gitlink creation is allowed, and non-recursive
+      gitlink-to-file replacement fails atomically before checkout.
   - Execution log: `logs/2026-06-03_0000-t1-family.md`.
 
 ---

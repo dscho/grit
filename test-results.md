@@ -27,6 +27,11 @@
   t1011-read-tree-sparse-checkout.sh` passes 23/23 after `checkout -q` began suppressing
   leaving-detached-HEAD messages while still allowing sparse-checkout warnings. Regression run with
   `t1001`, `t1002`, `t1004`, `t1011`, and `t2020-checkout-detach.sh` passes all five files.
+- Group 1 read-tree submodule recursion: `./scripts/run-tests.sh --timeout 180 --verbose
+  t1013-read-tree-submodule.sh` passes 68/68 after recursive gitlink removal/replacement began
+  using submodule-aware untracked checks, ignored-file gitlink creation was allowed, and
+  non-recursive gitlink-to-file replacement now fails before checkout. Regression run with `t1001`,
+  `t1002`, `t1004`, `t1011`, and `t1013` passes all five files.
 
 # Test Results
 
