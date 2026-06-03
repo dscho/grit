@@ -862,20 +862,22 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
             }
         }
 
-        // `--remove`: remove the path from the index. Missing paths, existing files, and
-        // directory/typechange cases are all dropped without error if tracked (matches
-        // `remove_file_from_index` semantics expected by the test suite). Exception: when
-        // the path is an existing directory on disk that is not itself tracked but has
-        // tracked children, git's `process_directory` errors (`add individual files
-        // instead`) instead of removing — so fall through to the directory handling below.
+        // `--remove`: matches Git's `read-cache.c:process_path` / `remove_one_path`.
+        // `--remove` (allow_remove) only DROPS an index entry when the path is GONE from
+        // disk (lstat ENOENT/ENOTDIR). When the file still EXISTS on disk it must be
+        // re-hashed and UPDATED, exactly like `add_one_path` — so fall through to the
+        // normal stat-and-update path below. `--force-remove` (handled above) always drops.
+        // Exception preserved: an existing directory on disk that is not itself tracked but
+        // has tracked children is rejected by git's `process_directory` (handled below).
         if path_mode == PathMode::Remove {
-            let exact_tracked = index.get(&rel_bytes, 0).is_some();
-            let dir_on_disk = std::fs::symlink_metadata(&abs_path)
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
-            if !(dir_on_disk && !exact_tracked) {
-                let _ = index.remove(&rel_bytes);
-                continue;
+            match std::fs::symlink_metadata(&abs_path) {
+                // File/symlink/dir-gitlink exists on disk: fall through to stat-and-update.
+                Ok(_) => {}
+                // Path is missing on disk: drop the index entry.
+                Err(_) => {
+                    let _ = index.remove(&rel_bytes);
+                    continue;
+                }
             }
         }
 
@@ -1090,11 +1092,14 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
             }
         };
 
-        let mut entry = entry_from_stat(&abs_path, &rel_bytes, oid, mode)
+        let entry = entry_from_stat(&abs_path, &rel_bytes, oid, mode)
             .with_context(|| format!("stat failed for '{}'", abs_path.display()))?;
-        if entry.mtime_sec == current_unix_seconds_u32() {
-            entry.size = 0;
-        }
+        // Git records the REAL file size in the index even for a same-second add
+        // (verified: `git ls-files --debug` shows the true size). Raciness is detected
+        // later by comparing an entry's mtime against the index file's own mtime
+        // (`is_racy_timestamp`), not by zeroing the cached size at add time. Zeroing the
+        // size here made unchanged files look stat-dirty in a later tree-vs-worktree
+        // `diff-index`, producing spurious `M` lines (t4005/t4007/t4008/t4009/t4011).
 
         index.stage_file(entry);
 
@@ -1143,8 +1148,10 @@ pub fn run(args: Args, raw_rest: &[String]) -> Result<()> {
             repo.write_index_at_split(&index_path, &mut index, split_write)
                 .context("writing index")?;
         }
-        // -q (quiet) suppresses the error exit; otherwise exit 1 if files need updating
-        if !uptodate && !args.quiet {
+        // Git `builtin/update-index.c`: the command always `return has_errors ? 1 : 0`
+        // regardless of `-q`. `-q`/quiet only suppresses the per-file diagnostic output
+        // inside refresh_index, NOT the exit status (t4002 diff-files preconditions).
+        if !uptodate {
             std::process::exit(1);
         }
         return Ok(());

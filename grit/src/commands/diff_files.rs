@@ -979,20 +979,20 @@ fn collect_changes(
                         }
                     }
                     let content_matches = effective_wt_oid == *idx_oid && wt_mode == idx_canonical;
-                    let racy_clean =
-                        idx_entry.size == 0 && index_entry_is_racy(idx_entry, index_mtime);
                     // Git's `run_diff_files` reports a file as modified whenever the worktree
                     // stat tuple disagrees with the index, even if re-hashing the content would
                     // yield the same OID (it never re-hashes to clear the change). Only suppress
                     // a content-equal entry when its on-disk stat *also* matches the index; a
                     // stat-dirty entry must still be reported as `M` (t7508 read-only repo).
+                    // For racy entries (mtime in the racy window relative to the index file's
+                    // own mtime), git re-hashes: a content-equal racy entry is suppressed
+                    // (t0010 racy-clean), a content-different one is reported.
                     let stat_agrees = fs::symlink_metadata(&abs)
                         .map(|m| stat_matches(idx_entry, &m))
                         .unwrap_or(false);
                     if content_matches
                         && index_stat_is_trusted(idx_entry)
                         && stat_agrees
-                        && !racy_clean
                         && !idx_entry.intent_to_add()
                     {
                         continue;
@@ -1000,7 +1000,6 @@ fn collect_changes(
                     if content_matches
                         && index_stat_is_trusted(idx_entry)
                         && git_dir_allows_index_refresh(&repo.git_dir)
-                        && !racy_clean
                         && !idx_entry.intent_to_add()
                     {
                         continue;
@@ -1849,8 +1848,8 @@ fn read_worktree_info_fast(
     // Symlinks: when lstat matches the index, skip readlink+hash (matches Git `ce_match_stat`;
     // needed so `diff-files` agrees with `apply` after symlink-only updates — see t4115).
     if canonicalize_mode(index_entry.mode) == MODE_SYMLINK && meta.file_type().is_symlink() {
-        let smudged_racy = index_entry.size == 0 && index_entry_is_racy(index_entry, index_mtime);
-        if stat_matches(index_entry, &meta) && !smudged_racy {
+        let racy = index_entry_is_racy(index_entry, index_mtime);
+        if stat_matches(index_entry, &meta) && !racy {
             return Ok(WorktreeStatus::Unchanged);
         }
     }
@@ -1858,8 +1857,8 @@ fn read_worktree_info_fast(
     // Fast path: if stat info matches the index, file is unchanged.
     // But also check if the index mode differs from the worktree mode
     // (e.g., after git update-index --chmod=+x).
-    let smudged_racy = index_entry.size == 0 && index_entry_is_racy(index_entry, index_mtime);
-    if meta.file_type().is_file() && stat_matches(index_entry, &meta) && !smudged_racy {
+    let racy = index_entry_is_racy(index_entry, index_mtime);
+    if meta.file_type().is_file() && stat_matches(index_entry, &meta) && !racy {
         let wt_mode = if meta.permissions().mode() & 0o111 != 0 {
             MODE_EXECUTABLE
         } else {
