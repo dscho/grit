@@ -4133,7 +4133,8 @@ fn preprocess_fetch_argv(rest: &[String]) -> Vec<String> {
 
 /// `git format-patch -3` uses a negative-looking revision count; clap otherwise parses `-3` as
 /// unknown short flags and leaves `--stdout` in `revisions`. Peel off `-<digits>` and pass the
-/// count via a hidden long option.
+/// count via a hidden long option. Also translate the various attached short forms (`-v<x>`,
+/// `-U<n>`, `-O<file>`) into long options clap understands, so they are not swallowed as revisions.
 fn preprocess_format_patch_argv(rest: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(rest.len() + 1);
     let mut max_count: Option<usize> = None;
@@ -4144,6 +4145,7 @@ fn preprocess_format_patch_argv(rest: &[String]) -> Vec<String> {
             out.extend_from_slice(&rest[i..]);
             break;
         }
+        // `-<digits>` count shorthand (e.g. `-3`).
         if arg.len() > 1
             && arg.starts_with('-')
             && arg.as_bytes().get(1).is_some_and(u8::is_ascii_digit)
@@ -4155,6 +4157,32 @@ fn preprocess_format_patch_argv(rest: &[String]) -> Vec<String> {
                     i += 1;
                     continue;
                 }
+            }
+        }
+        // `-v<x>` attached reroll count (anything after `-v`, including non-numeric like
+        // `-v4rev2` or `-v4.4` or `-v4---...`). Bare `-v <x>` is handled by clap (short option).
+        if let Some(val) = arg.strip_prefix("-v") {
+            if !val.is_empty() {
+                out.push(format!("--reroll-count={val}"));
+                i += 1;
+                continue;
+            }
+        }
+        // `-U<n>` attached unified context.
+        if let Some(val) = arg.strip_prefix("-U") {
+            if !val.is_empty() {
+                out.push(format!("--unified={val}"));
+                i += 1;
+                continue;
+            }
+        }
+        // `-O<file>` attached orderfile (clap can mis-parse paths starting with `.`).
+        if let Some(val) = arg.strip_prefix("-O") {
+            if !val.is_empty() && !val.starts_with('=') {
+                out.push("-O".to_owned());
+                out.push(val.to_owned());
+                i += 1;
+                continue;
             }
         }
         out.push(arg.clone());
@@ -4513,8 +4541,44 @@ fn preprocess_expand_tabs_for_rev_cmd(rest: &[String]) -> Vec<String> {
     out
 }
 
+/// Value-less `git log` option flags that git accepts in any position (before or after
+/// revision arguments). clap treats the `revisions` positional as `allow_hyphen_values`,
+/// so a flag appearing after a revision would be consumed as a revision instead of an
+/// option. Hoisting these specific flags ahead of the positionals restores git's behavior
+/// without disturbing options that take values.
+fn hoist_trailing_log_flags(rest: &[String]) -> Vec<String> {
+    const FLAGS: &[&str] = &["--reverse"];
+    let mut hoisted: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    let mut after_dashdash = false;
+    for arg in rest {
+        if after_dashdash {
+            tail.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            after_dashdash = true;
+            tail.push(arg.clone());
+            continue;
+        }
+        if FLAGS.contains(&arg.as_str()) {
+            hoisted.push(arg.clone());
+        } else {
+            tail.push(arg.clone());
+        }
+    }
+    hoisted.extend(tail);
+    hoisted
+}
+
 fn preprocess_log_args(rest: &[String]) -> Vec<String> {
     let rest = preprocess_git_notes_display_argv(rest, NotesDisplayDefault::OnIfUnset);
+    // git accepts value-less options interspersed with / after revision arguments
+    // (e.g. `git log -2 <rev> --reverse`). clap's `allow_hyphen_values` revisions
+    // positional would otherwise swallow such a trailing flag as a revision. Hoist
+    // these flags before the positional revisions (stopping at `--`, after which
+    // everything is a pathspec).
+    let rest = hoist_trailing_log_flags(&rest);
     let mut result = Vec::new();
     let mut saw_graph = false;
     let mut i = 0usize;
@@ -5414,7 +5478,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "sh-i18n--envsubst" => commands::sh_i18n_envsubst::run_from_argv(rest),
         "sh-setup" => commands::sh_setup::run(parse_cmd_args(subcmd, rest)),
         "shell" => commands::shell::run(parse_cmd_args(subcmd, rest)),
-        "shortlog" => commands::shortlog::run(parse_cmd_args(subcmd, rest)),
+        "shortlog" => commands::shortlog::run_with_raw_args(rest),
         "show" => {
             let rest = preprocess_expand_tabs_for_rev_cmd(rest);
             let rest = preprocess_show_argv(&rest);
@@ -5505,7 +5569,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "verify-tag" => commands::verify_tag::run(parse_cmd_args(subcmd, rest)),
         "version" => commands::version::run(parse_cmd_args(subcmd, rest)),
         "web--browse" => commands::web_browse::run(parse_cmd_args(subcmd, rest)),
-        "whatchanged" => commands::whatchanged::run(parse_cmd_args(subcmd, rest)),
+        "whatchanged" => commands::whatchanged::run(rest),
         "worktree" => commands::worktree::run(parse_cmd_args(subcmd, rest)),
         "write-tree" => commands::write_tree::run(parse_cmd_args(subcmd, rest)),
         "test-tool" => {

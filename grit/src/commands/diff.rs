@@ -271,6 +271,11 @@ fn parse_word_diff_from_argv() -> (WordDiffModeCli, Option<String>) {
 
 fn effective_word_diff(args: &Args, stdout_is_tty: bool) -> Option<EffectiveWordDiff> {
     let (mut mode, regex_override) = parse_word_diff_from_argv();
+    // git: `--word-diff-regex=<re>` implies word-diff in plain mode unless a mode is
+    // given explicitly (see Documentation/diff-options.txt and t4034 subtest 15).
+    if args.word_diff_regex.is_some() && mode == WordDiffModeCli::None && args.word_diff.is_none() {
+        mode = WordDiffModeCli::Plain;
+    }
     if args.color_words.is_some() {
         mode = WordDiffModeCli::Color;
     }
@@ -673,6 +678,240 @@ const GREEN: &str = "\x1b[32m";
 const CYAN: &str = "\x1b[36m";
 const BG_RED: &str = "\x1b[41m";
 const MAGENTA: &str = "\x1b[35m";
+
+/// `ws_error_highlight` bits (Git `WSEH_NEW`/`WSEH_OLD`/`WSEH_CONTEXT`).
+const WSEH_NEW: u8 = 1;
+const WSEH_OLD: u8 = 2;
+const WSEH_CONTEXT: u8 = 4;
+
+/// Resolve a diff color slot, honoring both `color.diff.<slot>` and `diff.color.<slot>`
+/// (Git aliases), parsing the value with `parse_color`. `default_name` is a Git color *name*
+/// (e.g. `green`, `bold red`, `normal`, or empty) used when neither config key is set.
+fn resolve_diff_color(config: &ConfigSet, slot: &str, default_name: &str) -> String {
+    let raw = config
+        .get(&format!("color.diff.{slot}"))
+        .or_else(|| config.get(&format!("diff.color.{slot}")));
+    let name = match raw {
+        Some(v) if !v.is_empty() => v,
+        _ => default_name.to_owned(),
+    };
+    grit_lib::config::parse_color(&name).unwrap_or_default()
+}
+
+/// Parse one `--ws-error-highlight` / `diff.wsErrorHighlight` value (Git `parse_ws_error_highlight`).
+/// Returns `None` on an unknown token (Git reports an error / leaves default in that case).
+fn parse_ws_error_highlight(arg: &str) -> Option<u8> {
+    let mut val: u8 = 0;
+    for tok in arg.split(',') {
+        match tok {
+            "" => {}
+            "none" => val = 0,
+            "default" => val = WSEH_NEW,
+            "all" => val = WSEH_NEW | WSEH_OLD | WSEH_CONTEXT,
+            "new" => val |= WSEH_NEW,
+            "old" => val |= WSEH_OLD,
+            "context" => val |= WSEH_CONTEXT,
+            _ => return None,
+        }
+    }
+    Some(val)
+}
+
+/// Last `--ws-error-highlight=<value>` on the command line, if any (Git: later flag wins).
+fn ws_error_highlight_from_argv() -> Option<u8> {
+    let argv: Vec<String> = std::env::args().collect();
+    let mut result: Option<u8> = None;
+    let mut i = 0usize;
+    while i < argv.len() {
+        let a = argv[i].as_str();
+        if let Some(v) = a.strip_prefix("--ws-error-highlight=") {
+            if let Some(b) = parse_ws_error_highlight(v) {
+                result = Some(b);
+            }
+        } else if a == "--ws-error-highlight" {
+            if let Some(n) = argv.get(i + 1) {
+                if let Some(b) = parse_ws_error_highlight(n) {
+                    result = Some(b);
+                }
+                i += 1;
+            }
+        }
+        i += 1;
+    }
+    result
+}
+
+/// Effective `ws_error_highlight` bitmask: CLI flag overrides `diff.wsErrorHighlight` config,
+/// which overrides the built-in default of `WSEH_NEW`.
+fn effective_ws_error_highlight(config: &ConfigSet) -> u8 {
+    if let Some(v) = ws_error_highlight_from_argv() {
+        return v;
+    }
+    if let Some(cfg) = config.get("diff.wsErrorHighlight") {
+        if let Some(v) = parse_ws_error_highlight(&cfg) {
+            return v;
+        }
+    }
+    WSEH_NEW
+}
+
+/// Context for whitespace-error highlighting while writing a colored patch.
+struct WsColorCtx {
+    /// Whitespace rule bits for the file being diffed.
+    ws_rule: u32,
+    /// `ws_error_highlight` bitmask (which line kinds get highlighted).
+    highlight: u8,
+    /// Resolved colors.
+    new_color: String,
+    old_color: String,
+    context_color: String,
+    ws_color: String,
+    reset: String,
+    /// Git `blank_at_eof_in_preimage` / `blank_at_eof_in_postimage`: a `+` blank line is
+    /// flagged only when `pre_threshold <= lno_in_preimage && post_threshold <= lno_in_postimage`.
+    /// Both `0` disables blank-at-eof highlighting.
+    blank_at_eof_pre: usize,
+    blank_at_eof_post: usize,
+}
+
+/// Port of Git `ws_check_emit_1` (emit side): paint whitespace errors in `body` using
+/// `set` (the line's base color), `reset`, and `ws` (the whitespace-error color).
+fn ws_check_emit(out: &mut String, body: &str, ws_rule: u32, set: &str, reset: &str, ws: &str) {
+    let bytes = body.as_bytes();
+    let mut len = bytes.len();
+
+    let mut trailing_newline = false;
+    if len > 0 && bytes[len - 1] == b'\n' {
+        trailing_newline = true;
+        len -= 1;
+    }
+    let mut trailing_carriage_return = false;
+    if (ws_rule & ws::WS_CR_AT_EOL) != 0 && len > 0 && bytes[len - 1] == b'\r' {
+        trailing_carriage_return = true;
+        len -= 1;
+    }
+
+    let mut trailing_whitespace: isize = -1;
+    if (ws_rule & ws::WS_BLANK_AT_EOL) != 0 {
+        let mut i = len as isize - 1;
+        while i >= 0 {
+            if bytes[i as usize].is_ascii_whitespace() {
+                trailing_whitespace = i;
+            } else {
+                break;
+            }
+            i -= 1;
+        }
+    }
+    let trailing_whitespace = if trailing_whitespace == -1 {
+        len
+    } else {
+        trailing_whitespace as usize
+    };
+
+    let push = |out: &mut String, range: &[u8]| {
+        out.push_str(&String::from_utf8_lossy(range));
+    };
+
+    // Check indentation.
+    let mut written = 0usize;
+    let mut i = 0usize;
+    while i < trailing_whitespace {
+        let c = bytes[i];
+        if c == b' ' {
+            i += 1;
+            continue;
+        }
+        if c != b'\t' {
+            break;
+        }
+        if (ws_rule & ws::WS_SPACE_BEFORE_TAB) != 0 && written < i {
+            out.push_str(ws);
+            push(out, &bytes[written..i]);
+            out.push_str(reset);
+            push(out, &bytes[i..i + 1]);
+        } else if (ws_rule & ws::WS_TAB_IN_INDENT) != 0 {
+            push(out, &bytes[written..i]);
+            out.push_str(ws);
+            push(out, &bytes[i..i + 1]);
+            out.push_str(reset);
+        } else {
+            push(out, &bytes[written..i + 1]);
+        }
+        written = i + 1;
+        i += 1;
+    }
+
+    // Check for indent using non-tab.
+    if (ws_rule & ws::WS_INDENT_WITH_NON_TAB) != 0 && i - written >= ws::ws_tab_width(ws_rule) {
+        out.push_str(ws);
+        push(out, &bytes[written..i]);
+        out.push_str(reset);
+        written = i;
+    }
+
+    // Emit non-highlighted (middle) segment.
+    if trailing_whitespace > written {
+        out.push_str(set);
+        push(out, &bytes[written..trailing_whitespace]);
+        out.push_str(reset);
+    }
+    // Highlight trailing whitespace errors.
+    if trailing_whitespace != len {
+        out.push_str(ws);
+        push(out, &bytes[trailing_whitespace..len]);
+        out.push_str(reset);
+    }
+    if trailing_carriage_return {
+        out.push('\r');
+    }
+    if trailing_newline {
+        out.push('\n');
+    }
+}
+
+/// Emit one content line (`+`/`-`/` `) with whitespace-error markup, mirroring Git
+/// `emit_line_ws_markup` for the non-dual-color case (`set_sign == NULL`).
+fn emit_ws_markup_line(
+    out: &mut String,
+    sign: char,
+    body: &str,
+    set: &str,
+    reset: &str,
+    ws_color: Option<&str>,
+    ws_rule: u32,
+    blank_at_eof: bool,
+) {
+    let (body_no_nl, nl) = match body.strip_suffix('\n') {
+        Some(b) => (b, "\n"),
+        None => (body, ""),
+    };
+    match ws_color {
+        None => {
+            // No highlighting: `{set}{sign}{body}{reset}`.
+            out.push_str(set);
+            out.push(sign);
+            out.push_str(body_no_nl);
+            out.push_str(reset);
+            out.push_str(nl);
+        }
+        Some(ws) if blank_at_eof => {
+            // Blank line at EOF: paint the whole `+` line (including sign) with ws color.
+            out.push_str(ws);
+            out.push(sign);
+            out.push_str(body_no_nl);
+            out.push_str(reset);
+            out.push_str(nl);
+        }
+        Some(ws) => {
+            // Prefix `{set}{sign}{reset}`, then the body via ws_check_emit.
+            out.push_str(set);
+            out.push(sign);
+            out.push_str(reset);
+            ws_check_emit(out, body, ws_rule, set, reset, ws);
+        }
+    }
+}
 
 /// Whitespace-ignore options bundled together.
 #[derive(Debug, Default)]
@@ -1257,11 +1496,11 @@ pub struct Args {
     pub no_relative: bool,
 
     /// Colorize the output. Values: always, never, auto.
-    #[arg(long = "color", value_name = "WHEN", default_missing_value = "always", num_args = 0..=1)]
+    #[arg(long = "color", value_name = "WHEN", default_missing_value = "always", num_args = 0..=1, require_equals = true)]
     pub color: Option<String>,
 
     /// Show a word-level diff with `[-removed-]{+added+}` markers.
-    #[arg(long = "word-diff", value_name = "MODE", default_missing_value = "plain", num_args = 0..=1)]
+    #[arg(long = "word-diff", value_name = "MODE", default_missing_value = "plain", num_args = 0..=1, require_equals = true, overrides_with = "word_diff")]
     pub word_diff: Option<String>,
 
     /// Regular expression that defines a word for word diff (Git `--word-diff-regex`).
@@ -1837,6 +2076,17 @@ pub fn run(mut args: Args) -> Result<()> {
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| "log".to_string()),
         );
+    }
+    // No CLI `--submodule`: fall back to the `diff.submodule` config value (Git's
+    // `git_diff_ui_config`). Plumbing (`diff-index`/`diff-tree`) ignores this and is handled in
+    // its own command, so this porcelain default only affects `git diff`. See t4041/t4060 #3.
+    if args.submodule.as_deref().is_none_or(str::is_empty) {
+        if let Some(val) = diff_config.get("diff.submodule") {
+            let v = val.trim();
+            if matches!(v, "log" | "short" | "diff") {
+                args.submodule = Some(v.to_string());
+            }
+        }
     }
     let emit_unified_patch = diff_emit_unified_patch_from_argv(&raw_args);
     let indent_heuristic = resolve_indent_heuristic(
@@ -3117,7 +3367,7 @@ pub fn run(mut args: Args) -> Result<()> {
         let mut need_blank_before_patch = false;
 
         if args.raw {
-            write_raw(&mut out, &entries, oid_len)?;
+            write_raw(&mut out, &entries, oid_len, !args.cached && revs.len() <= 1)?;
             wrote_output = true;
             need_blank_before_patch = true;
         }
@@ -3220,7 +3470,7 @@ pub fn run(mut args: Args) -> Result<()> {
         }
 
         if args.patch_with_raw && show_unified_patch && !args.raw {
-            write_raw(&mut out, &entries, oid_len)?;
+            write_raw(&mut out, &entries, oid_len, !args.cached && revs.len() <= 1)?;
             need_blank_before_patch = true;
         }
         if args.patch_with_stat && show_unified_patch && !stat_block_active {
@@ -3777,6 +4027,22 @@ fn run_no_index(args: Args) -> Result<()> {
         args.no_indent_heuristic,
     );
 
+    // Validate the funcname driver up front so a malformed pattern (e.g. a negated
+    // last expression, `diff.<driver>.funcname = "!static"`) is reported as a fatal
+    // error with exit 128, matching git, instead of being silently ignored.
+    for rel in [path_a_str.as_str(), path_b_str.as_str()] {
+        if let Err(msg) = matcher_for_path_parsed(
+            diff_algo_ctx.config.as_ref(),
+            &diff_algo_ctx.attrs.rules,
+            &diff_algo_ctx.attrs.macros,
+            rel,
+            diff_algo_ctx.ignore_case_attrs,
+        ) {
+            eprintln!("fatal: {msg}");
+            std::process::exit(128);
+        }
+    }
+
     // Read file or symlink target (for symlinks, read the target path as content)
     let read_path_or_symlink = |p: &Path, name: &str| -> Result<Vec<u8>> {
         if let Ok(meta) = std::fs::symlink_metadata(p) {
@@ -3950,7 +4216,7 @@ fn run_no_index(args: Args) -> Result<()> {
 
     let diff_body = if let Some(ref wd) = effective_word_diff_opt {
         let word_re_opt = if let Some(ref o) = wd.regex_override {
-            RegexBuilder::new(o).multi_line(true).build().ok()
+            WordRe::build(o, false)
         } else {
             word_regex_pattern_for_path_parsed(
                 cfg_for_word_regex,
@@ -3959,13 +4225,7 @@ fn run_no_index(args: Args) -> Result<()> {
                 path_a_str.as_str(),
                 ignore_case_attrs,
             )
-            .and_then(|(pat, ic)| {
-                RegexBuilder::new(&pat)
-                    .multi_line(true)
-                    .case_insensitive(ic)
-                    .build()
-                    .ok()
-            })
+            .and_then(|(pat, ic)| WordRe::build(&pat, ic))
         };
         word_diff_generate_patch(
             cfg_for_word_regex,
@@ -6444,11 +6704,92 @@ fn write_blob_to_blob_patch_fragment(
         patch
     };
     if use_color {
-        write_colored_patch(out, &patch, suppress_incomplete_highlight_after_plus)?;
+        let entry_mode = if suppress_incomplete_highlight_after_plus {
+            "120000"
+        } else {
+            "100644"
+        };
+        let ws_ctx = build_ws_color_ctx(
+            algo_ctx.config.as_ref(),
+            &algo_ctx.attrs,
+            path_for_attrs,
+            entry_mode,
+            algo_ctx.ignore_case_attrs,
+            old_content.as_bytes(),
+            new_content.as_bytes(),
+        );
+        match ws_ctx {
+            Some(ctx) => write_colored_patch_ws(
+                out,
+                &patch,
+                suppress_incomplete_highlight_after_plus,
+                Some(&ctx),
+            )?,
+            None => write_colored_patch(out, &patch, suppress_incomplete_highlight_after_plus)?,
+        }
     } else {
         write!(out, "{patch}")?;
     }
     Ok(())
+}
+
+/// Build the whitespace-error-highlight context for a colored patch fragment, or `None` when
+/// no highlighting applies (rule has no checkable bits, or `ws_error_highlight` selects nothing).
+fn build_ws_color_ctx(
+    config: &ConfigSet,
+    attrs: &ParsedGitAttributes,
+    path_for_attrs: &str,
+    entry_mode: &str,
+    ignore_case_attrs: bool,
+    old_content: &[u8],
+    new_content: &[u8],
+) -> Option<WsColorCtx> {
+    let highlight = effective_ws_error_highlight(config);
+    let ws_rule =
+        effective_ws_rule_for_path(attrs, path_for_attrs, entry_mode, config, ignore_case_attrs)
+            .ok()?;
+    // Default whitespace color is GIT_COLOR_BG_RED (`\x1b[41m`), which has no simple color name.
+    let ws_color = {
+        let raw = config
+            .get("color.diff.whitespace")
+            .or_else(|| config.get("diff.color.whitespace"));
+        match raw {
+            Some(v) if !v.is_empty() => grit_lib::config::parse_color(&v).unwrap_or_default(),
+            _ => BG_RED.to_owned(),
+        }
+    };
+    let (blank_at_eof_pre, blank_at_eof_post) = if ws_rule & WS_BLANK_AT_EOF != 0 {
+        check_blank_at_eof(old_content, new_content)
+    } else {
+        (0, 0)
+    };
+    Some(WsColorCtx {
+        ws_rule,
+        highlight,
+        new_color: resolve_diff_color(config, "new", "green"),
+        old_color: resolve_diff_color(config, "old", "red"),
+        context_color: resolve_diff_color(config, "context", "normal"),
+        ws_color,
+        reset: RESET.to_owned(),
+        blank_at_eof_pre,
+        blank_at_eof_post,
+    })
+}
+
+/// Port of Git `check_blank_at_eof` (`diff.c`): returns
+/// `(blank_at_eof_in_preimage, blank_at_eof_in_postimage)`, or `(0, 0)` when not applicable.
+fn check_blank_at_eof(pre: &[u8], post: &[u8]) -> (usize, usize) {
+    let l1 = count_trailing_blank_lines(pre);
+    let l2 = count_trailing_blank_lines(post);
+    if l2 <= l1 {
+        return (0, 0);
+    }
+    let at1 = count_lines_git(pre);
+    let at2 = count_lines_git(post);
+    (
+        at1.saturating_sub(l1).saturating_add(1),
+        at2.saturating_sub(l2).saturating_add(1),
+    )
 }
 
 fn write_patch_with_prefix(
@@ -6495,6 +6836,29 @@ fn write_patch_with_prefix(
 
         if let Some(fmt) = submodule_fmt {
             if entry.old_mode == "160000" || entry.new_mode == "160000" {
+                // A blob→gitlink typechange against the work tree records the new gitlink as zero;
+                // resolve the submodule's checked-out HEAD so `write_patch_entry` produces the
+                // `Submodule … (new submodule)` summary with the real commit. See t4041/t4060 #17.
+                let mut resolved;
+                let entry: &DiffEntry = if entry.new_mode == "160000"
+                    && entry.new_oid == zero_oid()
+                    && entry.old_mode != "160000"
+                {
+                    let head = work_tree
+                        .and_then(|wt| {
+                            grit_lib::diff::read_submodule_head_oid(&wt.join(entry.path()))
+                        })
+                        .unwrap_or_else(zero_oid);
+                    if head == zero_oid() {
+                        entry
+                    } else {
+                        resolved = entry.clone();
+                        resolved.new_oid = head;
+                        &resolved
+                    }
+                } else {
+                    entry
+                };
                 if fmt == "log" {
                     if entry.old_mode == "160000"
                         && entry.new_mode == "160000"
@@ -6881,7 +7245,7 @@ fn write_patch_with_prefix(
 
         if let Some(wd) = word_diff {
             let word_re_opt = if let Some(ref o) = wd.regex_override {
-                RegexBuilder::new(o).multi_line(true).build().ok()
+                WordRe::build(o, false)
             } else {
                 word_regex_pattern_for_path_parsed(
                     config,
@@ -6890,13 +7254,7 @@ fn write_patch_with_prefix(
                     path_for_attrs.as_str(),
                     algo_ctx.ignore_case_attrs,
                 )
-                .and_then(|(pat, ic)| {
-                    RegexBuilder::new(&pat)
-                        .multi_line(true)
-                        .case_insensitive(ic)
-                        .build()
-                        .ok()
-                })
+                .and_then(|(pat, ic)| WordRe::build(&pat, ic))
             };
             let patch = word_diff_generate_patch(
                 config,
@@ -6956,7 +7314,19 @@ fn write_patch_with_prefix(
             };
 
             if use_color {
-                write_colored_patch(out, &patch, false)?;
+                let ws_ctx = build_ws_color_ctx(
+                    config,
+                    &algo_ctx.attrs,
+                    path_for_attrs.as_str(),
+                    &entry.new_mode,
+                    algo_ctx.ignore_case_attrs,
+                    old_content.as_bytes(),
+                    new_content.as_bytes(),
+                );
+                match ws_ctx {
+                    Some(ctx) => write_colored_patch_ws(out, &patch, false, Some(&ctx))?,
+                    None => write_colored_patch(out, &patch, false)?,
+                }
             } else {
                 write!(out, "{patch}")?;
             }
@@ -6991,31 +7361,137 @@ fn write_colored_patch(
     patch: &str,
     suppress_incomplete_red_after_plus: bool,
 ) -> Result<()> {
+    write_colored_patch_ws(out, patch, suppress_incomplete_red_after_plus, None)
+}
+
+fn write_colored_patch_ws(
+    out: &mut impl Write,
+    patch: &str,
+    suppress_incomplete_red_after_plus: bool,
+    ws: Option<&WsColorCtx>,
+) -> Result<()> {
     let mut last_was_plus_hunk_line = false;
+    // Running pre/post-image line numbers (Git starts both at 1), for blank-at-eof detection.
+    let mut lno_pre: usize = 1;
+    let mut lno_post: usize = 1;
+    // The whitespace-error highlight bit for the last content line, for the `\ No newline` marker.
+    let mut last_line_kind: u8 = 0; // 0 = none/context, 1 = '+', 2 = '-'
     for line in patch.split_inclusive('\n') {
         let line_no_nl = line.strip_suffix('\n').unwrap_or(line);
+        let nl = if line.ends_with('\n') { "\n" } else { "" };
         if line_no_nl.starts_with('\\') {
-            if last_was_plus_hunk_line && !suppress_incomplete_red_after_plus {
-                writeln!(out, "{BG_RED}{line_no_nl}{RESET}")?;
+            // `\ No newline at end of file` marker.
+            if let Some(ctx) = ws {
+                let kind_bit = match last_line_kind {
+                    1 => WSEH_NEW,
+                    2 => WSEH_OLD,
+                    _ => WSEH_CONTEXT,
+                };
+                let highlight_incomplete = (ctx.ws_rule & WS_INCOMPLETE_LINE) != 0
+                    && (kind_bit & ctx.highlight) != 0
+                    && !ctx.ws_color.is_empty();
+                let set = if highlight_incomplete {
+                    ctx.ws_color.as_str()
+                } else {
+                    ctx.context_color.as_str()
+                };
+                write!(out, "{set}{line_no_nl}{}{nl}", ctx.reset)?;
+            } else if last_was_plus_hunk_line && !suppress_incomplete_red_after_plus {
+                write!(out, "{BG_RED}{line_no_nl}{RESET}{nl}")?;
             } else {
-                writeln!(out, "{CYAN}{line_no_nl}{RESET}")?;
+                write!(out, "{CYAN}{line_no_nl}{RESET}{nl}")?;
             }
             continue;
         }
         if line.starts_with("---") || line.starts_with("+++") {
             last_was_plus_hunk_line = false;
+            last_line_kind = 0;
             writeln!(out, "{BOLD}{line_no_nl}{RESET}")?;
         } else if line.starts_with("@@") {
             last_was_plus_hunk_line = false;
+            last_line_kind = 0;
             writeln!(out, "{CYAN}{line_no_nl}{RESET}")?;
+        } else if let Some(ctx) = ws {
+            // ws-aware content line emission.
+            let mut buf = String::new();
+            if let Some(rest) = line.strip_prefix('-') {
+                last_was_plus_hunk_line = false;
+                last_line_kind = 2;
+                lno_pre += 1;
+                let hi = (ctx.highlight & WSEH_OLD) != 0 && !ctx.ws_color.is_empty();
+                emit_ws_markup_line(
+                    &mut buf,
+                    '-',
+                    rest,
+                    &ctx.old_color,
+                    &ctx.reset,
+                    if hi {
+                        Some(ctx.ws_color.as_str())
+                    } else {
+                        None
+                    },
+                    ctx.ws_rule,
+                    false,
+                );
+            } else if let Some(rest) = line.strip_prefix('+') {
+                last_was_plus_hunk_line = true;
+                last_line_kind = 1;
+                lno_post += 1;
+                let blank_at_eof = ctx.blank_at_eof_pre != 0
+                    && ctx.blank_at_eof_post != 0
+                    && ctx.blank_at_eof_pre <= lno_pre
+                    && ctx.blank_at_eof_post <= lno_post
+                    && ws::ws_blank_line(rest.strip_suffix('\n').unwrap_or(rest));
+                let hi = (ctx.highlight & WSEH_NEW) != 0 && !ctx.ws_color.is_empty();
+                emit_ws_markup_line(
+                    &mut buf,
+                    '+',
+                    rest,
+                    &ctx.new_color,
+                    &ctx.reset,
+                    if hi {
+                        Some(ctx.ws_color.as_str())
+                    } else {
+                        None
+                    },
+                    ctx.ws_rule,
+                    blank_at_eof,
+                );
+            } else {
+                last_was_plus_hunk_line = false;
+                last_line_kind = 0;
+                lno_pre += 1;
+                lno_post += 1;
+                let hi = (ctx.highlight & WSEH_CONTEXT) != 0 && !ctx.ws_color.is_empty();
+                // Context lines: strip leading space, emit with context color.
+                let rest = line.strip_prefix(' ').unwrap_or(line);
+                emit_ws_markup_line(
+                    &mut buf,
+                    ' ',
+                    rest,
+                    &ctx.context_color,
+                    &ctx.reset,
+                    if hi {
+                        Some(ctx.ws_color.as_str())
+                    } else {
+                        None
+                    },
+                    ctx.ws_rule,
+                    false,
+                );
+            }
+            out.write_all(buf.as_bytes())?;
         } else if line.starts_with('-') {
             last_was_plus_hunk_line = false;
+            last_line_kind = 2;
             writeln!(out, "{RED}{line_no_nl}{RESET}")?;
         } else if line.starts_with('+') {
             last_was_plus_hunk_line = true;
+            last_line_kind = 1;
             writeln!(out, "{GREEN}{line_no_nl}{RESET}")?;
         } else {
             last_was_plus_hunk_line = false;
+            last_line_kind = 0;
             writeln!(out, "{line_no_nl}{RESET}")?;
         }
     }
@@ -7023,38 +7499,106 @@ fn write_colored_patch(
 }
 
 /// Next word span from `pos`, matching Git `find_word_boundaries` (`diff.c`).
-fn next_git_word(text: &str, mut pos: usize, word_re: Option<&Regex>) -> Option<(usize, usize)> {
-    let bytes = text.as_bytes();
-    while pos < text.len() {
-        if let Some(re) = word_re {
-            if let Some(m) = re.find_at(text, pos) {
-                let begin = m.start();
-                let matched = text.get(begin..m.end())?;
-                let rel_nl = matched.find('\n');
-                let end = rel_nl.map(|p| begin + p).unwrap_or(m.end());
-                if begin == end {
-                    pos = begin.saturating_add(1);
-                    continue;
-                }
-                return Some((begin, end));
-            }
-        }
-        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos >= bytes.len() {
-            return None;
-        }
-        let mut end = pos + 1;
-        while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
-            end += 1;
-        }
-        return Some((pos, end));
-    }
-    None
+/// Word-diff tokenizer regex.
+///
+/// Git compiles the word-diff `wordRegex` with POSIX `regcomp`/`regexec`
+/// (`REG_EXTENDED`), which yields *leftmost-longest* match semantics: at the
+/// earliest start position, the longest possible match wins regardless of the
+/// order of alternatives. The `regex` crate is leftmost-*first* (Perl-style
+/// preference order), so for a pattern like cpp's
+/// `[a-zA-Z_]...|[0-9][0-9.]*...|0[xXbB]...` it would match just `0` of `0xdead`
+/// (second alternative) instead of the whole `0xdead` (third alternative).
+///
+/// We reproduce this with two engines: the `regex` crate (leftmost-first) to
+/// locate the earliest match *start*, then a `regex-automata` dense DFA built
+/// with `MatchKind::All`, searched *anchored* at that start, to take the longest
+/// match there. (An unanchored `MatchKind::All` search does not give
+/// leftmost-longest, so anchoring at the leftmost start is required.)
+pub struct WordRe {
+    start: Regex,
+    longest: regex_automata::dfa::regex::Regex,
 }
 
-fn git_word_spans(text: &str, word_re: Option<&Regex>) -> Vec<(usize, usize)> {
+impl WordRe {
+    fn build(pattern: &str, case_insensitive: bool) -> Option<Self> {
+        use regex_automata::{
+            dfa::{dense, regex::Regex as DfaRegex},
+            util::syntax,
+            MatchKind,
+        };
+        let start = RegexBuilder::new(pattern)
+            .multi_line(true)
+            .case_insensitive(case_insensitive)
+            .build()
+            .ok()?;
+        let longest = DfaRegex::builder()
+            .syntax(
+                syntax::Config::new()
+                    .multi_line(true)
+                    .case_insensitive(case_insensitive),
+            )
+            .dense(dense::Config::new().match_kind(MatchKind::All))
+            .build(pattern)
+            .ok()?;
+        Some(WordRe { start, longest })
+    }
+
+    /// Leftmost-longest match at or after `pos`. Returns the byte range.
+    fn find_at(&self, text: &str, pos: usize) -> Option<(usize, usize)> {
+        use regex_automata::{Anchored, Input};
+        let m = self.start.find_at(text, pos)?;
+        let begin = m.start();
+        // Take the longest match anchored at the leftmost start (POSIX semantics).
+        let input = Input::new(text)
+            .span(begin..text.len())
+            .anchored(Anchored::Yes);
+        match self.longest.find(input) {
+            Some(lm) => Some((lm.start(), lm.end())),
+            // Fall back to the leftmost-first match if the DFA search fails.
+            None => Some((begin, m.end())),
+        }
+    }
+}
+
+fn next_git_word(text: &str, mut pos: usize, word_re: Option<&WordRe>) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    // git find_word_boundaries: when a word_regex is configured, words are *only* the
+    // regex matches. If no further match is found, there is no word (return -1) — we do
+    // NOT fall back to whitespace splitting.
+    if let Some(re) = word_re {
+        while pos < text.len() {
+            let Some((m_start, m_end)) = re.find_at(text, pos) else {
+                return None;
+            };
+            let begin = m_start;
+            // git truncates the match at the first embedded newline.
+            let matched = text.get(begin..m_end)?;
+            let rel_nl = matched.find('\n');
+            let end = rel_nl.map(|p| begin + p).unwrap_or(m_end);
+            if begin == end {
+                // empty match: advance one byte and retry.
+                pos = begin.saturating_add(1);
+                continue;
+            }
+            return Some((begin, end));
+        }
+        return None;
+    }
+    // No regex: whitespace-delimited words.
+    while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+        pos += 1;
+    }
+    if pos >= bytes.len() {
+        return None;
+    }
+    let mut end = pos + 1;
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    Some((pos, end))
+}
+
+fn git_word_spans(text: &str, word_re: Option<&WordRe>) -> Vec<(usize, usize)> {
     let mut spans = Vec::new();
     let mut i = 0usize;
     while i < text.len() {
@@ -7074,6 +7618,238 @@ fn word_lines_from_spans(text: &str, spans: &[(usize, usize)]) -> String {
         s.push('\n');
     }
     s
+}
+
+/// A single output style for word-diff, matching git's `diff_words_style`.
+struct GitWordStyle {
+    new_prefix: &'static str,
+    new_suffix: &'static str,
+    new_color: String,
+    old_prefix: &'static str,
+    old_suffix: &'static str,
+    old_color: String,
+    ctx_prefix: &'static str,
+    ctx_suffix: &'static str,
+    ctx_color: String,
+    newline: &'static str,
+}
+
+struct GitStyleElem<'a> {
+    prefix: &'a str,
+    suffix: &'a str,
+    color: &'a str,
+}
+
+/// Faithful port of git's `fn_out_diff_words_write_helper` (diff.c).
+///
+/// Emits `buf` (a sub-slice of bytes) using the given style element, splitting on
+/// newlines and inserting `newline` (e.g. `\n`, `~\n`) between physical lines.
+fn git_words_write_helper(out: &mut String, st: &GitStyleElem, newline: &str, buf: &[u8]) {
+    let mut buf = buf;
+    let mut print = false;
+    loop {
+        // No graph/line prefix in these contexts; `print` only added the line prefix.
+        let _ = print;
+        let nl_pos = buf.iter().position(|&c| c == b'\n');
+        let seg_end = nl_pos.unwrap_or(buf.len());
+        if seg_end != 0 {
+            let has_color = !st.color.is_empty();
+            if has_color {
+                out.push_str(st.color);
+            }
+            out.push_str(st.prefix);
+            if let Ok(s) = std::str::from_utf8(&buf[..seg_end]) {
+                out.push_str(s);
+            }
+            out.push_str(st.suffix);
+            if has_color {
+                out.push_str(RESET);
+            }
+        }
+        match nl_pos {
+            None => break,
+            Some(p) => {
+                out.push_str(newline);
+                buf = &buf[p + 1..];
+                print = true;
+                if buf.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Faithful port of git's `diff_words_show` / `fn_out_diff_words_aux` (diff.c).
+///
+/// `minus`/`plus` are the accumulated raw line bodies for one diff hunk (each physical
+/// line terminated by `\n`). Produces the word-diff rendering for the configured style.
+fn git_word_diff_show(
+    out: &mut String,
+    minus: &str,
+    plus: &str,
+    word_re: Option<&WordRe>,
+    style: &GitWordStyle,
+) {
+    let minus_b = minus.as_bytes();
+    let plus_b = plus.as_bytes();
+
+    let new_el = GitStyleElem {
+        prefix: style.new_prefix,
+        suffix: style.new_suffix,
+        color: &style.new_color,
+    };
+    let old_el = GitStyleElem {
+        prefix: style.old_prefix,
+        suffix: style.old_suffix,
+        color: &style.old_color,
+    };
+    let ctx_el = GitStyleElem {
+        prefix: style.ctx_prefix,
+        suffix: style.ctx_suffix,
+        color: &style.ctx_color,
+    };
+
+    // Special case: only removal (no plus text at all).
+    if plus_b.is_empty() {
+        git_words_write_helper(out, &old_el, style.newline, minus_b);
+        return;
+    }
+
+    // Tokenize each side into word spans (git diff_words_fill).
+    let minus_spans = git_word_spans(minus, word_re);
+    let plus_spans = git_word_spans(plus, word_re);
+
+    // Build the per-word "lines" buffers and diff them (xdiff, ctxlen=0).
+    let mw: Vec<&str> = minus_spans
+        .iter()
+        .map(|(a, b)| minus.get(*a..*b).unwrap_or(""))
+        .collect();
+    let pw: Vec<&str> = plus_spans
+        .iter()
+        .map(|(a, b)| plus.get(*a..*b).unwrap_or(""))
+        .collect();
+
+    // Diff the word streams with raw Myers (no Git-style hunk sliding). Git's
+    // word diff keeps each changed run bounded by the surrounding equal words;
+    // applying `xdl_change_compact`-style sliding here can over-merge a changed
+    // word with an adjacent equal one across line boundaries (e.g. gluing the
+    // closing `'` of `'x'`/`'y'` to the changed letter), so we deliberately use
+    // `capture_diff_slices` rather than `diff_slice_ops_compacted`.
+    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &mw, &pw);
+
+    // current_plus tracks the byte offset into `plus` already emitted.
+    let mut current_plus: usize = 0;
+
+    // Walk the diff ops, grouping consecutive replace/insert/delete into single
+    // callbacks like xdiff hunks. We emulate fn_out_diff_words_aux per changed region.
+    use similar::DiffTag;
+    let mut idx = 0usize;
+    while idx < ops.len() {
+        let op = ops[idx];
+        let (tag, _o_range, _n_range) = op.as_tag_tuple();
+        if tag == DiffTag::Equal {
+            idx += 1;
+            continue;
+        }
+        // Coalesce a maximal run of non-equal ops into one hunk.
+        // minus_first/plus_first are the word indices at the hunk boundary in each
+        // stream (matching git's xdiff hunk start), used for the zero-length case.
+        let (_, first_o, first_n) = ops[idx].as_tag_tuple();
+        let minus_first = first_o.start;
+        let plus_first = first_n.start;
+        let mut minus_count = 0usize;
+        let mut plus_count = 0usize;
+        let mut m_lo = usize::MAX;
+        let mut m_hi = 0usize;
+        let mut p_lo = usize::MAX;
+        let mut p_hi = 0usize;
+        while idx < ops.len() {
+            let (t, orange, nrange) = ops[idx].as_tag_tuple();
+            if t == DiffTag::Equal {
+                break;
+            }
+            if orange.start < orange.end {
+                m_lo = m_lo.min(orange.start);
+                m_hi = m_hi.max(orange.end);
+                minus_count += orange.end - orange.start;
+            }
+            if nrange.start < nrange.end {
+                p_lo = p_lo.min(nrange.start);
+                p_hi = p_hi.max(nrange.end);
+                plus_count += nrange.end - nrange.start;
+            }
+            idx += 1;
+        }
+
+        // Compute byte ranges into minus/plus, mirroring fn_out_diff_words_aux.
+        // For len>0: begin = orig[first].begin, end = orig[first+len-1].end.
+        // For len==0: begin = end = orig[first].end (end of word before boundary).
+        let (minus_begin, minus_end) = if minus_count > 0 {
+            (
+                minus_spans.get(m_lo).map(|s| s.0).unwrap_or(minus.len()),
+                minus_spans
+                    .get(m_hi - 1)
+                    .map(|s| s.1)
+                    .unwrap_or(minus.len()),
+            )
+        } else {
+            let mb = word_end_at_orig(&minus_spans, minus_first);
+            (mb, mb)
+        };
+        let (plus_begin, plus_end) = if plus_count > 0 {
+            (
+                plus_spans.get(p_lo).map(|s| s.0).unwrap_or(plus.len()),
+                plus_spans.get(p_hi - 1).map(|s| s.1).unwrap_or(plus.len()),
+            )
+        } else {
+            let pe = word_end_at_orig(&plus_spans, plus_first);
+            (pe, pe)
+        };
+
+        // Emit context = plus[current_plus .. plus_begin].
+        if current_plus != plus_begin && plus_begin <= plus.len() && current_plus <= plus_begin {
+            git_words_write_helper(
+                out,
+                &ctx_el,
+                style.newline,
+                &plus_b[current_plus..plus_begin],
+            );
+        }
+        if minus_begin != minus_end {
+            git_words_write_helper(
+                out,
+                &old_el,
+                style.newline,
+                &minus_b[minus_begin..minus_end],
+            );
+        }
+        if plus_begin != plus_end {
+            git_words_write_helper(out, &new_el, style.newline, &plus_b[plus_begin..plus_end]);
+        }
+        current_plus = plus_end;
+    }
+
+    // Trailing context.
+    if current_plus != plus_b.len() && current_plus <= plus_b.len() {
+        git_words_write_helper(out, &ctx_el, style.newline, &plus_b[current_plus..]);
+    }
+}
+
+/// Byte offset of `orig[k].end` for a zero-length word range at xdiff word position `k`.
+///
+/// git's `orig` array has a fake 0th word at offset 0, then real words at index 1..=nr.
+/// A word-stream position `k` (0-based, as similar reports) corresponds to the boundary
+/// *after* the previous emitted word: that is `spans[k-1].end`, or 0 at the start.
+fn word_end_at_orig(spans: &[(usize, usize)], k: usize) -> usize {
+    if k == 0 {
+        0
+    } else {
+        spans
+            .get(k - 1)
+            .map(|s| s.1)
+            .unwrap_or_else(|| spans.last().map(|s| s.1).unwrap_or(0))
+    }
 }
 
 /// Strip one leading tab from a unified-diff context body for `--word-diff=porcelain`.
@@ -7696,7 +8472,7 @@ fn word_diff_emit_plain_markers(
     out: &mut String,
     minus: &str,
     plus: &str,
-    word_re: Option<&Regex>,
+    word_re: Option<&WordRe>,
 ) {
     let ms = git_word_spans(minus, word_re);
     let ps = git_word_spans(plus, word_re);
@@ -7725,7 +8501,7 @@ fn word_diff_generate_patch(
     dst_prefix: &str,
     wd: &EffectiveWordDiff,
     header_use_color: bool,
-    word_re: Option<&Regex>,
+    word_re: Option<&WordRe>,
     algo_ctx: &DiffAlgoContext,
     algo_cli: Option<CliDiffAlgo>,
     indent_heuristic: bool,
@@ -7825,7 +8601,10 @@ fn word_diff_generate_patch(
                     plus_buf.clear();
                     break;
                 }
-                if ln.starts_with('-') && !ln.starts_with("---") {
+                if ln.starts_with('-') {
+                    // Inside the hunk body the `--- a/file` header has already been
+                    // consumed by the outer loop, so any `-` line is a deletion — even
+                    // one whose content itself begins with `-` (e.g. `---a==--b`).
                     let body = ln.strip_prefix('-').unwrap_or(ln);
                     minus_buf.push_str(body);
                     let no_nl = lines.get(i + 1).is_some_and(|n| n.starts_with('\\'));
@@ -7833,7 +8612,7 @@ fn word_diff_generate_patch(
                         minus_buf.push('\n');
                     }
                     i += 1;
-                } else if ln.starts_with('+') && !ln.starts_with("+++") {
+                } else if ln.starts_with('+') {
                     let body = ln.strip_prefix('+').unwrap_or(ln);
                     plus_buf.push_str(body);
                     let no_nl = lines.get(i + 1).is_some_and(|n| n.starts_with('\\'));
@@ -7856,28 +8635,11 @@ fn word_diff_generate_patch(
                     minus_buf.clear();
                     plus_buf.clear();
                     if matches!(wd.mode, WordDiffModeCli::Porcelain) {
-                        // `word_diff_emit_body` turns a trailing line break after the last plus-side
-                        // word into ` \n~\n`. The unified diff also carries a separate empty context
-                        // line (` ` with empty body) for that same blank line — emitting both matches
-                        // Git's porcelain output with a duplicated empty context line.
-                        if rest.is_empty() && out.ends_with(" \n~\n") {
-                            i += 1;
-                            continue;
-                        }
-                        let after_word_line = out.ends_with("~\n");
-                        let ctx_body = porcelain_context_body(rest);
-                        writeln!(out, " {ctx_body}").ok();
-                        // After `-`/`+` porcelain lines Git ends with `~\n`. The next unified line
-                        // is often an empty context row (` `); that becomes ` \n~\n`, not ` \n` alone.
-                        if rest.is_empty() && after_word_line {
-                            out.push_str("~\n");
-                        }
-                        // Git emits `~\n~\n` after a context line that shows non-whitespace file
-                        // content, before the next blank context or change lines.
-                        if rest.chars().any(|c| !c.is_whitespace()) {
-                            out.push_str("~\n~\n");
-                        }
+                        // git DIFF_SYMBOL_WORDS_PORCELAIN: emit_line(context, line) then "~\n".
+                        writeln!(out, " {rest}").ok();
+                        out.push_str("~\n");
                     } else if wd.force_color && header_use_color {
+                        // git DIFF_SYMBOL_WORDS: context line painted with diff context color.
                         word_diff_emit_context_line_plain(&mut out, config, header_use_color, rest);
                     } else {
                         writeln!(out, "{rest}").ok();
@@ -7936,36 +8698,88 @@ fn word_diff_flush_hunk(
     config: &ConfigSet,
     wd: &EffectiveWordDiff,
     use_color: bool,
-    word_re: Option<&Regex>,
+    word_re: Option<&WordRe>,
     minus: &str,
     plus: &str,
 ) {
     if minus.is_empty() && plus.is_empty() {
         return;
     }
+    let color_on = use_color;
+    let (old_c, new_c, ctx_c) = if color_on {
+        (
+            ansi_diff_color(config, "diff.color.old", RED),
+            ansi_diff_color(config, "diff.color.new", GREEN),
+            ansi_diff_color(config, "diff.color.context", ""),
+        )
+    } else {
+        (String::new(), String::new(), String::new())
+    };
     match wd.mode {
         WordDiffModeCli::Porcelain => {
-            let ms = git_word_spans(minus, word_re);
-            let ps = git_word_spans(plus, word_re);
-            word_diff_emit_porcelain(out, minus, plus, &ms, &ps);
+            let style = GitWordStyle {
+                new_prefix: "+",
+                new_suffix: "\n",
+                new_color: String::new(),
+                old_prefix: "-",
+                old_suffix: "\n",
+                old_color: String::new(),
+                ctx_prefix: " ",
+                ctx_suffix: "\n",
+                ctx_color: String::new(),
+                newline: "~\n",
+            };
+            git_word_diff_show(out, minus, plus, word_re, &style);
         }
         WordDiffModeCli::Plain => {
-            if wd.force_color && use_color {
-                let ms = git_word_spans(minus, word_re);
-                let ps = git_word_spans(plus, word_re);
-                word_diff_emit_plain_color(out, minus, plus, &ms, &ps, config, true);
+            // git `--word-diff=plain` keeps the `[-`/`-]`/`{+`/`+}` markers; `--color`
+            // merely fills in the color fields (DIFF_WORDS_PLAIN style + colors).
+            let style = if wd.force_color && color_on {
+                GitWordStyle {
+                    new_prefix: "{+",
+                    new_suffix: "+}",
+                    new_color: new_c,
+                    old_prefix: "[-",
+                    old_suffix: "-]",
+                    old_color: old_c,
+                    ctx_prefix: "",
+                    ctx_suffix: "",
+                    ctx_color: ctx_c,
+                    newline: "\n",
+                }
             } else {
-                word_diff_emit_plain_markers(out, minus, plus, word_re);
-            }
+                GitWordStyle {
+                    new_prefix: "{+",
+                    new_suffix: "+}",
+                    new_color: String::new(),
+                    old_prefix: "[-",
+                    old_suffix: "-]",
+                    old_color: String::new(),
+                    ctx_prefix: "",
+                    ctx_suffix: "",
+                    ctx_color: String::new(),
+                    newline: "\n",
+                }
+            };
+            git_word_diff_show(out, minus, plus, word_re, &style);
             if !out.ends_with('\n') {
                 out.push('\n');
             }
         }
         WordDiffModeCli::Color => {
-            let ms = git_word_spans(minus, word_re);
-            let ps = git_word_spans(plus, word_re);
-            let color_body = wd.force_color && use_color;
-            word_diff_emit_plain_color(out, minus, plus, &ms, &ps, config, color_body);
+            let style = GitWordStyle {
+                new_prefix: "",
+                new_suffix: "",
+                new_color: new_c,
+                old_prefix: "",
+                old_suffix: "",
+                old_color: old_c,
+                ctx_prefix: "",
+                ctx_suffix: "",
+                ctx_color: ctx_c,
+                newline: "\n",
+            };
+            git_word_diff_show(out, minus, plus, word_re, &style);
             if !out.ends_with('\n') {
                 out.push('\n');
             }
@@ -8430,7 +9244,12 @@ fn write_name_only(
 /// Write `{status_letter}\t{path}` for each entry.
 /// For renames/copies, output `R100\told_path\tnew_path`.
 /// Write raw diff format: `:old-mode new-mode old-oid new-oid status\tpath`
-fn write_raw(out: &mut impl Write, entries: &[DiffEntry], abbrev_len: usize) -> Result<()> {
+fn write_raw(
+    out: &mut impl Write,
+    entries: &[DiffEntry],
+    abbrev_len: usize,
+    worktree_new_side: bool,
+) -> Result<()> {
     for entry in entries {
         let old_mode = &entry.old_mode;
         let new_mode = &entry.new_mode;
@@ -8439,7 +9258,16 @@ fn write_raw(out: &mut impl Write, entries: &[DiffEntry], abbrev_len: usize) -> 
         let olen = abbrev_len.min(old_oid_hex.len());
         let nlen = abbrev_len.min(new_oid_hex.len());
         let old_oid = &old_oid_hex[..olen];
-        let new_oid = &new_oid_hex[..nlen];
+        // A gitlink whose new side is the work tree (e.g. a blob→gitlink typechange or a
+        // worktree-side submodule bump) prints the all-zero OID in raw plumbing, even though the
+        // `--submodule` patch shows the real HEAD. See t4041/t4060.
+        let zero_wt_gitlink = worktree_new_side && new_mode == "160000";
+        let zeroed = "0".repeat(nlen);
+        let new_oid = if zero_wt_gitlink {
+            zeroed.as_str()
+        } else {
+            &new_oid_hex[..nlen]
+        };
         let status = entry.status.letter();
         match entry.status {
             DiffStatus::Renamed | DiffStatus::Copied => {
