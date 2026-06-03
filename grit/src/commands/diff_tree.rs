@@ -2778,7 +2778,7 @@ fn emit_git_binary_patch(out: &mut impl Write, old_raw: &[u8], new_raw: &[u8]) -
     Ok(())
 }
 
-fn write_patch_entry(
+pub(crate) fn write_patch_entry(
     out: &mut impl Write,
     odb: &Odb,
     entry: &DiffEntry,
@@ -3354,7 +3354,11 @@ fn commit_tree(odb: &Odb, commit_oid: &ObjectId) -> Result<ObjectId> {
 fn read_blob_pair(odb: &Odb, entry: &DiffEntry) -> Result<(String, String)> {
     let zero = grit_lib::diff::zero_oid();
 
-    let old_content = if entry.old_oid == zero {
+    let old_content = if entry.old_mode == "160000" {
+        // Gitlink: the submodule commit is not in this repository's ODB; Git
+        // synthesizes the textual `Subproject commit` content instead.
+        format!("Subproject commit {}\n", entry.old_oid.to_hex())
+    } else if entry.old_oid == zero {
         if entry.old_mode != "000000" {
             bail!("unable to read {}", zero.to_hex());
         }
@@ -3366,7 +3370,9 @@ fn read_blob_pair(odb: &Odb, entry: &DiffEntry) -> Result<(String, String)> {
         String::from_utf8_lossy(&obj.data).into_owned()
     };
 
-    let new_content = if entry.new_oid == zero {
+    let new_content = if entry.new_mode == "160000" {
+        format!("Subproject commit {}\n", entry.new_oid.to_hex())
+    } else if entry.new_oid == zero {
         if entry.new_mode != "000000" {
             bail!("unable to read {}", zero.to_hex());
         }

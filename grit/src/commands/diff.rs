@@ -9850,10 +9850,31 @@ fn resolve_diff_prefixes(args: &Args, repo: &Repository, cached: bool) -> (Strin
 
 /// Write unified diff output for a list of DiffEntry pairs.
 pub fn write_patch_from_pairs(
-    _out: &mut dyn std::io::Write,
-    _entries: &[DiffEntry],
-    _repo: &Repository,
+    out: &mut dyn std::io::Write,
+    entries: &[DiffEntry],
+    repo: &Repository,
 ) -> anyhow::Result<()> {
-    // Stub: full implementation pending
+    // Match `git diff-tree -p` defaults: 3 context lines, 7-char abbrev,
+    // config-driven path quoting, indent heuristic on (t4070 diff-pairs).
+    let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
+        .unwrap_or_else(|_| grit_lib::config::ConfigSet::new());
+    let quote_fully = config.quote_path_fully();
+    let indent_heuristic = grit_lib::diff::resolve_indent_heuristic(&config, false, false);
+    let mut out = out;
+    for entry in entries {
+        crate::commands::diff_tree::write_patch_entry(
+            &mut out,
+            &repo.odb,
+            entry,
+            3,
+            Some(7),
+            false,
+            false,
+            false,
+            &repo.git_dir,
+            quote_fully,
+            indent_heuristic,
+        )?;
+    }
     Ok(())
 }
