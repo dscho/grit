@@ -840,6 +840,81 @@ fn load_blob_content(repo: &Repository, spec: &str) -> Result<Vec<u8>> {
     Ok(obj.data)
 }
 
+fn ordered_note_fragments_from_argv(repo: &Repository) -> Result<Option<Vec<String>>> {
+    let argv: Vec<String> = std::env::args().collect();
+    let Some(notes_pos) = argv.iter().position(|a| a == "notes") else {
+        return Ok(None);
+    };
+    let mut i = notes_pos + 1;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if matches!(arg.as_str(), "add" | "append" | "edit") {
+            i += 1;
+            break;
+        }
+        i += 1;
+    }
+    let mut out = Vec::new();
+    let mut saw_fragment = false;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "-m" | "--message" => {
+                if let Some(v) = argv.get(i + 1) {
+                    out.push(v.clone());
+                    saw_fragment = true;
+                    i += 2;
+                    continue;
+                }
+            }
+            "-F" | "--file" => {
+                if let Some(v) = argv.get(i + 1) {
+                    out.push(read_note_file(&PathBuf::from(v))?);
+                    saw_fragment = true;
+                    i += 2;
+                    continue;
+                }
+            }
+            "-C" | "--reuse-message" | "-c" | "--reedit-message" => {
+                if let Some(v) = argv.get(i + 1) {
+                    out.push(String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned());
+                    saw_fragment = true;
+                    i += 2;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        if let Some(v) = arg.strip_prefix("--message=") {
+            out.push(v.to_owned());
+            saw_fragment = true;
+        } else if let Some(v) = arg.strip_prefix("--file=") {
+            out.push(read_note_file(&PathBuf::from(v))?);
+            saw_fragment = true;
+        } else if let Some(v) = arg.strip_prefix("--reuse-message=") {
+            out.push(String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned());
+            saw_fragment = true;
+        } else if let Some(v) = arg.strip_prefix("--reedit-message=") {
+            out.push(String::from_utf8_lossy(&load_blob_content(repo, v)?).into_owned());
+            saw_fragment = true;
+        } else if arg.starts_with("-m") && arg.len() > 2 {
+            out.push(arg[2..].to_owned());
+            saw_fragment = true;
+        } else if arg.starts_with("-F") && arg.len() > 2 {
+            out.push(read_note_file(&PathBuf::from(&arg[2..]))?);
+            saw_fragment = true;
+        } else if arg.starts_with("-C") && arg.len() > 2 {
+            out.push(String::from_utf8_lossy(&load_blob_content(repo, &arg[2..])?).into_owned());
+            saw_fragment = true;
+        } else if arg.starts_with("-c") && arg.len() > 2 {
+            out.push(String::from_utf8_lossy(&load_blob_content(repo, &arg[2..])?).into_owned());
+            saw_fragment = true;
+        }
+        i += 1;
+    }
+    Ok(saw_fragment.then_some(out))
+}
+
 /// Launch the editor on a temporary file and return its contents.
 fn launch_editor(repo: &Repository, initial: &str) -> Result<String> {
     let editor = resolve_editor(repo);
@@ -893,21 +968,26 @@ fn add_note(
         .find(|e| note_object_name(&e.path).as_deref() == Some(hex.as_str()))
         .and_then(|e| repo.odb.read(&e.oid).ok())
         .map(|obj| String::from_utf8_lossy(&obj.data).to_string());
-    let mut parts: Vec<String> = Vec::new();
-    for m in messages {
-        parts.push(m.clone());
-    }
-    for f in files {
-        parts.push(read_note_file(f)?);
-    }
-    if let Some(spec) = reuse_message {
-        let data = load_blob_content(repo, spec)?;
-        parts.push(String::from_utf8_lossy(&data).into_owned());
-    }
-    if let Some(spec) = reedit_message {
-        let data = load_blob_content(repo, spec)?;
-        parts.push(String::from_utf8_lossy(&data).into_owned());
-    }
+    let parts: Vec<String> = if let Some(ordered) = ordered_note_fragments_from_argv(repo)? {
+        ordered
+    } else {
+        let mut parts = Vec::new();
+        for m in messages {
+            parts.push(m.clone());
+        }
+        for f in files {
+            parts.push(read_note_file(f)?);
+        }
+        if let Some(spec) = reuse_message {
+            let data = load_blob_content(repo, spec)?;
+            parts.push(String::from_utf8_lossy(&data).into_owned());
+        }
+        if let Some(spec) = reedit_message {
+            let data = load_blob_content(repo, spec)?;
+            parts.push(String::from_utf8_lossy(&data).into_owned());
+        }
+        parts
+    };
     let has_cli = !parts.is_empty()
         || reuse_message.is_some()
         || reedit_message.is_some()
@@ -1021,21 +1101,26 @@ Please use 'git notes add -f -m/-F/-c/-C' instead."
         .and_then(|e| repo.odb.read(&e.oid).ok())
         .map(|obj| String::from_utf8_lossy(&obj.data).to_string());
     let note_exists = existing.is_some();
-    let mut parts: Vec<String> = Vec::new();
-    for m in messages {
-        parts.push(m.clone());
-    }
-    for f in files {
-        parts.push(read_note_file(f)?);
-    }
-    if let Some(spec) = reuse_message {
-        let data = load_blob_content(repo, spec)?;
-        parts.push(String::from_utf8_lossy(&data).into_owned());
-    }
-    if let Some(spec) = reedit_message {
-        let data = load_blob_content(repo, spec)?;
-        parts.push(String::from_utf8_lossy(&data).into_owned());
-    }
+    let mut parts: Vec<String> = if let Some(ordered) = ordered_note_fragments_from_argv(repo)? {
+        ordered
+    } else {
+        let mut parts = Vec::new();
+        for m in messages {
+            parts.push(m.clone());
+        }
+        for f in files {
+            parts.push(read_note_file(f)?);
+        }
+        if let Some(spec) = reuse_message {
+            let data = load_blob_content(repo, spec)?;
+            parts.push(String::from_utf8_lossy(&data).into_owned());
+        }
+        if let Some(spec) = reedit_message {
+            let data = load_blob_content(repo, spec)?;
+            parts.push(String::from_utf8_lossy(&data).into_owned());
+        }
+        parts
+    };
     if !is_edit
         && messages.is_empty()
         && files.is_empty()
