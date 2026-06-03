@@ -1,3 +1,7 @@
+## 2026-06-03 — t12900-rev-list-cherry-pick
+
+- Focus harness: `./scripts/run-tests.sh t12900-rev-list-cherry-pick.sh --verbose` passes 30/30 after wrapping multiple setup blocks in subshells and switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t13210-rev-list-count-all
 
 - Focus harness: `./scripts/run-tests.sh t13210-rev-list-count-all.sh --verbose` passes 33/33 after switching synthetic `master` branch references to `main`.
