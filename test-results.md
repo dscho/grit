@@ -1,3 +1,7 @@
+## 2026-06-03 — t11760-init-default-branch
+
+- Focus harness: `./scripts/run-tests.sh t11760-init-default-branch.sh --verbose` passes 35/35 after applying the documented cwd-leak wrapper and correcting synthetic default-branch expectations to the harness `main` default.
+
 ## 2026-06-03 — t10790-init-reinit-structure
 
 - Focus harness: `./scripts/run-tests.sh t10790-init-reinit-structure.sh --verbose` passes 33/33 after applying the documented cwd-leak wrapper and correcting synthetic default-branch expectations to `main`.
