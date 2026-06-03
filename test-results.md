@@ -1,3 +1,7 @@
+## 2026-06-03 — t12730-switch-start-point
+
+- Focus harness: `./scripts/run-tests.sh t12730-switch-start-point.sh --verbose` passes 36/36 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t10560-switch-create-detach
 
 - Focus harness: `./scripts/run-tests.sh t10560-switch-create-detach.sh --verbose` passes 28/28 after switching synthetic `master` branch references to `main`.
