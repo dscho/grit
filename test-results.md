@@ -8,6 +8,14 @@
 Updated: 2026-06-03
 - t6 plan artifact: created `t6-plan.md` grouping current t6 rows by dependency/topic and claimed
   `t6021-rev-list-exclude-hidden.sh` first as the highest-failing t6 row.
+- t6600 reachability focus: `./scripts/run-tests.sh t6600-test-reach.sh --verbose` improves from
+  16/47 to 40/47 after adding the `test-tool reach` helper operations for ref_newer,
+  merge-base membership, descendant checks, merge-base listing, head reduction, reachability
+  subsets, and first-parent branch-base selection.
+- Verification for this increment: `cargo fmt`, `cargo clippy --fix --allow-dirty`,
+  `cargo build --release -p grit-cli`, and the focused harness ran. Clippy completed with the
+  existing warning backlog and failed auto-fixes in unrelated files; unrelated auto-fixes were not
+  kept.
 - Build unblock: `cargo build --release -p grit-cli` initially failed because `merge --abort`
   still called `checkout_merge_reset_worktree` with its old three-argument signature; the caller
   now passes explicit non-recursive submodule flags and release builds complete.

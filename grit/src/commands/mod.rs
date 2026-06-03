@@ -146,6 +146,7 @@ pub mod submodule_helper;
 pub mod switch;
 pub mod symbolic_ref;
 pub mod tag;
+pub mod test_tool_reach;
 pub mod test_tool_ref_store;
 pub mod test_tool_rot13_filter;
 pub mod unpack_file;

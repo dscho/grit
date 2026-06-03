@@ -5571,6 +5571,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                 "find-pack" => run_test_tool_find_pack(rest),
                 "partial-clone" => run_test_tool_partial_clone(rest),
                 "ref-store" => run_test_tool_ref_store(rest),
+                "reach" => commands::test_tool_reach::run(&rest[1..]),
                 "path-walk" => run_test_tool_path_walk(rest),
                 "online-cpus" => run_test_tool_online_cpus(rest),
                 "lazy-init-name-hash" => run_test_tool_lazy_init_name_hash(rest),
