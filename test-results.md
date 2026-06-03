@@ -1,3 +1,8 @@
+## 2026-06-03 — t1406-submodule-ref-store
+
+- Focus harness: `./scripts/run-tests.sh t1406-submodule-ref-store.sh --verbose` passes 15/15 after routing `test-tool ref-store submodule:*` to the ref-store helper and fixing reflog entry order.
+- Quality gates passed: `cargo fmt && cargo test -p grit-lib --lib && cargo check -p grit-cli && cargo clippy --fix --allow-dirty` (with unrelated clippy edits reverted).
+
 ## 2026-06-03 — t1422-show-ref-exists and t1462-refs-exists
 
 - Focus harnesses: `./scripts/run-tests.sh t1422-show-ref-exists.sh --verbose` and `./scripts/run-tests.sh t1462-refs-exists.sh --verbose` both pass 12/12 after isolating the shared setup and using absolute repo paths in `show-ref-exists-tests.sh`.
