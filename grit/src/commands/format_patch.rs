@@ -18,7 +18,6 @@ use grit_lib::odb::Odb;
 use grit_lib::patch_ids::compute_patch_id;
 use grit_lib::repo::Repository;
 
-use crate::commands::log::append_format_patch_notes;
 use grit_lib::rev_list::{
     rev_list, split_revision_token, split_symmetric_diff, OrderingMode, RevListOptions,
 };
@@ -304,9 +303,15 @@ pub struct Args {
     #[arg(long = "no-signature")]
     pub no_signature: bool,
 
-    /// Append notes.
-    #[arg(long = "notes", default_missing_value = "", num_args = 0..=1, require_equals = true)]
-    pub notes: Option<String>,
+    /// Append notes (optionally from a specific notes ref; may be repeated).
+    #[arg(
+        long = "notes",
+        default_missing_value = "",
+        num_args = 0..=1,
+        require_equals = true,
+        action = clap::ArgAction::Append
+    )]
+    pub notes: Vec<String>,
 
     /// Suppress notes.
     #[arg(long = "no-notes")]
@@ -442,6 +447,9 @@ struct PatchOptions {
     zero_commit: bool,
     /// `-p`/`--patch` given without any stat option: suppress the per-patch diffstat block.
     suppress_stat: bool,
+    /// Ordered `(header, refname)` notes refs to append to each patch body (from `--notes` /
+    /// `format.notes`); empty when notes display is disabled.
+    notes_refs: Vec<(String, String)>,
 }
 
 pub fn run(mut args: Args) -> Result<()> {
@@ -898,6 +906,7 @@ pub fn run(mut args: Args) -> Result<()> {
         zero_commit: args.zero_commit,
         // `-p`/`--patch` suppresses the diffstat (unless an explicit stat form is requested).
         suppress_stat: args.patch && args.stat.is_none() && !args.numstat && !args.shortstat,
+        notes_refs: resolve_notes_refs(&args, &config),
     };
 
     let mut log_output_encoding = config
@@ -1866,8 +1875,9 @@ fn format_single_patch(
         .collect::<Vec<_>>()
         .join("\n");
     let body = body.trim_start_matches('\n');
-    let body_owned = append_format_patch_notes(repo, oid, body);
-    let body = body_owned.as_str();
+    // Notes are emitted after the `---` separator (in the diffstat region), NOT inside the commit
+    // message body, so they appear after any Signed-off-by trailer. See below.
+    let notes_block = crate::commands::log::format_patch_notes_block(repo, oid, &opts.notes_refs);
 
     // Apply signoff trailer to the body text.
     let signoff_line = if opts.signoff {
@@ -1933,6 +1943,10 @@ fn format_single_patch(
         }
 
         out.push_str("---\n");
+        if !notes_block.is_empty() {
+            out.push_str(&notes_block);
+            out.push('\n');
+        }
         out.push_str(&stat_block);
         out.push('\n');
 
@@ -1983,6 +1997,11 @@ fn format_single_patch(
             out.push('\n');
         } else {
             out.push_str("---\n");
+        }
+        // Notes block (after the `---` separator, before the diffstat/diff), separated by a blank.
+        if !notes_block.is_empty() {
+            out.push_str(&notes_block);
+            out.push('\n');
         }
         out.push_str(&diff_text);
     }
@@ -3306,6 +3325,65 @@ fn resolve_attach(args: &Args, config: &ConfigSet) -> Option<String> {
 fn current_branch_name(repo: &Repository) -> Option<String> {
     let head = grit_lib::state::resolve_head(&repo.git_dir).ok()?;
     head.branch_name().map(|s| s.to_string())
+}
+
+/// Map a `format.notes` / `--notes=` value to a full notes ref (`refs/notes/<x>` unless already a
+/// full `refs/...` ref). An empty value or `true` means the default `refs/notes/commits`.
+fn notes_value_to_ref(val: &str) -> String {
+    let v = val.trim();
+    if v.is_empty() || v == "true" {
+        "refs/notes/commits".to_string()
+    } else if v.starts_with("refs/") {
+        v.to_string()
+    } else {
+        format!("refs/notes/{v}")
+    }
+}
+
+/// Build the ordered `(header, refname)` list of notes to display, honoring `format.notes`
+/// (multi-value, `false` clears) followed by command-line `--notes[=ref]` / `--no-notes`
+/// processed in their original argv order (`--no-notes` clears all accumulated refs).
+fn resolve_notes_refs(args: &Args, config: &ConfigSet) -> Vec<(String, String)> {
+    let mut refs: Vec<String> = Vec::new();
+    let add = |refs: &mut Vec<String>, r: String| {
+        if !refs.contains(&r) {
+            refs.push(r);
+        }
+    };
+
+    // Config: format.notes (multi-value, in order). `false`/`no`/`off`/`0` clears the list.
+    for v in config.get_all("format.notes") {
+        let t = v.trim();
+        if matches!(t, "false" | "no" | "off" | "0") {
+            refs.clear();
+        } else {
+            add(&mut refs, notes_value_to_ref(t));
+        }
+    }
+
+    // Command line: replay `--notes`/`--no-notes` in argv order so the last of a conflicting pair
+    // wins (git treats these as ordered toggles).
+    for arg in std::env::args().skip(1) {
+        if arg == "--no-notes" {
+            refs.clear();
+        } else if arg == "--notes" {
+            add(&mut refs, "refs/notes/commits".to_string());
+        } else if let Some(val) = arg.strip_prefix("--notes=") {
+            add(&mut refs, notes_value_to_ref(val));
+        }
+    }
+
+    refs.into_iter()
+        .map(|refname| {
+            let short = refname.strip_prefix("refs/notes/").unwrap_or(&refname);
+            let header = if refname == "refs/notes/commits" {
+                "Notes".to_string()
+            } else {
+                format!("Notes ({short})")
+            };
+            (header, refname)
+        })
+        .collect()
 }
 
 /// Resolve the upstream (`@{upstream}`) commit of the current branch from `branch.<name>.{remote,merge}`.
