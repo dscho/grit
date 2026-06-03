@@ -2595,16 +2595,53 @@ pub fn parse_color(s: &str) -> std::result::Result<String, String> {
 
 /// Match a URL against a URL pattern from config.
 pub fn url_matches(pattern_url: &str, target_url: &str) -> bool {
-    let pattern = pattern_url.trim_end_matches('/');
-    let target = target_url.trim_end_matches('/');
-    if target == pattern {
-        return true;
+    url_match_specificity(pattern_url, target_url).is_some()
+}
+
+fn url_match_specificity(pattern_url: &str, target_url: &str) -> Option<usize> {
+    let pattern = url::Url::parse(pattern_url).ok()?;
+    let target = url::Url::parse(target_url).ok()?;
+    if pattern.scheme() != target.scheme() {
+        return None;
     }
-    if let Some(rest) = target.strip_prefix(pattern) {
-        return rest.starts_with('/') || rest.is_empty();
+    let pattern_host = pattern.host_str()?.to_ascii_lowercase();
+    let target_host = target.host_str()?.to_ascii_lowercase();
+    if !url_host_matches(&pattern_host, &target_host) {
+        return None;
     }
-    let pattern_slash = format!("{}/", pattern);
-    target.starts_with(&pattern_slash)
+    if !pattern.username().is_empty() && pattern.username() != target.username() {
+        return None;
+    }
+    let pattern_path = pattern.path().trim_end_matches('/');
+    let target_path = target.path().trim_end_matches('/');
+    let path_matches = pattern_path.is_empty()
+        || pattern_path == "/"
+        || target_path == pattern_path
+        || target_path
+            .strip_prefix(pattern_path)
+            .is_some_and(|rest| rest.starts_with('/'));
+    if !path_matches {
+        return None;
+    }
+    let literal_host_chars = pattern_host.chars().filter(|ch| *ch != '*').count();
+    Some(
+        literal_host_chars.saturating_mul(1_000_000)
+            + pattern_path.len().saturating_mul(1_000)
+            + pattern.username().len(),
+    )
+}
+
+fn url_host_matches(pattern: &str, target: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == target;
+    }
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    let target_labels: Vec<&str> = target.split('.').collect();
+    pattern_labels.len() == target_labels.len()
+        && pattern_labels
+            .iter()
+            .zip(target_labels)
+            .all(|(p, t)| *p == "*" || *p == t)
 }
 
 /// Get the best URL match for a specific key.
@@ -2639,8 +2676,8 @@ pub fn get_urlmatch_entries<'a>(
             matches.push((0, entry));
         } else {
             let subsection = &key[first_dot + 1..last_dot];
-            if url_matches(subsection, url) {
-                matches.push((subsection.len(), entry));
+            if let Some(specificity) = url_match_specificity(subsection, url) {
+                matches.push((specificity, entry));
             }
         }
     }
@@ -2672,7 +2709,7 @@ pub fn get_urlmatch_all_in_section(
             continue;
         }
         let entry_variable = &key[last_dot + 1..];
-        let val = entry.value.as_deref().unwrap_or("true");
+        let val = entry.value.as_deref().unwrap_or("");
         if first_dot == last_dot {
             let canonical = format!("{}.{}", section_lower, entry_variable);
             matches.push((
@@ -2684,11 +2721,11 @@ pub fn get_urlmatch_all_in_section(
             ));
         } else {
             let subsection = &key[first_dot + 1..last_dot];
-            if url_matches(subsection, url) {
+            if let Some(specificity) = url_match_specificity(subsection, url) {
                 let canonical = format!("{}.{}", section_lower, entry_variable);
                 matches.push((
                     entry_variable.to_lowercase(),
-                    subsection.len(),
+                    specificity,
                     val.to_owned(),
                     canonical,
                     entry.scope,

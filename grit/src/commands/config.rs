@@ -1200,13 +1200,21 @@ fn cmd_get_urlmatch(args: &Args, key: &str, url: &str, git_dir: Option<&Path>) -
             std::process::exit(1);
         }
         for (var_key, val, scope) in &entries {
-            let val = format_typed_value(args, Some(var_key), val)?;
             let prefix = if args.show_scope {
-                format!("{}\t", scope)
+                format!("{}	", scope)
             } else {
                 String::new()
             };
-            print!("{prefix}{var_key} {val}{terminator}");
+            if val.is_empty()
+                && !args.type_bool
+                && !args.type_bool_or_int
+                && args.type_name.is_none()
+            {
+                print!("{prefix}{var_key}{terminator}");
+            } else {
+                let val = format_typed_value(args, Some(var_key), val)?;
+                print!("{prefix}{var_key} {val}{terminator}");
+            }
         }
     }
     Ok(())
