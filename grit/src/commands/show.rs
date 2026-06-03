@@ -1452,6 +1452,11 @@ fn show_commit(
             args.stat_count,
             &config,
         )?;
+        // `--summary` (and `--patch-with-stat`, which implies it) emits create/delete mode,
+        // mode-change, and rename/copy lines after the diffstat.
+        if args.summary || args.patch_with_stat {
+            write_show_summary_lines(out, &diff_entries)?;
+        }
         if !show_patch {
             return Ok(());
         }
@@ -1692,6 +1697,56 @@ fn show_commit(
         write!(out, "{patch}")?;
     }
 
+    Ok(())
+}
+
+/// Write git's `--summary` lines (create/delete mode, mode change, rename/copy) for the
+/// given diff entries.
+fn write_show_summary_lines(
+    out: &mut impl Write,
+    entries: &[grit_lib::diff::DiffEntry],
+) -> Result<()> {
+    use grit_lib::diff::DiffStatus;
+    for entry in entries {
+        match entry.status {
+            DiffStatus::Added => {
+                writeln!(out, " create mode {} {}", entry.new_mode, entry.path())?;
+            }
+            DiffStatus::Deleted => {
+                writeln!(out, " delete mode {} {}", entry.old_mode, entry.path())?;
+            }
+            DiffStatus::Modified | DiffStatus::TypeChanged
+                if entry.old_mode != entry.new_mode =>
+            {
+                writeln!(
+                    out,
+                    " mode change {} => {} {}",
+                    entry.old_mode,
+                    entry.new_mode,
+                    entry.path()
+                )?;
+            }
+            DiffStatus::Renamed => {
+                let sim = entry.score.unwrap_or(100);
+                writeln!(
+                    out,
+                    " rename {} => {} ({sim}%)",
+                    entry.old_path.as_deref().unwrap_or(""),
+                    entry.new_path.as_deref().unwrap_or("")
+                )?;
+            }
+            DiffStatus::Copied => {
+                let sim = entry.score.unwrap_or(100);
+                writeln!(
+                    out,
+                    " copy {} => {} ({sim}%)",
+                    entry.old_path.as_deref().unwrap_or(""),
+                    entry.new_path.as_deref().unwrap_or("")
+                )?;
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
