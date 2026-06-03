@@ -1162,6 +1162,8 @@ pub fn run(args: Args) -> Result<()> {
     let print_object = |oid: &grit_lib::objects::ObjectId, path: &str| {
         if options.no_object_names {
             emit_record(&oid.to_string());
+        } else if path == "\0" {
+            emit_record(&oid.to_string());
         } else if path.is_empty() {
             if result.bitmap_object_format {
                 emit_record(&oid.to_string());

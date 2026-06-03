@@ -48,7 +48,9 @@
   - Pack/index correctness subgroup complete: `t5300-pack-object`, `t5300-unpack-objects`,
     `t5302-pack-index`, `t5302-show-index`, `t5303-pack-corruption`,
     `t5303-pack-corruption-resilience`, `t5313-pack-bounds-checks`, and `t5351-unpack-large-objects`.
-  - Next focus group: pack object selection/filtering, starting with `t5305-include-tag.sh`.
+  - Completed `t5305-include-tag.sh` (15/15) after adding `--include-tag` annotated
+    tag-chain inclusion and tag-of-tag rev-list object walks.
+  - Next focus: `t5306-pack-nobase.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

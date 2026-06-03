@@ -618,6 +618,9 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Collect object IDs.
     let mut pack_list = collect_oids(&repo, &args)?;
+    if args.include_tag {
+        include_annotated_tags_for_packed_commits(&repo, &mut pack_list.oids)?;
+    }
     omit_prefiltered_blobs(&repo, &mut pack_list.oids, args.filter.as_deref())?;
 
     // Git shows this progress title when progress is enabled. Tests set `GIT_PROGRESS_DELAY` and
@@ -1053,6 +1056,49 @@ fn reachable_objects_for_full_repack(repo: &Repository, args: &Args) -> Result<V
         }
     }
     Ok(out)
+}
+
+fn include_annotated_tags_for_packed_commits(
+    repo: &Repository,
+    oids: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let mut packed: HashSet<ObjectId> = oids.iter().copied().collect();
+    let tags = refs::list_refs(&repo.git_dir, "refs/tags/").unwrap_or_default();
+    let mut to_add = Vec::new();
+    for (_name, tag_oid) in tags {
+        let Ok(chain) = tag_chain_to_commit(repo, tag_oid) else {
+            continue;
+        };
+        let Some(commit_oid) = chain.last().copied() else {
+            continue;
+        };
+        if !packed.contains(&commit_oid) {
+            continue;
+        }
+        for oid in chain.into_iter().rev().skip(1).rev() {
+            if packed.insert(oid) {
+                to_add.push(oid);
+            }
+        }
+    }
+    oids.extend(to_add);
+    Ok(())
+}
+
+fn tag_chain_to_commit(repo: &Repository, mut oid: ObjectId) -> Result<Vec<ObjectId>> {
+    let mut chain = Vec::new();
+    for _ in 0..16 {
+        chain.push(oid);
+        let obj = repo.odb.read(&oid)?;
+        match obj.kind {
+            ObjectKind::Commit => return Ok(chain),
+            ObjectKind::Tag => {
+                oid = parse_tag(&obj.data)?.object;
+            }
+            _ => bail!("tag does not peel to commit"),
+        }
+    }
+    bail!("tag nesting too deep")
 }
 
 /// Basename without `.pack` / `.idx` (e.g. `pack-abc123`).
@@ -3319,6 +3365,15 @@ fn optimize_blob_deltas(
                         continue;
                     }
                     if b.data.is_empty() {
+                        continue;
+                    }
+                    if blobs.len() > 3
+                        && t.data.starts_with(&b.data)
+                        && t.data.len() > b.data.len()
+                        && best_base.is_none_or(|bb| b.data.len() > bb.data.len())
+                    {
+                        best_base = Some(b);
+                        best_common = b.data.len();
                         continue;
                     }
                     if blobs.len() <= 3 {

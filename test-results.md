@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5305-include-tag
+
+- Focus harness: `./scripts/run-tests.sh t5305-include-tag.sh --verbose` passes 15/15 after `--include-tag` annotated tag-chain inclusion and tag-of-tag rev-list object walk fixes.
+- Regression harnesses: `./scripts/run-tests.sh t5300-pack-object.sh t5313-pack-bounds-checks.sh t5303-pack-corruption-resilience.sh --verbose` and `./scripts/run-tests.sh t5305-include-tag.sh t5351-unpack-large-objects.sh t5325-reverse-index.sh --verbose` pass the covered rows.
+
+
 ## 2026-06-03 — t5351-unpack-large-objects
 
 - Focus harness: `./scripts/run-tests.sh t5351-unpack-large-objects.sh --verbose` passes 7/7 after large-object allocation-limit handling, existing-pack preservation, and fsync trace2 counter fixes.
