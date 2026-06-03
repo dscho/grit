@@ -1,3 +1,7 @@
+## 2026-06-03 — t1002-read-tree-m-u-2way
+
+- Focus harness: `./scripts/run-tests.sh t1002-read-tree-m-u-2way.sh --verbose` passes 22/22 after the read-tree stat-refresh fix.
+
 ## 2026-06-03 — t1001-read-tree-m-2way
 
 - Focus harness: `./scripts/run-tests.sh t1001-read-tree-m-2way.sh --verbose` passes 29/29 after refreshing verified stat cache for carried-forward read-tree indexes while preserving dirty initial tree loads.
