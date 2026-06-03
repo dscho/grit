@@ -677,8 +677,13 @@ fatal: bad config variable 'fetch.negotiationalgorithm' in file '{file_disp}' at
             }
             if entry_line_value_has_unclosed_quote(&logical_line) {
                 let file_disp = config_error_path_display(path);
+                let location = if file_disp == "standard input" {
+                    "standard input".to_owned()
+                } else {
+                    format!("file '{file_disp}'")
+                };
                 return Err(Error::ConfigError(format!(
-                    "bad config line {} in file '{file_disp}'",
+                    "bad config line {} in {location}",
                     start_idx + 1
                 )));
             }
@@ -703,8 +708,13 @@ fatal: bad config variable 'fetch.negotiationalgorithm' in file '{file_disp}' at
                 continue;
             } else {
                 let file_disp = config_error_path_display(path);
+                let location = if file_disp == "standard input" {
+                    "standard input".to_owned()
+                } else {
+                    format!("file {file_disp}")
+                };
                 return Err(Error::Message(format!(
-                    "fatal: bad config line {} in file {file_disp}",
+                    "fatal: bad config line {} in {location}",
                     start_idx + 1
                 )));
             }
@@ -1274,6 +1284,13 @@ fatal: bad config variable 'fetch.negotiationalgorithm' in file '{file_disp}' at
 
         while idx < self.raw_lines.len() {
             let line = self.raw_lines[idx].clone();
+            if line.len() > 512 * 1024 {
+                let file_disp = config_error_path_display(&self.path);
+                return Err(Error::ConfigError(format!(
+                    "refusing to work with overly long line in '{file_disp}' on line {}",
+                    idx + 1
+                )));
+            }
             let mut inline_remainder = None;
             if parser.try_parse_section_with_remainder(&line, &mut inline_remainder) {
                 let old_style = section_line_is_old_style_subsection(&line);

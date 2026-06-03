@@ -1774,7 +1774,7 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
             Err(err) => {
                 if let Some(key) = config_key {
                     return Err(fatal_config_parse(format!(
-                        "fatal: bad numeric config value '{val}' for '{key}'"
+                        "fatal: bad numeric config value '{val}' for '{key}' in file .git/config: invalid unit"
                     )));
                 }
                 bail!("{}", err);
