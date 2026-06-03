@@ -4270,13 +4270,25 @@ fn preprocess_diff_args(rest: &[String]) -> Vec<String> {
                 continue;
             }
         }
-        if arg == "-U" {
-            // `-U <N>` with a space — merge into `--unified=<N>`
-            if i + 1 < rest.len() {
+        if arg == "-U" || arg == "--unified" {
+            // `-U <N>` with a space — merge into `--unified=<N>` only when the next token is
+            // numeric. Bare `-U` (e.g. `git diff -U <rev>`) uses the default context and must
+            // not swallow the following revision/path.
+            if i + 1 < rest.len() && rest[i + 1].chars().all(|c| c.is_ascii_digit()) && !rest[i + 1].is_empty() {
                 result.push(format!("--unified={}", rest[i + 1]));
                 i += 2;
             } else {
-                result.push(arg.clone());
+                result.push("--unified=3".to_owned());
+                i += 1;
+            }
+        } else if arg == "--abbrev" {
+            // Bare `--abbrev` uses git's default abbreviation (7) and must not consume the
+            // following revision/path as its value.
+            if i + 1 < rest.len() && rest[i + 1].chars().all(|c| c.is_ascii_digit()) && !rest[i + 1].is_empty() {
+                result.push(format!("--abbrev={}", rest[i + 1]));
+                i += 2;
+            } else {
+                result.push("--abbrev=7".to_owned());
                 i += 1;
             }
         } else if arg == "--word-diff" {
