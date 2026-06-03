@@ -361,7 +361,7 @@ t13030-switch-quiet-verbose	t1	yes	30	13	17	false	ok	0
 t1304-default-acl	t1	yes	4	4	0	true	ok	0
 t13040-restore-quiet-progress	t1	yes	30	27	3	false	ok	0
 t1305-config-include	t1	yes	37	37	0	true	ok	0
-t13050-reset-hard-untracked	t1	yes	30	2	28	false	ok	0
+t13050-reset-hard-untracked	t1	yes	30	30	0	true	ok	0
 t1306-xdg-files	t1	yes	21	21	0	true	ok	0
 t13060-cherry-pick-mainline	t1	yes	31	2	29	false	ok	0
 t1307-config-blob	t1	yes	13	13	0	true	ok	0

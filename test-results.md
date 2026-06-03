@@ -1,3 +1,7 @@
+## 2026-06-03 — t13050-reset-hard-untracked
+
+- Focus harness: `./scripts/run-tests.sh t13050-reset-hard-untracked.sh --verbose` passes 30/30 after wrapping setup `cd repo` in a subshell.
+
 ## 2026-06-03 — t13290-commit-allow-empty-msg
 
 - Focus harness: `./scripts/run-tests.sh t13290-commit-allow-empty-msg.sh --verbose` passes 30/30 after applying the documented cwd-leak wrapper to setup.
