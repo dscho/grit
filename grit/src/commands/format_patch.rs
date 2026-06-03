@@ -447,11 +447,19 @@ struct PatchOptions {
     zero_commit: bool,
     /// `-p`/`--patch` given without any stat option: suppress the per-patch diffstat block.
     suppress_stat: bool,
+    /// `--stat` requested (human-readable diffstat block).
+    want_stat: bool,
+    /// `--numstat` requested (machine-readable `ins\tdel\tpath` block).
+    want_numstat: bool,
+    /// `--shortstat` requested (single summary line).
+    want_shortstat: bool,
     /// Ordered `(header, refname)` notes refs to append to each patch body (from `--notes` /
     /// `format.notes`); empty when notes display is disabled.
     notes_refs: Vec<(String, String)>,
     /// Pathspec (from `format-patch -- <path>...`): restricts each patch's diff to these paths.
     pathspec: Vec<String>,
+    /// Rename-detection similarity threshold (`Some(50)` by default; `None` with `--no-renames`).
+    rename_threshold: Option<u32>,
 }
 
 pub fn run(mut args: Args) -> Result<()> {
@@ -524,6 +532,23 @@ pub fn run(mut args: Args) -> Result<()> {
             }
         }
     }
+
+    // Rename detection: format-patch enables it by default (threshold 50), unless `--no-renames`
+    // is given or `diff.renames` is disabled in config. `-M` forces it on.
+    let rename_threshold: Option<u32> = if args.no_renames {
+        None
+    } else if args.detect_renames {
+        Some(50)
+    } else {
+        match config.get("diff.renames") {
+            Some(val) => match val.to_lowercase().as_str() {
+                "false" | "no" | "0" => None,
+                "true" | "yes" | "1" | "" | "copies" | "copy" => Some(50),
+                _ => None,
+            },
+            None => Some(50),
+        }
+    };
 
     let stat_width = args.stat_width_cli.unwrap_or(FORMAT_PATCH_STAT_WIDTH);
     let stat_name_width = args.stat_name_width;
@@ -908,8 +933,16 @@ pub fn run(mut args: Args) -> Result<()> {
         zero_commit: args.zero_commit,
         // `-p`/`--patch` suppresses the diffstat (unless an explicit stat form is requested).
         suppress_stat: args.patch && args.stat.is_none() && !args.numstat && !args.shortstat,
+        // Human-readable diffstat is shown by default; it is also shown when `--stat` is given
+        // explicitly. When only `--numstat`/`--shortstat` are requested (without `--stat`), the
+        // human diffstat is NOT shown.
+        want_stat: !(args.patch && args.stat.is_none() && !args.numstat && !args.shortstat)
+            && (args.stat.is_some() || (!args.numstat && !args.shortstat)),
+        want_numstat: args.numstat,
+        want_shortstat: args.shortstat,
         notes_refs: resolve_notes_refs(&args, &config),
         pathspec: pathspec.clone(),
+        rename_threshold,
     };
 
     let mut log_output_encoding = config
@@ -1417,23 +1450,89 @@ fn diffstat_for_patch_entries(
             });
         }
     }
-    let line_prefix = if opts.format_patch_graph { "|  " } else { "" };
-    let dstat_opts = DiffstatOptions {
-        total_width: opts.stat_width,
-        line_prefix,
-        subtract_prefix_from_terminal: false,
-        stat_name_width: opts.stat_name_width,
-        stat_graph_width: opts.stat_graph_width,
-        stat_count: opts.stat_count,
-        color_add: "",
-        color_del: "",
-        color_reset: "",
-        graph_bar_slack: 0,
-        graph_prefix_budget_slack: 0,
-    };
-    let mut buf = Vec::new();
-    write_diffstat_block(&mut buf, &files, &dstat_opts)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    let mut out = String::new();
+
+    // `--numstat`: machine-readable `ins\tdel\tpath` lines (binary files use `-\t-\tpath`).
+    if opts.want_numstat {
+        for (file, entry) in files.iter().zip(entries.iter()) {
+            let display = match entry.status {
+                DiffStatus::Renamed | DiffStatus::Copied => {
+                    let old = entry.old_path.as_deref().unwrap_or("");
+                    let new = entry.new_path.as_deref().unwrap_or("");
+                    let pretty = grit_lib::diff::format_rename_path(old, new);
+                    grit_lib::quote_path::quote_c_style(&pretty, false)
+                }
+                _ => file.path_display.clone(),
+            };
+            if file.is_binary {
+                out.push_str(&format!("-\t-\t{display}\n"));
+            } else {
+                out.push_str(&format!(
+                    "{}\t{}\t{}\n",
+                    file.insertions, file.deletions, display
+                ));
+            }
+        }
+    }
+
+    // `--shortstat`: single summary line.
+    if opts.want_shortstat && !files.is_empty() {
+        let total_ins: usize = files
+            .iter()
+            .filter(|f| !f.is_binary)
+            .map(|f| f.insertions)
+            .sum();
+        let total_del: usize = files
+            .iter()
+            .filter(|f| !f.is_binary)
+            .map(|f| f.deletions)
+            .sum();
+        let files_changed = files.len();
+        let mut summary = format!(
+            " {} file{} changed",
+            files_changed,
+            if files_changed == 1 { "" } else { "s" }
+        );
+        if total_ins > 0 {
+            summary.push_str(&format!(
+                ", {} insertion{}(+)",
+                total_ins,
+                if total_ins == 1 { "" } else { "s" }
+            ));
+        }
+        if total_del > 0 {
+            summary.push_str(&format!(
+                ", {} deletion{}(-)",
+                total_del,
+                if total_del == 1 { "" } else { "s" }
+            ));
+        }
+        out.push_str(&summary);
+        out.push('\n');
+    }
+
+    // Human-readable `--stat` diffstat block.
+    if opts.want_stat {
+        let line_prefix = if opts.format_patch_graph { "|  " } else { "" };
+        let dstat_opts = DiffstatOptions {
+            total_width: opts.stat_width,
+            line_prefix,
+            subtract_prefix_from_terminal: false,
+            stat_name_width: opts.stat_name_width,
+            stat_graph_width: opts.stat_graph_width,
+            stat_count: opts.stat_count,
+            color_add: "",
+            color_del: "",
+            color_reset: "",
+            graph_bar_slack: 0,
+            graph_prefix_budget_slack: 0,
+        };
+        let mut buf = Vec::new();
+        write_diffstat_block(&mut buf, &files, &dstat_opts)?;
+        out.push_str(&String::from_utf8_lossy(&buf));
+    }
+
+    Ok(out)
 }
 
 fn read_blob_raw(odb: &Odb, oid: &ObjectId) -> Vec<u8> {
@@ -1543,6 +1642,9 @@ fn format_cover_letter(
 
     let mut diff_entries = diff_trees(&repo.odb, first_parent_tree.as_ref(), Some(last_tree), "")
         .context("computing diff for cover letter")?;
+    if let Some(threshold) = patch_opts.rename_threshold {
+        diff_entries = grit_lib::diff::detect_renames(&repo.odb, None, diff_entries, threshold);
+    }
     if !patch_opts.pathspec.is_empty() {
         diff_entries.retain(|e| {
             patch_opts
@@ -1738,6 +1840,10 @@ fn format_single_patch(
 
     let mut diff_entries_raw = diff_trees(odb, parent_tree_oid.as_ref(), Some(&commit.tree), "")
         .context("computing diff")?;
+    // Rename detection (format-patch enables it by default; `--no-renames` disables).
+    if let Some(threshold) = opts.rename_threshold {
+        diff_entries_raw = grit_lib::diff::detect_renames(odb, None, diff_entries_raw, threshold);
+    }
     // Restrict each patch's diff to the pathspec (`format-patch -- <path>...`).
     if !opts.pathspec.is_empty() {
         diff_entries_raw.retain(|e| {
@@ -2012,12 +2118,12 @@ fn format_single_patch(
             out.push('\n');
         }
 
-        if opts.suppress_stat {
-            // `-p` with no stat: git omits the `---` separator and the diffstat, emitting a blank
-            // line before the raw diff instead.
-            out.push('\n');
-        } else {
+        if opts.want_stat {
             out.push_str("---\n");
+        } else {
+            // `-p` with no stat, or only `--numstat`/`--shortstat`: git omits the `---` separator,
+            // emitting a blank line before the stat/raw diff instead.
+            out.push('\n');
         }
         // Notes block (after the `---` separator, before the diffstat/diff), separated by a blank.
         if !notes_block.is_empty() {
@@ -2125,14 +2231,26 @@ fn write_diff_header_to_string(
             }
         }
         DiffStatus::Renamed => {
-            let _ = writeln!(out, "similarity index 100%");
+            let sim = entry.score.unwrap_or(100);
+            let _ = writeln!(out, "similarity index {sim}%");
             let _ = writeln!(out, "rename from {old_path}");
             let _ = writeln!(out, "rename to {new_path}");
+            if entry.old_oid != entry.new_oid {
+                let old_abbrev = &entry.old_oid.to_hex()[..7];
+                let new_abbrev = &entry.new_oid.to_hex()[..7];
+                let _ = writeln!(out, "index {old_abbrev}..{new_abbrev}");
+            }
         }
         DiffStatus::Copied => {
-            let _ = writeln!(out, "similarity index 100%");
+            let sim = entry.score.unwrap_or(100);
+            let _ = writeln!(out, "similarity index {sim}%");
             let _ = writeln!(out, "copy from {old_path}");
             let _ = writeln!(out, "copy to {new_path}");
+            if entry.old_oid != entry.new_oid {
+                let old_abbrev = &entry.old_oid.to_hex()[..7];
+                let new_abbrev = &entry.new_oid.to_hex()[..7];
+                let _ = writeln!(out, "index {old_abbrev}..{new_abbrev}");
+            }
         }
         DiffStatus::TypeChanged => {
             let _ = writeln!(out, "old mode {}", entry.old_mode);
