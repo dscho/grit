@@ -373,6 +373,7 @@ dependencies = [
  "merge3",
  "nix",
  "regex",
+ "regex-automata",
  "sha1",
  "sha2",
  "shell-words",
