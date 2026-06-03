@@ -7590,6 +7590,22 @@ pub(crate) fn merge_tree_write_tree_core(
     // When true, record paths passed to the content merge machinery for `Auto-merging` output.
     record_auto_merge_paths: bool,
 ) -> Result<MergeTreeWriteOutput> {
+    // `--quiet` (mergeability_only) reports only clean/conflict status; git runs the full merge
+    // into a throwaway tmp object dir and leaves the real object store untouched. Mirror that by
+    // routing every object write through an in-memory overlay that is discarded on return.
+    struct OverlayGuard<'a>(&'a Repository, bool);
+    impl Drop for OverlayGuard<'_> {
+        fn drop(&mut self) {
+            if self.1 {
+                self.0.odb.disable_mem_overlay();
+            }
+        }
+    }
+    if mergeability_only {
+        repo.odb.enable_mem_overlay();
+    }
+    let _overlay_guard = OverlayGuard(repo, mergeability_only);
+
     let mut auto_merge_paths: Vec<String> = Vec::new();
     let auto_ref: Option<&mut Vec<String>> = if record_auto_merge_paths {
         Some(&mut auto_merge_paths)
