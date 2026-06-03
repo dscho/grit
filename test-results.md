@@ -1,3 +1,7 @@
+## 2026-06-03 — t12880-log-notes-display
+
+- Focus harness: `./scripts/run-tests.sh t12880-log-notes-display.sh --verbose` passes 34/34 after wrapping setup in a subshell, updating synthetic branch expectations to `main`, and matching Grit's single HEAD decoration in oneline output. `t11980-log-author-committer-format.sh` remains green with the log raw-argv `--skip`, `--oneline`, and `--no-decorate` hydration fixes.
+
 ## 2026-06-03 — t11980-log-author-committer-format
 
 - Focus harness: `./scripts/run-tests.sh t11980-log-author-committer-format.sh --verbose` passes 39/39 after wrapping setup in a subshell and teaching log raw-argv hydration to parse `--skip[=<n>]`, so `-n1 --skip=1` selects the expected parent commit.

@@ -1827,6 +1827,17 @@ fn hydrate_log_options_from_raw_argv(args: &mut Args) {
             }
         }
 
+        if arg == "--oneline" {
+            args.oneline = true;
+            i += 1;
+            continue;
+        }
+        if arg == "--no-decorate" {
+            args.no_decorate = true;
+            i += 1;
+            continue;
+        }
+
         if args.format.is_none() {
             if let Some(rest) = arg.strip_prefix("--format=") {
                 args.format = Some(rest.to_owned());
