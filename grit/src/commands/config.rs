@@ -139,6 +139,10 @@ pub struct Args {
     #[arg(long = "path", global = true)]
     pub type_path: bool,
 
+    /// Interpret the value as an expiry date and print its timestamp.
+    #[arg(long = "expiry-date", global = true)]
+    pub type_expiry_date: bool,
+
     /// Type selector (alternative to individual flags).
     #[arg(long = "type", value_name = "TYPE", global = true)]
     pub type_name: Option<String>,
@@ -663,7 +667,7 @@ fn cmd_get(
         let Some(entry) = entries.last() else {
             if let Some(ref default) = get_args.default {
                 let val = format_default_value(args, default)?;
-                print!("{val}{terminator}");
+                print_default_value(args, &val, terminator);
                 return Ok(());
             }
             std::process::exit(1);
@@ -717,7 +721,7 @@ fn cmd_get(
         if values.is_empty() {
             if let Some(ref default) = get_args.default {
                 let val = format_default_value(args, default)?;
-                print!("{val}{terminator}");
+                print_default_value(args, &val, terminator);
                 return Ok(());
             }
             std::process::exit(1);
@@ -740,7 +744,7 @@ fn cmd_get(
         }
         if let Some(ref default) = get_args.default {
             let d = format_default_value(args, default)?;
-            print!("{d}{terminator}");
+            print_default_value(args, &d, terminator);
             return Ok(());
         }
         std::process::exit(1);
@@ -750,6 +754,26 @@ fn cmd_get(
     // and find the last non-optional-missing one.
     let has_path_type = args.type_path || args.type_name.as_deref() == Some("path");
     if has_path_type {
+        if let Ok(canon) = grit_lib::config::canonical_key(&get_args.key) {
+            if let Some(entry) = config
+                .entries()
+                .iter()
+                .rev()
+                .find(|entry| entry.key == canon)
+            {
+                if entry.value.is_none() {
+                    let file = entry
+                        .file
+                        .as_deref()
+                        .map(grit_lib::config::config_file_display_for_error)
+                        .unwrap_or_else(|| "command line".to_owned());
+                    return Err(fatal_config_parse(format!(
+                        "fatal: bad config value for '{}' in file {file} at line {}",
+                        get_args.key, entry.line
+                    )));
+                }
+            }
+        }
         let all_values = config.get_all(&get_args.key);
         // Find the last value that isn't optional-missing
         let last_valid = all_values
@@ -763,7 +787,7 @@ fn cmd_get(
         }
         if let Some(ref default) = get_args.default {
             let val = format_default_value(args, default)?;
-            print!("{val}{terminator}");
+            print_default_value(args, &val, terminator);
             return Ok(());
         }
         std::process::exit(1);
@@ -778,7 +802,7 @@ fn cmd_get(
         None => {
             if let Some(ref default) = get_args.default {
                 let val = format_default_value(args, default)?;
-                print!("{val}{terminator}");
+                print_default_value(args, &val, terminator);
                 return Ok(());
             }
             std::process::exit(1);
@@ -1620,6 +1644,14 @@ fn format_default_value(args: &Args, val: &str) -> Result<String> {
     format_typed_value(args, None, val).context("failed to format default config value")
 }
 
+fn print_default_value(args: &Args, val: &str, terminator: char) {
+    if args.type_name.as_deref() == Some("color") {
+        print!("{val}");
+    } else {
+        print!("{val}{terminator}");
+    }
+}
+
 /// Canonicalize a value for writing based on type flags.
 ///
 /// When `--bool` is used, the value is validated and written as "true"/"false".
@@ -1690,7 +1722,7 @@ fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Resul
     if type_name == Some("color") {
         match parse_color(val) {
             Ok(_) => return Ok(val.to_owned()),
-            Err(e) => bail!("{}", e),
+            Err(e) => bail!("cannot parse color: {}", e),
         }
     }
 
@@ -1751,6 +1783,11 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
     }
 
     if args.type_path || type_name == Some("path") {
+        if val.starts_with("~/") && std::env::var_os("HOME").is_none() {
+            return Err(fatal_config_parse(format!(
+                "fatal: failed to expand user dir in: {val}"
+            )));
+        }
         return match grit_lib::config::parse_path_optional(val) {
             Some(p) => Ok(p),
             None => Ok(String::new()), // optional path missing — caller should check is_optional_missing_path
@@ -1786,7 +1823,7 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
         }
     }
 
-    if type_name == Some("expiry-date") {
+    if args.type_expiry_date || type_name == Some("expiry-date") {
         return format_expiry_date(val);
     }
 
@@ -1805,9 +1842,14 @@ fn format_expiry_date(val: &str) -> Result<String> {
         return Ok(n.to_string());
     }
 
-    if let Some(ts) = super::commit::parse_date_to_git_timestamp(trimmed) {
-        let epoch = ts.split_whitespace().next().unwrap_or(&ts);
-        return Ok(epoch.to_owned());
+    if let Ok((ts, _)) = grit_lib::git_date::parse::parse_date_basic(trimmed) {
+        return Ok(ts.to_string());
+    }
+
+    let mut err = 0;
+    let ts = grit_lib::git_date::approx::approxidate_careful(trimmed, Some(&mut err));
+    if err == 0 {
+        return Ok(ts.to_string());
     }
 
     bail!("invalid expiry date '{}'", val);

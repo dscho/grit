@@ -232,6 +232,9 @@ pub fn config_file_display_for_error(path: &Path) -> String {
 }
 
 fn config_error_path_display(path: &Path) -> String {
+    if path == Path::new("-") {
+        return "standard input".to_owned();
+    }
     if path.file_name().and_then(|s| s.to_str()) == Some("config")
         && path
             .parent()
