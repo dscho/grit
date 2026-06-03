@@ -8227,6 +8227,22 @@ fn run_symmetric_log(
         .context("failed to compute merge bases for symmetric range")?;
     let negative: Vec<String> = bases.iter().map(|b| b.to_hex()).collect();
 
+    let ordering = if args.topo_order || args.simplify_merges {
+        if args.author_date_order {
+            OrderingMode::AuthorDateTopo
+        } else {
+            OrderingMode::Topo
+        }
+    } else if args.date_order || args.author_date_order {
+        if args.author_date_order {
+            OrderingMode::AuthorDateWalk
+        } else {
+            OrderingMode::DateOrderWalk
+        }
+    } else {
+        OrderingMode::Default
+    };
+
     // `rev-list` resolves each positive spec; empty sides mean HEAD (same as parsing above).
     let positive = vec![lhs_spec.to_owned(), rhs_spec.to_owned()];
     let options = RevListOptions {
@@ -8237,7 +8253,7 @@ fn run_symmetric_log(
         symmetric_right: Some(rhs_oid),
         boundary: args.boundary,
         first_parent: args.first_parent,
-        ordering: OrderingMode::Topo,
+        ordering,
         reverse: false,
         ..RevListOptions::default()
     };

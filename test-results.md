@@ -1344,3 +1344,10 @@ Updated: 2026-06-01
   `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6000 symmetric log ordering focus: after making the dedicated symmetric-log path use default
+  date ordering unless topo/date options request otherwise, the direct debug run advances through
+  test 10 and `./scripts/run-tests.sh t6000-rev-list-misc.sh` improves from 14/23 to 15/23 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
