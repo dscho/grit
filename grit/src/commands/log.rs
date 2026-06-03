@@ -5933,6 +5933,28 @@ fn run_reflog_walk(
                     }
                     writeln!(out)?;
                 }
+                "reference" => {
+                    // `--pretty=reference` ignores reflog selectors; render the
+                    // `%h (%s, %ad)` reference line (short date unless --date set).
+                    let date_ph = if cli_date_for_reflog.is_some() {
+                        "%ad"
+                    } else {
+                        "%as"
+                    };
+                    let template = format!("%h (%s, {date_ph})");
+                    let line = apply_reflog_format_string(
+                        &template,
+                        &entry.new_oid,
+                        &commit_data,
+                        &percent_gd,
+                        &entry.message,
+                        &entry.identity,
+                        mailmap,
+                        use_mailmap,
+                        et,
+                    );
+                    writeln!(out, "{}", line)?;
+                }
                 _ => {
                     let fmt_str = fmt
                         .strip_prefix("tformat:")
@@ -6187,6 +6209,14 @@ fn apply_reflog_format_string(
                                 extract_email(&commit.author)
                             };
                             result.push_str(&local_part_of_email(&email));
+                        }
+                        Some('s') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&commit.author, Some("short")));
+                        }
+                        Some('d') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&commit.author, None));
                         }
                         _ => {
                             result.push_str("%a");
