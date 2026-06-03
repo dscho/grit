@@ -598,7 +598,9 @@ fn write_merge_tree_stdout_to(
     w.write_all(&[line_term])?;
 
     if out.has_conflicts {
-        let quote = config_quote_path(repo);
+        // With NUL line termination (`-z`/`--stdin`), git never C-quotes paths — the NUL
+        // delimiter already makes any byte safe, so non-ASCII names appear verbatim.
+        let quote = !nul && config_quote_path(repo);
         let mut seen_name_only: Option<String> = None;
         for e in &out.index.entries {
             if e.stage() == 0 || e.mode == grit_lib::index::MODE_TREE {
@@ -784,6 +786,38 @@ fn write_merge_tree_stdout_to(
                     }
                     continue;
                 }
+                if d.kind == "file/directory" {
+                    // git lists the relocated path and the original directory path, and orders the
+                    // `file/directory` row before the companion `modify/delete` row at the same
+                    // relocated path.
+                    let new = d.subject_path.as_str();
+                    let short = "CONFLICT (file/directory)".to_string();
+                    let long = format!("{short}: {}", d.body);
+                    if let Some(old) = d.remerge_anchor_path.as_deref() {
+                        zrows.push((
+                            new.to_string(),
+                            0,
+                            String::new(),
+                            ZMsg::OtherConflict {
+                                paths: vec![new, old],
+                                short,
+                                long,
+                            },
+                        ));
+                    } else {
+                        zrows.push((
+                            new.to_string(),
+                            0,
+                            String::new(),
+                            ZMsg::OtherConflict {
+                                paths: vec![new],
+                                short,
+                                long,
+                            },
+                        ));
+                    }
+                    continue;
+                }
                 let tier = match d.kind {
                     "rename/delete" => 0u8,
                     "modify/delete" => 1,
@@ -813,6 +847,12 @@ fn write_merge_tree_stdout_to(
                     } else {
                         (s, l, vec![d.subject_path.as_str()])
                     }
+                } else if d.kind == "modify/delete" {
+                    // git always lists the single (possibly relocated) subject path for
+                    // modify/delete, even when an anchor to the original path is recorded.
+                    let s = format!("CONFLICT ({})", d.kind);
+                    let l = format!("{s}: {}", d.body);
+                    (s, l, vec![d.subject_path.as_str()])
                 } else {
                     let s = format!("CONFLICT ({})", d.kind);
                     let l = format!("{s}: {}", d.body);
