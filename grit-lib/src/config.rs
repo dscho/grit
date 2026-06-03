@@ -569,6 +569,7 @@ fn escape_value(s: &str) -> String {
         || s.contains('"')
         || s.contains('\\')
         || s.contains('\n')
+        || s.contains('\r')
         || s.contains('#')
         || s.contains(';');
 
