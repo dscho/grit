@@ -3682,15 +3682,33 @@ fn extract_function_context(
     let start_str = &rest[..comma_or_space];
     let start_line: usize = start_str.parse().ok()?;
 
-    if start_line <= 1 {
+    // Parse the old line count; "@@ -<start>,<count> ..." (no comma means count 1).
+    let old_count: usize = if let Some(comma) = rest.find(',') {
+        let after = &rest[comma + 1..];
+        let end = after.find([' ', '\t']).unwrap_or(after.len());
+        after[..end].parse().unwrap_or(1)
+    } else {
+        1
+    };
+
+    if start_line == 0 {
         return None;
     }
 
-    // Look backwards from the line before the hunk start for a line that
-    // starts with a non-whitespace character (Git's default funcname pattern).
-    // start_line is 1-indexed, so the hunk starts at old_lines[start_line-1].
-    // We want to look at lines before that: old_lines[0..start_line-1].
-    let search_end = (start_line - 1).min(old_lines.len());
+    // Look backwards for a line that matches the funcname pattern. start_line is
+    // 1-indexed. For a normal hunk the first changed pre-image line is
+    // old_lines[start_line-1], so we search lines strictly before it
+    // (old_lines[0..start_line-1]). For a pure insertion (old count 0) the
+    // content is inserted *after* old line start_line, so Git's function search
+    // begins at that line itself: search old_lines[0..start_line].
+    let search_end = if old_count == 0 {
+        start_line.min(old_lines.len())
+    } else {
+        if start_line <= 1 {
+            return None;
+        }
+        (start_line - 1).min(old_lines.len())
+    };
     let truncate = |text: &str| {
         if text.len() > 80 {
             let mut end = 80;
