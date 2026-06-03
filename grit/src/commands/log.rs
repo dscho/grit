@@ -5720,6 +5720,19 @@ fn reflog_walk_percent_gd(
     format!("{display_name}@{{{idx_from_tip}}}")
 }
 
+fn shorten_reflog_selector(selector: &str) -> String {
+    let Some(at) = selector.find("@{") else {
+        return selector.to_string();
+    };
+    let name = &selector[..at];
+    let suffix = &selector[at..];
+    if let Some(short) = name.strip_prefix("refs/heads/") {
+        format!("{short}{suffix}")
+    } else {
+        selector.to_string()
+    }
+}
+
 /// Reflog file key plus display name for `%gd` / headers (matches Git `complete_reflogs`).
 struct ReflogWalkRef {
     log_ref: String,
@@ -5837,12 +5850,15 @@ fn run_reflog_walk(
     mailmap: &MailmapTable,
 ) -> Result<()> {
     let rev_specs: Vec<String> = if args.revisions.is_empty() {
-        // Bare `--reflog`/`--walk-reflogs` walks every ref's reflog plus HEAD.
-        let mut refs = grit_lib::reflog::list_reflog_refs(&repo.git_dir).unwrap_or_default();
-        if refs.is_empty() {
-            refs.push("HEAD".to_string());
+        if args.all {
+            let mut refs = grit_lib::reflog::list_reflog_refs(&repo.git_dir).unwrap_or_default();
+            if refs.is_empty() {
+                refs.push("HEAD".to_string());
+            }
+            refs
+        } else {
+            vec!["HEAD".to_string()]
         }
-        refs
     } else {
         args.revisions.clone()
     };
@@ -6095,7 +6111,7 @@ fn run_reflog_walk(
             format!("{display_name}@{{{idx_from_tip}}}")
         };
 
-        let percent_gd = reflog_walk_percent_gd(
+        let percent_gd_full = reflog_walk_percent_gd(
             &display_name,
             &entry,
             nr,
@@ -6104,6 +6120,7 @@ fn run_reflog_walk(
             last_reflog_suffix,
             cli_date_for_reflog,
         );
+        let percent_gd_short = shorten_reflog_selector(&percent_gd_full);
         let et = args.expand_tabs_in_log;
 
         let is_oneline_fmt = args.format.as_deref() == Some("oneline") || args.oneline;
@@ -6294,7 +6311,8 @@ fn run_reflog_walk(
                         &template,
                         &entry.new_oid,
                         &commit_data,
-                        &percent_gd,
+                        &percent_gd_full,
+                        &percent_gd_short,
                         &entry.message,
                         &entry.identity,
                         mailmap,
@@ -6315,7 +6333,8 @@ fn run_reflog_walk(
                         fmt_str,
                         &entry.new_oid,
                         &commit_data,
-                        &percent_gd,
+                        &percent_gd_full,
+                        &percent_gd_short,
                         &entry.message,
                         &entry.identity,
                         mailmap,
@@ -6417,7 +6436,8 @@ fn apply_reflog_format_string(
     fmt: &str,
     oid: &ObjectId,
     commit: &grit_lib::objects::CommitData,
-    percent_gd: &str,
+    percent_gd_full: &str,
+    percent_gd_short: &str,
     reflog_msg: &str,
     reflog_identity: &str,
     mailmap: &MailmapTable,
@@ -6493,9 +6513,13 @@ fn apply_reflog_format_string(
                 Some('g') => {
                     chars.next();
                     match chars.peek() {
+                        Some('D') => {
+                            chars.next();
+                            result.push_str(percent_gd_full);
+                        }
                         Some('d') => {
                             chars.next();
-                            result.push_str(percent_gd);
+                            result.push_str(percent_gd_short);
                         }
                         Some('s') => {
                             chars.next();

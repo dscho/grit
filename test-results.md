@@ -1197,3 +1197,7 @@ Updated: 2026-06-01
   trailing body newline, `./scripts/run-tests.sh t6006-rev-list-format.sh` improves from 68/80 to
   70/80 and refreshed `data/test-files.csv` plus dashboards. Full workspace/harness sweeps were
   skipped for this narrow increment.
+- t6006 reflog format focus: after making bare `log -g` walk `HEAD`, adding `%gD`/short `%gd`
+  reflog selectors, and accepting `reflog --abbrev=<n>`, `./scripts/run-tests.sh
+  t6006-rev-list-format.sh` improves from 70/80 to 73/80 and refreshed `data/test-files.csv` plus
+  dashboards. Full workspace/harness sweeps were skipped for this narrow increment.
