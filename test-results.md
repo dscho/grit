@@ -1260,3 +1260,10 @@ Updated: 2026-06-01
   grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
   --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
   `cargo test -p grit-lib --lib`.
+- t6120 name-rev tag-object focus: after adding direct names for annotated tag objects while
+  keeping peeled commits named as `<tag>^0`, the direct verbose run reaches `describe chokes on
+  severely broken submodules` and `./scripts/run-tests.sh t6120-describe.sh` improves from 91/105
+  to 92/105 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo
+  check -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo
+  clippy --fix --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics
+  remain), and `cargo test -p grit-lib --lib`.

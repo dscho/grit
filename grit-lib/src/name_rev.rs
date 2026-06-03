@@ -80,6 +80,18 @@ pub fn build_name_map(
         let Some(commit_oid) = tip.commit_oid else {
             continue;
         };
+        if tip.deref {
+            names.insert(
+                tip.object_oid,
+                RevName {
+                    tip_name: tip.display_name.clone(),
+                    taggerdate: tip.taggerdate,
+                    generation: 0,
+                    distance: 0,
+                    from_tag: tip.from_tag,
+                },
+            );
+        }
         name_from_tip(
             repo,
             &mut names,
@@ -286,6 +298,8 @@ fn name_from_tip(
 
 /// A ref tip to be used as a naming source.
 struct TipEntry {
+    /// The object ID stored directly in the ref.
+    object_oid: ObjectId,
     /// Short display name for output (e.g. `"main"`, `"tags/v1.0"`).
     display_name: String,
     /// Peeled commit OID, if the ref ultimately resolves to a commit.
@@ -348,6 +362,7 @@ fn collect_tips(repo: &Repository, options: &NameRevOptions) -> Result<Vec<TipEn
         let (commit_oid, taggerdate, deref) = peel_to_commit(repo, oid)?;
 
         tips.push(TipEntry {
+            object_oid: oid,
             display_name,
             commit_oid,
             taggerdate,

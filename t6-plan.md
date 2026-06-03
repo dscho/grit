@@ -89,11 +89,12 @@ Completed pathspec files: `t6130`, `t6132`, `t6133-pathspec-toplevel`, `t6134-*`
 
 ## Describe
 
-- [~] `t6120-describe.sh` — 91/105 passing, 12 failing. Improved describe candidate
+- [~] `t6120-describe.sh` — 92/105 passing, 11 failing. Improved describe candidate
   selection/counting, describe-name rev parsing, inverse pattern/exact options, exact
   `--contains` output, renamed annotated-tag handling, dirty/broken commit-ish rejection, `--all`
-  branch/remote pattern matching, and `refs/original` describe candidates. Next blocker: name-rev
-  should distinguish exact tag objects from peeled tagged commits.
+  branch/remote pattern matching, `refs/original` describe candidates, and exact tag-object
+  name-rev output. Next blocker: dirty describe should fail when absorbed submodule gitdirs are
+  broken.
 
 Completed describe/name files: `t6120-name-rev`.
 
