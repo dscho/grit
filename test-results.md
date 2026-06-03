@@ -1,3 +1,7 @@
+## 2026-06-03 — t10610-show-ref-dereference-extra
+
+- Focus harness: `./scripts/run-tests.sh t10610-show-ref-dereference-extra.sh --verbose` passes 40/40 after aligning show-ref branch patterns and verification refs with `main`.
+
 ## 2026-06-03 — t1007-hash-object
 
 - Focus harness: `./scripts/run-tests.sh t1007-hash-object.sh --verbose` passes 40/40 after `hash-object --path` applies attribute/filter context and tree validation reports malformed modes, empty filenames, and duplicate entries.
