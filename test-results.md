@@ -1205,3 +1205,9 @@ Updated: 2026-06-01
   `./scripts/run-tests.sh t6006-rev-list-format.sh` improves from 73/80 to 74/80 and refreshed
   `data/test-files.csv` plus dashboards. Full workspace/harness sweeps were skipped for this
   narrow increment.
+- t6006 empty-message oneline focus: after allowing newline-only `--cleanup=verbatim` commit
+  messages and accepting `rev-list --oneline --graph`, `./scripts/run-tests.sh
+  t6006-rev-list-format.sh` improves from 74/80 to 75/80 and refreshed `data/test-files.csv` plus
+  dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`
+  (existing warning backlog remains), `cargo build -p grit-cli`, `cargo build --release -p
+  grit-cli`, and `cargo test -p grit-lib --lib`.

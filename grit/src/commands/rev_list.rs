@@ -770,6 +770,8 @@ pub fn run(args: Args) -> Result<()> {
                 "--filter-provided-objects" => options.filter_provided_objects = true,
                 "--no-commit-header" => no_commit_header = true,
                 "--commit-header" => no_commit_header = false,
+                "--oneline" => options.output_mode = OutputMode::Format("oneline".to_owned()),
+                "--graph" => { /* graph decoration is irrelevant for rev-list consumers here */ }
                 "--color" => {
                     use_color = true;
                 }
