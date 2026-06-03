@@ -1,3 +1,7 @@
+## 2026-06-03 — t13330-switch-reflog-entry
+
+- Focus harness: `./scripts/run-tests.sh t13330-switch-reflog-entry.sh --verbose` passes 30/30 after switching synthetic `master` branch references to `main`.
+
 ## 2026-06-03 — t11530-switch-orphan-track
 
 - Focus harness: `./scripts/run-tests.sh t11530-switch-orphan-track.sh --verbose` passes 30/30 after switching synthetic `master` branch references to `main`.
