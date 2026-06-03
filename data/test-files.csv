@@ -229,7 +229,7 @@ t11420-rev-parse-flags-args	t1	yes	33	23	10	false	ok	0
 t11430-rev-parse-git-dir	t1	yes	35	34	1	false	ok	0
 t11440-config-type-bool-int	t1	yes	38	38	0	true	ok	0
 t11450-config-include-path	t1	yes	28	28	0	true	ok	0
-t11460-init-separate-git-dir	t1	yes	34	22	12	false	ok	0
+t11460-init-separate-git-dir	t1	yes	34	34	0	true	ok	0
 t11470-branch-copy-move	t1	yes	31	25	6	false	ok	0
 t11480-tag-message-file	t1	yes	35	35	0	true	ok	0
 t11490-commit-fixup-squash	t1	yes	33	32	1	false	ok	0

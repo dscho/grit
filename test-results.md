@@ -1,3 +1,7 @@
+## 2026-06-03 — t11460-init-separate-git-dir
+
+- Focus harness: `./scripts/run-tests.sh t11460-init-separate-git-dir.sh --verbose` passes 34/34 after applying the documented subshell wrapper to cd-using test bodies so cwd no longer leaks between top-level tests.
+
 ## 2026-06-03 — t12350-config-worktree-scope
 
 - Focus harness: `./scripts/run-tests.sh t12350-config-worktree-scope.sh --verbose` passes 33/33 after wrapping the setup `cd repo` in a subshell and correcting the synthetic `--worktree` expectations to match Git's fallback to local config without `extensions.worktreeConfig`.
