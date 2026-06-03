@@ -1387,3 +1387,10 @@ Updated: 2026-06-01
   plus `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
   `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
   backlog remains and unrelated auto-fixes were reverted), and `cargo test -p grit-lib --lib`.
+- t6019 ancestry-path parser focus: after teaching `git log` to accept `--ancestry-path=<rev>` and
+  repeated explicit ancestry pivots, the direct debug run advances through test 11 and
+  `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh` improves from 5/18 to 12/18 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted),
+  and `cargo test -p grit-lib --lib`.

@@ -156,12 +156,16 @@ pub struct Args {
     pub internal_remotes_pattern: Option<String>,
 
     /// Only show commits on the ancestry path between endpoints.
-    #[arg(long = "ancestry-path")]
+    #[arg(long = "ancestry-path", value_name = "REV", default_missing_value = "", num_args = 0..=1, require_equals = true)]
+    pub ancestry_path_args: Vec<String>,
+
+    /// Whether ancestry-path filtering is active after CLI normalization.
+    #[arg(skip)]
     pub ancestry_path: bool,
 
     /// Bottom commit for `--ancestry-path=<rev>` (parsed from argv in `run`, not clap).
     #[arg(skip)]
-    pub ancestry_path_bottom: Option<String>,
+    pub ancestry_path_bottoms: Vec<String>,
 
     /// Only show commits that are decorated (have refs).
     #[arg(long = "simplify-by-decoration")]
@@ -1894,12 +1898,29 @@ fn hydrate_log_options_from_raw_argv(args: &mut Args) {
         if let Some(rest) = arg.strip_prefix("--ancestry-path=") {
             args.ancestry_path = true;
             if !rest.is_empty() {
-                args.ancestry_path_bottom = Some(rest.to_owned());
+                args.ancestry_path_bottoms.push(rest.to_owned());
             }
         }
 
         i += 1;
     }
+}
+
+fn normalize_ancestry_path_arg(args: &mut Args) {
+    if !args.ancestry_path_args.is_empty() {
+        args.ancestry_path = true;
+        args.ancestry_path_bottoms.extend(
+            args.ancestry_path_args
+                .drain(..)
+                .filter(|value| !value.is_empty()),
+        );
+    }
+    if !args.ancestry_path_bottoms.is_empty() {
+        args.ancestry_path = true;
+    }
+    let mut seen = HashSet::new();
+    args.ancestry_path_bottoms
+        .retain(|value| seen.insert(value.clone()));
 }
 
 /// Resolve revision specs to commit OIDs, dropping specs that fail to resolve when
@@ -2300,11 +2321,11 @@ fn run_rev_list_log(
         all_refs: args.all || stdin_all_refs,
         first_parent: args.first_parent,
         ancestry_path: args.ancestry_path,
-        ancestry_path_bottoms: if let Some(ref b) = args.ancestry_path_bottom {
-            vec![resolve_revision_as_commit(repo, b.as_str())?]
-        } else {
-            Vec::new()
-        },
+        ancestry_path_bottoms: args
+            .ancestry_path_bottoms
+            .iter()
+            .map(|b| resolve_revision_as_commit(repo, b.as_str()).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?,
         skip: args.skip.unwrap_or(0),
         max_count: args.max_count,
         ordering,
@@ -2582,11 +2603,11 @@ fn run_graph_log(
         all_refs: args.all || stdin_all_refs,
         first_parent: args.first_parent,
         ancestry_path: args.ancestry_path,
-        ancestry_path_bottoms: if let Some(ref b) = args.ancestry_path_bottom {
-            vec![resolve_revision_as_commit(repo, b.as_str())?]
-        } else {
-            Vec::new()
-        },
+        ancestry_path_bottoms: args
+            .ancestry_path_bottoms
+            .iter()
+            .map(|b| resolve_revision_as_commit(repo, b.as_str()).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?,
         simplify_by_decoration: false,
         skip: args.skip.unwrap_or(0),
         max_count: args.max_count,
@@ -4315,6 +4336,7 @@ fn emit_bloom_perf_line(stats: &BloomWalkStats, path: &str) {
 /// Run the `log` command.
 pub fn run(mut args: Args) -> Result<()> {
     hydrate_log_options_from_raw_argv(&mut args);
+    normalize_ancestry_path_arg(&mut args);
 
     // `--tags`/`--remotes` are accepted as proper options (so they don't absorb
     // following `--decorate` etc. via the hyphen-tolerant positional list); turn
@@ -4444,14 +4466,6 @@ pub fn run(mut args: Args) -> Result<()> {
             }
         }
         args.log_output_encoding = enc;
-    }
-
-    for raw in std::env::args_os().map(|a| a.to_string_lossy().into_owned()) {
-        if let Some(rest) = raw.strip_prefix("--ancestry-path=") {
-            if !rest.is_empty() {
-                args.ancestry_path_bottom = Some(rest.to_owned());
-            }
-        }
     }
 
     let cfg = ConfigSet::load(Some(&repo.git_dir), true).context("loading git config")?;
