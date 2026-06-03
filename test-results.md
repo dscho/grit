@@ -3,6 +3,13 @@
 - Focus harness: `./scripts/run-tests.sh t7300-clean.sh` passes 55/55 after updating clean behavior for unreadable non-empty directories and preserving the harness global config file.
 - `cargo check` completed with the existing warning backlog. `cargo test -p grit-lib --lib` passed (233 tests). `cargo clippy --fix --allow-dirty` completed with the known warning backlog and failed auto-fixes in unrelated files (`bundle_uri_test_tool.rs`, `mergetool.rs`, `reset.rs`, `sparse_checkout.rs`, `worktree.rs`); unrelated auto-fixes were not kept.
 
+## 2026-06-03 — t1 family
+
+- Group 0 harness anomaly: `./scripts/run-tests.sh --timeout 60 --verbose
+  t12280-log-shortlog-format.sh` passes 36/36 after wrapping the setup block in a subshell so its
+  `cd repo` does not leak into later top-level test blocks. This repaired the prior timeout /
+  zero-count CSV row.
+
 # Test Results
 
 Updated: 2026-06-02
