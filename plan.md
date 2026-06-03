@@ -59,7 +59,10 @@
     `tree:0`.
   - Completed `t5318-pack-objects-revs-exclude.sh` (9/9) after making the synthetic
     fixture explicitly initialize its expected `master` branch and clear old repo metadata.
-  - Next focus: `t5331-pack-objects-stdin.sh`.
+  - Partial `t5331-pack-objects-stdin.sh`: improved from 2/16 to 9/16 by adding optional
+    `--stdin-packs[=mode]` parsing, incompatibility diagnostics, alternate pack lookup, and
+    duplicate-preserving per-pack inclusion. Continue here; remaining failures are tests 5, 6,
+    7, 8, 11, 12, and 13.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

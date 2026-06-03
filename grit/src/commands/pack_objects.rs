@@ -79,8 +79,8 @@ pub struct Args {
     pub all: bool,
 
     /// Read pack filenames from stdin instead of object IDs.
-    #[arg(long = "stdin-packs")]
-    pub stdin_packs: bool,
+    #[arg(long = "stdin-packs", num_args = 0..=1, default_missing_value = "", require_equals = true)]
+    pub stdin_packs: Option<String>,
 
     /// Disambiguation placeholder: Git rejects this (revision.c `--stdin` must not apply).
     #[arg(long = "stdin", hide = true)]
@@ -570,6 +570,12 @@ pub fn run(mut args: Args) -> Result<()> {
 
     if args.stdin_disambiguation {
         bail!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
+    }
+    if args.stdin_packs.is_some() && !args.filter.is_empty() {
+        bail!("options '--stdin-packs' and '--filter' cannot be used together");
+    }
+    if args.stdin_packs.is_some() && args.revs {
+        bail!("cannot use internal rev list with --stdin-packs");
     }
     if !args.extra.is_empty() {
         bail!("fatal: bad arguments to pack-objects");
@@ -1724,7 +1730,7 @@ fn build_thin_push_pack_from_have_set(
 }
 
 /// Apply `git pack-objects --filter=<spec>` (subset: `blob:none` for `gc.repackFilter` tests).
-fn pack_index_path_for_stdin_pack_spec(pack_dir: &Path, spec: &str) -> Result<PathBuf> {
+fn pack_index_path_for_stdin_pack_spec(pack_dirs: &[PathBuf], spec: &str) -> Result<PathBuf> {
     let idx_path = if spec.contains('/') || spec.contains('\\') {
         let p = PathBuf::from(spec);
         if p.extension().is_some_and(|e| e == "pack") {
@@ -1734,7 +1740,17 @@ fn pack_index_path_for_stdin_pack_spec(pack_dir: &Path, spec: &str) -> Result<Pa
         }
     } else {
         let stem = spec.strip_suffix(".pack").unwrap_or(spec);
-        pack_dir.join(format!("{stem}.idx"))
+        pack_dirs
+            .iter()
+            .map(|pack_dir| pack_dir.join(format!("{stem}.idx")))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| {
+                pack_dirs
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(format!("{stem}.idx"))
+            })
     };
     let idx_path = if idx_path.extension().is_some_and(|e| e == "pack") {
         idx_path.with_extension("idx")
@@ -1745,6 +1761,18 @@ fn pack_index_path_for_stdin_pack_spec(pack_dir: &Path, spec: &str) -> Result<Pa
         bail!("pack index not found: {}", idx_path.display());
     }
     Ok(idx_path)
+}
+
+fn normalize_stdin_pack_spec_name(spec: &str) -> String {
+    let file_name = Path::new(spec)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(spec);
+    let name = file_name
+        .strip_suffix(".idx")
+        .or_else(|| file_name.strip_suffix(".pack"))
+        .unwrap_or(file_name);
+    name.to_string()
 }
 
 fn apply_list_objects_filter(entries: &mut Vec<PackEntry>, filter: Option<&str>) {
@@ -2604,7 +2632,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
     // below, otherwise the leading `^` of an excluded pack makes the line look
     // like a rev exclusion and the pack name is fed to rev-parse (`repack
     // --geometric` on a partial clone: t5616 "after fetching descendants ...").
-    if args.stdin_packs {
+    if args.stdin_packs.is_some() {
         return collect_stdin_packs_oids(repo, args, &stdin_lines);
     }
 
@@ -2749,18 +2777,28 @@ fn collect_stdin_packs_oids(
     stdin_lines: &[String],
 ) -> Result<PackObjectList> {
     let pack_dir = repo.odb.objects_dir().join("pack");
+    let mut pack_dirs = vec![pack_dir.clone()];
+    if let Ok(alts) = grit_lib::pack::read_alternates_recursive(repo.odb.objects_dir()) {
+        pack_dirs.extend(alts.into_iter().map(|dir| dir.join("pack")));
+    }
+    let excluded_specs: HashSet<String> = stdin_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter_map(|s| s.strip_prefix('^').map(str::trim))
+        .map(normalize_stdin_pack_spec_name)
+        .collect();
     let mut missing_specs: Vec<String> = stdin_lines
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.strip_prefix('^').unwrap_or(s).trim().to_string())
-        .filter(|s| pack_index_path_for_stdin_pack_spec(&pack_dir, s).is_err())
+        .filter(|s| pack_index_path_for_stdin_pack_spec(&pack_dirs, s).is_err())
         .collect();
     if !missing_specs.is_empty() {
         missing_specs.sort();
         bail!("fatal: could not find pack '{}'", missing_specs[0]);
     }
-    let mut oids: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut oids: Vec<ObjectId> = Vec::new();
     let mut exclude: HashSet<ObjectId> = HashSet::new();
     for trimmed in stdin_lines
         .iter()
@@ -2771,7 +2809,7 @@ fn collect_stdin_packs_oids(
             continue;
         }
         let spec = trimmed[1..].trim();
-        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, spec)?;
+        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dirs, spec)?;
         let idx = grit_lib::pack::read_pack_index(&idx_path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
         for entry in idx.entries {
@@ -2796,15 +2834,16 @@ fn collect_stdin_packs_oids(
         if trimmed.starts_with('^') {
             continue;
         }
-        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, trimmed)?;
+        if excluded_specs.contains(&normalize_stdin_pack_spec_name(trimmed)) {
+            continue;
+        }
+        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dirs, trimmed)?;
         let idx = grit_lib::pack::read_pack_index(&idx_path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
         for entry in idx.entries {
             if entry.oid.len() == 20 {
                 if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
-                    if !exclude.contains(&oid) {
-                        oids.insert(oid);
-                    }
+                    oids.push(oid);
                 }
             }
         }
@@ -2815,12 +2854,12 @@ fn collect_stdin_packs_oids(
         collect_all_loose(&repo.odb, &mut loose)?;
         for oid in loose {
             if !exclude.contains(&oid) {
-                oids.insert(oid);
+                oids.push(oid);
             }
         }
     }
     Ok(PackObjectList {
-        oids: oids.into_iter().collect(),
+        oids,
         force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,

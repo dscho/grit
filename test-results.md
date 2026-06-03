@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5331-pack-objects-stdin partial
+
+- Focus harness: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh --verbose` improved to 9/16 after optional `--stdin-packs[=mode]` parsing, incompatibility diagnostics, alternate pack lookup, and duplicate-preserving per-pack inclusion.
+- Regression harness: `./scripts/run-tests.sh t5317-pack-objects-filter-objects.sh t5331-pack-objects-stdin.sh --verbose` keeps `t5317` at 33/33 and `t5331` at 9/16.
+
+
 ## 2026-06-03 — t5318-pack-objects-revs-exclude
 
 - Focus harness: `./scripts/run-tests.sh t5318-pack-objects-revs-exclude.sh --verbose` passes 9/9 after fixture branch initialization and setup cleanup.
