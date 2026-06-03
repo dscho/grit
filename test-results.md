@@ -1,3 +1,7 @@
+## 2026-06-03 — t1512-rev-parse-disambiguation
+
+- Focus harness: `./scripts/run-tests.sh t1512-rev-parse-disambiguation.sh --verbose` passes 38/38 after multi-pathspec `rm` matches unmerged stage entries for rename/rename conflict cleanup.
+
 ## 2026-06-03 — t1050-large partial
 
 - Focus harness improved from 14/29 to 15/29 after `hash-object` rejects negative `core.bigFileThreshold` values with a bad numeric config diagnostic. Remaining failures require large-blob packfile behavior.
