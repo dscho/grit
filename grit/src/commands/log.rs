@@ -605,8 +605,8 @@ pub struct Args {
     #[arg(last = true)]
     pub pathspecs: Vec<String>,
 
-    /// Break complete rewrites into pairs.
-    #[arg(short = 'B', long = "break-rewrites")]
+    /// Break complete rewrites into pairs. Takes an optional `-B[<n>][/<m>]` argument.
+    #[arg(short = 'B', long = "break-rewrites", default_missing_value = "", num_args = 0..=1, require_equals = true)]
     pub break_rewrites: Option<String>,
 
     /// Show tree objects in diff.
@@ -4107,6 +4107,16 @@ pub fn run(mut args: Args) -> Result<()> {
     if !args.find_copies_parts.is_empty() {
         args.find_copies = args.find_copies_parts.last().cloned();
         args.find_copies_harder = args.find_copies_parts.len() >= 2;
+    }
+
+    // `--follow` implicitly enables copy detection with find-copies-harder (git revision.c sets
+    // DIFF_DETECT_COPY | DIFF_FIND_COPIES_HARDER), so a file that first appears as a copy of a
+    // still-existing file is rendered `C100 old new` and its history is followed back.
+    if args.follow && !args.no_renames {
+        if args.find_copies.is_none() {
+            args.find_copies = Some("50".to_owned());
+        }
+        args.find_copies_harder = true;
     }
 
     let repo = Repository::discover(None).context("not a git repository")?;
@@ -11192,7 +11202,7 @@ fn follow_filter(
     initial_path: &str,
     max_count: Option<usize>,
 ) -> Result<Vec<(ObjectId, CommitInfo)>> {
-    use grit_lib::diff::detect_renames;
+    use grit_lib::diff::detect_copies;
 
     let mut tracked_path = initial_path.to_string();
     let mut result = Vec::new();
@@ -11207,32 +11217,34 @@ fn follow_filter(
         };
 
         let raw_entries = diff_trees(odb, parent_tree.as_ref(), Some(&info.tree), "")?;
-        let entries = detect_renames(odb, None, raw_entries, 50);
+        // `--follow` implicitly enables copy detection with `--find-copies-harder` (git
+        // revision.c sets DIFF_DETECT_COPY | DIFF_FIND_COPIES_HARDER), so a file that first
+        // appears as a copy of a still-existing file is followed back into the source's history.
+        let source_tree_entries = if let Some(ref pt) = parent_tree {
+            collect_tree_blobs_for_copy(odb, pt, "")?
+        } else {
+            Vec::new()
+        };
+        let entries = detect_copies(odb, None, raw_entries, 50, true, &source_tree_entries);
 
         let mut touches = false;
+        let mut retarget: Option<String> = None;
         for entry in &entries {
             match entry.status {
-                DiffStatus::Renamed => {
-                    // Check if the new path matches our tracked path
-                    if let Some(new_path) = entry.new_path.as_deref() {
-                        if new_path == tracked_path {
-                            touches = true;
-                            // Update tracked path to the old name for older commits
-                            if let Some(old_path) = entry.old_path.as_deref() {
-                                tracked_path = old_path.to_string();
-                            }
+                DiffStatus::Renamed | DiffStatus::Copied => {
+                    // The new path is the copy/rename destination; follow it back to the source.
+                    if entry.new_path.as_deref() == Some(tracked_path.as_str()) {
+                        touches = true;
+                        if let Some(old_path) = entry.old_path.as_deref() {
+                            retarget = Some(old_path.to_string());
                         }
                     }
-                    // Also check old path
-                    if let Some(old_path) = entry.old_path.as_deref() {
-                        if old_path == tracked_path {
-                            touches = true;
-                        }
+                    if entry.old_path.as_deref() == Some(tracked_path.as_str()) {
+                        touches = true;
                     }
                 }
                 _ => {
-                    let path = entry.path();
-                    if path == tracked_path {
+                    if entry.path() == tracked_path {
                         touches = true;
                     }
                 }
@@ -11241,6 +11253,9 @@ fn follow_filter(
 
         if touches {
             result.push((oid, info));
+            if let Some(new_target) = retarget {
+                tracked_path = new_target;
+            }
             if let Some(max) = max_count {
                 if result.len() >= max {
                     break;
