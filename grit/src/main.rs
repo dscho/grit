@@ -4493,7 +4493,11 @@ fn preprocess_git_notes_display_argv(
         out.push(rest[i].clone());
         i += 1;
     }
-    out.extend(notes_tail);
+    if !notes_tail.is_empty() {
+        let mut reordered = notes_tail;
+        reordered.extend(out);
+        out = reordered;
+    }
     match cli_on {
         Some(true) => std::env::set_var("GIT_GRIT_LOG_NOTES_CLI", "on"),
         Some(false) => std::env::set_var("GIT_GRIT_LOG_NOTES_CLI", "off"),

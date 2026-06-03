@@ -407,9 +407,6 @@ fn read_patches_from_log(
         .arg("--output-indicator-context=#")
         .arg("--pretty=medium")
         .arg("-p");
-    for arg in rev_args {
-        cmd.arg(arg);
-    }
     if args.diff_merges.is_none() {
         cmd.arg("--no-merges");
     }
@@ -425,6 +422,9 @@ fn read_patches_from_log(
     }
     if let Some(dm) = &args.diff_merges {
         cmd.arg(format!("--diff-merges={dm}"));
+    }
+    for arg in rev_args {
+        cmd.arg(arg);
     }
     for e in log_extra {
         cmd.arg(e);

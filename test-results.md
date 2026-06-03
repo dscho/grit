@@ -1,3 +1,12 @@
+## 2026-06-03 — t3206-range-diff custom notes partial
+
+- Focus harness improved from 38/48 to 40/48 after log note-display options are reordered before
+  revisions, allowing `range-diff --notes=<ref>` to compare custom/multiple notes.
+- Validation: `./scripts/run-tests.sh t3206-range-diff.sh t9300-branch-delete-force.sh` reports
+  `t3206` at 40/48 and keeps `t9300` at 25/25.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3206-range-diff partial
 
 - Focus harness improved from 37/48 to 38/48 after `HEAD@{1}` falls back to the current branch
