@@ -17,7 +17,11 @@
     behavior, scoped pathspecs, glob archive pathspecs, and bare tree attrs for attr pathspecs.
   - Completed `t5001-archive-attr.sh` (44/44) after adding tree/worktree/bare archive
     attribute sourcing and missing export-subst placeholders.
-  - Next focus: `t5003-archive-zip.sh`.
+  - Completed `t5003-archive-zip.sh` (82/82) after accepting ZIP compression-level
+    options and matching the smart-HTTP remote archive fixture behavior.
+  - Archive dependency group now passes: `t5000-tar-tree`, `t5000-write-tree`, `t5001`,
+    `t5002`, `t5003`, and `t5004`.
+  - Next focus group: request-pull/server-info, starting with `t5150-request-pull.sh`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

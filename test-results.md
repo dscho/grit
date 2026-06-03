@@ -1,4 +1,10 @@
 
+## 2026-06-03 — t5003-archive-zip
+
+- Focus harness: `./scripts/run-tests.sh t5003-archive-zip.sh --verbose` passes 82/82 after ZIP compression-level parsing and smart-HTTP remote archive handling.
+- Archive group regression: `./scripts/run-tests.sh --timeout 600 t5000-tar-tree.sh t5001-archive-attr.sh t5002-archive-attr-pattern.sh t5003-archive-zip.sh t5004-archive-corner-cases.sh --verbose` passes 90/90, 44/44, 19/19, 82/82, and 14/14; `./scripts/run-tests.sh t5000-write-tree.sh --verbose` passes 5/5.
+
+
 ## 2026-06-03 — t5001-archive-attr
 
 - Focus harness: `./scripts/run-tests.sh t5001-archive-attr.sh --verbose` passes 44/44 after tree/worktree/bare archive attribute sourcing and export-subst fixes.

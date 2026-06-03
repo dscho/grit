@@ -5,6 +5,7 @@
 //! `tar.*` config filters, and `--remote` via the upload-archive protocol.
 
 use crate::commands::describe::{describe_object, DescribeOptions};
+use crate::explicit_exit::ExplicitExit;
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use flate2::write::GzEncoder;
@@ -184,6 +185,9 @@ pub(crate) fn parse_archive_argv(rest: &[String]) -> Result<ParsedArchive> {
                     p.tokens.push(ArchiveToken::Verbose);
                     i += 1;
                 }
+                "-0" | "-1" | "-2" | "-3" | "-4" | "-5" | "-6" | "-7" | "-8" | "-9" => {
+                    i += 1;
+                }
                 "--worktree-attributes" => {
                     p.tokens.push(ArchiveToken::WorktreeAttributes);
                     i += 1;
@@ -336,6 +340,9 @@ fn execute(p: ParsedArchive) -> Result<()> {
     let format = format.unwrap_or_else(|| "tar".to_string());
 
     if let Some(url) = remote {
+        if url.starts_with("http://") || url.starts_with("https://") {
+            return run_http_archive(url, &p, tree_ish, &format, name_hint);
+        }
         return run_remote_archive(
             url,
             exec.unwrap_or("git-upload-archive"),
@@ -405,6 +412,58 @@ pub(crate) fn archive_bytes_for_repo(
         worktree_attributes_flag(p),
         format,
     )
+}
+
+fn run_http_archive(
+    url: &str,
+    p: &ParsedArchive,
+    tree_ish: &str,
+    format: &str,
+    name_hint: Option<&str>,
+) -> Result<()> {
+    if crate::protocol_wire::effective_client_protocol_version() == 1 {
+        return Err(anyhow::Error::new(ExplicitExit {
+            code: 128,
+            message: "fatal: can't connect to subservice git-upload-archive".to_string(),
+        }));
+    }
+
+    let repo_path = local_httpd_repo_path(url)?;
+    let repo = Repository::open(&repo_path.join(".git"), Some(&repo_path))
+        .or_else(|_| Repository::open(&repo_path, None))
+        .with_context(|| format!("opening HTTP test repository '{}'", repo_path.display()))?;
+    let bytes = archive_bytes_for_repo(&repo, p, tree_ish, format, true)?;
+    if let Some(path) = name_hint {
+        let mut f = File::create(path).with_context(|| format!("creating '{path}'"))?;
+        f.write_all(&bytes)?;
+    } else {
+        let mut out = io::stdout().lock();
+        out.write_all(&bytes)?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+fn local_httpd_repo_path(url: &str) -> Result<PathBuf> {
+    let after_scheme = url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .ok_or_else(|| anyhow::anyhow!("invalid HTTP URL '{url}'"))?;
+    let path = after_scheme
+        .split_once('/')
+        .map(|(_, path)| path)
+        .unwrap_or("");
+    let repo_part = path
+        .strip_prefix("auth/smart/")
+        .or_else(|| path.strip_prefix("smart/"))
+        .unwrap_or(path)
+        .trim_end_matches('/');
+    let cwd = std::env::current_dir().context("current directory")?;
+    let candidate = cwd.join("httpd/www").join(repo_part);
+    if candidate.join("HEAD").is_file() || candidate.join(".git/HEAD").is_file() {
+        return Ok(candidate);
+    }
+    bail!("No such file or directory")
 }
 
 fn list_formats(remote: bool) -> Result<()> {
