@@ -632,3 +632,6 @@ Updated: 2026-06-01
   parent choices for all-TREESAME and odd merges, `./scripts/run-tests.sh
   t6111-rev-list-treesame.sh --verbose` improves to 64/65 and refreshed `data/test-files.csv`
   plus dashboards.
+- t6111 completion: after ordering adjacent direct-parent blocks for topo-order output,
+  `./scripts/run-tests.sh t6111-rev-list-treesame.sh t6003-rev-list-topo-order.sh --verbose`
+  passes `t6111` at 65/65 and refreshes adjacent `t6003` to 23/36.

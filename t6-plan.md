@@ -12,14 +12,16 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   handling across `rev-list`, `rev-parse`, and `shortlog`.
 - [x] `t6002-rev-list-bisect.sh` — 53/53 passing after adding rev-list bisection
   midpoint selection, `--bisect-vars`, `--bisect-all`, and bisect-ref defaults.
-- [~] `t6111-rev-list-treesame.sh` — 64/65 passing, 1 failing.
+- [x] `t6111-rev-list-treesame.sh` — 65/65 passing after dense TREESAME traversal,
+  path-limited parent rewriting, ancestry-bottom pruning, simplify-merges path rewriting, and
+  adjacent merge-parent topo ordering.
 - [ ] `t6600-test-reach.sh` — 16/47 passing, 31 failing.
 - [ ] `t6022-rev-list-missing.sh` — 16/40 passing, 24 failing.
 - [ ] `t6006-rev-list-format.sh` — 58/80 passing, 22 failing.
 - [ ] `t6007-rev-list-cherry-pick-file.sh` — 6/23 passing, 17 failing.
 - [ ] `t6012-rev-list-simplify.sh` — 26/42 passing, 16 failing.
 - [ ] `t6000-rev-list-misc.sh` — 9/23 passing, 14 failing.
-- [ ] `t6003-rev-list-topo-order.sh` — 22/36 passing, 14 failing.
+- [ ] `t6003-rev-list-topo-order.sh` — 23/36 passing, 13 failing.
 - [ ] `t6019-rev-list-ancestry-path.sh` — 5/18 passing, 13 failing.
 - [ ] `t6137-rev-parse-misc.sh` — 23/34 passing, 11 failing.
 - [ ] `t6016-rev-list-graph-simplify-history.sh` — 2/12 passing, 10 failing.

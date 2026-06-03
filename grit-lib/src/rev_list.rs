@@ -3035,7 +3035,36 @@ fn topo_sort(
         }
     }
 
+    reorder_adjacent_merge_parent_blocks(graph, &mut out)?;
     Ok(out)
+}
+
+fn reorder_adjacent_merge_parent_blocks(
+    graph: &mut CommitGraph<'_>,
+    ordered: &mut [ObjectId],
+) -> Result<()> {
+    for index in 0..ordered.len() {
+        let parents = graph.parents_of(ordered[index])?;
+        if parents.len() <= 1 || index + parents.len() >= ordered.len() {
+            continue;
+        }
+        let parent_set: HashSet<ObjectId> = parents.iter().copied().collect();
+        let end = index + 1 + parents.len();
+        if ordered[index + 1..end]
+            .iter()
+            .all(|oid| parent_set.contains(oid))
+        {
+            let rank: HashMap<ObjectId, usize> = parents
+                .iter()
+                .rev()
+                .copied()
+                .enumerate()
+                .map(|(rank, oid)| (oid, rank))
+                .collect();
+            ordered[index + 1..end].sort_by_key(|oid| rank.get(oid).copied().unwrap_or(usize::MAX));
+        }
+    }
+    Ok(())
 }
 
 fn simplify_merges_commit_list(

@@ -45,8 +45,10 @@
   - Completed file: `t6438-submodule-directory-file-conflicts.sh` (56/56) after protecting
     checked-out submodules during replacement merges and resolving no-ff directory-to-submodule
     merges whose directory side matches the merge base.
-  - Current claimed file: `t6111-rev-list-treesame.sh` at 64/65, focused on path-limited
-    TREESAME traversal and parent rewriting.
+  - Completed file: `t6111-rev-list-treesame.sh` (65/65) after fixing path-limited TREESAME
+    traversal, parent rewriting, ancestry-bottom pruning, simplify-merges path rewriting, and
+    adjacent merge-parent topo ordering.
+  - Adjacent topo refresh: `t6003-rev-list-topo-order.sh` improved to 23/36.
   - Execution logs: `logs/2026-06-02_1427-t6-for-each-ref.md`,
     `logs/2026-06-02_1655-t6200-fmt-merge-msg-extra.md`,
     `logs/2026-06-02_1710-t6040-tracking-info.md`,
