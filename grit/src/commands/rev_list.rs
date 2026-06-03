@@ -600,9 +600,13 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     if walk_reflog {
+        // Bare `--reflog` (no positional revision) walks the reflogs of HEAD and
+        // every ref, mirroring Git's `add_reflogs_to_pending`.
         if revision_specs.is_empty() {
-            eprintln!("usage: git rev-list [<options>] <commit>... [--] [<path>...]");
-            std::process::exit(129);
+            revision_specs = grit_lib::reflog::list_reflog_refs(&repo.git_dir).unwrap_or_default();
+            if revision_specs.is_empty() {
+                return Ok(());
+            }
         }
         return run_rev_list_reflog_walk(
             &repo,

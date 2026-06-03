@@ -106,6 +106,15 @@ pub struct Args {
     #[arg(skip)]
     pub(crate) expand_tabs_in_log: usize,
 
+    /// Output the commit log in the given encoding (overrides `i18n.logOutputEncoding`).
+    #[arg(long = "encoding")]
+    pub encoding: Option<String>,
+
+    /// Effective log output encoding label (resolved after parsing): `--encoding`
+    /// > `i18n.logOutputEncoding` > UTF-8. `None` means no reencoding (UTF-8).
+    #[arg(skip)]
+    pub(crate) log_output_encoding: Option<String>,
+
     /// Show in reverse order.
     #[arg(long = "reverse")]
     pub reverse: bool,
@@ -277,6 +286,14 @@ pub struct Args {
     /// `--branches` includes every branch; `--branches=<glob>` only matching ones.
     #[arg(long = "branches", num_args = 0..=1, default_missing_value = "")]
     pub branches: Option<String>,
+
+    /// Include tag refs (refs/tags/) in the revision walk, optionally limited to a glob.
+    #[arg(long = "tags", num_args = 0..=1, default_missing_value = "")]
+    pub tags: Option<String>,
+
+    /// Include remote-tracking refs (refs/remotes/) in the walk, optionally limited to a glob.
+    #[arg(long = "remotes", num_args = 0..=1, default_missing_value = "")]
+    pub remotes: Option<String>,
 
     /// Follow file renames (single file only).
     #[arg(long = "follow")]
@@ -588,8 +605,8 @@ pub struct Args {
     #[arg(last = true)]
     pub pathspecs: Vec<String>,
 
-    /// Break complete rewrites into pairs.
-    #[arg(short = 'B', long = "break-rewrites")]
+    /// Break complete rewrites into pairs. Takes an optional `-B[<n>][/<m>]` argument.
+    #[arg(short = 'B', long = "break-rewrites", default_missing_value = "", num_args = 0..=1, require_equals = true)]
     pub break_rewrites: Option<String>,
 
     /// Show tree objects in diff.
@@ -1102,7 +1119,7 @@ fn run_line_log(
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
     let (show_decorations, decorate_full) =
@@ -1585,7 +1602,7 @@ fn resolve_decoration_display(
             },
         }
     }
-    for arg in std::env::args() {
+    for arg in std::env::args_os().map(|a| a.to_string_lossy().into_owned()) {
         if arg == "--no-decorate" {
             show = false;
             full = false;
@@ -1608,11 +1625,12 @@ fn resolve_decoration_display(
     }
     let oneline_like = log_uses_builtin_oneline(args);
     if oneline_like && !args.no_decorate && !show {
-        // Upstream Git only decorates `--oneline` for TTY/pager output, but many harness tests
-        // (and users comparing to `git log` in scripts) expect branch tips on every line; match
-        // that behavior unless `--no-decorate` is set.
-        show = true;
-        full = false;
+        // Upstream Git only auto-decorates default log output (including `--oneline`)
+        // when stdout is a terminal; piped/redirected output is left undecorated.
+        if std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            show = true;
+            full = false;
+        }
     }
     (show, full)
 }
@@ -1812,6 +1830,12 @@ fn hydrate_log_options_from_raw_argv(args: &mut Args) {
                 i += 2;
                 continue;
             }
+        }
+
+        if !args.oneline && arg == "--oneline" {
+            args.oneline = true;
+            i += 1;
+            continue;
         }
 
         if args.format.is_none() {
@@ -2058,6 +2082,9 @@ fn extract_log_cli_revision_specs(
     let mut implied_pathspecs: Vec<String> = Vec::new();
     let mut revision_specs = Vec::new();
     let mut after_end_of_options = false;
+    // When an explicit `--` is present, tokens before it MUST resolve as objects; git's
+    // setup_revisions does not reinterpret them as pathspecs on failure (t4208).
+    let has_dashdash = merged_revisions.iter().any(|r| r == "--");
     for rev in merged_revisions {
         if rev == "--end-of-options" {
             after_end_of_options = true;
@@ -2097,8 +2124,21 @@ fn extract_log_cli_revision_specs(
             }
         } else {
             match resolve_revision_as_commit(repo, rev) {
-                Ok(_) => revision_specs.push(rev.clone()),
-                Err(_err) if is_likely_pathspec_during_rev_parse(rev) => {
+                Ok(_) => {
+                    // git's setup_revisions: when a token resolves as a revision but the same
+                    // token (minus any magic) also names an existing worktree/index path and no
+                    // explicit `--` separator is present, the argument is ambiguous (t4208 `:/a`).
+                    if !has_dashdash && rev_token_collides_with_path(repo, rev) {
+                        return Err(anyhow::anyhow!(
+                            "fatal: ambiguous argument '{rev}': both revision and filename\n\
+                             Use '--' to separate paths from revisions, like this:\n\
+                             'git <command> [<revision>...] -- [<file>...]'"
+                        ));
+                    }
+                    revision_specs.push(rev.clone())
+                }
+                // An explicit `--` forces object resolution: do not reinterpret as pathspec.
+                Err(_err) if !has_dashdash && is_likely_pathspec_during_rev_parse(rev) => {
                     implied_pathspecs.push(rev.clone())
                 }
                 Err(_err) => match resolve_revision_as_commit_after_precompose(repo, rev) {
@@ -2112,12 +2152,18 @@ fn extract_log_cli_revision_specs(
                     }
                     // git's verify_filename: a token that fails to resolve as a revision but
                     // names an existing worktree/index path is an implied pathspec.
-                    Err(_err) if token_names_existing_path(repo, rev) => {
+                    Err(_err) if !has_dashdash && token_names_existing_path(repo, rev) => {
                         implied_pathspecs.push(rev.clone());
                     }
                     // `--ignore-missing`: drop tokens that name no object instead of erroring.
                     Err(_err) if args.ignore_missing => {}
-                    Err(err) => return Err(err.into()),
+                    Err(_err) => {
+                        return Err(anyhow::anyhow!(
+                            "fatal: ambiguous argument '{rev}': unknown revision or path not in the working tree.\n\
+                             Use '--' to separate paths from revisions, like this:\n\
+                             'git <command> [<revision>...] -- [<file>...]'"
+                        ));
+                    }
                 },
             }
         }
@@ -2157,7 +2203,17 @@ fn run_rev_list_log(
     let (core_commit_graph, cg_read_paths, cg_changed_ver) = load_bloom_walk_config(&repo.git_dir);
     let use_bloom = core_commit_graph
         && !combined_pathspecs.is_empty()
-        && grit_lib::pathspec::pathspecs_allow_bloom(&combined_pathspecs);
+        && grit_lib::pathspec::pathspecs_allow_bloom(&combined_pathspecs)
+        && !args.walk_reflogs;
+    let trace2_perf = std::env::var("GIT_TRACE2_PERF")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let bloom_stats: Option<BloomWalkStatsHandle> = if trace2_perf && use_bloom {
+        Some(Arc::new(Mutex::new(BloomWalkStats::default())))
+    } else {
+        None
+    };
+    let _bloom_perf_guard = bloom_stats.as_ref().map(|h| BloomPerfGuard(Arc::clone(h)));
 
     let ordering = if args.topo_order || args.simplify_merges {
         if args.author_date_order {
@@ -2198,6 +2254,7 @@ fn run_rev_list_log(
         use_commit_graph_bloom: use_bloom,
         commit_graph_read_changed_paths: cg_read_paths,
         commit_graph_changed_paths_version: cg_changed_ver,
+        bloom_stats: bloom_stats.clone(),
         ..RevListOptions::default()
     };
 
@@ -2223,7 +2280,7 @@ fn run_rev_list_log(
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
     let (show_decorations, decorate_full) =
@@ -2498,7 +2555,7 @@ fn run_graph_log(
             p.clone()
         };
         let re = RegexBuilder::new(&pat)
-            .case_insensitive(true)
+            .case_insensitive(args.regexp_ignore_case)
             .build()
             .with_context(|| format!("invalid --author regex: {p}"))?;
         author_res_graph.push(re);
@@ -2511,7 +2568,7 @@ fn run_graph_log(
             p.clone()
         };
         let re = RegexBuilder::new(&pat)
-            .case_insensitive(true)
+            .case_insensitive(args.regexp_ignore_case)
             .build()
             .with_context(|| format!("invalid --committer regex: {p}"))?;
         committer_res_graph.push(re);
@@ -2610,7 +2667,7 @@ fn run_graph_log(
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
     let (show_decorations_graph, decorate_full_graph) =
@@ -3986,6 +4043,33 @@ fn emit_bloom_perf_line(stats: &BloomWalkStats, path: &str) {
 pub fn run(mut args: Args) -> Result<()> {
     hydrate_log_options_from_raw_argv(&mut args);
 
+    // `--tags`/`--remotes` are accepted as proper options (so they don't absorb
+    // following `--decorate` etc. via the hyphen-tolerant positional list); turn
+    // them back into the pseudo-ref tokens the revision expander understands.
+    {
+        let mut injected: Vec<String> = Vec::new();
+        if let Some(glob) = args.tags.take() {
+            injected.push(if glob.is_empty() {
+                "--tags".to_owned()
+            } else {
+                format!("--tags={glob}")
+            });
+        }
+        if let Some(glob) = args.remotes.take() {
+            injected.push(if glob.is_empty() {
+                "--remotes".to_owned()
+            } else {
+                format!("--remotes={glob}")
+            });
+        }
+        if !injected.is_empty() {
+            args.revisions.extend(injected.iter().cloned());
+            if !args.raw_argv_tail.is_empty() {
+                args.raw_argv_tail.extend(injected);
+            }
+        }
+    }
+
     let saw_bare_l = args.line_range.iter().any(|s| s.is_empty());
     args.line_range.retain(|s| !s.is_empty());
     if saw_bare_l && args.line_range.is_empty() {
@@ -4025,6 +4109,16 @@ pub fn run(mut args: Args) -> Result<()> {
         args.find_copies_harder = args.find_copies_parts.len() >= 2;
     }
 
+    // `--follow` implicitly enables copy detection with find-copies-harder (git revision.c sets
+    // DIFF_DETECT_COPY | DIFF_FIND_COPIES_HARDER), so a file that first appears as a copy of a
+    // still-existing file is rendered `C100 old new` and its history is followed back.
+    if args.follow && !args.no_renames {
+        if args.find_copies.is_none() {
+            args.find_copies = Some("50".to_owned());
+        }
+        args.find_copies_harder = true;
+    }
+
     let repo = Repository::discover(None).context("not a git repository")?;
     if args.format.is_none() {
         args.format = args.pretty.clone();
@@ -4038,7 +4132,7 @@ pub fn run(mut args: Args) -> Result<()> {
     validate_log_pickaxe_options(&repo, &args)?;
 
     if let Some(ref fmt) = args.format {
-        let resolved = resolve_pretty_alias_with_config(fmt, &repo);
+        let resolved = resolve_pretty_alias_checked(fmt, &repo)?;
         if resolved != *fmt {
             args.format = Some(resolved);
         }
@@ -4057,7 +4151,29 @@ pub fn run(mut args: Args) -> Result<()> {
         args.oneline,
     );
 
-    for raw in std::env::args() {
+    // Resolve the effective log output encoding: --encoding overrides
+    // i18n.logOutputEncoding; absent both, output stays UTF-8 (no reencoding).
+    {
+        let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        let mut enc = args
+            .encoding
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                cfg.get("i18n.logOutputEncoding")
+                    .or_else(|| cfg.get("i18n.logoutputencoding"))
+            });
+        if let Some(label) = enc.as_deref() {
+            if label.eq_ignore_ascii_case("UTF-8") || label.eq_ignore_ascii_case("UTF8") {
+                enc = None;
+            }
+        }
+        args.log_output_encoding = enc;
+    }
+
+    for raw in std::env::args_os().map(|a| a.to_string_lossy().into_owned()) {
         if let Some(rest) = raw.strip_prefix("--ancestry-path=") {
             if !rest.is_empty() {
                 args.ancestry_path_bottom = Some(rest.to_owned());
@@ -4126,13 +4242,13 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let mut author_res: Vec<Regex> = Vec::new();
     for p in &args.authors {
-        let re = build_grep_regex(p, grep_ptype, true)
+        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
             .with_context(|| format!("invalid --author regex: {p}"))?;
         author_res.push(re);
     }
     let mut committer_res: Vec<Regex> = Vec::new();
     for p in &args.committers {
-        let re = build_grep_regex(p, grep_ptype, true)
+        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
             .with_context(|| format!("invalid --committer regex: {p}"))?;
         committer_res.push(re);
     }
@@ -4170,7 +4286,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Resolve pretty format aliases from config
     if let Some(ref fmt) = args.format {
-        let resolved = resolve_pretty_alias_with_config(fmt, &repo);
+        let resolved = resolve_pretty_alias_checked(fmt, &repo)?;
         if resolved != *fmt {
             args.format = Some(resolved);
         }
@@ -4369,7 +4485,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 .strip_prefix("format:")
                 .or_else(|| fmt.strip_prefix("tformat:"))
                 .unwrap_or(fmt);
-            template.contains("%d") || template.contains("%D")
+            template.contains("%d") || template.contains("%D") || template.contains("%(decorate")
         })
         .unwrap_or(false);
 
@@ -4811,7 +4927,38 @@ pub fn run(mut args: Args) -> Result<()> {
 /// Git rejects pathspecs that escape the worktree (e.g. `..`) as
 /// "outside repository", and also rejects pathspecs provided while running in
 /// an unqualified `.git` context.
+/// Validate `:(...)` long magic words, matching git's pathspec.c `get_prefix`/magic parser.
+/// Returns the `fatal: Invalid pathspec magic '<word>' in '<spec>'` error for an unknown word.
+fn validate_pathspec_magic_words(pathspecs: &[String]) -> Result<()> {
+    for spec in pathspecs {
+        let Some(rest) = spec.strip_prefix(":(") else {
+            continue;
+        };
+        let Some(close) = rest.find(')') else {
+            continue;
+        };
+        let magic_part = &rest[..close];
+        for raw in magic_part.split(',') {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+            // Forms taking a value: `prefix:...`, `attr:...`.
+            let word = token.split(':').next().unwrap_or(token);
+            let known = matches!(
+                word,
+                "top" | "literal" | "icase" | "glob" | "attr" | "exclude" | "prefix"
+            );
+            if !known {
+                anyhow::bail!("fatal: Invalid pathspec magic '{word}' in '{spec}'");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_pathspec_scope(repo: &Repository, pathspecs: &[String]) -> Result<()> {
+    validate_pathspec_magic_words(pathspecs)?;
     if pathspecs.is_empty() {
         return Ok(());
     }
@@ -4971,9 +5118,18 @@ pub fn run_no_walk(
             oids.push(*oid);
         }
     } else {
-        for rev in &args.revisions {
+        // Expand pseudo-refs (`--tags`, `--all`, `--branches`, `--remotes`,
+        // `--glob=`) into concrete revision tokens before resolving each.
+        let expanded = merge_log_revision_argv(repo, args)?;
+        let mut seen = HashSet::new();
+        for rev in &expanded {
+            if rev == "--" || rev.starts_with('^') {
+                continue;
+            }
             let oid = resolve_revision_as_commit(repo, rev)?;
-            oids.push(oid);
+            if seen.insert(oid) {
+                oids.push(oid);
+            }
         }
     }
 
@@ -5402,7 +5558,12 @@ fn run_reflog_walk(
     mailmap: &MailmapTable,
 ) -> Result<()> {
     let rev_specs: Vec<String> = if args.revisions.is_empty() {
-        vec!["HEAD".to_string()]
+        // Bare `--reflog`/`--walk-reflogs` walks every ref's reflog plus HEAD.
+        let mut refs = grit_lib::reflog::list_reflog_refs(&repo.git_dir).unwrap_or_default();
+        if refs.is_empty() {
+            refs.push("HEAD".to_string());
+        }
+        refs
     } else {
         args.revisions.clone()
     };
@@ -5841,6 +6002,28 @@ fn run_reflog_walk(
                     }
                     writeln!(out)?;
                 }
+                "reference" => {
+                    // `--pretty=reference` ignores reflog selectors; render the
+                    // `%h (%s, %ad)` reference line (short date unless --date set).
+                    let date_ph = if cli_date_for_reflog.is_some() {
+                        "%ad"
+                    } else {
+                        "%as"
+                    };
+                    let template = format!("%h (%s, {date_ph})");
+                    let line = apply_reflog_format_string(
+                        &template,
+                        &entry.new_oid,
+                        &commit_data,
+                        &percent_gd,
+                        &entry.message,
+                        &entry.identity,
+                        mailmap,
+                        use_mailmap,
+                        et,
+                    );
+                    writeln!(out, "{}", line)?;
+                }
                 _ => {
                     let fmt_str = fmt
                         .strip_prefix("tformat:")
@@ -6095,6 +6278,14 @@ fn apply_reflog_format_string(
                                 extract_email(&commit.author)
                             };
                             result.push_str(&local_part_of_email(&email));
+                        }
+                        Some('s') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&commit.author, Some("short")));
+                        }
+                        Some('d') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&commit.author, None));
                         }
                         _ => {
                             result.push_str("%a");
@@ -7718,6 +7909,17 @@ fn run_symmetric_log(
     Ok(())
 }
 
+/// Encode a formatted log fragment for output. With no active output encoding
+/// (UTF-8), the UTF-8 bytes are returned verbatim; otherwise the string is
+/// reencoded to the target charset (Git's `logmsg_reencode`).
+fn encode_log_str(s: &str, encoding: Option<&str>) -> Vec<u8> {
+    match encoding {
+        None => s.as_bytes().to_vec(),
+        Some(label) => grit_lib::commit_encoding::encode_header_text(label, s)
+            .unwrap_or_else(|| s.as_bytes().to_vec()),
+    }
+}
+
 /// Format and print a single commit.
 ///
 /// When `parent_line_override` is set (e.g. `log --parents` after line-log rewrite), `%p` / `%P`
@@ -7763,9 +7965,12 @@ fn format_commit(
         } else {
             first_line.to_owned()
         };
+        let enc = args.log_output_encoding.as_deref();
         let abbrev = &hex[..abbrev_len.min(hex.len())];
         if let Some(src) = source_for_oneline {
-            writeln!(out, "{abbrev}\t{src} {first_line}")?;
+            let line = format!("{abbrev}\t{src} {first_line}");
+            out.write_all(&encode_log_str(&line, enc))?;
+            out.write_all(b"\n")?;
         } else {
             let oid_color = if use_color {
                 decoration_paint
@@ -7788,15 +7993,16 @@ fn format_commit(
                 decoration_paint,
                 head_for_decor,
             );
-            writeln!(
-                out,
+            let line = format!(
                 "{}{}{}{} {}",
                 oid_color,
                 &hex[..abbrev_len.min(hex.len())],
                 oid_reset,
                 dec,
                 first_line
-            )?;
+            );
+            out.write_all(&encode_log_str(&line, enc))?;
+            out.write_all(b"\n")?;
         }
         return Ok(());
     }
@@ -7845,14 +8051,16 @@ fn format_commit(
                 et,
                 signature_ref,
             );
+            let bytes = encode_log_str(&formatted, args.log_output_encoding.as_deref());
             if is_tformat {
+                out.write_all(&bytes)?;
                 if args.null_terminator {
-                    write!(out, "{formatted}\0")?;
+                    out.write_all(b"\0")?;
                 } else {
-                    writeln!(out, "{formatted}")?;
+                    out.write_all(b"\n")?;
                 }
             } else {
-                write!(out, "{formatted}")?;
+                out.write_all(&bytes)?;
             }
         }
         Some("raw") => {
@@ -8049,14 +8257,35 @@ fn format_commit(
             write_notes(out, oid, notes_cache, args, odb)?;
         }
         Some("reference") => {
-            let subject = info.message.lines().next().unwrap_or("");
-            let line = grit_lib::commit_pretty::format_reference_line(
+            // `--pretty=reference` is equivalent to the format
+            // `%C(auto)%h (%s, %as)` (short committer date), except an explicit
+            // `--date` overrides the date mode and the hash is always abbreviated.
+            // It never shows decorations or reflog selectors.
+            let date_ph = if date_format.is_some() { "%ad" } else { "%as" };
+            let template = format!("%C(auto)%h (%s, {date_ph})");
+            // Force abbreviation even under --no-abbrev-commit.
+            let ref_abbrev = if abbrev_len >= 40 { 7 } else { abbrev_len };
+            let formatted = apply_format_string(
+                &template,
                 oid,
-                subject,
-                &info.committer,
-                abbrev_len,
+                info,
+                None,
+                date_format,
+                ref_abbrev,
+                use_color,
+                decoration_paint,
+                head_for_decor,
+                None,
+                display_parents,
+                log_marker,
+                mailmap,
+                use_mailmap,
+                et,
+                signature_ref,
             );
-            writeln!(out, "{line}")?;
+            let bytes = encode_log_str(&formatted, args.log_output_encoding.as_deref());
+            out.write_all(&bytes)?;
+            out.write_all(b"\n")?;
         }
         Some(other) => {
             // Try as a format string directly
@@ -8087,6 +8316,156 @@ fn format_commit(
 }
 
 /// Apply a format string with placeholders like %H, %h, %s, %an, %ae, etc.
+/// Expand the `%xNN`, `%n`, `%t`, `%%` escapes that appear in trailer
+/// separator values (Git's `format_trailer_match` / `strbuf_expand`).
+fn expand_trailer_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('x') => {
+                chars.next();
+                let mut hx = String::new();
+                for _ in 0..2 {
+                    if let Some(&d) = chars.peek() {
+                        if d.is_ascii_hexdigit() {
+                            hx.push(d);
+                            chars.next();
+                        }
+                    }
+                }
+                if let Ok(b) = u8::from_str_radix(&hx, 16) {
+                    out.push(b as char);
+                }
+            }
+            Some('n') => {
+                chars.next();
+                out.push('\n');
+            }
+            Some('t') => {
+                chars.next();
+                out.push('\t');
+            }
+            Some('%') => {
+                chars.next();
+                out.push('%');
+            }
+            _ => out.push('%'),
+        }
+    }
+    out
+}
+
+/// Parse the option string of a `%(trailers...)` placeholder (the part after
+/// `trailers`, beginning with an optional `:`). Returns `None` on an invalid
+/// option so the caller can emit the placeholder literally (matching Git).
+fn parse_trailers_opts(rest: &str) -> Option<grit_lib::commit_trailers::TrailerOpts> {
+    use grit_lib::commit_trailers::TrailerOpts;
+    let mut opts = TrailerOpts::default();
+    let body = match rest.strip_prefix(':') {
+        Some(b) => b,
+        None => {
+            // `%(trailers)` with no colon: default options.
+            if rest.is_empty() {
+                return Some(opts);
+            }
+            // e.g. `%(trailersfoo)` — not a valid placeholder.
+            return None;
+        }
+    };
+    if body.is_empty() {
+        return Some(opts);
+    }
+    let mut explicit_only: Option<bool> = None;
+    let mut has_key_filter = false;
+    for tok in body.split(',') {
+        let (name, value) = match tok.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (tok, None),
+        };
+        let truthy = |v: Option<&str>| -> bool {
+            matches!(
+                v,
+                None | Some("yes") | Some("true") | Some("on") | Some("1") | Some("")
+            )
+        };
+        match name {
+            "only" => explicit_only = Some(truthy(value)),
+            "unfold" => opts.unfold = truthy(value),
+            "keyonly" => opts.keyonly = truthy(value),
+            "valueonly" => opts.valueonly = truthy(value),
+            "key" => {
+                let v = value?; // `key` without value is an error.
+                let mut k = v.to_owned();
+                // A trailing `:` on the key is tolerated (test 75).
+                if let Some(stripped) = k.strip_suffix(':') {
+                    k = stripped.to_owned();
+                }
+                opts.filter_keys.push(k);
+                has_key_filter = true;
+            }
+            "separator" => {
+                opts.separator = expand_trailer_value(value.unwrap_or(""));
+            }
+            "key_value_separator" => {
+                opts.key_value_separator = expand_trailer_value(value.unwrap_or(""));
+            }
+            _ => return None,
+        }
+    }
+    // Git: a key filter turns on only_trailers unless overridden by an explicit
+    // only=no.
+    opts.only_trailers = explicit_only.unwrap_or(has_key_filter);
+    Some(opts)
+}
+
+/// Parse the option string of a `%(describe...)` placeholder (the part after
+/// `describe`). Returns `None` on a malformed option (so the placeholder is
+/// emitted literally).
+fn parse_describe_opts(rest: &str) -> Option<crate::commands::describe::DescribeOptions> {
+    let mut opts = crate::commands::describe::DescribeOptions::default_for_format();
+    let body = match rest.strip_prefix(':') {
+        Some(b) => b,
+        None => {
+            if rest.is_empty() {
+                return Some(opts);
+            }
+            return None;
+        }
+    };
+    if body.is_empty() {
+        return Some(opts);
+    }
+    for tok in body.split(',') {
+        let (name, value) = match tok.split_once('=') {
+            Some((n, v)) => (n, Some(v)),
+            None => (tok, None),
+        };
+        match name {
+            "match" => opts.match_pattern.push(value?.to_owned()),
+            "exclude" => opts.exclude_pattern.push(value?.to_owned()),
+            "tags" => opts.tags = true,
+            "abbrev" => opts.abbrev = value?.parse().ok()?,
+            _ => return None,
+        }
+    }
+    Some(opts)
+}
+
+/// Run `git describe` for a commit during pretty formatting; returns `None`
+/// when no description is found (Git emits an empty placeholder).
+fn run_describe_for_format(
+    oid: &ObjectId,
+    opts: &crate::commands::describe::DescribeOptions,
+) -> Option<String> {
+    let repo = grit_lib::repo::Repository::discover(None).ok()?;
+    crate::commands::describe::describe_object(&repo, *oid, opts).ok()
+}
+
 fn apply_format_string(
     template: &str,
     oid: &ObjectId,
@@ -8127,29 +8506,89 @@ fn apply_format_string(
         trunc: Trunc,
         absolute: bool,
     }
+    // Git-style display width of a single character: control characters render
+    // with zero columns, wide characters with two, everything else with one.
+    fn char_display_width(c: char) -> usize {
+        let cp = c as u32;
+        if cp < 0x20 || cp == 0x7f {
+            0
+        } else {
+            1
+        }
+    }
+    fn display_width(s: &str) -> usize {
+        s.chars().map(char_display_width).sum()
+    }
     fn apply_col(spec: &ColSpec, s: &str) -> String {
-        let char_len = s.chars().count();
+        let char_len = display_width(s);
         if char_len > spec.width {
+            // Truncation operates on display columns; leading zero-width control
+            // characters are preserved and do not count toward the budget.
             match spec.trunc {
                 Trunc::None => s.to_owned(),
                 Trunc::Trunc => {
-                    let mut out: String = s.chars().take(spec.width.saturating_sub(2)).collect();
+                    let budget = spec.width.saturating_sub(2);
+                    let mut out = String::new();
+                    let mut used = 0usize;
+                    for c in s.chars() {
+                        let w = char_display_width(c);
+                        if used + w > budget {
+                            break;
+                        }
+                        out.push(c);
+                        used += w;
+                    }
                     out.push_str("..");
                     out
                 }
                 Trunc::LTrunc => {
-                    let skip = char_len - spec.width + 2;
+                    // Skip from the left until the remaining display width fits.
+                    let target = spec.width.saturating_sub(2);
+                    let chars: Vec<char> = s.chars().collect();
+                    // Find the smallest suffix whose display width <= target.
+                    let mut idx = chars.len();
+                    let mut acc = 0usize;
+                    while idx > 0 {
+                        let w = char_display_width(chars[idx - 1]);
+                        if acc + w > target {
+                            break;
+                        }
+                        acc += w;
+                        idx -= 1;
+                    }
                     let mut out = String::from("..");
-                    out.extend(s.chars().skip(skip));
+                    out.extend(chars[idx..].iter());
                     out
                 }
                 Trunc::MTrunc => {
                     let keep = spec.width.saturating_sub(2);
-                    let left = keep / 2;
-                    let right = keep - left;
-                    let mut out: String = s.chars().take(left).collect();
+                    let left_budget = keep / 2;
+                    let right_budget = keep - left_budget;
+                    let chars: Vec<char> = s.chars().collect();
+                    let mut out = String::new();
+                    let mut used = 0usize;
+                    let mut li = 0usize;
+                    while li < chars.len() {
+                        let w = char_display_width(chars[li]);
+                        if used + w > left_budget {
+                            break;
+                        }
+                        out.push(chars[li]);
+                        used += w;
+                        li += 1;
+                    }
                     out.push_str("..");
-                    out.extend(s.chars().skip(char_len - right));
+                    let mut ri = chars.len();
+                    let mut racc = 0usize;
+                    while ri > li {
+                        let w = char_display_width(chars[ri - 1]);
+                        if racc + w > right_budget {
+                            break;
+                        }
+                        racc += w;
+                        ri -= 1;
+                    }
+                    out.extend(chars[ri..].iter());
                     out
                 }
             }
@@ -8246,9 +8685,12 @@ fn apply_format_string(
         } else {
             Trunc::None
         };
-        if chars.peek() == Some(&')') {
-            chars.next();
+        // A valid directive must be terminated by `)`. If it is missing, Git
+        // treats the whole `%<(...` run as a literal; signal that with None.
+        if chars.peek() != Some(&')') {
+            return None;
         }
+        chars.next();
         Some(ColSpec {
             width,
             align,
@@ -8263,31 +8705,67 @@ fn apply_format_string(
 
     while let Some(ch) = chars.next() {
         if ch == '%' {
-            // Check alignment directives
+            // Check alignment directives. Parse against a clone so a malformed
+            // directive (e.g. a missing `)`) can be re-emitted literally without
+            // having consumed any input (Git pretty.c behavior).
             if chars.peek() == Some(&'<') {
-                chars.next();
-                if let Some(spec) = parse_col_spec(&mut chars, Align::Left) {
+                let mut probe = chars.clone();
+                probe.next(); // consume '<'
+                if let Some(spec) = parse_col_spec(&mut probe, Align::Left) {
+                    chars = probe;
                     pending_col = Some(spec);
+                } else {
+                    result.push('%');
                 }
                 continue;
             }
             if chars.peek() == Some(&'>') {
-                chars.next();
-                if chars.peek() == Some(&'<') {
-                    chars.next();
-                    if let Some(spec) = parse_col_spec(&mut chars, Align::Center) {
-                        pending_col = Some(spec);
-                    }
-                } else if chars.peek() == Some(&'>') {
-                    chars.next();
-                    if let Some(spec) = parse_col_spec(&mut chars, Align::Right) {
-                        pending_col = Some(spec);
-                    }
-                } else if let Some(spec) = parse_col_spec(&mut chars, Align::Right) {
+                let mut probe = chars.clone();
+                probe.next(); // consume '>'
+                let parsed = if probe.peek() == Some(&'<') {
+                    probe.next();
+                    parse_col_spec(&mut probe, Align::Center)
+                } else if probe.peek() == Some(&'>') {
+                    probe.next();
+                    parse_col_spec(&mut probe, Align::Right)
+                } else {
+                    parse_col_spec(&mut probe, Align::Right)
+                };
+                if let Some(spec) = parsed {
+                    chars = probe;
                     pending_col = Some(spec);
+                } else {
+                    result.push('%');
                 }
                 continue;
             }
+
+            // Add/space/del magic: %+<placeholder>, % <placeholder>, %-<placeholder>.
+            // The magic conditionally adjusts whitespace around the next
+            // placeholder's output (Git pretty.c add_lf/add_sp/del_lf).
+            #[derive(Clone, Copy, PartialEq)]
+            enum Magic {
+                None,
+                AddLf,
+                AddSp,
+                DelLf,
+            }
+            let magic = match chars.peek() {
+                Some('+') => {
+                    chars.next();
+                    Magic::AddLf
+                }
+                Some(' ') => {
+                    chars.next();
+                    Magic::AddSp
+                }
+                Some('-') => {
+                    chars.next();
+                    Magic::DelLf
+                }
+                _ => Magic::None,
+            };
+            let magic_start = result.len();
 
             let col_start = if pending_col.is_some() {
                 result.len()
@@ -8401,6 +8879,10 @@ fn apply_format_string(
                             chars.next();
                             result.push_str(&format_date_with_mode(&info.author, Some("relative")));
                         }
+                        Some('h') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&info.author, Some("human")));
+                        }
                         _ => result.push_str("%a"),
                     }
                 }
@@ -8481,6 +8963,10 @@ fn apply_format_string(
                                 &info.committer,
                                 Some("relative"),
                             ));
+                        }
+                        Some('h') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&info.committer, Some("human")));
                         }
                         _ => result.push_str("%c"),
                     }
@@ -8736,7 +9222,98 @@ fn apply_format_string(
                         result.push('%');
                     }
                 }
+                Some('(') => {
+                    // Extended placeholders: %(trailers:...), %(describe:...),
+                    // %(decorate:...). Capture the balanced `(...)` payload.
+                    let mut look = chars.clone();
+                    look.next(); // consume '('
+                    let mut inner = String::new();
+                    let mut closed = false;
+                    for c in look.by_ref() {
+                        if c == ')' {
+                            closed = true;
+                            break;
+                        }
+                        inner.push(c);
+                    }
+                    if !closed {
+                        // Malformed: emit literally.
+                        result.push('%');
+                    } else if let Some(rest) = inner.strip_prefix("trailers") {
+                        if let Some(opts) = parse_trailers_opts(rest) {
+                            chars = look;
+                            let formatted =
+                                grit_lib::commit_trailers::format_trailers(&info.message, &opts);
+                            result.push_str(&formatted);
+                        } else {
+                            // Invalid option (e.g. `key` without value): emit the
+                            // leading `%` and let the loop reparse `(...)` as text.
+                            result.push('%');
+                        }
+                    } else if let Some(rest) = inner.strip_prefix("describe") {
+                        if let Some(opts) = parse_describe_opts(rest) {
+                            chars = look;
+                            if let Some(desc) = run_describe_for_format(oid, &opts) {
+                                result.push_str(&desc);
+                            }
+                            // On describe failure (no tag, no --always) Git emits
+                            // nothing for the placeholder.
+                        } else {
+                            result.push('%');
+                        }
+                    } else if let Some(rest) = inner.strip_prefix("decorate") {
+                        if let Some(opts) = parse_decorate_opts(rest) {
+                            chars = look;
+                            let dec = format_decorate_custom(
+                                &hex,
+                                decorations,
+                                use_color,
+                                decoration_paint,
+                                head_for_decor,
+                                &opts,
+                            );
+                            result.push_str(&dec);
+                        } else {
+                            // Unknown option (e.g. typo'd "separater"): emit the
+                            // leading `%` and reparse `(...)` as text.
+                            result.push('%');
+                        }
+                    } else {
+                        // Unhandled extended placeholder: emit literally.
+                        result.push('%');
+                    }
+                }
                 _ => result.push('%'),
+            }
+            // Apply add/space/del magic to the just-produced placeholder output.
+            if magic != Magic::None {
+                let produced_empty = result.len() == magic_start;
+                match magic {
+                    Magic::AddLf => {
+                        if !produced_empty {
+                            result.insert(magic_start, '\n');
+                        }
+                    }
+                    Magic::AddSp => {
+                        if !produced_empty {
+                            result.insert(magic_start, ' ');
+                        }
+                    }
+                    Magic::DelLf => {
+                        if !produced_empty {
+                            // Remove a run of trailing newlines that immediately
+                            // precede this placeholder's output.
+                            let mut cut = magic_start;
+                            while cut > 0 && result.as_bytes()[cut - 1] == b'\n' {
+                                cut -= 1;
+                            }
+                            if cut < magic_start {
+                                result.replace_range(cut..magic_start, "");
+                            }
+                        }
+                    }
+                    Magic::None => {}
+                }
             }
             // Apply pending column formatting
             if let Some(spec) = pending_col.take() {
@@ -8745,7 +9322,7 @@ fn apply_format_string(
                 if spec.absolute {
                     // Absolute column: pad from start of current line to target column
                     let line_start = result.rfind('\n').map(|p| p + 1).unwrap_or(0);
-                    let current_col = result[line_start..].chars().count();
+                    let current_col = display_width(&result[line_start..]);
                     let target_width = spec.width.saturating_sub(current_col);
                     let mut adjusted_spec = ColSpec {
                         width: target_width,
@@ -8754,8 +9331,8 @@ fn apply_format_string(
                         absolute: false,
                     };
                     // For absolute positioning, ensure minimum width matches the value length
-                    if target_width < added.chars().count() {
-                        adjusted_spec.width = added.chars().count();
+                    if target_width < display_width(&added) {
+                        adjusted_spec.width = display_width(&added);
                     }
                     result.push_str(&apply_col(&adjusted_spec, &added));
                 } else {
@@ -9133,6 +9710,14 @@ fn resolve_revision_as_commit_after_precompose(repo: &Repository, rev: &str) -> 
 /// uses this to decide that a token which fails to resolve as a revision is actually a pathspec
 /// (e.g. `git log ichi` where `ichi` is a tracked file, used by `--follow`).
 fn token_names_existing_path(repo: &Repository, token: &str) -> bool {
+    // Short exclude magic sigils `:^` / `:!` name a path via their suffix; git's verify_filename
+    // accepts `:^sub` as a pathspec only when `sub` exists (`:^does-not-exist` is ambiguous).
+    if let Some(rest) = token
+        .strip_prefix(":^")
+        .or_else(|| token.strip_prefix(":!"))
+    {
+        return !rest.is_empty() && token_names_existing_path(repo, rest);
+    }
     if token.is_empty() {
         return false;
     }
@@ -9158,6 +9743,19 @@ fn token_names_existing_path(repo: &Repository, token: &str) -> bool {
                     return true;
                 }
             }
+        }
+    }
+    false
+}
+
+/// git's setup_revisions ambiguity check: a `:/pattern` revision that ALSO names an existing
+/// worktree/index path (`pattern` as a file) is ambiguous (`git log :/a` with file `a` present).
+/// Returns true when such a collision exists. Only `:/`-style search revisions can collide this
+/// way (a plain object name like a branch/sha is never a relative path here).
+fn rev_token_collides_with_path(repo: &Repository, token: &str) -> bool {
+    if let Some(pattern) = token.strip_prefix(":/") {
+        if !pattern.is_empty() && !pattern.contains('/') {
+            return token_names_existing_path(repo, pattern);
         }
     }
     false
@@ -9436,6 +10034,109 @@ pub(crate) fn oneline_decoration_for_hex(repo: &Repository, hex: &str) -> String
 }
 
 /// Format decoration string for a commit (with parentheses), matching Git's `format_decorations`.
+/// Customisable options for the `%(decorate:...)` pretty placeholder.
+struct DecorateOpts {
+    prefix: String,
+    suffix: String,
+    separator: String,
+    pointer: String,
+    tag: String,
+}
+
+/// Parse `%(decorate...)` options. Returns `None` on an unrecognised option so
+/// the placeholder can be emitted literally (Git pretty.c behavior).
+fn parse_decorate_opts(rest: &str) -> Option<DecorateOpts> {
+    let mut opts = DecorateOpts {
+        prefix: " (".to_owned(),
+        suffix: ")".to_owned(),
+        separator: ", ".to_owned(),
+        pointer: " -> ".to_owned(),
+        tag: "tag: ".to_owned(),
+    };
+    let body = match rest.strip_prefix(':') {
+        Some(b) => b,
+        None => {
+            if rest.is_empty() {
+                return Some(opts);
+            }
+            return None;
+        }
+    };
+    if body.is_empty() {
+        return Some(opts);
+    }
+    for tok in body.split(',') {
+        let (name, value) = tok.split_once('=')?;
+        let v = expand_trailer_value(value);
+        match name {
+            "prefix" => opts.prefix = v,
+            "suffix" => opts.suffix = v,
+            "separator" => opts.separator = v,
+            "pointer" => opts.pointer = v,
+            "tag" => opts.tag = v,
+            _ => return None,
+        }
+    }
+    Some(opts)
+}
+
+/// Render `%(decorate:...)` with customisable prefix/suffix/separator/pointer/tag.
+fn format_decorate_custom(
+    hex: &str,
+    decorations: Option<&DecorationMap>,
+    use_color: bool,
+    paint: Option<&DecorationPaint>,
+    head: &HeadState,
+    opts: &DecorateOpts,
+) -> String {
+    let _ = use_color;
+    let _ = paint;
+    let Some(map) = decorations else {
+        return String::new();
+    };
+    let Some(items) = map.get(hex) else {
+        return String::new();
+    };
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let skip_idx = current_branch_decoration_index(items, head);
+    let mut parts: Vec<String> = Vec::new();
+    for (i, it) in items.iter().enumerate() {
+        if skip_idx == Some(i) {
+            continue;
+        }
+        let mut piece = String::new();
+        if it.kind == DecorationKind::Tag {
+            piece.push_str(&opts.tag);
+        }
+        piece.push_str(&it.display);
+        if it.kind == DecorationKind::Head {
+            if let Some(bi) = skip_idx {
+                let branch = &items[bi];
+                piece.push_str(&opts.pointer);
+                let d = &branch.display;
+                if branch.kind == DecorationKind::Tag && d.starts_with("tag: ") {
+                    piece.push_str(d.trim_start_matches("tag: "));
+                } else {
+                    piece.push_str(d);
+                }
+            }
+        }
+        parts.push(piece);
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{}{}{}",
+        opts.prefix,
+        parts.join(&opts.separator),
+        opts.suffix
+    )
+}
+
 fn format_decoration(
     hex: &str,
     decorations: Option<&DecorationMap>,
@@ -10538,7 +11239,7 @@ fn follow_filter(
     initial_path: &str,
     max_count: Option<usize>,
 ) -> Result<Vec<(ObjectId, CommitInfo)>> {
-    use grit_lib::diff::detect_renames;
+    use grit_lib::diff::detect_copies;
 
     let mut tracked_path = initial_path.to_string();
     let mut result = Vec::new();
@@ -10553,32 +11254,34 @@ fn follow_filter(
         };
 
         let raw_entries = diff_trees(odb, parent_tree.as_ref(), Some(&info.tree), "")?;
-        let entries = detect_renames(odb, None, raw_entries, 50);
+        // `--follow` implicitly enables copy detection with `--find-copies-harder` (git
+        // revision.c sets DIFF_DETECT_COPY | DIFF_FIND_COPIES_HARDER), so a file that first
+        // appears as a copy of a still-existing file is followed back into the source's history.
+        let source_tree_entries = if let Some(ref pt) = parent_tree {
+            collect_tree_blobs_for_copy(odb, pt, "")?
+        } else {
+            Vec::new()
+        };
+        let entries = detect_copies(odb, None, raw_entries, 50, true, &source_tree_entries);
 
         let mut touches = false;
+        let mut retarget: Option<String> = None;
         for entry in &entries {
             match entry.status {
-                DiffStatus::Renamed => {
-                    // Check if the new path matches our tracked path
-                    if let Some(new_path) = entry.new_path.as_deref() {
-                        if new_path == tracked_path {
-                            touches = true;
-                            // Update tracked path to the old name for older commits
-                            if let Some(old_path) = entry.old_path.as_deref() {
-                                tracked_path = old_path.to_string();
-                            }
+                DiffStatus::Renamed | DiffStatus::Copied => {
+                    // The new path is the copy/rename destination; follow it back to the source.
+                    if entry.new_path.as_deref() == Some(tracked_path.as_str()) {
+                        touches = true;
+                        if let Some(old_path) = entry.old_path.as_deref() {
+                            retarget = Some(old_path.to_string());
                         }
                     }
-                    // Also check old path
-                    if let Some(old_path) = entry.old_path.as_deref() {
-                        if old_path == tracked_path {
-                            touches = true;
-                        }
+                    if entry.old_path.as_deref() == Some(tracked_path.as_str()) {
+                        touches = true;
                     }
                 }
                 _ => {
-                    let path = entry.path();
-                    if path == tracked_path {
+                    if entry.path() == tracked_path {
                         touches = true;
                     }
                 }
@@ -10587,6 +11290,9 @@ fn follow_filter(
 
         if touches {
             result.push((oid, info));
+            if let Some(new_target) = retarget {
+                tracked_path = new_target;
+            }
             if let Some(max) = max_count {
                 if result.len() >= max {
                     break;
@@ -10837,33 +11543,62 @@ pub(crate) fn resolve_pretty_alias_with_config(fmt: &str, repo: &Repository) -> 
         return fmt.to_string();
     }
 
-    // Try to resolve from config, with loop detection
+    match resolve_pretty_alias_checked(fmt, repo) {
+        Ok(v) => v,
+        // Fall back to the original string for non-fatal callers (e.g. show).
+        Err(_) => fmt.to_string(),
+    }
+}
+
+/// Like [`resolve_pretty_alias_with_config`] but returns an error (matching
+/// Git's `fatal: invalid --pretty format`) when the name resolves to neither a
+/// builtin, a `format:`/`tformat:` string, an existing `pretty.<name>` alias,
+/// nor an inline format (containing `%`); also errors on an alias cycle.
+pub(crate) fn resolve_pretty_alias_checked(fmt: &str, repo: &Repository) -> Result<String> {
+    match fmt {
+        "oneline" | "short" | "medium" | "full" | "fuller" | "reference" | "email" | "raw"
+        | "mboxrd" => return Ok(fmt.to_string()),
+        _ => {}
+    }
+    if fmt.starts_with("format:") || fmt.starts_with("tformat:") {
+        return Ok(fmt.to_string());
+    }
+
     let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
     let mut visited = std::collections::HashSet::new();
     let mut current = fmt.to_string();
 
     loop {
-        if visited.contains(&current) {
-            return current;
+        if !visited.insert(current.clone()) {
+            // Cycle among aliases.
+            return Err(anyhow::anyhow!("invalid --pretty format: {fmt}"));
         }
-        visited.insert(current.clone());
 
-        let key = format!("pretty.{}", current);
+        let key = format!("pretty.{current}");
         if let Some(value) = config.get(&key) {
             match value.as_str() {
                 "oneline" | "short" | "medium" | "full" | "fuller" | "reference" | "email"
                 | "raw" | "mboxrd" => {
-                    return value;
+                    return Ok(value);
                 }
                 v if v.starts_with("format:") || v.starts_with("tformat:") => {
-                    return value;
+                    return Ok(value);
                 }
                 _ => {
                     current = value;
                 }
             }
+        } else if current.contains('%') {
+            // An inline format string (implicit tformat): not an alias.
+            return Ok(current);
+        } else if current == fmt {
+            // The user-supplied name is not a builtin, not an alias, and has no
+            // format placeholder: Git rejects it.
+            return Err(anyhow::anyhow!("invalid --pretty format: {fmt}"));
         } else {
-            return current;
+            // A previous alias resolved to a terminal name that is itself
+            // neither a builtin nor a known alias: fatal.
+            return Err(anyhow::anyhow!("invalid --pretty format: {current}"));
         }
     }
 }
