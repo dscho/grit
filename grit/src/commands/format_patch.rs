@@ -450,6 +450,8 @@ struct PatchOptions {
     /// Ordered `(header, refname)` notes refs to append to each patch body (from `--notes` /
     /// `format.notes`); empty when notes display is disabled.
     notes_refs: Vec<(String, String)>,
+    /// Pathspec (from `format-patch -- <path>...`): restricts each patch's diff to these paths.
+    pathspec: Vec<String>,
 }
 
 pub fn run(mut args: Args) -> Result<()> {
@@ -907,6 +909,7 @@ pub fn run(mut args: Args) -> Result<()> {
         // `-p`/`--patch` suppresses the diffstat (unless an explicit stat form is requested).
         suppress_stat: args.patch && args.stat.is_none() && !args.numstat && !args.shortstat,
         notes_refs: resolve_notes_refs(&args, &config),
+        pathspec: pathspec.clone(),
     };
 
     let mut log_output_encoding = config
@@ -1538,8 +1541,16 @@ fn format_cover_letter(
     });
     let last_tree = &last_commit.tree;
 
-    let diff_entries = diff_trees(&repo.odb, first_parent_tree.as_ref(), Some(last_tree), "")
+    let mut diff_entries = diff_trees(&repo.odb, first_parent_tree.as_ref(), Some(last_tree), "")
         .context("computing diff for cover letter")?;
+    if !patch_opts.pathspec.is_empty() {
+        diff_entries.retain(|e| {
+            patch_opts
+                .pathspec
+                .iter()
+                .any(|ps| path_matches_spec(e.path(), ps))
+        });
+    }
     let diff_entries = apply_relative_filter(diff_entries, patch_opts.relative.as_deref());
 
     out.push_str(&diffstat_for_patch_entries(
@@ -1725,8 +1736,16 @@ fn format_single_patch(
     });
     let parent_tree_oid: Option<ObjectId> = parent_tree.flatten();
 
-    let diff_entries_raw = diff_trees(odb, parent_tree_oid.as_ref(), Some(&commit.tree), "")
+    let mut diff_entries_raw = diff_trees(odb, parent_tree_oid.as_ref(), Some(&commit.tree), "")
         .context("computing diff")?;
+    // Restrict each patch's diff to the pathspec (`format-patch -- <path>...`).
+    if !opts.pathspec.is_empty() {
+        diff_entries_raw.retain(|e| {
+            opts.pathspec
+                .iter()
+                .any(|ps| path_matches_spec(e.path(), ps))
+        });
+    }
     let diff_entries_raw = apply_relative_filter(diff_entries_raw, opts.relative.as_deref());
     let diff_entries = if let Some(ref order_path) = opts.order_file {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
