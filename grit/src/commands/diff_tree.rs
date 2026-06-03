@@ -130,6 +130,13 @@ struct Options {
     patch_with_stat: bool,
     /// Show summary (new/deleted/mode changes) after diff.
     summary: bool,
+    /// Whether `--raw` was given explicitly (so the default raw format is not
+    /// the only output and is not suppressed by `--summary`).
+    raw_explicit: bool,
+    /// Annotate `--stat` filenames with `(new)`/`(gone)`/`(mode +x)` (`--compact-summary`).
+    compact_summary: bool,
+    /// Show only the summary line of `--stat` (`--shortstat`).
+    shortstat: bool,
     /// Pretty-print commit header (--pretty). None = off, Some("oneline"), Some("medium"), etc.
     pretty: Option<String>,
     /// Show combined stat+summary after diff.
@@ -258,6 +265,9 @@ impl Default for Options {
             patch_with_raw: false,
             patch_with_stat: false,
             summary: false,
+            raw_explicit: false,
+            compact_summary: false,
+            shortstat: false,
             pretty: None,
             stat_too: false,
             max_depth: None,
@@ -336,7 +346,10 @@ fn parse_options(repo: &Repository, argv: &[String]) -> Result<Options> {
                     opts.combined_patch = true;
                     opts.combined_use_cc_word = true;
                 }
-                "--raw" => opts.format = OutputFormat::Raw,
+                "--raw" => {
+                    opts.format = OutputFormat::Raw;
+                    opts.raw_explicit = true;
+                }
                 "-p" | "-u" | "--patch" => opts.format = OutputFormat::Patch,
                 "--binary" => {
                     opts.format = OutputFormat::Patch;
@@ -345,6 +358,16 @@ fn parse_options(repo: &Repository, argv: &[String]) -> Result<Options> {
                 "--stat" => {
                     opts.format = OutputFormat::Stat;
                     opts.stat_too = true;
+                }
+                "--compact-summary" => {
+                    opts.format = OutputFormat::Stat;
+                    opts.stat_too = true;
+                    opts.compact_summary = true;
+                }
+                "--shortstat" => {
+                    opts.format = OutputFormat::Stat;
+                    opts.stat_too = true;
+                    opts.shortstat = true;
                 }
                 "--name-only" => opts.format = OutputFormat::NameOnly,
                 "--name-status" => opts.format = OutputFormat::NameStatus,
@@ -1861,7 +1884,14 @@ fn print_combined_merge_output(
     };
 
     if want_stat && !stat_entries.is_empty() {
-        print_stat_summary(out, odb, &stat_entries, quote_fully)?;
+        print_stat_summary(
+            out,
+            odb,
+            &stat_entries,
+            quote_fully,
+            opts.compact_summary,
+            opts.shortstat,
+        )?;
     }
 
     if want_raw {
@@ -2347,9 +2377,11 @@ fn print_diff(
 
     match opts.format {
         OutputFormat::Raw => {
-            // When --pretty is set AND --summary or --stat is also set, suppress raw output.
-            // Otherwise show raw output normally.
-            let suppress_raw = opts.pretty.is_some() && opts.summary;
+            // `diff-tree` only defaults to raw output when no other output format
+            // was requested (git's diff_tree_tweak_rev). `--summary` selects the
+            // summary format, so unless `--raw` was given explicitly the default
+            // raw lines are suppressed (matches `git diff-tree --summary`).
+            let suppress_raw = opts.summary && !opts.raw_explicit;
             if !suppress_raw {
                 if opts.nul_terminated {
                     let abbrev = opts.abbrev;
@@ -2373,7 +2405,14 @@ fn print_diff(
         OutputFormat::Patch => {
             // --patch-with-stat: show stat before patch
             if opts.patch_with_stat {
-                print_stat_summary(out, odb, entries, quote_fully)?;
+                print_stat_summary(
+                    out,
+                    odb,
+                    entries,
+                    quote_fully,
+                    opts.compact_summary,
+                    opts.shortstat,
+                )?;
                 writeln!(out)?;
             }
             // --patch-with-raw: show raw before patch
@@ -2404,7 +2443,14 @@ fn print_diff(
             }
         }
         OutputFormat::Stat => {
-            print_stat_summary(out, odb, entries, quote_fully)?;
+            print_stat_summary(
+                out,
+                odb,
+                entries,
+                quote_fully,
+                opts.compact_summary,
+                opts.shortstat,
+            )?;
             if opts.summary {
                 write_summary(out, entries)?;
             }
@@ -2722,43 +2768,82 @@ fn write_patch_entry(
 }
 
 /// Write a `--stat` summary.
+fn stat_mode_has_executable_bit(mode_str: &str) -> bool {
+    u32::from_str_radix(mode_str, 8)
+        .map(|m| m & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Quote `entry`'s path and, for `--compact-summary`, append git's
+/// `(new)` / `(gone)` / `(mode +x)` / `(mode -x)` annotation.
+fn stat_display_path(entry: &DiffEntry, quote_fully: bool, compact: bool) -> String {
+    let path = quote_c_style(entry.path(), quote_fully);
+    if !compact {
+        return path;
+    }
+    match entry.status {
+        DiffStatus::Added => format!("{path} (new)"),
+        DiffStatus::Deleted => format!("{path} (gone)"),
+        _ => {
+            let old_x = stat_mode_has_executable_bit(&entry.old_mode);
+            let new_x = stat_mode_has_executable_bit(&entry.new_mode);
+            if new_x != old_x {
+                if new_x {
+                    format!("{path} (mode +x)")
+                } else {
+                    format!("{path} (mode -x)")
+                }
+            } else {
+                path
+            }
+        }
+    }
+}
+
 fn print_stat_summary(
     out: &mut impl Write,
     odb: &Odb,
     entries: &[DiffEntry],
     quote_fully: bool,
+    compact_summary: bool,
+    shortstat: bool,
 ) -> Result<bool> {
     use grit_lib::diff::format_stat_line_width;
 
     let max_path_len = entries
         .iter()
-        .map(|e| quote_c_style(e.path(), quote_fully).len())
+        .map(|e| stat_display_path(e, quote_fully, compact_summary).len())
         .max()
         .unwrap_or(0);
     let mut total_ins = 0usize;
     let mut total_del = 0usize;
 
     // First pass: compute all stats
-    let mut file_stats: Vec<(&str, usize, usize)> = Vec::new();
+    let mut file_stats: Vec<(String, usize, usize)> = Vec::new();
     for entry in entries {
         let (old_content, new_content) = read_blob_pair(odb, entry)?;
         let (ins, del) = count_changes(&old_content, &new_content);
         total_ins += ins;
         total_del += del;
-        file_stats.push((entry.path(), ins, del));
+        file_stats.push((
+            stat_display_path(entry, quote_fully, compact_summary),
+            ins,
+            del,
+        ));
     }
 
     // Compute count width based on max total change
     let max_count = file_stats.iter().map(|(_, i, d)| i + d).max().unwrap_or(0);
     let count_width = format!("{}", max_count).len();
 
-    for (path, ins, del) in &file_stats {
-        let q = quote_c_style(path, quote_fully);
-        writeln!(
-            out,
-            "{}",
-            format_stat_line_width(&q, *ins, *del, max_path_len, count_width)
-        )?;
+    if !shortstat {
+        for (path, ins, del) in &file_stats {
+            writeln!(
+                out,
+                "{}",
+                format_stat_line_width(path, *ins, *del, max_path_len, count_width)
+            )?;
+        }
     }
 
     let n = entries.len();
