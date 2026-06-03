@@ -1,3 +1,7 @@
+## 2026-06-03 — t10630-symbolic-ref-chain-extra
+
+- Focus harness: `./scripts/run-tests.sh t10630-symbolic-ref-chain-extra.sh --verbose` passes 35/35 after aligning symbolic-ref branch expectations with the `main` default branch.
+
 ## 2026-06-03 — t1700-split-index
 
 - Focus harness: `./scripts/run-tests.sh t1700-split-index.sh --verbose` passes 29/29 after checkout/reset index writers clear cache-tree extensions when entries contain null OIDs.
