@@ -27,9 +27,9 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   conditional pretty placeholders, `show` `%b` trailing newline handling, reflog `%gD`/`%gd`
   formatting plus `%h` abbreviation, verbatim newline-only commit messages, `rev-list --oneline`
   and `--graph` acceptance, and pretty output encoding from `i18n.commitEncoding`.
-- [~] `t6007-rev-list-cherry-pick-file.sh` — 21/23 passing, 2 failing after
-  path-limited patch-id matching plus `--cherry-mark` / `--cherry` marker and count semantics;
-  remaining failures cover duplicate patch-id matching and empty-left symmetric ranges.
+- [~] `t6007-rev-list-cherry-pick-file.sh` — 22/23 passing, 1 failing after
+  path-limited patch-id matching plus `--cherry-mark` / `--cherry` marker/count semantics and
+  duplicate patch-id matching; remaining failure covers empty-left symmetric ranges.
 - [ ] `t6012-rev-list-simplify.sh` — 26/42 passing, 16 failing.
 - [ ] `t6000-rev-list-misc.sh` — 9/23 passing, 14 failing.
 - [ ] `t6003-rev-list-topo-order.sh` — 23/36 passing, 13 failing.

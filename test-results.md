@@ -1232,3 +1232,9 @@ Updated: 2026-06-01
   `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p
   grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning backlog and known failed
   auto-fix diagnostics remain), and `cargo test -p grit-lib --lib`.
+- t6007 duplicate patch-id focus: after retaining all commits for a patch-id on the indexed side of
+  cherry equivalence, duplicate add/revert/add sequences are omitted by `--cherry-pick` and
+  `./scripts/run-tests.sh t6007-rev-list-cherry-pick-file.sh` improves from 21/23 to 22/23 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog remains), and `cargo test -p grit-lib --lib`.

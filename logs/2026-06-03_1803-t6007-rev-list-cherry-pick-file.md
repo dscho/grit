@@ -15,3 +15,8 @@
 - Direct verbose run reaches test 22 before the duplicate patch-id case fails; official harness
   `./scripts/run-tests.sh t6007-rev-list-cherry-pick-file.sh` improves from 8/23 to 21/23 and
   refreshes `data/test-files.csv` plus dashboards.
+- Third increment: changed cherry equivalence to retain all commits for a patch-id on the indexed
+  side so duplicate add/revert/add sequences on both sides are all omitted by `--cherry-pick`.
+- Direct verbose run reaches the final `...shy-diff` parser case; official harness
+  `./scripts/run-tests.sh t6007-rev-list-cherry-pick-file.sh` improves from 21/23 to 22/23 and
+  refreshes `data/test-files.csv` plus dashboards.

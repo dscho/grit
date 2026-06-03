@@ -1155,32 +1155,32 @@ pub fn rev_list(
             && !right_commits.is_empty()
             && left_commits.len() < right_commits.len();
 
-        let mut by_patch: HashMap<ObjectId, ObjectId> = HashMap::new();
+        let mut by_patch: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         if left_first {
             for oid in &left_commits {
                 if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    by_patch.entry(pid).or_insert(*oid);
+                    by_patch.entry(pid).or_default().push(*oid);
                 }
             }
             for oid in &right_commits {
                 if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    if let Some(&other) = by_patch.get(&pid) {
+                    if let Some(others) = by_patch.get(&pid) {
                         cherry_equivalent.insert(*oid);
-                        cherry_equivalent.insert(other);
+                        cherry_equivalent.extend(others.iter().copied());
                     }
                 }
             }
         } else {
             for oid in &right_commits {
                 if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    by_patch.entry(pid).or_insert(*oid);
+                    by_patch.entry(pid).or_default().push(*oid);
                 }
             }
             for oid in &left_commits {
                 if let Ok(Some(pid)) = compute_cherry_patch_id(repo, oid, &options.paths) {
-                    if let Some(&other) = by_patch.get(&pid) {
+                    if let Some(others) = by_patch.get(&pid) {
                         cherry_equivalent.insert(*oid);
-                        cherry_equivalent.insert(other);
+                        cherry_equivalent.extend(others.iter().copied());
                     }
                 }
             }
