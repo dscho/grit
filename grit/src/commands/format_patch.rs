@@ -876,7 +876,7 @@ pub fn run(mut args: Args) -> Result<()> {
         extra_headers,
         from_header: from_header_mode,
         signoff: args.signoff,
-        attach: args.attach.clone(),
+        attach: resolve_attach(&args, &config),
         inline: args.inline.clone(),
         keep_subject: args.keep_subject,
         base_commit,
@@ -1812,12 +1812,14 @@ fn format_single_patch(
     let stat_block = diff_text[..patch_start].to_string();
     let patch_only = diff_text[patch_start..].to_string();
 
+    // Git prepends a fixed `------------` prefix to the user-supplied attachment separator to form
+    // the MIME boundary (`--<boundary>` then yields `--------------<sep>` delimiter lines).
     let mime_boundary = opts
         .attach
         .as_deref()
         .or(opts.inline.as_deref())
         .filter(|b| !b.is_empty())
-        .map(|b| b.to_owned());
+        .map(|b| format!("------------{b}"));
     let use_mime = opts.attach.is_some() || opts.inline.is_some();
     let boundary = mime_boundary.unwrap_or_else(|| "------------grit-patch-boundary".to_owned());
 
@@ -1952,6 +1954,17 @@ fn format_single_patch(
         ));
         out.push('\n');
         out.push_str(&patch_only);
+        // The base-commit / prerequisite footer belongs inside the patch attachment part, before
+        // the closing MIME boundary (git appends it to the diff body, which is the attachment).
+        if include_base {
+            if let Some(ref base_hex) = opts.base_commit {
+                out.push('\n');
+                out.push_str(&format!("base-commit: {base_hex}\n"));
+                for pid in &opts.prereq_patch_ids {
+                    out.push_str(&format!("prerequisite-patch-id: {pid}\n"));
+                }
+            }
+        }
         out.push_str(&format!("--{boundary}--\n"));
         out.push('\n');
     } else {
@@ -1974,8 +1987,9 @@ fn format_single_patch(
         out.push_str(&diff_text);
     }
 
-    // prerequisite-patch-id + base-commit info (appended to the last patch in the series)
-    if include_base {
+    // prerequisite-patch-id + base-commit info (appended to the last patch in the series). For MIME
+    // attachments this footer was already emitted inside the attachment part above.
+    if !use_mime && include_base {
         if let Some(ref base_hex) = opts.base_commit {
             out.push('\n');
             out.push_str(&format!("base-commit: {base_hex}\n"));
@@ -3270,6 +3284,23 @@ fn current_branch_description(repo: &Repository, config: &ConfigSet) -> Option<S
     let branch = current_branch_name(repo)?;
     let key = format!("branch.{branch}.description");
     config.get(&key).filter(|s| !s.is_empty())
+}
+
+/// Resolve the effective `--attach` separator: an explicit `--attach[=sep]` on the command line
+/// wins; otherwise `format.attach` enables attachment when set to a non-empty value (an empty
+/// value explicitly disables it, even overriding a value inherited from a broader config scope).
+/// `--inline` suppresses attachment entirely.
+fn resolve_attach(args: &Args, config: &ConfigSet) -> Option<String> {
+    if let Some(a) = args.attach.clone() {
+        return Some(a);
+    }
+    if args.inline.is_some() {
+        return None;
+    }
+    match config.get("format.attach") {
+        Some(v) if !v.is_empty() => Some(v),
+        _ => None,
+    }
 }
 
 fn current_branch_name(repo: &Repository) -> Option<String> {
