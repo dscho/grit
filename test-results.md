@@ -9,6 +9,9 @@
   t12280-log-shortlog-format.sh` passes 36/36 after wrapping the setup block in a subshell so its
   `cd repo` does not leak into later top-level test blocks. This repaired the prior timeout /
   zero-count CSV row.
+- Group 0 unsafe fixture audit: `t1509-root-work-tree.sh` was marked `in_scope=skip` after direct
+  harness execution confirmed it intentionally emits `1..0 # SKIP Test requiring writable / ...`.
+  The test requires clobbering root-level paths and is not safe for normal automated runs.
 
 # Test Results
 

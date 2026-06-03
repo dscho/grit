@@ -18,8 +18,12 @@
     8. Commit/reset/mv/cherry-pick/sequencer.
     9. Long tail plus skipped `t1` audit.
   - Initial CSV state: 368 in-scope `t1` rows, 134 non-green in-scope rows, and 8 skipped rows.
-  - Current focus: Group 0, starting with `t12280-log-shortlog-format.sh` timeout / zero-count
-    anomaly.
+  - Completed Group 0:
+    - `t12280-log-shortlog-format.sh` passes 36/36 after containing its setup `cd repo`.
+    - `t1509-root-work-tree.sh` is marked `in_scope=skip` after audit confirmed it intentionally
+      requires unsafe writable-root execution and emits a zero-test SKIP.
+  - Current focus: Group 1 foundational read-tree/sparse/index/object behavior, starting with
+    `t1001-read-tree-m-2way.sh`.
   - Execution log: `logs/2026-06-03_0000-t1-family.md`.
 
 ---
