@@ -19,6 +19,10 @@
   t1002-read-tree-m-u-2way.sh` passes 22/22 after `read-tree -u` began refreshing content-verified
   index stat data after checkout. Regression run with `t1001-read-tree-m-2way.sh` and
   `t1002-read-tree-m-u-2way.sh` passes both files (29/29, 22/22).
+- Group 1 read-tree/merge-recursive D/F case: `./scripts/run-tests.sh --timeout 120 --verbose
+  t1004-read-tree-m-u-wf.sh` passes 17/17 after directory/file conflict detection stopped
+  flagging the file side when it is unchanged from the merge base. Regression run with `t1001`,
+  `t1002`, `t1004`, and `t6434-merge-recursive-rename-options.sh` passes all four files.
 
 # Test Results
 

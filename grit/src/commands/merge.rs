@@ -8479,6 +8479,12 @@ fn apply_directory_file_conflicts(
                 && path_has_tree_descendant(theirs_entries, path)
                 && t.is_none()
             {
+                if base
+                    .get(path)
+                    .is_some_and(|be| be.oid == oe.oid && be.mode == oe.mode)
+                {
+                    continue;
+                }
                 df_cases.push((path.clone(), true));
             }
         }
@@ -8488,6 +8494,12 @@ fn apply_directory_file_conflicts(
                 && path_has_tree_descendant(ours_entries, path)
                 && o.is_none()
             {
+                if base
+                    .get(path)
+                    .is_some_and(|be| be.oid == te.oid && be.mode == te.mode)
+                {
+                    continue;
+                }
                 df_cases.push((path.clone(), false));
             }
         }
