@@ -1090,6 +1090,11 @@ fn show_commit(
         Some("medium") | None => {
             // Medium format (default)
             writeln!(out, "commit {hex}")?;
+            if commit.parents.len() > 1 {
+                let abbrevs: Vec<String> =
+                    commit.parents.iter().map(|p| p.to_hex()[..7].to_string()).collect();
+                writeln!(out, "Merge: {}", abbrevs.join(" "))?;
+            }
             if let Some(sig) = &signature_lines {
                 out.write_all(sig.as_bytes())?;
             }
