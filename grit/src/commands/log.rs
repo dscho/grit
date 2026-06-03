@@ -11731,6 +11731,9 @@ pub(crate) fn resolve_pretty_alias_with_config(fmt: &str, repo: &Repository) -> 
 /// builtin, a `format:`/`tformat:` string, an existing `pretty.<name>` alias,
 /// nor an inline format (containing `%`); also errors on an alias cycle.
 pub(crate) fn resolve_pretty_alias_checked(fmt: &str, repo: &Repository) -> Result<String> {
+    if fmt.is_empty() {
+        return Ok(fmt.to_string());
+    }
     match fmt {
         "oneline" | "short" | "medium" | "full" | "fuller" | "reference" | "email" | "raw"
         | "mboxrd" => return Ok(fmt.to_string()),
