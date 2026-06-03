@@ -1539,7 +1539,9 @@ fn resolve_config_file(args: &Args, git_dir: Option<&Path>) -> Result<(ConfigSco
         return Ok((ConfigScope::Global, path));
     }
     if args.worktree {
-        let gd = git_dir.ok_or_else(|| anyhow::anyhow!("not in a git repository"))?;
+        let gd = git_dir.ok_or_else(|| {
+            fatal_config_parse("fatal: --worktree can only be used inside a git repository")
+        })?;
         return resolve_worktree_config_file(gd);
     }
     if let Ok(path) = std::env::var("GIT_CONFIG") {
@@ -1662,13 +1664,11 @@ fn load_config(
                 system_path.display()
             )));
         };
-        {
-            if process_includes {
-                set.merge_file_with_includes(&f, true, &load_opts.include_ctx)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-            } else {
-                set.merge(&f);
-            }
+        if process_includes {
+            set.merge_file_with_includes(&f, true, &load_opts.include_ctx)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+        } else {
+            set.merge(&f);
         }
         return Ok(set);
     }
