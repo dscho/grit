@@ -1189,3 +1189,7 @@ Updated: 2026-06-01
   with the commit color under `--color`, `./scripts/run-tests.sh t6006-rev-list-format.sh`
   improves from 64/80 to 65/80 and refreshed `data/test-files.csv` plus dashboards. Full
   workspace/harness sweeps were skipped for this narrow increment.
+- t6006 show conditional focus: after adding `%+`, `%-`, and `% ` conditional wrappers to
+  `git show --pretty=format:`, `./scripts/run-tests.sh t6006-rev-list-format.sh` improves from
+  65/80 to 68/80 and refreshed `data/test-files.csv` plus dashboards. Full workspace/harness
+  sweeps were skipped for this narrow increment.

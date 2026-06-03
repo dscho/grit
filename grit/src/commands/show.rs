@@ -1977,6 +1977,30 @@ fn apply_format_string(
 
     while let Some(ch) = chars.next() {
         if ch == '%' {
+            #[derive(Clone, Copy, PartialEq)]
+            enum Magic {
+                None,
+                AddLf,
+                AddSp,
+                DelLf,
+            }
+            let magic = match chars.peek() {
+                Some('+') => {
+                    chars.next();
+                    Magic::AddLf
+                }
+                Some(' ') => {
+                    chars.next();
+                    Magic::AddSp
+                }
+                Some('-') => {
+                    chars.next();
+                    Magic::DelLf
+                }
+                _ => Magic::None,
+            };
+            let magic_start = result.len();
+
             match chars.peek() {
                 Some('H') => {
                     chars.next();
@@ -2125,6 +2149,33 @@ fn apply_format_string(
                     result.push('%');
                 }
                 _ => result.push('%'),
+            }
+            if magic != Magic::None {
+                let produced_empty = result.len() == magic_start;
+                match magic {
+                    Magic::AddLf => {
+                        if !produced_empty {
+                            result.insert(magic_start, '\n');
+                        }
+                    }
+                    Magic::AddSp => {
+                        if !produced_empty {
+                            result.insert(magic_start, ' ');
+                        }
+                    }
+                    Magic::DelLf => {
+                        if produced_empty {
+                            let mut cut = magic_start;
+                            while cut > 0 && result.as_bytes()[cut - 1] == b'\n' {
+                                cut -= 1;
+                            }
+                            if cut < magic_start {
+                                result.replace_range(cut..magic_start, "");
+                            }
+                        }
+                    }
+                    Magic::None => {}
+                }
             }
         } else {
             result.push(ch);
