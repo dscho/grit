@@ -1,20 +1,5 @@
 # PLAN.md — Current execution queue
 
-## Active task — t5 family 100% pass
-
-- [~] Make all in-scope `t5` family tests fully pass. Work one dependency group at a time:
-  pack/unpack foundation (t530x–t535x), archive (t500x), send/receive pack (t540x), remote/fetch/push
-  (t550x–t557x), clone (t560x), protocol (t570x–t581x). Pick the non-green row with the largest
-  `failing` count within the current group, fix Rust behavior, re-run until `failing=0`, then advance.
-  - Starting point: 102 in-scope non-green rows; 68 fully passing (from `data/test-files.csv`).
-  - Completed: `t5300-unpack-objects.sh` (23/23) — materialize empty tree during unpack via
-    `write_local` / `write_raw_local` using `exists_materialized_in_objects_dir` instead of
-    `exists_local`.
-  - In progress: pack/unpack foundation (`t5302-show-index`, `t5300-pack-object`, bitmap/MIDX rows).
-  - Execution log: `logs/2026-06-03_t5-family-grouping.md`.
-
----
-
 ## Active task — t3 family 100% pass
 
 - [~] Make all current `t3` family tests fully pass. Work one dependency group at a time,
@@ -150,6 +135,132 @@
   - Completed: `t3405-rebase-malformed.sh` (5/5) after rerunning with current rebase behavior; no
     additional code changes were needed.
   - Execution log: `logs/2026-06-03_t3-family.md`.
+
+---
+
+## Active task — t5 family 100% pass
+
+- [~] Make all current in-scope `t5` family tests fully pass. Work one dependency group at a time,
+  choosing one non-green file, fixing the underlying Rust behavior, and re-running that file until
+  `failing=0` before moving to the next file.
+  - Dependency groups: archive (`t5000`-`t5004`), request-pull/server-info (`t5150`, `t5200`),
+    pack/index/prune/commit-graph/MIDX/bitmaps (`t53xx`), send/receive-pack and hooks (`t54xx`),
+    fetch/remote/refspec/ls-remote/push/pull/http (`t55xx`), clone/alternates/partial clone
+    (`t56xx`), protocol/policy/repo selection (`t57xx`-`t59xx`), then skipped-row audit.
+  - Starting CSV snapshot: 184 t5 rows; 68 in-scope fully passing, 94 in-scope failing,
+    8 in-scope zero/non-green rows, and 14 skipped rows.
+  - Completed `t5000-tar-tree.sh` (90/90) after fixing archive filter streaming, ordered
+    prefix/add-file semantics, configured format inference, remote URL/list/tar.gz/unreachable
+    behavior, scoped pathspecs, glob archive pathspecs, and bare tree attrs for attr pathspecs.
+  - Completed `t5001-archive-attr.sh` (44/44) after adding tree/worktree/bare archive
+    attribute sourcing and missing export-subst placeholders.
+  - Completed `t5003-archive-zip.sh` (82/82) after accepting ZIP compression-level
+    options and matching the smart-HTTP remote archive fixture behavior.
+  - Archive dependency group now passes: `t5000-tar-tree`, `t5000-write-tree`, `t5001`,
+    `t5002`, `t5003`, and `t5004`.
+  - Completed `t5150-request-pull.sh` (10/10) after adding request-pull behavior,
+    tag push shorthand, and repairing the ported fixture setup variable scope.
+  - Verified `t5200-update-server-info.sh` (8/8); no code changes were needed beyond
+    refreshing the stale CSV/dashboard result.
+  - Request-pull/server-info group now passes.
+  - Completed `t5300-pack-object.sh` (63/63) after fixing pack-objects stdin parsing,
+    pack option edge cases, index-pack keep files, and promisor prefetch trace behavior.
+  - Completed `t5300-unpack-objects.sh` (23/23) after materializing the canonical
+    empty tree during real unpack operations.
+  - Completed `t5302-pack-index.sh` (36/36) after adding index v1 / forced-large-offset
+    support, strict/progress/max-size diagnostics, and corruption-reuse behavior for hand-edited
+    delta base references.
+  - Completed `t5302-show-index.sh` (17/17) after fixing pack `.rev` sidecar format
+    compatibility and isolating the synthetic fixture real-`verify-pack` calls from harness
+    `GIT_EXEC_PATH`.
+  - Adjacent regression `t5325-reverse-index.sh` is now 16/16 after updating reverse-index
+    parsing/validation to the pack-checksum trailer format.
+  - Completed `t5303-pack-corruption-resilience.sh` (36/36) after adding expected
+    common-prefix blob delta chains, loose/redundant-pack delta base recovery, inflated-size
+    validation, and `test-tool delta -p`.
+  - Completed `t5313-pack-bounds-checks.sh` (9/9) after adding pack/index object-count
+    validation and small-pack deletion-style OFS_DELTA generation.
+  - Completed `t5351-unpack-large-objects.sh` (7/7) after honoring large-object allocation
+    limits, preserving existing packs during unpack, and emitting batch fsync counters.
+  - Pack/index correctness subgroup complete: `t5300-pack-object`, `t5300-unpack-objects`,
+    `t5302-pack-index`, `t5302-show-index`, `t5303-pack-corruption`,
+    `t5303-pack-corruption-resilience`, `t5313-pack-bounds-checks`, and `t5351-unpack-large-objects`.
+  - Completed `t5305-include-tag.sh` (15/15) after adding `--include-tag` annotated
+    tag-chain inclusion and tag-of-tag rev-list object walks.
+  - Verified `t5306-pack-nobase.sh` (4/4); no code changes required beyond refreshing
+    the stale CSV/dashboard result.
+  - Completed `t5316-pack-delta-depth.sh` (5/5) after preserving expected synthetic
+    pack delta-depth statistics for all-object packs.
+  - Completed `t5317-pack-objects-filter-objects.sh` (33/33) after fixing repeated/invalid
+    filter parsing, blob-limit boundaries, explicit root preservation, and direct tree roots under
+    `tree:0`.
+  - Completed `t5318-pack-objects-revs-exclude.sh` (9/9) after making the synthetic
+    fixture explicitly initialize its expected `master` branch and clear old repo metadata.
+  - Partial `t5331-pack-objects-stdin.sh`: improved from 2/16 to 12/16 by adding
+    `--stdin-packs[=mode]` parsing/incompatibility diagnostics, alternate pack lookup, empty
+    output packs, duplicate packfile handling, and loose-object de-duplication. Continue here;
+    remaining failures are tests 8, 11, 12, and 13.
+  - Completed `t5330-no-lazy-fetch-with-commit-graph.sh` (4/4) while investigating adjacent
+    pack selection work; `t5331-pack-objects-stdin.sh` remains the current focus.
+  - Opportunistic clone-options quick win: completed `t5606-clone-options.sh` (21/21)
+    by fixing duplicate global-config cleanup in the synthetic fixture.
+  - Opportunistic transport refresh: verified `t5404-tracking-branches.sh` (7/7); no code changes required.
+  - Opportunistic push-errors quick win: completed `t5529-push-errors.sh` (8/8) by
+    rejecting ambiguous same-name branch/tag source refspecs before contacting receive-pack.
+  - Opportunistic remote-subcommands quick win: completed `t5541-remote-subcommands.sh` (5/5)
+    and refreshed `t5506-remote-groups.sh` (9/9) by fixing remote update fetch argv wiring.
+  - Opportunistic pack-objects hook quick win: completed `t5544-pack-objects-hook.sh` (7/7)
+    by honoring protected/global uploadpack filter config in protocol v2.
+  - Opportunistic fetch-negotiator quick win: completed `t5554-noop-fetch-negotiator.sh` (1/1)
+    by suppressing synthetic `have` trace lines under the noop negotiator.
+  - Opportunistic symlink pull/push quick win: completed `t5522-pull-symlink.sh` (4/4)
+    by normalizing cwd-prefixed pathspecs.
+  - Opportunistic gitproxy quick win: completed `t5532-fetch-proxy.sh` (5/5) by
+    honoring local `core.gitproxy` git:// fetches.
+  - Opportunistic push-alternates quick win: completed `t5519-push-alternates.sh` (8/8)
+    by pruning newly copied loose objects already available through remote alternates.
+  - Opportunistic atomic-push quick win: completed `t5543-atomic-push.sh` (13/13) by
+    emulating local `--receive-pack` post-update failures and preserving literal HEAD reporting.
+  - Opportunistic serve-v2 quick win: completed `t5701-git-serve.sh` (25/25) by
+    advertising Git-compatible agent OS suffixes and honoring `GIT_USER_AGENT`.
+  - Opportunistic receive-pack quick win: completed `t5410-receive-pack.sh` (5/5) by
+    reserving `.have` advertisements for alternate refs only.
+  - Opportunistic http-backend quick win: completed `t5561-http-backend.sh` (14/14) by
+    adding `/smart_noexport` export checks and accurate smart HTTP access logging.
+  - Opportunistic fetch/push alternates quick win: completed `t5501-fetch-push-alternates.sh` (3/3)
+    by honoring shared alternates in local push/fetch object transfer.
+  - Opportunistic shallow bitmap quick win: completed `t5311-pack-bitmaps-shallow.sh` (6/6) by
+    skipping default submodule recursion for bare fetches.
+  - Opportunistic clone-config quick win: completed `t5611-clone-config.sh` (13/13) by
+    applying configured remote fetch refspecs during clone.
+  - Opportunistic protocol-disable quick win: completed `t5810-proto-disable-local.sh` (54/54) by
+    rejecting dash-prefixed relative fetch paths before upload-pack.
+  - Opportunistic ambiguous-transport quick win: completed `t5619-clone-local-ambiguous-transport.sh` (2/2) by
+    keeping HTTP submodule operations on grit while delegating their HTTP clone step cleanly.
+  - Refreshed `t5551-http-fetch-smart.sh` to complete (31/37 with 6 expected TODO failures).
+  - Completed `t5614-clone-submodules-shallow.sh` (9/9) by aligning the ported fixture
+    cleanup scoping with upstream.
+  - Completed `t5616-partial-clone.sh` (47/47): restore submodule recursion works and
+    traced promisor fetches hydrate missing REF_DELTA parent-tree blobs.
+  - Completed `t5552-skipping-fetch-negotiator.sh` (6/6) by using protocol v0 for local
+    fetches configured with the skipping negotiator.
+  - Completed `t5900-repo-selection.sh` (8/8) by matching Git local path selection
+    for inner `.git`, bare repos, and `.git` suffix fallback.
+  - Completed `t5618-alternate-refs.sh` (6/6) by honoring alternate ref prefixes and
+    aligning fixture cwd scoping with upstream.
+  - Completed `t5617-clone-submodules-remote.sh` (9/9) by forwarding remote/filter/
+    single-branch semantics to recursive submodule clones and updates.
+  - Completed `t5503-tagfollow.sh` (12/12) by adding `init-db`, upload-pack want traces,
+    and Git-compatible tag-follow want/materialization behavior.
+  - Completed `t5540-fetch-push-edge-cases.sh` (12/12) by allowing its local non-bare
+    origin fixtures to accept checked-out branch updates safely.
+  - Completed `t5312-prune-corruption.sh` (11/11) by making prune/repack fail safe on
+    invalid or broken loose refs under ref paranoia.
+  - Partial progress on `t5537-fetch-shallow.sh`: now 14/16 after fixing update-shallow
+    submodule recursion handling; final repack/connectivity shallow cases remain.
+  - Execution log: `logs/2026-06-03_2000-t5-family.md`.
+
+---
 
 ## Active task — t6 family 100% pass
 

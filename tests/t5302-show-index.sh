@@ -64,7 +64,7 @@ test_expect_success 'show-index: object IDs present in pack also appear in outpu
 	cd repo &&
 	idx=$(echo .git/objects/pack/*.idx) &&
 	# Extract OIDs listed by verify-pack
-	"$REAL_GIT" verify-pack -v "$idx" |
+	env -u GIT_EXEC_PATH "$REAL_GIT" verify-pack -v "$idx" |
 		grep -E "^[0-9a-f]{40}" |
 		awk "{print \$1}" | sort >expected_oids &&
 	# Extract OIDs from show-index output
@@ -177,7 +177,7 @@ test_expect_success 'show-index output matches verify-pack object count' '
 	cd repo &&
 	idx=$(echo .git/objects/pack/*.idx) &&
 	show_count=$(git show-index <"$idx" | wc -l) &&
-	verify_count=$("$REAL_GIT" verify-pack -v "$idx" | grep -cE "^[0-9a-f]{40}") &&
+	verify_count=$(env -u GIT_EXEC_PATH "$REAL_GIT" verify-pack -v "$idx" | grep -cE "^[0-9a-f]{40}") &&
 	test "$show_count" = "$verify_count"
 	)
 '

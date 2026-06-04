@@ -22,7 +22,7 @@ test_expect_success 'submodule.stickyRecursiveClone flag manipulates submodule.r
 	git clone --recurse-submodules parent clone_recurse_true &&
 	test_cmp_config -C clone_recurse_true true submodule.recurse &&
 
-	test_config_global submodule.stickyRecursiveClone false &&
+	git config --global submodule.stickyRecursiveClone false &&
 	git clone --recurse-submodules parent clone_recurse_false &&
 	test_expect_code 1 git -C clone_recurse_false config --get submodule.recurse
 

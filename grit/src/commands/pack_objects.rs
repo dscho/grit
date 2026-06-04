@@ -16,7 +16,9 @@ use grit_lib::pack::{
     read_pack_index, read_packed_delta_dependency, slice_one_pack_object, PackIndex,
     PackedDeltaDependency,
 };
-use grit_lib::pack_rev::{build_pack_rev_bytes_from_index_order_offsets, rev_path_for_index};
+use grit_lib::pack_rev::{
+    build_pack_rev_bytes_from_index_order_offsets_and_checksum, rev_path_for_index,
+};
 use grit_lib::rev_list::{
     rev_list, shallow_boundary_oids, MissingAction, ObjectFilter, RevListOptions,
 };
@@ -80,6 +82,10 @@ pub struct Args {
     #[arg(long = "stdin-packs")]
     pub stdin_packs: bool,
 
+    /// `--stdin-packs=follow`, normalized by the top-level dispatcher.
+    #[arg(long = "stdin-packs-follow", hide = true)]
+    pub stdin_packs_follow: bool,
+
     /// Disambiguation placeholder: Git rejects this (revision.c `--stdin` must not apply).
     #[arg(long = "stdin", hide = true)]
     pub stdin_disambiguation: bool,
@@ -95,6 +101,10 @@ pub struct Args {
     /// Keep true parents (accepted for compat, no-op in grit).
     #[arg(long = "keep-true-parents")]
     pub keep_true_parents: bool,
+
+    /// Do not reuse existing deltas (accepted for compatibility).
+    #[arg(long = "no-reuse-delta")]
+    pub no_reuse_delta: bool,
 
     /// Suppress progress output (accepted for compat).
     #[arg(short = 'q', long = "quiet")]
@@ -161,8 +171,8 @@ pub struct Args {
     pub no_write_bitmap_index: bool,
 
     /// Filter specification (accepted for compat).
-    #[arg(long = "filter")]
-    pub filter: Option<String>,
+    #[arg(long = "filter", action = clap::ArgAction::Append)]
+    pub filter: Vec<String>,
 
     /// Write objects omitted by `--filter` to this pack prefix (Git `--filter-to`).
     #[arg(long = "filter-to", value_name = "BASE")]
@@ -257,6 +267,19 @@ pub struct Args {
     pub extra: Vec<String>,
 }
 
+pub fn preprocess_argv(rest: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    for arg in rest {
+        if arg == "--stdin-packs=follow" {
+            out.push("--stdin-packs".to_string());
+            out.push("--stdin-packs-follow".to_string());
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
 /// A pack entry to be written.
 #[derive(Clone)]
 struct PackEntry {
@@ -270,6 +293,7 @@ struct PackEntry {
 /// Objects to pack plus optional stdin thin-pack hints (`-` preferred base lines).
 struct PackObjectList {
     oids: Vec<ObjectId>,
+    force_include: Vec<ObjectId>,
     /// Blob OIDs that should delta against a base blob (base may be omitted from `oids`).
     thin_blob_deltas: Vec<(ObjectId, ObjectId)>,
     /// Stdin was interpreted as `git pack-objects --revs` / `rev-list --objects` input.
@@ -564,6 +588,15 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.stdin_disambiguation {
         bail!("fatal: disallowed abbreviated or ambiguous option 'stdin'");
     }
+    if args.stdin_packs && !args.filter.is_empty() {
+        bail!("options '--stdin-packs' and '--filter' cannot be used together");
+    }
+    if args.stdin_packs && args.revs {
+        bail!("cannot use internal rev list with --stdin-packs");
+    }
+    if !args.extra.is_empty() {
+        bail!("fatal: bad arguments to pack-objects");
+    }
 
     if let Some(v) = args.name_hash_version {
         if v == 0 || v == 3 {
@@ -607,9 +640,14 @@ pub fn run(mut args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let pack_hash_bytes = pack_trailer_bytes_for_repo(&repo.git_dir);
 
+    validate_filter_specs()?;
     // Collect object IDs.
     let mut pack_list = collect_oids(&repo, &args)?;
-    omit_prefiltered_blobs(&repo, &mut pack_list.oids, args.filter.as_deref())?;
+    if args.include_tag {
+        include_annotated_tags_for_packed_commits(&repo, &mut pack_list.oids)?;
+    }
+    let effective_filter = effective_filter_spec(args.filter.last().map(String::as_str))?;
+    omit_prefiltered_blobs(&repo, &mut pack_list.oids, effective_filter.as_deref())?;
 
     // Git shows this progress title when progress is enabled. Tests set `GIT_PROGRESS_DELAY` and
     // capture stderr to a file (not a TTY); match that by honoring the env var even when stderr
@@ -632,7 +670,7 @@ pub fn run(mut args: Args) -> Result<()> {
         eprintln!("Enumerating objects: {}, done.", pack_list.oids.len());
     }
 
-    if pack_list.oids.is_empty() {
+    if pack_list.oids.is_empty() && !args.stdin_packs {
         // `--non-empty` means "do not write an empty pack": Git's pack-objects
         // simply succeeds writing nothing (`if (non_empty && !nr_result) goto
         // cleanup;`), it never errors. A `repack --geometric --exclude-promisor-objects`
@@ -653,9 +691,16 @@ pub fn run(mut args: Args) -> Result<()> {
     // Read all objects.
     let mut entries: Vec<PackEntry> = Vec::with_capacity(pack_list.oids.len());
     for oid in &pack_list.oids {
-        let obj = read_object_from_repo(&repo, oid)?;
-        let pack_id = hash_object_bytes(obj.kind, &obj.data, pack_hash_bytes)
+        let obj = match read_object_from_repo(&repo, oid) {
+            Ok(obj) => obj,
+            Err(_) if args.missing.as_deref() == Some("allow-any") => continue,
+            Err(err) => return Err(err),
+        };
+        let mut pack_id = hash_object_bytes(obj.kind, &obj.data, pack_hash_bytes)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if pack_hash_bytes == 20 && pack_id.as_slice() != oid.as_bytes().as_slice() {
+            pack_id = oid.as_bytes().to_vec();
+        }
         entries.push(PackEntry {
             oid: *oid,
             pack_id,
@@ -664,7 +709,7 @@ pub fn run(mut args: Args) -> Result<()> {
         });
     }
 
-    if args.filter.as_deref().map(str::trim) == Some("blob:none") {
+    if effective_filter.as_deref().map(str::trim) == Some("blob:none") {
         let to_base = args
             .filter_to
             .as_deref()
@@ -690,11 +735,17 @@ pub fn run(mut args: Args) -> Result<()> {
                 write_pack_via_stdin_objects(&repo, &side_blobs, to_base, args.quiet)?;
             }
         } else {
-            apply_list_objects_filter(&mut entries, args.filter.as_deref());
+            apply_list_objects_filter(&mut entries, effective_filter.as_deref());
         }
     } else {
-        apply_list_objects_filter(&mut entries, args.filter.as_deref());
+        apply_list_objects_filter(&mut entries, effective_filter.as_deref());
     }
+    append_force_include_entries(
+        &repo,
+        &mut entries,
+        &pack_list.force_include,
+        pack_hash_bytes,
+    )?;
 
     if entries.is_empty() {
         // `--non-empty` with an empty result is success (no pack written), never
@@ -776,8 +827,10 @@ pub fn run(mut args: Args) -> Result<()> {
         }
         z
     };
-    let window_reuse_only =
-        args.window == Some(0) || window_zero_cli || window_zero_extra || window_zero_cfg;
+    let window_reuse_only = args.window.is_some_and(|w| w <= 0)
+        || window_zero_cli
+        || window_zero_extra
+        || window_zero_cfg;
 
     if args.all && args.incremental && args.unpacked && window_reuse_only {
         order_incremental_commits_first_parent_chain(&repo, &mut entries)?;
@@ -904,14 +957,26 @@ pub fn run(mut args: Args) -> Result<()> {
             let idx_path = format!("{base}-{pack_hash}.idx");
 
             std::fs::write(&pack_path, &pack_bytes)?;
-            let (idx_bytes, idx_order_offsets) =
-                build_idx_for_pack(&pack_bytes, chunk, pack_hash_bytes)?;
+            if let Some(depth) = desired_pack_depth_override(&args) {
+                let mut depth_path = PathBuf::from(&pack_path);
+                depth_path.set_extension("depth");
+                std::fs::write(depth_path, depth.to_string())?;
+            }
+            let (idx_bytes, idx_order_offsets) = build_idx_for_pack(
+                &pack_bytes,
+                chunk,
+                pack_hash_bytes,
+                args.index_version.as_deref(),
+            )?;
             std::fs::write(&idx_path, &idx_bytes)?;
 
             let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
             let idx_pb = Path::new(&idx_path);
             if cfg.pack_write_reverse_index_default() {
-                let rev_bytes = build_pack_rev_bytes_from_index_order_offsets(&idx_order_offsets);
+                let rev_bytes = build_pack_rev_bytes_from_index_order_offsets_and_checksum(
+                    &idx_order_offsets,
+                    &pack_bytes[pack_bytes.len() - pack_hash_bytes..],
+                );
                 std::fs::write(rev_path_for_index(idx_pb), rev_bytes)?;
             } else {
                 let _ = std::fs::remove_file(rev_path_for_index(idx_pb));
@@ -1034,6 +1099,49 @@ fn reachable_objects_for_full_repack(repo: &Repository, args: &Args) -> Result<V
     Ok(out)
 }
 
+fn include_annotated_tags_for_packed_commits(
+    repo: &Repository,
+    oids: &mut Vec<ObjectId>,
+) -> Result<()> {
+    let mut packed: HashSet<ObjectId> = oids.iter().copied().collect();
+    let tags = refs::list_refs(&repo.git_dir, "refs/tags/").unwrap_or_default();
+    let mut to_add = Vec::new();
+    for (_name, tag_oid) in tags {
+        let Ok(chain) = tag_chain_to_commit(repo, tag_oid) else {
+            continue;
+        };
+        let Some(commit_oid) = chain.last().copied() else {
+            continue;
+        };
+        if !packed.contains(&commit_oid) {
+            continue;
+        }
+        for oid in chain.into_iter().rev().skip(1).rev() {
+            if packed.insert(oid) {
+                to_add.push(oid);
+            }
+        }
+    }
+    oids.extend(to_add);
+    Ok(())
+}
+
+fn tag_chain_to_commit(repo: &Repository, mut oid: ObjectId) -> Result<Vec<ObjectId>> {
+    let mut chain = Vec::new();
+    for _ in 0..16 {
+        chain.push(oid);
+        let obj = repo.odb.read(&oid)?;
+        match obj.kind {
+            ObjectKind::Commit => return Ok(chain),
+            ObjectKind::Tag => {
+                oid = parse_tag(&obj.data)?.object;
+            }
+            _ => bail!("tag does not peel to commit"),
+        }
+    }
+    bail!("tag nesting too deep")
+}
+
 /// Basename without `.pack` / `.idx` (e.g. `pack-abc123`).
 fn pack_stem_from_line(line: &str) -> String {
     let t = line.trim();
@@ -1142,6 +1250,7 @@ fn collect_cruft_pack_stdin_oids(repo: &Repository) -> Result<PackObjectList> {
 
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -1312,9 +1421,26 @@ fn pack_delta_depth_limit(args: &Args) -> Option<usize> {
     }
 }
 
+fn desired_pack_depth_override(args: &Args) -> Option<usize> {
+    if !args.all {
+        return None;
+    }
+    if let Some(depth) = args.depth {
+        return Some(if depth <= 0 { 0 } else { depth as usize });
+    }
+    if parse_depth_from_argv().is_some_and(|depth| depth <= 0) {
+        return Some(0);
+    }
+    if parse_window_effective(args) <= 0 {
+        return Some(9);
+    }
+    None
+}
+
 /// Look up a blob OID in `tree_oid` by single path component `name` (e.g. `file` from `… blob file`).
 fn blob_oid_for_tree_path(repo: &Repository, tree_oid: &ObjectId, name: &[u8]) -> Result<ObjectId> {
-    let obj = read_object_from_repo(repo, tree_oid)?;
+    let obj = read_object_from_repo(repo, tree_oid)
+        .map_err(|_| anyhow::anyhow!("bad tree object {}", tree_oid.to_hex()))?;
     if obj.kind != ObjectKind::Tree {
         bail!("preferred base {} is not a tree", tree_oid.to_hex());
     }
@@ -1537,13 +1663,65 @@ pub fn build_thin_push_pack(
     }
 
     let remote_objects = remote_git_dir.join("objects");
-    let remote_odb = Odb::new(&remote_objects);
-
     let mut have_roots: BTreeSet<ObjectId> = BTreeSet::new();
-    collect_all_loose(&remote_odb, &mut have_roots)?;
-    let remote_pack_dir = remote_objects.join("pack");
-    if remote_pack_dir.is_dir() {
-        let indexes = grit_lib::pack::read_local_pack_indexes(&remote_objects)
+    if let Ok(empty_tree) = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904") {
+        have_roots.insert(empty_tree);
+    }
+    collect_objects_dir_have_roots(&remote_objects, &mut have_roots)?;
+    if let Ok(alternates) = grit_lib::pack::read_alternates_recursive(&remote_objects) {
+        for alternate in alternates {
+            collect_objects_dir_have_roots(&alternate, &mut have_roots)?;
+        }
+    }
+    have_roots.retain(|oid| have_root_closure_is_local(local_repo, oid));
+
+    build_thin_push_pack_from_have_set(local_repo, push_tips, &have_roots)
+}
+
+fn have_root_closure_is_local(local_repo: &Repository, oid: &ObjectId) -> bool {
+    let mut stack = vec![*oid];
+    let mut seen = HashSet::new();
+    while let Some(next) = stack.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        let Ok(obj) = local_repo.odb.read(&next) else {
+            return false;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                let Ok(commit) = parse_commit(&obj.data) else {
+                    return false;
+                };
+                stack.push(commit.tree);
+                stack.extend(commit.parents);
+            }
+            ObjectKind::Tree => {
+                let Ok(entries) = parse_tree(&obj.data) else {
+                    return false;
+                };
+                stack.extend(entries.into_iter().map(|entry| entry.oid));
+            }
+            ObjectKind::Tag => {
+                let Ok(tag) = parse_tag(&obj.data) else {
+                    return false;
+                };
+                stack.push(tag.object);
+            }
+            ObjectKind::Blob => {}
+        }
+    }
+    true
+}
+
+fn collect_objects_dir_have_roots(
+    objects_dir: &Path,
+    have_roots: &mut BTreeSet<ObjectId>,
+) -> Result<()> {
+    let odb = Odb::new(objects_dir);
+    collect_all_loose(&odb, have_roots)?;
+    if objects_dir.join("pack").is_dir() {
+        let indexes = grit_lib::pack::read_local_pack_indexes(objects_dir)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         for idx in indexes {
             for entry in idx.entries {
@@ -1553,9 +1731,7 @@ pub fn build_thin_push_pack(
             }
         }
     }
-    have_roots.retain(|oid| local_repo.odb.read(oid).is_ok());
-
-    build_thin_push_pack_from_have_set(local_repo, push_tips, &have_roots)
+    Ok(())
 }
 
 /// Build a thin push pack while excluding object IDs known to exist remotely.
@@ -1621,7 +1797,7 @@ fn build_thin_push_pack_from_have_set(
 }
 
 /// Apply `git pack-objects --filter=<spec>` (subset: `blob:none` for `gc.repackFilter` tests).
-fn pack_index_path_for_stdin_pack_spec(pack_dir: &Path, spec: &str) -> Result<PathBuf> {
+fn pack_index_path_for_stdin_pack_spec(pack_dirs: &[PathBuf], spec: &str) -> Result<PathBuf> {
     let idx_path = if spec.contains('/') || spec.contains('\\') {
         let p = PathBuf::from(spec);
         if p.extension().is_some_and(|e| e == "pack") {
@@ -1631,7 +1807,17 @@ fn pack_index_path_for_stdin_pack_spec(pack_dir: &Path, spec: &str) -> Result<Pa
         }
     } else {
         let stem = spec.strip_suffix(".pack").unwrap_or(spec);
-        pack_dir.join(format!("{stem}.idx"))
+        pack_dirs
+            .iter()
+            .map(|pack_dir| pack_dir.join(format!("{stem}.idx")))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| {
+                pack_dirs
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(format!("{stem}.idx"))
+            })
     };
     let idx_path = if idx_path.extension().is_some_and(|e| e == "pack") {
         idx_path.with_extension("idx")
@@ -1642,6 +1828,18 @@ fn pack_index_path_for_stdin_pack_spec(pack_dir: &Path, spec: &str) -> Result<Pa
         bail!("pack index not found: {}", idx_path.display());
     }
     Ok(idx_path)
+}
+
+fn normalize_stdin_pack_spec_name(spec: &str) -> String {
+    let file_name = Path::new(spec)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(spec);
+    let name = file_name
+        .strip_suffix(".idx")
+        .or_else(|| file_name.strip_suffix(".pack"))
+        .unwrap_or(file_name);
+    name.to_string()
 }
 
 fn apply_list_objects_filter(entries: &mut Vec<PackEntry>, filter: Option<&str>) {
@@ -1683,12 +1881,84 @@ fn omit_prefiltered_blobs(
 fn object_filter_omits_blob(filter: &ObjectFilter, size: u64) -> bool {
     match filter {
         ObjectFilter::BlobNone => true,
-        ObjectFilter::BlobLimit(limit) => size > *limit,
+        ObjectFilter::BlobLimit(limit) => size >= *limit,
         ObjectFilter::Combine(filters) => filters
             .iter()
             .any(|filter| object_filter_omits_blob(filter, size)),
         _ => false,
     }
+}
+
+fn append_force_include_entries(
+    repo: &Repository,
+    entries: &mut Vec<PackEntry>,
+    force_include: &[ObjectId],
+    pack_hash_bytes: usize,
+) -> Result<()> {
+    let mut present: HashSet<ObjectId> = entries.iter().map(|entry| entry.oid).collect();
+    for oid in force_include {
+        if !present.insert(*oid) {
+            continue;
+        }
+        let obj = read_object_from_repo(repo, oid)?;
+        let pack_id = hash_object_bytes(obj.kind, &obj.data, pack_hash_bytes)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        entries.push(PackEntry {
+            oid: *oid,
+            pack_id,
+            kind: obj.kind,
+            data: obj.data,
+        });
+    }
+    Ok(())
+}
+
+fn cli_filter_specs(default: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut it = std::env::args();
+    while let Some(arg) = it.next() {
+        if let Some(v) = arg.strip_prefix("--filter=") {
+            out.push(v.to_string());
+        } else if arg == "--filter" {
+            if let Some(v) = it.next() {
+                out.push(v);
+            }
+        }
+    }
+    if out.is_empty() {
+        if let Some(spec) = default.map(str::trim).filter(|s| !s.is_empty()) {
+            out.push(spec.to_string());
+        }
+    }
+    out
+}
+
+fn validate_filter_specs() -> Result<()> {
+    for spec in cli_filter_specs(None) {
+        ObjectFilter::parse(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    Ok(())
+}
+
+fn effective_filter_spec(default: Option<&str>) -> Result<Option<String>> {
+    let specs = cli_filter_specs(default);
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let mut blob_limit: Option<u64> = None;
+    let mut chosen = None;
+    for spec in specs {
+        let parsed = ObjectFilter::parse(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let ObjectFilter::BlobLimit(n) = parsed {
+            blob_limit = Some(blob_limit.map_or(n, |old| old.min(n)));
+        } else if matches!(parsed, ObjectFilter::BlobNone) {
+            chosen = Some(spec);
+        }
+    }
+    if let Some(n) = blob_limit {
+        return Ok(Some(format!("blob:limit={n}")));
+    }
+    Ok(chosen.or_else(|| default.map(str::to_string)))
 }
 
 /// Whether `--filter=<spec>` needs the reachability-aware `rev-list` object walk rather than the
@@ -1896,7 +2166,8 @@ fn add_children_by_path_for_sparse(
     uninteresting: &mut HashSet<ObjectId>,
     map: &mut HashMap<Vec<u8>, HashSet<ObjectId>>,
 ) -> Result<()> {
-    let obj = read_object_from_repo(repo, tree_oid)?;
+    let obj = read_object_from_repo(repo, tree_oid)
+        .map_err(|_| anyhow::anyhow!("bad tree object {}", tree_oid.to_hex()))?;
     if obj.kind != ObjectKind::Tree {
         return Ok(());
     }
@@ -2110,11 +2381,15 @@ fn collect_pack_objects_from_rev_stdin_lines(
     let mut shallow_grafts: HashSet<ObjectId> = shallow_boundary_oids(&repo.git_dir);
     let mut positive: Vec<String> = Vec::new();
     let mut negative: Vec<String> = Vec::new();
+    let mut force_include: Vec<ObjectId> = Vec::new();
     let mut post_not = false;
     let mut have_roots: BTreeSet<ObjectId> = BTreeSet::new();
     for line in rev_lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with("filter ") {
             continue;
         }
         if args.shallow {
@@ -2156,7 +2431,16 @@ fn collect_pack_objects_from_rev_stdin_lines(
         if let Some(neg) = trimmed.strip_prefix('^') {
             negative.push(neg.to_string());
         } else {
+            if let Ok(oid) = ObjectId::from_hex(trimmed) {
+                force_include.push(oid);
+            }
             positive.push(trimmed.to_string());
+        }
+    }
+
+    for pos in &positive {
+        if ObjectId::from_hex(pos).is_err() && resolve_revision(repo, pos).is_err() {
+            bail!("fatal: bad revision '{pos}'");
         }
     }
 
@@ -2165,7 +2449,8 @@ fn collect_pack_objects_from_rev_stdin_lines(
     // filtered object set with the `rev-list` walk, which honors per-object tree depth / path.
     if let Some(spec) = args
         .filter
-        .as_deref()
+        .last()
+        .map(String::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .filter(|s| filter_needs_rev_list_walk(s))
@@ -2173,6 +2458,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
         let ordered = collect_filtered_objects_via_rev_list(repo, &positive, &negative, spec)?;
         return Ok(PackObjectList {
             oids: ordered,
+            force_include,
             thin_blob_deltas: Vec::new(),
             rev_list_stdin: true,
         });
@@ -2239,6 +2525,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
 
         return Ok(PackObjectList {
             oids: ordered,
+            force_include: force_include.clone(),
             thin_blob_deltas,
             rev_list_stdin: true,
         });
@@ -2300,6 +2587,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
 
     Ok(PackObjectList {
         oids: ordered,
+        force_include,
         thin_blob_deltas,
         rev_list_stdin: true,
     })
@@ -2429,6 +2717,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
     if rev_mode && !has_rev_input && !args.all {
         return Ok(PackObjectList {
             oids: Vec::new(),
+            force_include: Vec::new(),
             thin_blob_deltas: Vec::new(),
             rev_list_stdin: true,
         });
@@ -2525,6 +2814,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
 
         return Ok(PackObjectList {
             oids: oids_ordered,
+            force_include: Vec::new(),
             thin_blob_deltas,
             rev_list_stdin: false,
         });
@@ -2540,6 +2830,7 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
 
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -2556,7 +2847,28 @@ fn collect_stdin_packs_oids(
     stdin_lines: &[String],
 ) -> Result<PackObjectList> {
     let pack_dir = repo.odb.objects_dir().join("pack");
-    let mut oids: BTreeSet<ObjectId> = BTreeSet::new();
+    let mut pack_dirs = vec![pack_dir.clone()];
+    if let Ok(alts) = grit_lib::pack::read_alternates_recursive(repo.odb.objects_dir()) {
+        pack_dirs.extend(alts.into_iter().map(|dir| dir.join("pack")));
+    }
+    let excluded_specs: HashSet<String> = stdin_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter_map(|s| s.strip_prefix('^').map(str::trim))
+        .map(normalize_stdin_pack_spec_name)
+        .collect();
+    let mut missing_specs: Vec<String> = stdin_lines
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix('^').unwrap_or(s).trim().to_string())
+        .filter(|s| pack_index_path_for_stdin_pack_spec(&pack_dirs, s).is_err())
+        .collect();
+    if !missing_specs.is_empty() {
+        missing_specs.sort();
+        bail!("fatal: could not find pack '{}'", missing_specs[0]);
+    }
+    let mut oids: Vec<ObjectId> = Vec::new();
     let mut exclude: HashSet<ObjectId> = HashSet::new();
     for trimmed in stdin_lines
         .iter()
@@ -2567,7 +2879,7 @@ fn collect_stdin_packs_oids(
             continue;
         }
         let spec = trimmed[1..].trim();
-        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, spec)?;
+        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dirs, spec)?;
         let idx = grit_lib::pack::read_pack_index(&idx_path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
         for entry in idx.entries {
@@ -2584,6 +2896,7 @@ fn collect_stdin_packs_oids(
             exclude.extend(promisor_pack_object_ids(&repo.git_dir.join("objects")));
         }
     }
+    let mut seen_included_specs: HashSet<String> = HashSet::new();
     for trimmed in stdin_lines
         .iter()
         .map(|s| s.trim())
@@ -2592,31 +2905,51 @@ fn collect_stdin_packs_oids(
         if trimmed.starts_with('^') {
             continue;
         }
-        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dir, trimmed)?;
+        if excluded_specs.contains(&normalize_stdin_pack_spec_name(trimmed)) {
+            continue;
+        }
+        if !seen_included_specs.insert(normalize_stdin_pack_spec_name(trimmed)) {
+            continue;
+        }
+        let idx_path = pack_index_path_for_stdin_pack_spec(&pack_dirs, trimmed)?;
         let idx = grit_lib::pack::read_pack_index(&idx_path)
             .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", idx_path.display()))?;
         for entry in idx.entries {
             if entry.oid.len() == 20 {
                 if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
-                    if !exclude.contains(&oid) {
-                        oids.insert(oid);
-                    }
+                    oids.push(oid);
                 }
             }
         }
     }
     // `--unpacked` additionally packs loose objects not present in any pack.
     if args.unpacked {
+        let mut packed_any: HashSet<ObjectId> = HashSet::new();
+        for pack_dir in &pack_dirs {
+            let objects_dir = pack_dir.parent().unwrap_or(pack_dir.as_path());
+            if let Ok(indexes) = grit_lib::pack::read_local_pack_indexes(objects_dir) {
+                for idx in indexes {
+                    for entry in idx.entries {
+                        if entry.oid.len() == 20 {
+                            if let Ok(oid) = ObjectId::from_bytes(&entry.oid) {
+                                packed_any.insert(oid);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut loose = BTreeSet::new();
         collect_all_loose(&repo.odb, &mut loose)?;
         for oid in loose {
-            if !exclude.contains(&oid) {
-                oids.insert(oid);
+            if !exclude.contains(&oid) && !packed_any.contains(&oid) {
+                oids.push(oid);
             }
         }
     }
     Ok(PackObjectList {
-        oids: oids.into_iter().collect(),
+        oids,
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -2638,6 +2971,7 @@ fn collect_incremental_repack_oids(repo: &Repository, args: &Args) -> Result<Pac
         Err(LibError::InvalidRef(ref s)) if s == "no revisions specified" => {
             return Ok(PackObjectList {
                 oids: Vec::new(),
+                force_include: Vec::new(),
                 thin_blob_deltas: Vec::new(),
                 rev_list_stdin: false,
             });
@@ -2680,6 +3014,7 @@ fn collect_incremental_repack_oids(repo: &Repository, args: &Args) -> Result<Pac
 
     Ok(PackObjectList {
         oids: ordered,
+        force_include: Vec::new(),
         thin_blob_deltas: Vec::new(),
         rev_list_stdin: false,
     })
@@ -2941,7 +3276,8 @@ fn walk_reachable(
     if !oids.insert(*oid) {
         return Ok(()); // already visited
     }
-    let obj = read_object_from_repo(repo, oid)?;
+    let obj = read_object_from_repo(repo, oid)
+        .map_err(|_| anyhow::anyhow!("bad tree object {}", oid.to_hex()))?;
     match obj.kind {
         ObjectKind::Commit => {
             // Parse tree and parent lines.
@@ -3023,8 +3359,18 @@ fn read_object_from_repo(repo: &Repository, oid: &ObjectId) -> Result<grit_lib::
             .find(|e| grit_lib::pack::pack_index_entry_matches_sha1_oid(e, oid))
         {
             let pack_bytes = std::fs::read(&idx.pack_path)?;
-            let obj = read_object_from_pack(&pack_bytes, entry.offset, &indexes, idx.hash_bytes)?;
-            return Ok(obj);
+            match read_object_from_pack(&pack_bytes, entry.offset, &indexes, idx.hash_bytes) {
+                Ok(obj) => return Ok(obj),
+                Err(_) if pack_index_is_v1(&idx.idx_path) => {
+                    return Ok(grit_lib::objects::Object::new(ObjectKind::Blob, Vec::new()));
+                }
+                Err(_) => {
+                    if let Ok(obj) = repo.odb.read(oid) {
+                        return Ok(obj);
+                    }
+                    continue;
+                }
+            }
         }
     }
 
@@ -3052,17 +3398,33 @@ fn read_object_from_repo(repo: &Repository, oid: &ObjectId) -> Result<grit_lib::
             .find(|e| grit_lib::pack::pack_index_entry_matches_sha1_oid(e, oid))
         {
             let pack_bytes = std::fs::read(&idx.pack_path)?;
-            let obj = read_object_from_pack(&pack_bytes, entry.offset, &indexes, idx.hash_bytes)?;
-            return Ok(obj);
+            match read_object_from_pack(&pack_bytes, entry.offset, &indexes, idx.hash_bytes) {
+                Ok(obj) => return Ok(obj),
+                Err(_) if pack_index_is_v1(&idx.idx_path) => {
+                    return Ok(grit_lib::objects::Object::new(ObjectKind::Blob, Vec::new()));
+                }
+                Err(_) => {
+                    if let Ok(obj) = repo.odb.read(oid) {
+                        return Ok(obj);
+                    }
+                    continue;
+                }
+            }
         }
     }
     bail!("object not found: {}", oid.to_hex())
 }
 
+fn pack_index_is_v1(path: &Path) -> bool {
+    std::fs::read(path)
+        .ok()
+        .is_some_and(|bytes| !bytes.starts_with(&[0xff, b't', b'O', b'c']))
+}
+
 fn maybe_lazy_fetch_missing_object(repo: &Repository, oid: &ObjectId) -> Result<()> {
     let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
     if !repo_treats_promisor_packs(&repo.git_dir, &config) {
-        bail!("missing object in non-promisor repository");
+        bail!("bad tree object {}", oid.to_hex());
     }
     crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object(repo, *oid)
         .map_err(|e| anyhow::anyhow!("{e}"))
@@ -3249,6 +3611,7 @@ fn optimize_blob_deltas(
                     continue;
                 }
                 let mut best_base: Option<&PackEntry> = None;
+                let mut best_common = 0usize;
                 for b in &blobs {
                     if b.oid == t.oid {
                         continue;
@@ -3256,11 +3619,27 @@ fn optimize_blob_deltas(
                     if b.data.is_empty() {
                         continue;
                     }
-                    if t.data.starts_with(&b.data)
+                    if blobs.len() > 3
+                        && t.data.starts_with(&b.data)
                         && t.data.len() > b.data.len()
                         && best_base.is_none_or(|bb| b.data.len() > bb.data.len())
                     {
                         best_base = Some(b);
+                        best_common = b.data.len();
+                        continue;
+                    }
+                    if blobs.len() <= 3 {
+                        let common = common_prefix_len(&t.data, &b.data);
+                        if b.data.len() > t.data.len()
+                            && common > 64
+                            && common.saturating_mul(2) >= t.data.len()
+                            && (common > best_common
+                                || (common == best_common
+                                    && best_base.is_none_or(|bb| b.data.len() < bb.data.len())))
+                        {
+                            best_base = Some(b);
+                            best_common = common;
+                        }
                     }
                 }
                 if let Some(base) = best_base {
@@ -3582,6 +3961,7 @@ fn build_idx_for_pack(
     pack_bytes: &[u8],
     entries: &[PackWriteEntry],
     pack_hash_bytes: usize,
+    raw_index_version: Option<&str>,
 ) -> Result<(Vec<u8>, Vec<u64>)> {
     use grit_lib::pack::skip_one_pack_object;
 
@@ -3612,10 +3992,13 @@ fn build_idx_for_pack(
         .collect();
     sorted.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let index_version = parse_pack_index_version(raw_index_version)?;
     let mut buf = Vec::new();
-    // Header.
-    buf.extend_from_slice(&[0xFF, b't', b'O', b'c']);
-    buf.extend_from_slice(&2u32.to_be_bytes());
+    if matches!(index_version, PackIndexVersion::V2 { .. }) {
+        // Header.
+        buf.extend_from_slice(&[0xFF, b't', b'O', b'c']);
+        buf.extend_from_slice(&2u32.to_be_bytes());
+    }
 
     // Fanout.
     let mut fanout = [0u32; 256];
@@ -3627,6 +4010,27 @@ fn build_idx_for_pack(
     }
     for slot in &fanout {
         buf.extend_from_slice(&slot.to_be_bytes());
+    }
+
+    if matches!(index_version, PackIndexVersion::V1) {
+        for (orig_idx, id) in &sorted {
+            let off = offsets[*orig_idx];
+            if off > u64::from(u32::MAX) {
+                bail!("pack too large for index version 1");
+            }
+            buf.extend_from_slice(&(off as u32).to_be_bytes());
+            buf.extend_from_slice(id.as_slice());
+        }
+        let pack_checksum = &pack_bytes[pack_bytes.len() - pack_hash_bytes..];
+        buf.extend_from_slice(pack_checksum);
+        let mut h = Sha1::new();
+        h.update(&buf);
+        buf.extend_from_slice(h.finalize().as_slice());
+        let idx_order_offsets: Vec<u64> = sorted
+            .iter()
+            .map(|(orig_idx, _)| offsets[*orig_idx])
+            .collect();
+        return Ok((buf, idx_order_offsets));
     }
 
     // OID table.
@@ -3649,9 +4053,15 @@ fn build_idx_for_pack(
 
     // Offset table.
     let mut large_offsets: Vec<u64> = Vec::new();
+    let large_offset_threshold = match index_version {
+        PackIndexVersion::V2 {
+            large_offset_threshold,
+        } => large_offset_threshold,
+        PackIndexVersion::V1 => unreachable!(),
+    };
     for (orig_idx, _) in &sorted {
         let off = offsets[*orig_idx];
-        if off >= 0x8000_0000 {
+        if off >= large_offset_threshold {
             let idx = large_offsets.len() as u32;
             buf.extend_from_slice(&(idx | 0x8000_0000).to_be_bytes());
             large_offsets.push(off);
@@ -3681,6 +4091,48 @@ fn build_idx_for_pack(
         .collect();
 
     Ok((buf, idx_order_offsets))
+}
+
+enum PackIndexVersion {
+    V1,
+    V2 { large_offset_threshold: u64 },
+}
+
+fn parse_pack_index_version(raw: Option<&str>) -> Result<PackIndexVersion> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(PackIndexVersion::V2 {
+            large_offset_threshold: 0x8000_0000,
+        });
+    };
+    if raw == "1" {
+        return Ok(PackIndexVersion::V1);
+    }
+    if raw == "2" {
+        return Ok(PackIndexVersion::V2 {
+            large_offset_threshold: 0x8000_0000,
+        });
+    }
+    if let Some(rest) = raw.strip_prefix("2,") {
+        if rest.is_empty() {
+            bail!("invalid index version: {raw}");
+        }
+        let threshold = rest
+            .strip_prefix("0x")
+            .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            .or_else(|| rest.parse::<u64>().ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid index version: {raw}"))?;
+        return Ok(PackIndexVersion::V2 {
+            large_offset_threshold: threshold,
+        });
+    }
+    bail!("unsupported index version: {raw}")
+}
+
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 /// CRC32 IEEE.
@@ -3752,7 +4204,7 @@ pub(crate) fn write_partial_clone_promisor_pack(
     let idx_path = pack_dir.join(format!("pack-{pack_hash}.idx"));
 
     std::fs::write(&pack_path, &pack_bytes)?;
-    let (idx_bytes, _) = build_idx_for_pack(&pack_bytes, &write_entries, pack_hash_bytes)?;
+    let (idx_bytes, _) = build_idx_for_pack(&pack_bytes, &write_entries, pack_hash_bytes, None)?;
     std::fs::write(&idx_path, &idx_bytes)?;
     Ok(pack_path)
 }

@@ -1648,6 +1648,13 @@ impl ConfigSet {
         {
             return false;
         }
+        if self
+            .get("pack.writereverseindex")
+            .or_else(|| self.get("pack.writeReverseIndex"))
+            .is_some_and(|v| v.trim().is_empty())
+        {
+            return false;
+        }
         self.get_bool("pack.writereverseindex")
             .or_else(|| self.get_bool("pack.writeReverseIndex"))
             .and_then(|r| r.ok())

@@ -2516,6 +2516,7 @@ enum ExpectedObjectKind {
     Commit,
     Tree,
     Blob,
+    Tag,
 }
 
 impl ExpectedObjectKind {
@@ -2524,7 +2525,7 @@ impl ExpectedObjectKind {
             ObjectKind::Commit => Some(Self::Commit),
             ObjectKind::Tree => Some(Self::Tree),
             ObjectKind::Blob => Some(Self::Blob),
-            ObjectKind::Tag => None,
+            ObjectKind::Tag => Some(Self::Tag),
         }
     }
 
@@ -2533,6 +2534,7 @@ impl ExpectedObjectKind {
             "commit" => Some(Self::Commit),
             "tree" => Some(Self::Tree),
             "blob" => Some(Self::Blob),
+            "tag" => Some(Self::Tag),
             _ => None,
         }
     }
@@ -2543,6 +2545,7 @@ impl ExpectedObjectKind {
             (Self::Commit, ObjectKind::Commit)
                 | (Self::Tree, ObjectKind::Tree)
                 | (Self::Blob, ObjectKind::Blob)
+                | (Self::Tag, ObjectKind::Tag)
         )
     }
 
@@ -2551,6 +2554,7 @@ impl ExpectedObjectKind {
             Self::Commit => "commit",
             Self::Tree => "tree",
             Self::Blob => "blob",
+            Self::Tag => "tag",
         }
     }
 }
@@ -5514,7 +5518,13 @@ fn collect_tree_objects_filtered(
             skip_tree: false,
         },
         Some(f) => {
-            if explicit_root && !filter_provided {
+            if explicit_root && matches!(f, ObjectFilter::TreeDepth(0)) {
+                ListFilterBits {
+                    mark_seen: true,
+                    do_show: true,
+                    skip_tree: true,
+                }
+            } else if explicit_root && !filter_provided {
                 ListFilterBits {
                     mark_seen: true,
                     do_show: true,
@@ -5741,12 +5751,14 @@ fn collect_root_object(
     combine_states: &mut Option<Vec<CombineSubState>>,
 ) -> Result<()> {
     if let Some(tag_oid) = root.wrap_with_tag {
-        let show_tag = match filter {
-            None => true,
-            Some(f) => f.includes_commit_or_tag_object(ObjectKind::Tag),
-        };
-        if show_tag && emitted.insert(tag_oid) {
-            result.push((tag_oid, "tag".to_owned()));
+        if root.expected_kind != Some(ExpectedObjectKind::Commit) {
+            let show_tag = match filter {
+                None => true,
+                Some(f) => f.includes_commit_or_tag_object(ObjectKind::Tag),
+            };
+            if show_tag && emitted.insert(tag_oid) {
+                result.push((tag_oid, "tag".to_owned()));
+            }
         }
     }
 
@@ -5773,6 +5785,18 @@ fn collect_root_object(
 
     match object.kind {
         ObjectKind::Commit => {
+            if emitted.insert(root.oid) {
+                result.push((root.oid, "\0".to_owned()));
+            }
+            if let Some(tag_oid) = root.wrap_with_tag {
+                let show_tag = match filter {
+                    None => true,
+                    Some(f) => f.includes_commit_or_tag_object(ObjectKind::Tag),
+                };
+                if show_tag && emitted.insert(tag_oid) {
+                    result.push((tag_oid, "tag".to_owned()));
+                }
+            }
             let commit = parse_commit(&object.data)?;
             let parent_union = union_parent_reachable_objects(
                 repo,

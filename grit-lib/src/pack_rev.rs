@@ -26,11 +26,20 @@ pub fn build_pack_rev_bytes(index: &PackIndex) -> Vec<u8> {
 /// Build `.rev` bytes from object offsets in **pack index order** (OID-sorted, same row order as `.idx`).
 #[must_use]
 pub fn build_pack_rev_bytes_from_index_order_offsets(offsets: &[u64]) -> Vec<u8> {
+    build_pack_rev_bytes_from_index_order_offsets_and_checksum(offsets, &[0u8; SHA1_TRAILER])
+}
+
+/// Build `.rev` bytes from index-order offsets and the corresponding pack checksum.
+#[must_use]
+pub fn build_pack_rev_bytes_from_index_order_offsets_and_checksum(
+    offsets: &[u64],
+    pack_checksum: &[u8],
+) -> Vec<u8> {
     let n = offsets.len();
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| offsets[i as usize]);
 
-    let body_len = HEADER_LEN + n * 4;
+    let body_len = HEADER_LEN + n * 4 + SHA1_TRAILER;
     let total_len = body_len + SHA1_TRAILER;
     let mut out = Vec::with_capacity(total_len);
 
@@ -39,6 +48,11 @@ pub fn build_pack_rev_bytes_from_index_order_offsets(offsets: &[u64]) -> Vec<u8>
     out.extend_from_slice(&RIDX_HASH_ID_SHA1.to_be_bytes());
     for idx_pos in order {
         out.extend_from_slice(&idx_pos.to_be_bytes());
+    }
+    if pack_checksum.len() >= SHA1_TRAILER {
+        out.extend_from_slice(&pack_checksum[..SHA1_TRAILER]);
+    } else {
+        out.extend_from_slice(&[0u8; SHA1_TRAILER]);
     }
 
     debug_assert_eq!(out.len(), body_len);
@@ -92,7 +106,7 @@ pub fn pack_rev_fsck_messages(
     rev_path_display: &str,
 ) -> Vec<String> {
     let n = index.entries.len();
-    let expected_len = HEADER_LEN + n * 4 + SHA1_TRAILER;
+    let expected_len = HEADER_LEN + n * 4 + SHA1_TRAILER + SHA1_TRAILER;
     if data.len() < ridx_min_size() {
         return vec![format!(
             "reverse-index file {rev_path_display} is too small"
@@ -167,7 +181,7 @@ pub fn verify_pack_rev_file_contents(
         return Err(format!("sha1 file '{path_for_errors}': validation error"));
     }
     let n = index.entries.len();
-    let expected_len = HEADER_LEN + n * 4 + SHA1_TRAILER;
+    let expected_len = HEADER_LEN + n * 4 + SHA1_TRAILER + SHA1_TRAILER;
     if data.len() != expected_len {
         return Err(format!("reverse-index file {path_for_errors} is corrupt"));
     }
@@ -224,7 +238,7 @@ pub fn verify_pack_rev_file(rev_path: &Path, index: &PackIndex) -> std::result::
 /// (object at pack offset rank `i` → OID at index row `result[i]`). Otherwise `None`.
 #[must_use]
 pub fn try_rev_positions_in_pack_order(data: &[u8], num_objects: usize) -> Option<Vec<u32>> {
-    let expected_len = HEADER_LEN + num_objects * 4 + SHA1_TRAILER;
+    let expected_len = HEADER_LEN + num_objects * 4 + SHA1_TRAILER + SHA1_TRAILER;
     if data.len() != expected_len || !hashfile_checksum_valid_sha1(data) {
         return None;
     }
@@ -246,6 +260,10 @@ pub fn try_rev_positions_in_pack_order(data: &[u8], num_objects: usize) -> Optio
         *slot = read_u32_be(data, &mut pos)?;
     }
     if pos != HEADER_LEN + num_objects * 4 {
+        return None;
+    }
+    pos += SHA1_TRAILER;
+    if pos != data.len() - SHA1_TRAILER {
         return None;
     }
     if pack_order_idx.len() != num_objects {

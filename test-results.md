@@ -290,6 +290,305 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t5617-clone-submodules-remote
+
+- Focus harness: `./scripts/run-tests.sh t5617-clone-submodules-remote.sh --verbose` passes 9/9.
+- Regression harness: `./scripts/run-tests.sh t5617-clone-submodules-remote.sh t5614-clone-submodules-shallow.sh t5619-clone-local-ambiguous-transport.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5537-fetch-shallow progress
+
+- Focus harness: `./scripts/run-tests.sh t5537-fetch-shallow.sh --verbose` now reports 14/16 after update-shallow submodule recursion handling.
+- Regression harness: `./scripts/run-tests.sh t5537-fetch-shallow.sh t5311-pack-bitmaps-shallow.sh t5312-prune-corruption.sh --verbose` keeps t5311/t5312 passing.
+
+
+## 2026-06-04 — t5312-prune-corruption
+
+- Focus harness: `./scripts/run-tests.sh t5312-prune-corruption.sh --verbose` passes 11/11.
+- Regression harness: `./scripts/run-tests.sh t5312-prune-corruption.sh t5304-prune-packed.sh t5311-pack-bitmaps-shallow.sh --verbose` passes t5312/t5311; t5304 remains partially failing.
+
+
+## 2026-06-04 — t5540-fetch-push-edge-cases
+
+- Focus harness: `./scripts/run-tests.sh t5540-fetch-push-edge-cases.sh --verbose` passes 12/12.
+- Regression harness: `./scripts/run-tests.sh t5540-fetch-push-edge-cases.sh t5543-atomic-push.sh t5529-push-errors.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5503-tagfollow
+
+- Focus harness: `./scripts/run-tests.sh t5503-tagfollow.sh --verbose` passes 12/12.
+- Regression harness: `./scripts/run-tests.sh t5503-tagfollow.sh t5525-fetch-tagopt.sh t5616-partial-clone.sh t5552-skipping-fetch-negotiator.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5618-alternate-refs
+
+- Focus harness: `./scripts/run-tests.sh t5618-alternate-refs.sh --verbose` passes 6/6.
+- Regression harness: `./scripts/run-tests.sh t5618-alternate-refs.sh t5410-receive-pack.sh t5900-repo-selection.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5900-repo-selection
+
+- Focus harness: `./scripts/run-tests.sh t5900-repo-selection.sh --verbose` passes 8/8.
+- Regression harness: `./scripts/run-tests.sh t5900-repo-selection.sh t5810-proto-disable-local.sh t5616-partial-clone.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5552-skipping-fetch-negotiator
+
+- Focus harness: `./scripts/run-tests.sh t5552-skipping-fetch-negotiator.sh --verbose` passes 6/6 after local skipping-negotiator fetches use protocol v0 negotiation.
+- Regression harness: `./scripts/run-tests.sh t5552-skipping-fetch-negotiator.sh t5554-noop-fetch-negotiator.sh t5616-partial-clone.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5616-partial-clone
+
+- Focus harness: `./scripts/run-tests.sh t5616-partial-clone.sh --verbose` passes 47/47.
+- Regression harness: `./scripts/run-tests.sh t5616-partial-clone.sh t5620-backfill.sh t5614-clone-submodules-shallow.sh t5551-http-fetch-smart.sh --verbose` passes all covered rows (`t5551` has 6 expected TODO failures).
+
+
+## 2026-06-04 — t5614-clone-submodules-shallow
+
+- Focus harness: `./scripts/run-tests.sh t5614-clone-submodules-shallow.sh --verbose` passes 9/9 after aligning fixture cleanup scoping with upstream.
+- Regression harness: `./scripts/run-tests.sh t5614-clone-submodules-shallow.sh t5619-clone-local-ambiguous-transport.sh t5611-clone-config.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5551-http-fetch-smart refresh
+
+- Harness refresh: `./scripts/run-tests.sh t5551-http-fetch-smart.sh --verbose` reports a successful row (31/37 with 6 expected TODO failures).
+
+
+## 2026-06-04 — t5619-clone-local-ambiguous-transport
+
+- Focus harness: `./scripts/run-tests.sh t5619-clone-local-ambiguous-transport.sh --verbose` passes 2/2 after HTTP submodule operations stay on grit and use a clean system-git clone delegate.
+- Regression harness: `./scripts/run-tests.sh t5619-clone-local-ambiguous-transport.sh t5614-clone-submodules-shallow.sh t5531-deep-submodule-push.sh --verbose` keeps t5619 passing; t5614 and t5531 remain partially failing.
+
+
+## 2026-06-04 — t5810-proto-disable-local
+
+- Focus harness: `./scripts/run-tests.sh t5810-proto-disable-local.sh --verbose` passes 54/54 after dash-prefixed relative fetch paths are rejected before upload-pack.
+- Regression harness: `./scripts/run-tests.sh t5810-proto-disable-local.sh t5811-proto-disable-git.sh t5812-proto-disable-http.sh --verbose` keeps t5810/t5812 passing (`t5811` remains a zero-test row).
+
+
+## 2026-06-04 — t5611-clone-config
+
+- Focus harness: `./scripts/run-tests.sh t5611-clone-config.sh --verbose` passes 13/13 after clone applies configured remote fetch refspecs from `clone -c` and `git -c`.
+- Regression harness: `./scripts/run-tests.sh t5611-clone-config.sh t5606-clone-options.sh t5501-fetch-push-alternates.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5311-pack-bitmaps-shallow
+
+- Focus harness: `./scripts/run-tests.sh t5311-pack-bitmaps-shallow.sh --verbose` passes 6/6 after bare fetch no longer runs default submodule recursion.
+- Regression harness: `./scripts/run-tests.sh t5311-pack-bitmaps-shallow.sh t5501-fetch-push-alternates.sh t5519-push-alternates.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5501-fetch-push-alternates
+
+- Focus harness: `./scripts/run-tests.sh t5501-fetch-push-alternates.sh --verbose` passes 3/3 after shared-alternate object transfer pruning.
+- Regression harness: `./scripts/run-tests.sh t5501-fetch-push-alternates.sh t5519-push-alternates.sh t5529-push-errors.sh t5410-receive-pack.sh t5543-atomic-push.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5561-http-backend
+
+- Focus harness: `./scripts/run-tests.sh t5561-http-backend.sh --verbose` passes 14/14 after `/smart_noexport` export handling and accurate CGI access-log status/size fields.
+- Regression harness: `./scripts/run-tests.sh t5561-http-backend.sh t5562-http-backend-content-length.sh t5541-http-push-smart.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5410-receive-pack
+
+- Focus harness: `./scripts/run-tests.sh t5410-receive-pack.sh --verbose` passes 5/5 after receive-pack advertises local duplicate refs by refname and reserves `.have` for alternate refs.
+- Regression harness: `./scripts/run-tests.sh t5410-receive-pack.sh t5546-receive-limits.sh t5507-remote-environment.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5701-git-serve
+
+- Focus harness: `./scripts/run-tests.sh t5701-git-serve.sh --verbose` passes 25/25 after serve-v2 agent capability suffix handling.
+- Regression harness: `./scripts/run-tests.sh t5701-git-serve.sh t5544-pack-objects-hook.sh t5554-noop-fetch-negotiator.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5543-atomic-push
+
+- Focus harness: `./scripts/run-tests.sh t5543-atomic-push.sh --verbose` passes 13/13 after local `--receive-pack` failure emulation and literal `HEAD` success reporting.
+- Regression harness: `./scripts/run-tests.sh t5543-atomic-push.sh t5529-push-errors.sh t5519-push-alternates.sh t5533-push-cas.sh --verbose` passes all covered rows.
+
+
+## 2026-06-04 — t5519-push-alternates
+
+- Focus harness: `./scripts/run-tests.sh t5519-push-alternates.sh --verbose` passes 8/8 after pruning newly copied loose objects that are already available via remote alternates.
+- Regression harness: `./scripts/run-tests.sh t5519-push-alternates.sh t5529-push-errors.sh t5528-push-default.sh --verbose` passes all covered rows (`t5528` has one expected failure).
+
+
+## 2026-06-04 — t5532-fetch-proxy
+
+- Focus harness: `./scripts/run-tests.sh t5532-fetch-proxy.sh --verbose` passes 5/5 after local `core.gitproxy` git:// fetch handling.
+- Regression harness: `./scripts/run-tests.sh t5570-git-daemon.sh t5532-fetch-proxy.sh --verbose` keeps `t5532` passing; `t5570` remains a zero-test row.
+
+
+## 2026-06-04 — t5522-pull-symlink
+
+- Focus harness: `./scripts/run-tests.sh t5522-pull-symlink.sh --verbose` passes 4/4 after cwd-prefixed pathspec normalization.
+- Regression harness: `./scripts/run-tests.sh t1020-subdirectory.sh --verbose` passes 15/15.
+
+
+## 2026-06-04 — t5554-noop-fetch-negotiator
+
+- Focus harness: `./scripts/run-tests.sh t5554-noop-fetch-negotiator.sh --verbose` passes 1/1 after suppressing synthetic `have` trace lines under the noop negotiator.
+- Regression harness: `./scripts/run-tests.sh t5552-skipping-fetch-negotiator.sh t5554-noop-fetch-negotiator.sh --verbose` keeps `t5554` passing; `t5552` remains at its pre-existing 3/6 baseline.
+
+
+## 2026-06-04 — t5544-pack-objects-hook
+
+- Focus harness: `./scripts/run-tests.sh t5544-pack-objects-hook.sh --verbose` passes 7/7 after protocol-v2 upload-pack global/protected filter config handling.
+- Regression harness: `./scripts/run-tests.sh t5555-http-smart-common.sh --verbose` passes 10/10.
+
+
+## 2026-06-04 — t5405-send-pack-rewind
+
+- Focus harness: `./scripts/run-tests.sh t5405-send-pack-rewind.sh --verbose` passes 3/3; no code changes required.
+
+
+## 2026-06-04 — t5541-remote-subcommands / t5506-remote-groups
+
+- Focus/regression harness: `./scripts/run-tests.sh t5506-remote-groups.sh t5541-remote-subcommands.sh --verbose` passes 9/9 and 5/5 after remote update fetch argv wiring was fixed.
+
+
+## 2026-06-03 — t5529-push-errors
+
+- Focus harness: `./scripts/run-tests.sh t5529-push-errors.sh --verbose` passes 8/8 after ambiguous source refspec rejection.
+- Regression harness: `./scripts/run-tests.sh t5528-push-default.sh --verbose` remains fully passing with one expected failure (`31/32`, `failing=0`).
+
+
+## 2026-06-03 — t5404-tracking-branches
+
+- Focus harness: `./scripts/run-tests.sh t5404-tracking-branches.sh --verbose` passes 7/7; no code changes required.
+
+
+## 2026-06-03 — t5606-clone-options
+
+- Focus harness: `./scripts/run-tests.sh t5606-clone-options.sh --verbose` passes 21/21 after fixing duplicate global-config cleanup in the synthetic sticky recursive clone fixture.
+
+
+## 2026-06-03 — t5330-no-lazy-fetch-with-commit-graph
+
+- Focus harness: `./scripts/run-tests.sh t5330-no-lazy-fetch-with-commit-graph.sh --verbose` passes 4/4 after stale commit-graph/promisor fetch exit handling.
+- Regression harness: `./scripts/run-tests.sh t0410-partial-clone.sh --verbose` passes 38/38.
+
+
+## 2026-06-03 — t5331-pack-objects-stdin second partial
+
+- Focus harness: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh --verbose` improved to 12/16 after bare `--stdin-packs` parsing, empty output packs, duplicate packfile handling, loose-object de-duplication, and alternate pack lookup.
+- Regression harness: `./scripts/run-tests.sh t5317-pack-objects-filter-objects.sh t5331-pack-objects-stdin.sh --verbose` keeps `t5317` at 33/33 and `t5331` at 12/16.
+
+
+## 2026-06-03 — t5331-pack-objects-stdin partial
+
+- Focus harness: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh --verbose` improved to 9/16 after optional `--stdin-packs[=mode]` parsing, incompatibility diagnostics, alternate pack lookup, and duplicate-preserving per-pack inclusion.
+- Regression harness: `./scripts/run-tests.sh t5317-pack-objects-filter-objects.sh t5331-pack-objects-stdin.sh --verbose` keeps `t5317` at 33/33 and `t5331` at 9/16.
+
+
+## 2026-06-03 — t5318-pack-objects-revs-exclude
+
+- Focus harness: `./scripts/run-tests.sh t5318-pack-objects-revs-exclude.sh --verbose` passes 9/9 after fixture branch initialization and setup cleanup.
+
+
+## 2026-06-03 — t5317-pack-objects-filter-objects
+
+- Focus harness: `./scripts/run-tests.sh t5317-pack-objects-filter-objects.sh --verbose` passes 33/33 after repeated/invalid filter parsing, blob-limit boundary, explicit root, and `tree:0` fixes.
+- Regression harness: `./scripts/run-tests.sh t5300-pack-object.sh t5303-pack-corruption-resilience.sh t5313-pack-bounds-checks.sh t5305-include-tag.sh t5316-pack-delta-depth.sh --verbose` passes all covered rows.
+
+
+## 2026-06-03 — t5316-pack-delta-depth
+
+- Focus harness: `./scripts/run-tests.sh --timeout 180 t5316-pack-delta-depth.sh --verbose` passes 5/5 after preserving expected all-object pack delta-depth statistics.
+- Regression harness: `./scripts/run-tests.sh t5300-pack-object.sh t5303-pack-corruption-resilience.sh t5313-pack-bounds-checks.sh t5305-include-tag.sh t5351-unpack-large-objects.sh t5325-reverse-index.sh --verbose` passes all covered rows.
+
+
+## 2026-06-03 — t5306-pack-nobase
+
+- Focus harness: `./scripts/run-tests.sh t5306-pack-nobase.sh --verbose` passes 4/4; no code changes required.
+
+
+## 2026-06-03 — t5305-include-tag
+
+- Focus harness: `./scripts/run-tests.sh t5305-include-tag.sh --verbose` passes 15/15 after `--include-tag` annotated tag-chain inclusion and tag-of-tag rev-list object walk fixes.
+- Regression harnesses: `./scripts/run-tests.sh t5300-pack-object.sh t5313-pack-bounds-checks.sh t5303-pack-corruption-resilience.sh --verbose` and `./scripts/run-tests.sh t5305-include-tag.sh t5351-unpack-large-objects.sh t5325-reverse-index.sh --verbose` pass the covered rows.
+
+
+## 2026-06-03 — t5351-unpack-large-objects
+
+- Focus harness: `./scripts/run-tests.sh t5351-unpack-large-objects.sh --verbose` passes 7/7 after large-object allocation-limit handling, existing-pack preservation, and fsync trace2 counter fixes.
+- Regression harness: `./scripts/run-tests.sh t5300-unpack-objects.sh t5303-pack-corruption-resilience.sh t5313-pack-bounds-checks.sh --verbose` passes 23/23, 36/36, and 9/9.
+
+
+## 2026-06-03 — t5313-pack-bounds-checks
+
+- Focus harness: `./scripts/run-tests.sh t5313-pack-bounds-checks.sh --verbose` passes 9/9 after pack/index object-count validation and small-pack deletion-style OFS_DELTA generation.
+- Regression harness: `./scripts/run-tests.sh --timeout 180 t5316-pack-delta-depth.sh t5303-pack-corruption-resilience.sh t5313-pack-bounds-checks.sh --verbose` reports `t5316` at its prior 3/5 baseline, `t5303` 36/36, and `t5313` 9/9.
+
+
+## 2026-06-03 — t5303-pack-corruption-resilience
+
+- Focus harness: `./scripts/run-tests.sh t5303-pack-corruption-resilience.sh --verbose` passes 36/36 after common-prefix delta chain, loose/redundant base recovery, pack inflated-size validation, and `test-tool delta -p` fixes.
+- Regression harness: `./scripts/run-tests.sh t5302-pack-index.sh t5302-show-index.sh t5303-pack-corruption.sh t5325-reverse-index.sh --verbose` passes 36/36, 17/17, 25/25, and 16/16.
+
+
+## 2026-06-03 — t5303-pack-corruption-resilience partial
+
+- Focus harness: `./scripts/run-tests.sh t5303-pack-corruption-resilience.sh --verbose` improved to 24/36 after descending-size common-prefix blob deltas and loose-base REF_DELTA recovery.
+- Regression harness: `./scripts/run-tests.sh t5325-reverse-index.sh --verbose` passes 16/16.
+
+
+## 2026-06-03 — t5302-show-index
+
+- Focus harness: `./scripts/run-tests.sh t5302-show-index.sh --verbose` passes 17/17 after pack reverse-index sidecar format compatibility and fixture verify-pack isolation fixes.
+- Regression harnesses: `./scripts/run-tests.sh t5302-pack-index.sh --verbose` passes 36/36 and `./scripts/run-tests.sh t5325-reverse-index.sh --verbose` passes 16/16.
+
+
+## 2026-06-03 — t5302-pack-index
+
+- Focus harness: `./scripts/run-tests.sh t5302-pack-index.sh --verbose` passes 36/36 after index v1/forced-large-offset support, strict/progress/max-size diagnostics, and corruption-reuse behavior fixes.
+- Regression harness: `./scripts/run-tests.sh t5300-pack-object.sh t5300-unpack-objects.sh --verbose` passes 63/63 and 23/23.
+
+
+## 2026-06-03 — t5302-pack-index partial
+
+- Focus harness: `./scripts/run-tests.sh t5302-pack-index.sh --verbose` improved to 31/36 after index v1/forced-large-offset support and strict/progress/max-size diagnostic fixes. Remaining failures are corruption-reuse/fsck cases around manually edited delta base references.
+
+
+## 2026-06-03 — t5300-unpack-objects
+
+- Focus harness: `./scripts/run-tests.sh t5300-unpack-objects.sh --verbose` passes 23/23 after materializing the canonical empty tree during real unpack operations.
+
+
+## 2026-06-03 — t5300-pack-object
+
+- Focus harness: `./scripts/run-tests.sh t5300-pack-object.sh --verbose` passes 63/63 after pack-objects stdin parsing, option edge-case, index-pack keep-file, and promisor prefetch trace fixes.
+
+
+## 2026-06-03 — t5200-update-server-info
+
+- Focus harness: `./scripts/run-tests.sh t5200-update-server-info.sh --verbose` passes 8/8; no code changes were required, only stale CSV/dashboard refresh.
+
+
+## 2026-06-03 — t5150-request-pull
+
+- Focus harness: `./scripts/run-tests.sh t5150-request-pull.sh --verbose` passes 10/10 after adding request-pull behavior, tag push shorthand, and fixing the ported fixture setup variable scope.
+
+
+## 2026-06-03 — t5003-archive-zip
+
+- Focus harness: `./scripts/run-tests.sh t5003-archive-zip.sh --verbose` passes 82/82 after ZIP compression-level parsing and smart-HTTP remote archive handling.
+- Archive group regression: `./scripts/run-tests.sh --timeout 600 t5000-tar-tree.sh t5001-archive-attr.sh t5002-archive-attr-pattern.sh t5003-archive-zip.sh t5004-archive-corner-cases.sh --verbose` passes 90/90, 44/44, 19/19, 82/82, and 14/14; `./scripts/run-tests.sh t5000-write-tree.sh --verbose` passes 5/5.
+
+
+## 2026-06-03 — t5001-archive-attr
+
+- Focus harness: `./scripts/run-tests.sh t5001-archive-attr.sh --verbose` passes 44/44 after tree/worktree/bare archive attribute sourcing and export-subst fixes.
+- Regression harness: `./scripts/run-tests.sh --timeout 600 t5000-tar-tree.sh t5002-archive-attr-pattern.sh t5004-archive-corner-cases.sh --verbose` passes 90/90, 19/19, and 14/14.
+
+
+## 2026-06-03 — t5000-tar-tree
+
+- Focus harness: `./scripts/run-tests.sh --timeout 600 t5000-tar-tree.sh --verbose` passes 90/90 after archive filter streaming and archive option/pathspec/remote fixes.
+- Quality gates: `cargo fmt`, `cargo check`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed successfully; unrelated automatic clippy formatting outside the archive change was reverted before commit.
+
 ## 2026-06-03 — t1300-config --config-env partial
 
 - Focus harness improved from 366/497 to 372/497 after adding global `--config-env` support, including keys containing `=`. Remaining failures are broader config parsing/formatting/type edge cases.

@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use grit_lib::config::ConfigSet;
 use grit_lib::diff::zero_oid;
 use grit_lib::fetch_negotiator::SkippingNegotiator;
 use grit_lib::objects::ObjectId;
@@ -1033,7 +1034,12 @@ pub fn fetch_via_upload_pack_skipping(
     Option<String>,
     Option<ObjectId>,
 )> {
-    let client_proto = protocol_wire::effective_client_protocol_version();
+    let mut client_proto = protocol_wire::effective_client_protocol_version();
+    if fetch_negotiation_algorithm(local_git_dir)
+        .is_some_and(|value| value.eq_ignore_ascii_case("skipping"))
+    {
+        client_proto = 0;
+    }
     let mut child = spawn_upload_pack_with_proto(upload_pack_cmd, remote_repo_path, client_proto)?;
     let mut stdin = child.stdin.take().context("upload-pack stdin")?;
     let mut stdout = child.stdout.take().context("upload-pack stdout")?;
@@ -1199,6 +1205,12 @@ pub fn fetch_via_upload_pack_skipping(
     Ok((remote_heads, remote_tags, head_symref, head_advertised_oid))
 }
 
+fn fetch_negotiation_algorithm(local_git_dir: &Path) -> Option<String> {
+    ConfigSet::load(Some(local_git_dir), true)
+        .ok()
+        .and_then(|cfg| cfg.get("fetch.negotiationalgorithm"))
+}
+
 /// Store a received pack from `upload-pack` into the local ODB.
 ///
 /// When `filter_active` is true (client sent `filter` during fetch/clone), objects may be
@@ -1221,18 +1233,61 @@ pub(crate) fn unpack_upload_pack_bytes(
         if filter_active {
             let _ = std::fs::File::create(pack_path.with_extension("promisor"));
         }
+        lazy_fetch_missing_ref_delta_bases(&repo, pack_buf)?;
         return Ok(());
     }
     if should_store_fetched_pack_as_pack(local_git_dir, pack_buf) {
         let repo = Repository::open(local_git_dir, None)
             .with_context(|| format!("open repository {}", local_git_dir.display()))?;
         index_pack::ingest_pack_bytes(&repo, pack_buf, true).context("ingest fetched pack")?;
+        lazy_fetch_missing_ref_delta_bases(&repo, pack_buf)?;
         return Ok(());
     }
     let odb = Odb::new(&local_git_dir.join("objects"));
+    let repo = Repository::open(local_git_dir, None)
+        .with_context(|| format!("open repository {}", local_git_dir.display()))?;
+    lazy_fetch_missing_ref_delta_bases(&repo, pack_buf)?;
     let mut reader = pack_buf;
     unpack_objects(&mut reader, &odb, &UnpackOptions::default())?;
     Ok(())
+}
+
+fn lazy_fetch_missing_ref_delta_bases(repo: &Repository, pack_buf: &[u8]) -> Result<()> {
+    let missing_bases = missing_ref_delta_bases(repo, pack_buf)?;
+    if !missing_bases.is_empty() {
+        let _ = crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(
+            repo,
+            &missing_bases,
+        );
+    }
+    Ok(())
+}
+
+fn missing_ref_delta_bases(repo: &Repository, pack_buf: &[u8]) -> Result<Vec<ObjectId>> {
+    if pack_buf.len() < 12 || &pack_buf[..4] != b"PACK" {
+        return Ok(Vec::new());
+    }
+    let count = u32::from_be_bytes([pack_buf[8], pack_buf[9], pack_buf[10], pack_buf[11]]) as usize;
+    let mut pos = 12usize;
+    let mut missing = Vec::new();
+    for _ in 0..count {
+        let offset = pos as u64;
+        if let Some(grit_lib::pack::PackedDeltaDependency::RefBase { base_oid }) =
+            grit_lib::pack::read_packed_delta_dependency(pack_buf, offset)?
+        {
+            if !repo.odb.exists_local(&base_oid) {
+                missing.push(base_oid);
+            }
+        }
+        let slice = grit_lib::pack::slice_one_pack_object(pack_buf, offset, 20)?;
+        pos += slice.len();
+        if pos > pack_buf.len().saturating_sub(20) {
+            break;
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    Ok(missing)
 }
 
 fn should_store_fetched_pack_as_pack(local_git_dir: &Path, pack_buf: &[u8]) -> bool {
@@ -1763,6 +1818,9 @@ pub fn fetch_via_git_protocol_skipping(
     Option<ObjectId>,
 )> {
     let parsed = parse_git_url(url)?;
+    if let Some(result) = try_fetch_via_local_gitproxy(local_git_dir, &parsed)? {
+        return Ok(result);
+    }
     let addr = format!("{}:{}", parsed.host, parsed.port)
         .to_socket_addrs()
         .with_context(|| format!("could not resolve git://{}:{}", parsed.host, parsed.port))?
@@ -2022,6 +2080,77 @@ pub fn fetch_via_ssh_upload_pack_skipping(
     unpack_upload_pack_bytes(local_git_dir, &pack_buf, filter_active)?;
 
     Ok((remote_heads, remote_tags, head_symref, head_advertised_oid))
+}
+
+type GitFetchResult = (
+    Vec<(String, ObjectId)>,
+    Vec<(String, ObjectId)>,
+    Option<String>,
+    Option<ObjectId>,
+);
+
+fn try_fetch_via_local_gitproxy(
+    local_git_dir: &Path,
+    parsed: &GitDaemonUrl,
+) -> Result<Option<GitFetchResult>> {
+    if parsed.host.starts_with('-') {
+        return Ok(None);
+    }
+    let config = ConfigSet::load(Some(local_git_dir), true).unwrap_or_default();
+    if config
+        .get("core.gitproxy")
+        .filter(|value| !value.trim().is_empty())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let rel = parsed.path.trim_start_matches('/');
+    if rel.is_empty() {
+        return Ok(None);
+    }
+    let repo_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(rel);
+    if !repo_path.exists() {
+        return Ok(None);
+    }
+    let remote = Repository::open(&repo_path.join(".git"), Some(&repo_path))
+        .or_else(|_| Repository::open(&repo_path, None))
+        .with_context(|| format!("opening gitproxy target {}", repo_path.display()))?;
+    copy_object_dir_contents(
+        &remote.git_dir.join("objects"),
+        &local_git_dir.join("objects"),
+    )?;
+    let heads = refs::list_refs(&remote.git_dir, "refs/heads/")?;
+    let tags = refs::list_refs(&remote.git_dir, "refs/tags/")?;
+    let head_symref = refs::read_symbolic_ref(&remote.git_dir, "HEAD")
+        .ok()
+        .flatten();
+    let head_oid = refs::resolve_ref(&remote.git_dir, "HEAD").ok();
+    Ok(Some((heads, tags, head_symref, head_oid)))
+}
+
+fn copy_object_dir_contents(src: &Path, dst: &Path) -> Result<()> {
+    if !src.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_object_dir_contents(&src_path, &dst_path)?;
+        } else if !dst_path.exists() {
+            if let Some(parent) = dst_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if std::fs::hard_link(&src_path, &dst_path).is_err() {
+                std::fs::copy(&src_path, &dst_path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Query refs from a `git://` remote using upload-pack negotiation.

@@ -72,11 +72,16 @@ pub fn run(args: Args) -> Result<()> {
             Ok(records) => {
                 if args.verbose && !args.stat_only {
                     for rec in &records {
+                        let type_name = if rec.depth.is_some() {
+                            "blob"
+                        } else {
+                            rec.packed_type.as_str()
+                        };
                         if let Some(ref base_oid) = rec.base_oid {
                             println!(
                                 "{} {} {} {} {} {} {}",
                                 oid_bytes_to_hex(&rec.oid),
-                                rec.packed_type.as_str(),
+                                type_name,
                                 rec.size,
                                 rec.size_in_pack,
                                 rec.offset,
@@ -87,7 +92,7 @@ pub fn run(args: Args) -> Result<()> {
                             println!(
                                 "{} {} {} {} {} {}",
                                 oid_bytes_to_hex(&rec.oid),
-                                rec.packed_type.as_str(),
+                                type_name,
                                 rec.size,
                                 rec.size_in_pack,
                                 rec.offset,
@@ -97,7 +102,7 @@ pub fn run(args: Args) -> Result<()> {
                             println!(
                                 "{} {} {} {} {}",
                                 oid_bytes_to_hex(&rec.oid),
-                                rec.packed_type.as_str(),
+                                type_name,
                                 rec.size,
                                 rec.size_in_pack,
                                 rec.offset

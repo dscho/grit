@@ -282,10 +282,9 @@ pub fn resolve_pathspec(pathspec: &str, work_tree: &Path, prefix: Option<&str>) 
     }
 
     match prefix {
-        Some(p) if !p.is_empty() => PathBuf::from(p)
-            .join(pathspec)
-            .to_string_lossy()
-            .to_string(),
+        Some(p) if !p.is_empty() => {
+            normalize_relative_path_str(&PathBuf::from(p).join(pathspec).to_string_lossy())
+        }
         _ => pathspec.to_owned(),
     }
 }

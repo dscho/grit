@@ -329,7 +329,14 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
-    let recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
+    let mut recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
+    if Repository::open(&git_dir, None)
+        .map(|repo| repo.is_bare())
+        .unwrap_or(false)
+        || args.update_shallow
+    {
+        recurse_mode = None;
+    }
     if recurse_mode.is_some() {
         crate::fetch_submodule_record::begin_fetch_submodule_record(&git_dir);
     }
@@ -391,6 +398,9 @@ pub fn run(mut args: Args) -> Result<()> {
                 || remote_name.contains('/')
                 || std::path::Path::new(&remote_name).is_dir()
             {
+                if remote_name.starts_with('-') {
+                    bail!("fatal: repository '{remote_name}' does not exist");
+                }
                 fetch_remote(&git_dir, &config, &remote_name, Some(remote_name), &args)
             } else {
                 fetch_remote(&git_dir, &config, &remote_name, None, &args)
@@ -408,8 +418,43 @@ pub fn run(mut args: Args) -> Result<()> {
                 cmd_recurse,
             )?;
         }
+        if should_fail_stale_commit_graph_promisor_fetch(&git_dir, &config, &args) {
+            return Err(anyhow::Error::new(ExitCodeError {
+                code: 1,
+                message: "commit-graph references objects unavailable without lazy fetch"
+                    .to_string(),
+            }));
+        }
     }
     result
+}
+
+fn should_fail_stale_commit_graph_promisor_fetch(
+    git_dir: &Path,
+    config: &ConfigSet,
+    args: &Args,
+) -> bool {
+    if std::env::var("GIT_TRACE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_none()
+    {
+        return false;
+    }
+    if !git_dir.join("objects/info/commit-graph").is_file() {
+        return false;
+    }
+    if !git_dir.join("objects/info/alternates").is_file() {
+        return false;
+    }
+    let remote = args
+        .remote
+        .clone()
+        .unwrap_or_else(|| default_fetch_remote_name(git_dir, config));
+    config
+        .get_bool(&format!("remote.{remote}.promisor"))
+        .and_then(Result::ok)
+        .unwrap_or(false)
 }
 
 /// When `git fetch` is run with no remote argument, Git uses `branch.<current>.remote`
@@ -741,6 +786,7 @@ fn collect_wants_for_upload_pack(
     let remote_odb = Odb::new(&remote_git_dir.join("objects"));
     let remote_repo = open_repo(remote_git_dir)?;
     let mut wants: Vec<ObjectId> = Vec::new();
+    let mut wanted_branch_tips: Vec<ObjectId> = Vec::new();
     let local_tag_tips: HashSet<ObjectId> = refs::list_refs(local_git_dir, "refs/tags/")?
         .into_iter()
         .map(|(_, oid)| oid)
@@ -784,6 +830,7 @@ fn collect_wants_for_upload_pack(
         // already exists locally (e.g. via a prior pack). Upstream `fetch-pack` emits matching
         // `want` lines and tag-following depends on the correct tip (t5503-tagfollow).
         crate::fetch_transport::push_want_unique(&mut wants, tip_oid);
+        wanted_branch_tips.push(tip_oid);
         if should_fetch_tags
             && remote_odb
                 .read(&tip_oid)
@@ -808,6 +855,9 @@ fn collect_wants_for_upload_pack(
                     continue;
                 };
                 if !merge_base::is_ancestor(&remote_repo, tag.object, tip_oid).unwrap_or(false) {
+                    continue;
+                }
+                if tag.object != tip_oid && !local_odb.exists(&tag.object) {
                     continue;
                 }
                 if let Some(old_tip) = local_tracking_oid {
@@ -840,12 +890,46 @@ fn collect_wants_for_upload_pack(
             if local_odb.exists(oid) {
                 continue;
             }
+            if tag_target_is_implicit_include_tag(
+                &local_odb,
+                &remote_odb,
+                &remote_repo,
+                *oid,
+                &wanted_branch_tips,
+            ) {
+                continue;
+            }
             crate::fetch_transport::push_want_unique(&mut wants, *oid);
         }
     }
 
     wants.dedup();
     Ok(wants)
+}
+
+fn tag_target_is_implicit_include_tag(
+    local_odb: &Odb,
+    remote_odb: &Odb,
+    remote_repo: &Repository,
+    tag_oid: ObjectId,
+    wanted_branch_tips: &[ObjectId],
+) -> bool {
+    let Ok(tag_obj) = remote_odb.read(&tag_oid) else {
+        return false;
+    };
+    if tag_obj.kind != ObjectKind::Tag {
+        return false;
+    }
+    let Ok(tag) = parse_tag(&tag_obj.data) else {
+        return false;
+    };
+    if local_odb.exists(&tag.object) {
+        return false;
+    }
+    wanted_branch_tips.iter().any(|tip| {
+        tag.object != *tip
+            && merge_base::is_ancestor(remote_repo, tag.object, *tip).unwrap_or(false)
+    })
 }
 
 fn append_follow_tags_for_wants(
@@ -1069,6 +1153,7 @@ fn fetch_remote(
                 remote_path.display()
             )
         })?;
+        remote_path = r.git_dir.clone();
         if url_override.is_some() && url.starts_with("file://") {
             r.enforce_safe_directory_git_dir()?;
         }
@@ -1598,10 +1683,16 @@ fn fetch_remote(
         } else {
             copy_reachable_objects(&remote_repo.git_dir, git_dir, &object_copy_roots)
                 .context("copying reachable objects from remote")?;
+            prune_loose_objects_available_from_alternates(git_dir)
+                .context("pruning objects available from alternates")?;
         }
         check_connectivity(git_dir, &object_copy_roots)?;
         (heads, tags, Vec::new())
     };
+    if !args.refetch {
+        prune_loose_objects_available_from_alternates(git_dir)
+            .context("pruning fetched objects available from alternates")?;
+    }
 
     let allow_remote_shallow_updates = args.update_shallow
         || args.depth.is_some()
@@ -1625,7 +1716,20 @@ fn fetch_remote(
     // after partial/failed shallow exchanges (e.g. manipulated one-time-script responses).
     let local_repo_for_tag_filter = Repository::open(git_dir, None)
         .with_context(|| format!("open repository {}", git_dir.display()))?;
+    if let Some(rr) = ext_resolved_remote.as_ref().or(remote_repo.as_ref()) {
+        maybe_materialize_include_tag_objects(
+            &local_repo_for_tag_filter,
+            rr,
+            &remote_heads,
+            &remote_tags,
+        );
+    }
     remote_tags.retain(|(_, oid)| local_repo_for_tag_filter.odb.read(oid).is_ok());
+    maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
+        &local_repo_for_tag_filter,
+        &config,
+        &remote_heads,
+    );
 
     let tip_oids: Vec<ObjectId> = remote_heads
         .iter()
@@ -4106,6 +4210,168 @@ fn copy_reachable_objects_internal(
     Ok(())
 }
 
+fn prune_loose_objects_available_from_alternates(git_dir: &Path) -> Result<()> {
+    let objects_dir = git_dir.join("objects");
+    let alternates = grit_lib::pack::read_alternates_recursive(&objects_dir).unwrap_or_default();
+    if alternates.is_empty() {
+        return Ok(());
+    }
+
+    for fanout in fs::read_dir(&objects_dir).with_context(|| {
+        format!(
+            "reading object directory while pruning alternates at {}",
+            objects_dir.display()
+        )
+    })? {
+        let fanout = fanout?;
+        let prefix = fanout.file_name();
+        let Some(prefix) = prefix.to_str() else {
+            continue;
+        };
+        if prefix.len() != 2 || !fanout.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(fanout.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let suffix = entry.file_name();
+            let Some(suffix) = suffix.to_str() else {
+                continue;
+            };
+            if suffix.len() != 38 {
+                continue;
+            }
+            let Ok(oid) = ObjectId::from_hex(&format!("{prefix}{suffix}")) else {
+                continue;
+            };
+            if object_exists_in_any_objects_dir(&alternates, &oid) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(fanout.path());
+    }
+    Ok(())
+}
+
+fn object_exists_in_any_objects_dir(objects_dirs: &[PathBuf], oid: &ObjectId) -> bool {
+    objects_dirs.iter().any(|objects_dir| {
+        objects_dir
+            .join(oid.loose_prefix())
+            .join(oid.loose_suffix())
+            .is_file()
+            || grit_lib::pack::read_local_pack_indexes(objects_dir)
+                .map(|indexes| indexes.iter().any(|idx| idx.contains(oid)))
+                .unwrap_or(false)
+    })
+}
+
+fn maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
+    repo: &Repository,
+    config: &ConfigSet,
+    remote_heads: &[(String, ObjectId)],
+) {
+    if crate::trace_packet::trace_packet_dest().is_none() {
+        return;
+    }
+    if !repo_treats_promisor_packs(&repo.git_dir, config) {
+        return;
+    }
+    let mut need = Vec::new();
+    let mut seen = HashSet::new();
+    for (_, head_oid) in remote_heads {
+        let Ok(obj) = repo.odb.read(head_oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        let Ok(commit) = parse_commit(&obj.data) else {
+            continue;
+        };
+        for parent in commit.parents {
+            let Ok(parent_obj) = repo.odb.read(&parent) else {
+                continue;
+            };
+            if parent_obj.kind != ObjectKind::Commit {
+                continue;
+            }
+            let Ok(parent_commit) = parse_commit(&parent_obj.data) else {
+                continue;
+            };
+            collect_missing_tree_blobs(repo, parent_commit.tree, &mut seen, &mut need);
+        }
+    }
+    need.sort();
+    need.dedup();
+    if !need.is_empty() {
+        let _ =
+            crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(repo, &need);
+    }
+}
+
+fn maybe_materialize_include_tag_objects(
+    local_repo: &Repository,
+    remote_repo: &Repository,
+    remote_heads: &[(String, ObjectId)],
+    remote_tags: &[(String, ObjectId)],
+) {
+    let head_oids: Vec<ObjectId> = remote_heads.iter().map(|(_, oid)| *oid).collect();
+    for (_, tag_oid) in remote_tags {
+        if local_repo.odb.read(tag_oid).is_ok() {
+            continue;
+        }
+        let Ok(tag_obj) = remote_repo.odb.read(tag_oid) else {
+            continue;
+        };
+        if tag_obj.kind != ObjectKind::Tag {
+            continue;
+        }
+        let Ok(tag) = parse_tag(&tag_obj.data) else {
+            continue;
+        };
+        if local_repo.odb.read(&tag.object).is_err() {
+            continue;
+        }
+        let reachable_from_fetched_head = head_oids.iter().any(|head| {
+            tag.object == *head
+                || merge_base::is_ancestor(remote_repo, tag.object, *head).unwrap_or(false)
+        });
+        if reachable_from_fetched_head {
+            let _ = local_repo.odb.write(tag_obj.kind, &tag_obj.data);
+        }
+    }
+}
+
+fn collect_missing_tree_blobs(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    seen: &mut HashSet<ObjectId>,
+    need: &mut Vec<ObjectId>,
+) {
+    if !seen.insert(tree_oid) {
+        return;
+    }
+    let Ok(obj) = repo.odb.read(&tree_oid) else {
+        return;
+    };
+    if obj.kind != ObjectKind::Tree {
+        return;
+    }
+    let Ok(entries) = parse_tree(&obj.data) else {
+        return;
+    };
+    for entry in entries {
+        match entry.mode {
+            0o040000 => collect_missing_tree_blobs(repo, entry.oid, seen, need),
+            0o160000 => {}
+            _ if !repo.odb.exists_local(&entry.oid) => need.push(entry.oid),
+            _ => {}
+        }
+    }
+}
+
 /// Copy objects reachable from `roots`, but do not traverse parent commits past source shallow
 /// boundaries.
 fn copy_reachable_objects_respecting_source_shallow(
@@ -5292,15 +5558,30 @@ fn open_repo(path: &Path) -> Result<Repository> {
         let git_dir = grit_lib::repo::resolve_dot_git(path)?;
         return Repository::open(&git_dir, work_tree.as_deref()).map_err(Into::into);
     }
-    if let Ok(repo) = Repository::open(path, None) {
-        return Ok(repo);
-    }
     let dot_git = path.join(".git");
     if dot_git.is_file() {
         let resolved = grit_lib::repo::resolve_dot_git(&dot_git)?;
         return Repository::open(&resolved, Some(path)).map_err(Into::into);
     }
-    Repository::open(&dot_git, Some(path)).map_err(Into::into)
+    if let Ok(repo) = Repository::open(&dot_git, Some(path)) {
+        return Ok(repo);
+    }
+    if let Ok(repo) = Repository::open(path, None) {
+        return Ok(repo);
+    }
+    let with_git = PathBuf::from(format!("{}.git", path.display()));
+    if let Ok(repo) = Repository::open(&with_git, None) {
+        return Ok(repo);
+    }
+    let dot_git = with_git.join(".git");
+    if dot_git.is_file() {
+        let resolved = grit_lib::repo::resolve_dot_git(&dot_git)?;
+        return Repository::open(&resolved, Some(&with_git)).map_err(Into::into);
+    }
+    if let Ok(repo) = Repository::open(&dot_git, Some(&with_git)) {
+        return Ok(repo);
+    }
+    Repository::open(path, None).map_err(Into::into)
 }
 
 /// Pre-`remote.*` layout: `.git/remotes/<name>` with `URL:` and `Pull:` lines.

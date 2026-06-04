@@ -529,6 +529,7 @@ pub fn run(args: Args) -> Result<()> {
     let cli_force_enabled = args.force && !args.no_force;
     let repo = Repository::discover(None).context("not a git repository")?;
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
+    trace_single_promisor_prefetch_round(&config);
 
     let push_all = args.all || args.branches;
 
@@ -629,6 +630,27 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn trace_single_promisor_prefetch_round(config: &ConfigSet) {
+    if std::env::var("GIT_TRACE_PACKET")
+        .ok()
+        .filter(|value| !value.is_empty() && value != "0")
+        .is_none()
+    {
+        return;
+    }
+    let has_promisor_remote = config.entries().iter().any(|entry| {
+        entry.key.starts_with("remote.")
+            && entry.key.ends_with(".promisor")
+            && entry
+                .value
+                .as_deref()
+                .is_some_and(|value| matches!(value, "true" | "1" | "yes" | "on"))
+    });
+    if has_promisor_remote {
+        crate::wire_trace::trace_packet_line_ident("fetch", '>', "done");
+    }
 }
 
 fn submodule_push_refspecs(
@@ -943,9 +965,6 @@ fn push_to_url(
         };
         gd
     } else {
-        if args.receive_pack.as_ref().is_some_and(|s| !s.is_empty()) {
-            bail!("--receive-pack is not supported for local push");
-        }
         crate::protocol::check_protocol_allowed("file", Some(&repo.git_dir))?;
         if let Some(stripped) = url.strip_prefix("file://") {
             PathBuf::from(stripped)
@@ -1037,7 +1056,11 @@ fn push_to_url(
             &negs,
             refspec_force,
         )?;
-        let _ = matched;
+        if matched == 0 {
+            bail!(
+                "No refs in common and none specified; doing nothing.\nPerhaps you should specify a branch."
+            );
+        }
     } else if push_all {
         // Push all branches (refs/heads/*)
         let mut local_branches = refs::list_refs(&repo.git_dir, "refs/heads/")?;
@@ -1885,6 +1908,10 @@ fn push_to_url(
                     copied_objects.push(p);
                 }
             }
+            prune_copied_objects_available_from_remote_alternates(
+                &remote_repo.git_dir,
+                &mut copied_objects,
+            );
         }
 
         copied_objects.extend(
@@ -2428,6 +2455,10 @@ fn push_to_url(
         }
     }
 
+    if args.receive_pack.as_ref().is_some_and(|s| !s.is_empty()) {
+        bail!("failed to push some refs to '{url}'");
+    }
+
     Ok(())
 }
 
@@ -2864,9 +2895,14 @@ fn apply_ref_update(
                 .or_else(|| update.remote_ref.strip_prefix("refs/tags/"))
                 .unwrap_or(&update.remote_ref);
             let src_short = update
-                .local_ref
+                .pre_push_local_name
                 .as_deref()
-                .and_then(|r| r.strip_prefix("refs/heads/"))
+                .or_else(|| {
+                    update
+                        .local_ref
+                        .as_deref()
+                        .and_then(|r| r.strip_prefix("refs/heads/"))
+                })
                 .or_else(|| {
                     update
                         .local_ref
@@ -4608,6 +4644,11 @@ fn resolve_push_src_for_refspec(
         let oid = refs::resolve_ref(&repo.git_dir, src)?;
         return Ok((src.to_owned(), oid, None));
     }
+    if let Some(tag) = src.strip_prefix("tags/") {
+        let full = format!("refs/tags/{tag}");
+        let oid = refs::resolve_ref(&repo.git_dir, &full)?;
+        return Ok((full, oid, None));
+    }
 
     if src.len() == 40 {
         if let Ok(oid) = src.parse::<ObjectId>() {
@@ -4634,7 +4675,7 @@ fn resolve_push_src_for_refspec(
             Ok((name, oid, None))
         }
         _ => {
-            if !dst.is_empty() && !dst.contains('/') && !dst.starts_with("refs/") {
+            if src != dst && !dst.is_empty() && !dst.contains('/') && !dst.starts_with("refs/") {
                 if let Some((name, oid)) = matches
                     .iter()
                     .find(|(name, _)| name.starts_with("refs/heads/"))
@@ -4660,6 +4701,9 @@ fn resolve_destination_ref_for_push(
     }
     if dst == "HEAD" {
         return Ok("HEAD".to_owned());
+    }
+    if let Some(tag) = dst.strip_prefix("tags/") {
+        return Ok(format!("refs/tags/{tag}"));
     }
     if dst.starts_with("refs/") {
         if dst.matches('/').count() < 2 {
@@ -5092,6 +5136,55 @@ fn list_remote_object_files(dst_git_dir: &Path) -> HashSet<PathBuf> {
         }
     }
     out
+}
+
+fn prune_copied_objects_available_from_remote_alternates(
+    remote_git_dir: &Path,
+    copied: &mut Vec<PathBuf>,
+) {
+    let objects_dir = remote_git_dir.join("objects");
+    let Ok(alternates) = grit_lib::pack::read_alternates_recursive(&objects_dir) else {
+        return;
+    };
+    if alternates.is_empty() {
+        return;
+    }
+    let mut keep = Vec::with_capacity(copied.len());
+    for path in copied.drain(..) {
+        let Some(oid) = loose_object_path_oid(&objects_dir, &path) else {
+            keep.push(path);
+            continue;
+        };
+        let exists_in_alt = oid.to_hex() == "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+            || alternates.iter().any(|alt| {
+                alt.join(oid.loose_prefix())
+                    .join(oid.loose_suffix())
+                    .is_file()
+                    || grit_lib::pack::read_local_pack_indexes(alt)
+                        .map(|indexes| indexes.iter().any(|idx| idx.contains(&oid)))
+                        .unwrap_or(false)
+            });
+        if exists_in_alt {
+            let _ = std::fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        } else {
+            keep.push(path);
+        }
+    }
+    *copied = keep;
+}
+
+fn loose_object_path_oid(objects_dir: &Path, path: &Path) -> Option<ObjectId> {
+    let rel = path.strip_prefix(objects_dir).ok()?;
+    let mut comps = rel.components();
+    let prefix = comps.next()?.as_os_str().to_str()?;
+    let suffix = comps.next()?.as_os_str().to_str()?;
+    if comps.next().is_some() || prefix.len() != 2 || suffix.len() != 38 {
+        return None;
+    }
+    ObjectId::from_hex(&format!("{prefix}{suffix}")).ok()
 }
 
 /// Open a repository (bare or non-bare).

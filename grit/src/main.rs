@@ -1464,6 +1464,24 @@ fn run_test_tool_online_cpus(rest: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn run_test_tool_delta(rest: &[String]) -> Result<()> {
+    if rest.len() != 5 {
+        bail!("usage: test-tool delta (-d|-p) <from_file> <data_file> <out_file>");
+    }
+    match rest[1].as_str() {
+        "-p" => {
+            let base = std::fs::read(&rest[2]).with_context(|| format!("read {}", rest[2]))?;
+            let delta = std::fs::read(&rest[3]).with_context(|| format!("read {}", rest[3]))?;
+            let result = grit_lib::unpack_objects::apply_delta(&base, &delta)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            std::fs::write(&rest[4], result).with_context(|| format!("write {}", rest[4]))?;
+            Ok(())
+        }
+        "-d" => bail!("test-tool delta: delta generation is not implemented"),
+        _ => bail!("usage: test-tool delta (-d|-p) <from_file> <data_file> <out_file>"),
+    }
+}
+
 /// `test-tool lazy-init-name-hash` — exercise case-folding name/dir hash init (t3008, perf tests).
 fn run_test_tool_lazy_init_name_hash(rest: &[String]) -> Result<()> {
     use anyhow::Context;
@@ -5064,6 +5082,7 @@ pub(crate) const KNOWN_COMMANDS: &[&str] = &[
     "read-tree",
     "rebase",
     "receive-pack",
+    "request-pull",
     "reflog",
     "refs",
     "remote",
@@ -5372,7 +5391,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             commands::index_pack::normalize_argv_for_positional_pack(&mut argv);
             commands::index_pack::run(parse_cmd_args(subcmd, &argv))
         }
-        "init" => commands::init::run(parse_cmd_args(subcmd, rest), opts.bare),
+        "init" | "init-db" => commands::init::run(parse_cmd_args("init", rest), opts.bare),
         "interpret-trailers" => {
             if rest.len() == 1 && (rest[0] == "-h" || rest[0] == "--help") {
                 if let Some(syn) = commands::upstream_synopsis_help::synopsis_for_builtin(subcmd) {
@@ -5467,7 +5486,10 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             }
             commands::notes::run_from_argv(rest)
         }
-        "pack-objects" => commands::pack_objects::run(parse_cmd_args(subcmd, rest)),
+        "pack-objects" => {
+            let rest = commands::pack_objects::preprocess_argv(rest);
+            commands::pack_objects::run(parse_cmd_args(subcmd, &rest))
+        }
         "pkt-line" => {
             let sub = rest.first().map(|s| s.as_str()).unwrap_or("");
             match sub {
@@ -5490,6 +5512,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             &commands::rebase::preprocess_rebase_argv(rest),
         )),
         "receive-pack" => commands::receive_pack::run(parse_cmd_args(subcmd, rest)),
+        "request-pull" => commands::request_pull::run_from_argv(rest),
         "reflog" => {
             let rest = preprocess_expand_tabs_for_rev_cmd(&preprocess_log_args(rest));
             commands::reflog::run(parse_cmd_args(subcmd, &rest))
@@ -6079,6 +6102,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                     let args = preprocess_test_tool_args(rest)?;
                     test_tool_pack_deltas::run(&args)
                 }
+                "delta" => run_test_tool_delta(rest),
                 "dump-reftable" => {
                     // Supports `-b` (dump per-block stats) used by t0613.
                     let mut dump_blocks = false;

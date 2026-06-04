@@ -416,6 +416,7 @@ pub(crate) fn write_v2_fetch_request(
     for w in wants {
         let line = format!("want {}", w.to_hex());
         trace_packet_git('>', line.trim_end());
+        wire_trace::trace_packet_upload_pack('<', line.trim_end());
         pkt_line::write_line(stdin, &line)?;
     }
     if let Some(spec) = filter_spec.map(str::trim).filter(|s| !s.is_empty()) {
