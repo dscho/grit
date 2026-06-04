@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5810-proto-disable-local
+
+- Focus harness: `./scripts/run-tests.sh t5810-proto-disable-local.sh --verbose` passes 54/54 after dash-prefixed relative fetch paths are rejected before upload-pack.
+- Regression harness: `./scripts/run-tests.sh t5810-proto-disable-local.sh t5811-proto-disable-git.sh t5812-proto-disable-http.sh --verbose` keeps t5810/t5812 passing (`t5811` remains a zero-test row).
+
+
 ## 2026-06-04 — t5611-clone-config
 
 - Focus harness: `./scripts/run-tests.sh t5611-clone-config.sh --verbose` passes 13/13 after clone applies configured remote fetch refspecs from `clone -c` and `git -c`.

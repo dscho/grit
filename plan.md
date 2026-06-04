@@ -96,6 +96,8 @@
     skipping default submodule recursion for bare fetches.
   - Opportunistic clone-config quick win: completed `t5611-clone-config.sh` (13/13) by
     applying configured remote fetch refspecs during clone.
+  - Opportunistic protocol-disable quick win: completed `t5810-proto-disable-local.sh` (54/54) by
+    rejecting dash-prefixed relative fetch paths before upload-pack.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

@@ -397,6 +397,9 @@ pub fn run(mut args: Args) -> Result<()> {
                 || remote_name.contains('/')
                 || std::path::Path::new(&remote_name).is_dir()
             {
+                if remote_name.starts_with('-') {
+                    bail!("fatal: repository '{remote_name}' does not exist");
+                }
                 fetch_remote(&git_dir, &config, &remote_name, Some(remote_name), &args)
             } else {
                 fetch_remote(&git_dir, &config, &remote_name, None, &args)
