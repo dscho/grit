@@ -65,6 +65,8 @@
     remaining failures are tests 8, 11, 12, and 13.
   - Completed `t5330-no-lazy-fetch-with-commit-graph.sh` (4/4) while investigating adjacent
     pack selection work; `t5331-pack-objects-stdin.sh` remains the current focus.
+  - Opportunistic clone-options quick win: completed `t5606-clone-options.sh` (21/21)
+    by fixing duplicate global-config cleanup in the synthetic fixture.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

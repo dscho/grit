@@ -1,4 +1,9 @@
 
+## 2026-06-03 — t5606-clone-options
+
+- Focus harness: `./scripts/run-tests.sh t5606-clone-options.sh --verbose` passes 21/21 after fixing duplicate global-config cleanup in the synthetic sticky recursive clone fixture.
+
+
 ## 2026-06-03 — t5330-no-lazy-fetch-with-commit-graph
 
 - Focus harness: `./scripts/run-tests.sh t5330-no-lazy-fetch-with-commit-graph.sh --verbose` passes 4/4 after stale commit-graph/promisor fetch exit handling.
