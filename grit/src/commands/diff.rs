@@ -1964,7 +1964,7 @@ pub(crate) fn unstaged_patch_for_add_edit(
         &empty_sm,
         &empty_gm,
         None,
-        false,
+        &WhitespaceMode::default(),
         &diff_algo_ctx,
         diff_algo_cli,
         false,
@@ -3675,7 +3675,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &path_to_sm_name,
                     &gm_sub_ignore,
                     line_ignore,
-                    ws_mode.ignore_blank_lines,
+                    &ws_mode,
                     &diff_algo_ctx,
                     diff_algo_cli,
                     args.cached,
@@ -3904,7 +3904,7 @@ fn run_diff_blob_vs_file(
             &empty_sm,
             &empty_gm,
             None,
-            false,
+            &WhitespaceMode::default(),
             &diff_algo_ctx,
             diff_algo_cli,
             false,
@@ -7114,6 +7114,50 @@ fn check_blank_at_eof(pre: &[u8], post: &[u8]) -> (usize, usize) {
     )
 }
 
+/// Rewrite the `--- a/<path>` / `+++ b/<path>` labels produced by
+/// [`no_index_unified_patch_body`] (which always uses the `a/`,`b/` prefixes) so they use the
+/// caller's `src_prefix`/`dst_prefix`. The body (hunks) is left untouched.
+fn rewrite_patch_label_prefixes(
+    body: &str,
+    src_prefix: &str,
+    dst_prefix: &str,
+    old_path: &str,
+    new_path: &str,
+    quote_path_fully: bool,
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    let old_label = if old_path == "/dev/null" {
+        "--- /dev/null".to_string()
+    } else {
+        format!(
+            "--- {}",
+            format_diff_path_with_prefix(src_prefix, old_path, quote_path_fully)
+        )
+    };
+    let new_label = if new_path == "/dev/null" {
+        "+++ /dev/null".to_string()
+    } else {
+        format!(
+            "+++ {}",
+            format_diff_path_with_prefix(dst_prefix, new_path, quote_path_fully)
+        )
+    };
+    for (i, line) in body.split_inclusive('\n').enumerate() {
+        match i {
+            0 if line.starts_with("--- ") => {
+                out.push_str(&old_label);
+                out.push('\n');
+            }
+            1 if line.starts_with("+++ ") => {
+                out.push_str(&new_label);
+                out.push('\n');
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
 fn write_patch_with_prefix(
     out: &mut impl Write,
     repo: &Repository,
@@ -7142,7 +7186,7 @@ fn write_patch_with_prefix(
     path_to_sm_name: &HashMap<String, String>,
     gm_sub_ignore: &HashMap<String, String>,
     line_ignore: Option<&[Regex]>,
-    ignore_blank: bool,
+    ws_mode: &WhitespaceMode,
     algo_ctx: &DiffAlgoContext,
     algo_cli: Option<CliDiffAlgo>,
     cached: bool,
@@ -7152,6 +7196,7 @@ fn write_patch_with_prefix(
     relative_prefix: Option<&str>,
     indent_heuristic: bool,
 ) -> Result<()> {
+    let ignore_blank = ws_mode.ignore_blank_lines;
     for entry in entries {
         let old_path = entry.old_path.as_deref().unwrap_or("/dev/null");
         let new_path = entry.new_path.as_deref().unwrap_or("/dev/null");
@@ -7611,22 +7656,51 @@ fn write_patch_with_prefix(
                 algo_ctx.ignore_case_attrs,
             )
             .unwrap_or(None);
-            let patch = unified_diff_with_prefix_and_funcname_and_algorithm(
-                &old_content,
-                &new_content,
-                display_old,
-                display_new,
-                context_lines,
-                inter_hunk_context,
-                src_prefix,
-                dst_prefix,
-                func_matcher.as_ref(),
-                algo,
-                function_context,
-                use_git_histogram,
-                indent_heuristic,
-                quote_path_fully,
-            );
+            // When a whitespace-ignore mode other than (or in addition to) blank-line
+            // ignoring is active, diff normalised line keys but emit the original lines
+            // (Git's xdiff whitespace flags). `no_index_unified_patch_body` already does
+            // exactly this; reuse it so `-b`, `--ignore-space-at-eol`, and
+            // `--ignore-cr-at-eol` collapse whitespace-only hunks here too.
+            let ws_aware =
+                ws_mode.any() && (ws_mode.ignore_space_change
+                    || ws_mode.ignore_all_space
+                    || ws_mode.ignore_space_at_eol
+                    || ws_mode.ignore_cr_at_eol);
+            let patch = if ws_aware {
+                let body = no_index_unified_patch_body(
+                    old_content.as_bytes(),
+                    new_content.as_bytes(),
+                    display_old,
+                    display_new,
+                    context_lines,
+                    inter_hunk_context,
+                    ws_mode,
+                    algo,
+                    false,
+                    indent_heuristic,
+                    quote_path_fully,
+                );
+                // `no_index_unified_patch_body` emits `--- a/<old>` / `+++ b/<new>` labels using a
+                // fixed `a/`,`b/` prefix; rewrite them to the caller's prefixes.
+                rewrite_patch_label_prefixes(&body, src_prefix, dst_prefix, display_old, display_new, quote_path_fully)
+            } else {
+                unified_diff_with_prefix_and_funcname_and_algorithm(
+                    &old_content,
+                    &new_content,
+                    display_old,
+                    display_new,
+                    context_lines,
+                    inter_hunk_context,
+                    src_prefix,
+                    dst_prefix,
+                    func_matcher.as_ref(),
+                    algo,
+                    function_context,
+                    use_git_histogram,
+                    indent_heuristic,
+                    quote_path_fully,
+                )
+            };
             let patch = match line_ignore {
                 Some(ign) if !ign.is_empty() || ignore_blank => {
                     suppress_ignored_hunks_in_patch(&patch, ign, ignore_blank)
