@@ -2568,12 +2568,18 @@ fn resolve_reflog_oid(
                     "fatal: log for '{display}' is empty"
                 )));
             }
-            if index >= len {
+            if index > len {
                 return Err(Error::Message(format!(
                     "fatal: log for '{display}' only has {len} entries"
                 )));
             }
-            Ok(entries[len - 1 - index].new_oid)
+            let oid = entries[len - index].old_oid;
+            if oid.is_zero() {
+                return Err(Error::Message(format!(
+                    "fatal: log for '{display}' only has {len} entries"
+                )));
+            }
+            Ok(oid)
         }
         ReflogSelector::Date(target_ts) => {
             if entries.is_empty() {
