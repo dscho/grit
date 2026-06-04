@@ -57,7 +57,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   reuse the shared parent shorthand expansion for `^-` ranges.
 - [x] `t6010-merge-base.sh` — 12/12 passing after default multi-commit
   `merge-base` used first-vs-rest semantics instead of octopus semantics.
-- [ ] `t6011-rev-list-with-bad-commit.sh` — 5/6 passing, 1 failing.
+- [x] `t6011-rev-list-with-bad-commit.sh` — 6/6 passing after packed
+  object reads and fsck detect corrupt pack entries.
 - [ ] `t6013-rev-list-reverse-parents.sh` — 2/3 passing, 1 failing.
 
 Completed rev-list/revision files: `t6004`, `t6005`, `t6007-rev-list-cherry-pick-status`,

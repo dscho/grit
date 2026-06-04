@@ -1,3 +1,16 @@
+## 2026-06-04 — t6011-rev-list-with-bad-commit
+
+- Focus harness: `./scripts/run-tests.sh t6011-rev-list-with-bad-commit.sh --verbose` passes 6/6
+  after packed object reads and fsck detect corrupt pack entries.
+- Regression harness: `./scripts/run-tests.sh t6011-rev-list-with-bad-commit.sh t6022-rev-list-missing.sh t6010-merge-base.sh t6101-rev-parse-parents.sh t7700-repack.sh --verbose --timeout 180`
+  passes t6011 6/6, t6022 40/40, t6010 12/12, and t6101 38/38; `t7700-repack.sh` remains at its
+  pre-existing tracked baseline of 40/47.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
 ## 2026-06-04 — t6010-merge-base
 
 - Focus harness: `./scripts/run-tests.sh t6010-merge-base.sh --verbose` passes 12/12 after
