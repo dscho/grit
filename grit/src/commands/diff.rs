@@ -6771,14 +6771,15 @@ struct ExtDiffSide {
     hex: String,
     /// `temp->mode`: 6-octal mode (`.` when invalid).
     mode: String,
-    /// Keep the temp file alive for the duration of the call.
-    _tmp: Option<tempfile::NamedTempFile>,
+    /// Keep the temp dir alive for the duration of the call.
+    _tmp: Option<tempfile::TempDir>,
 }
 
 fn ext_diff_side(
     raw: &[u8],
     oid: &ObjectId,
     mode: &str,
+    path: &str,
     borrow_path: Option<&str>,
     zero_hex: bool,
 ) -> Result<ExtDiffSide> {
@@ -6808,13 +6809,25 @@ fn ext_diff_side(
             _tmp: None,
         });
     }
-    let tmp = tempfile::NamedTempFile::new().context("temp file for external diff")?;
-    fs::write(tmp.path(), raw)?;
+    // Git's `prep_temp_blob` uses `mks_tempfile_dt("git-blob-XXXXXX", base)`:
+    // the blob is written into a randomly-named directory under a file whose
+    // name is the path's basename, so the argv path's basename is "pretty"
+    // (preserves the extension, t4020 #68).
+    let base = path.rsplit('/').next().filter(|s| !s.is_empty());
+    let dir = tempfile::Builder::new()
+        .prefix("git-blob-")
+        .tempdir()
+        .context("temp dir for external diff")?;
+    let file_path = match base {
+        Some(b) => dir.path().join(b),
+        None => dir.path().join("blob"),
+    };
+    fs::write(&file_path, raw)?;
     Ok(ExtDiffSide {
-        name: tmp.path().to_string_lossy().into_owned(),
+        name: file_path.to_string_lossy().into_owned(),
         hex,
         mode: mode.to_owned(),
-        _tmp: Some(tmp),
+        _tmp: Some(dir),
     })
 }
 
@@ -6865,8 +6878,11 @@ fn run_external_diff_for_patch(
         return Ok(ExtDiffOutcome::Changed);
     }
 
-    let old_side = ext_diff_side(old_raw, old_oid, old_mode, old_borrow, old_zero_hex)?;
-    let new_side = ext_diff_side(new_raw, new_oid, new_mode, new_borrow, new_zero_hex)?;
+    // Temp-file basenames follow each side's path: the old side uses `name`,
+    // the new side uses the rename destination (`other`) when present.
+    let new_path = other_path.unwrap_or(display_path);
+    let old_side = ext_diff_side(old_raw, old_oid, old_mode, display_path, old_borrow, old_zero_hex)?;
+    let new_side = ext_diff_side(new_raw, new_oid, new_mode, new_path, new_borrow, new_zero_hex)?;
 
     const SHELL_META: &[char] = &[
         '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
