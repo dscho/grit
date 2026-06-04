@@ -139,6 +139,9 @@
     tag checkout abort cases for both apply and merge backends.
   - Completed: `t3412-rebase-root.sh` (25/25) after rerunning with the current binary; the prior
     root-rebase implementation and recent commit-ish peeling fixes left the stale CSV row green.
+  - Completed: `t3416-rebase-onto-threedots.sh` (18/18) after branch-argument rebase now carries
+    the pre-checkout upstream commit OID into replay setup instead of resolving tokens such as
+    `HEAD` after checking out the branch being rebased.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ---

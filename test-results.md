@@ -15,6 +15,18 @@
 - Quality gates were not rerun for this CSV/dashboard-only refresh; the previous t3407 gates still
   cover the current code revision.
 
+## 2026-06-04 — t3416-rebase-onto-threedots
+
+- Focus harness: `./scripts/run-tests.sh t3416-rebase-onto-threedots.sh --verbose` passes 18/18
+  after branch-argument rebase started carrying the pre-checkout upstream commit OID into replay
+  setup.
+- Adjacent verification: `./scripts/run-tests.sh t3416-rebase-onto-threedots.sh
+  t3407-rebase-abort.sh t3400-rebase.sh t3431-rebase-fork-point.sh
+  t3432-rebase-fast-forward.sh --verbose` kept `t3416`, `t3407`, and `t3400` green; `t3431` and
+  `t3432` remain known non-green future targets.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing

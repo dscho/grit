@@ -479,11 +479,7 @@ pub fn run(mut args: Args) -> Result<()> {
     // If a branch argument is given, checkout that branch first.
     // Resolve `upstream` before checkout: `git rebase <upstream> <branch>` uses the pre-checkout
     // meaning of `HEAD` and other relative specs.
-    let upstream_spec_before_hex: Option<String> = if args.branch.is_some() {
-        Some(args.upstream.clone().unwrap_or_else(|| "HEAD".to_owned()))
-    } else {
-        None
-    };
+    let mut upstream_spec_before_branch_checkout: Option<String> = None;
     if args.branch.is_some() {
         let repo = Repository::discover(None).context("not a git repository")?;
         if let Some(branch) = args.branch.as_deref() {
@@ -505,6 +501,7 @@ pub fn run(mut args: Args) -> Result<()> {
         let uoid = resolve_revision_as_commit_without_index_dwim(&repo, uspec)
             .with_context(|| format!("bad revision '{uspec}'"))?
             .to_hex();
+        upstream_spec_before_branch_checkout = Some(uoid.clone());
         args.upstream = Some(uoid);
     }
     if args.upstream.as_deref() == Some("-") {
@@ -580,7 +577,7 @@ pub fn run(mut args: Args) -> Result<()> {
     do_rebase(
         args,
         pre_rebase_hook_second,
-        upstream_spec_before_hex,
+        upstream_spec_before_branch_checkout,
         pre_rebase_upstream_label,
     )
 }

@@ -603,7 +603,7 @@ t3409-rebase-environ	t3	yes	3	3	0	true	ok	0
 t3412-rebase-root	t3	yes	25	25	0	true	ok	0
 t3413-rebase-hook	t3	yes	15	15	0	true	ok	0
 t3415-rebase-autosquash	t3	yes	28	24	4	false	ok	0
-t3416-rebase-onto-threedots	t3	yes	18	17	1	false	ok	0
+t3416-rebase-onto-threedots	t3	yes	18	18	0	true	ok	0
 t3417-rebase-whitespace-fix	t3	yes	4	4	0	true	ok	0
 t3418-rebase-continue	t3	yes	30	30	0	true	ok	0
 t3419-rebase-patch-id	t3	yes	8	6	2	false	ok	0
@@ -618,8 +618,8 @@ t3427-rebase-subtree	t3	yes	3	1	2	false	ok	0
 t3428-rebase-signoff	t3	yes	7	1	6	false	ok	0
 t3429-rebase-edit-todo	t3	yes	7	5	2	false	ok	0
 t3430-rebase-merges	t3	yes	34	2	32	false	ok	0
-t3431-rebase-fork-point	t3	yes	26	23	3	false	ok	0
-t3432-rebase-fast-forward	t3	yes	219	204	15	false	ok	0
+t3431-rebase-fork-point	t3	yes	26	24	2	false	ok	0
+t3432-rebase-fast-forward	t3	yes	225	201	18	false	ok	0
 t3433-rebase-across-mode-change	t3	yes	4	1	3	false	ok	0
 t3434-rebase-i18n	t3	yes	6	1	5	false	ok	0
 t3435-rebase-gpg-sign	t3	skip	11	0	0	false	ok	0
