@@ -193,6 +193,10 @@ pub struct Args {
     #[arg(short = 'm')]
     pub diff_merges: bool,
 
+    /// For merge commits, diff against the first parent only (like `git log --first-parent`).
+    #[arg(long = "first-parent")]
+    pub first_parent: bool,
+
     /// Dense combined diff for merge commits (`diff --combined`).
     #[arg(short = 'c')]
     pub combined: bool,
@@ -881,6 +885,90 @@ fn expand_typechange_entries_for_porcelain(entries: Vec<DiffEntry>) -> Vec<DiffE
     out
 }
 
+/// Emit `git show -m` for a merge commit: one full medium-format entry per parent, each header
+/// tagged `(from <parent>)` and followed by that parent's diff (matches `git log -m -p`).
+#[allow(clippy::too_many_arguments)]
+fn show_commit_separate_merge(
+    out: &mut impl Write,
+    repo: &Repository,
+    oid: &ObjectId,
+    commit: &grit_lib::objects::CommitData,
+    args: &Args,
+    config: &ConfigSet,
+    expand_tabs_in_log: usize,
+    _indent_heuristic: bool,
+    signature_lines: Option<&str>,
+) -> Result<()> {
+    let odb = &repo.odb;
+    let git_dir = &repo.git_dir;
+    let hex = oid.to_hex();
+    let abbrev_len = if args.no_abbrev {
+        40usize
+    } else {
+        args.abbrev
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7)
+    };
+    let context = args.unified.unwrap_or(3);
+    let use_textconv = !args.no_textconv;
+    let merge_abbrevs: Vec<String> = commit
+        .parents
+        .iter()
+        .map(|p| p.to_hex()[..7].to_string())
+        .collect();
+
+    let mut shown = 0usize;
+    for parent_oid in &commit.parents {
+        let parent_obj = odb.read(parent_oid).context("reading merge parent")?;
+        let parent_commit = parse_commit(&parent_obj.data).context("parsing merge parent")?;
+        let entries = diff_trees(odb, Some(&parent_commit.tree), Some(&commit.tree), "")
+            .context("computing merge parent diff")?;
+        if entries.is_empty() {
+            continue;
+        }
+        if shown > 0 {
+            writeln!(out)?;
+        }
+        shown += 1;
+
+        // Medium header, repeated for each parent with the `(from <parent>)` annotation.
+        writeln!(out, "commit {hex} (from {})", parent_oid.to_hex())?;
+        writeln!(out, "Merge: {}", merge_abbrevs.join(" "))?;
+        if let Some(sig) = signature_lines {
+            out.write_all(sig.as_bytes())?;
+        }
+        writeln!(out, "Author: {}", format_ident_display(&commit.author))?;
+        writeln!(out, "Date:   {}", format_date(&commit.author))?;
+        writeln!(out)?;
+        for line in commit.message.lines() {
+            writeln!(
+                out,
+                "{}",
+                grit_lib::tab_expand::indent_and_expand_tabs(line, 4, expand_tabs_in_log)
+            )?;
+        }
+        writeln!(out)?;
+
+        for entry in &entries {
+            if let Some(patch) = format_parent_patch(
+                git_dir,
+                config,
+                odb,
+                entry.path(),
+                &parent_commit.tree,
+                &commit.tree,
+                abbrev_len,
+                context,
+                use_textconv,
+            ) {
+                write!(out, "{patch}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Show a commit object: header + diff.
 fn show_commit(
     out: &mut impl Write,
@@ -1025,6 +1113,41 @@ fn show_commit(
                     && !args.name_status));
         will_show_stat && will_show_patch && !will_show_raw && !args.numstat
     };
+
+    // `git show -m` on a merge: emit one full entry per parent (medium header repeated with
+    // `(from <parent>)`, followed by that parent's diff), matching `git log -m -p`.
+    let medium_format = matches!(resolved_format.as_deref(), None | Some("medium"));
+    let separate_merge_patch = commit.parents.len() > 1
+        && args.diff_merges
+        && !args.combined
+        && !args.combined_cc
+        && !args.first_parent
+        && !args.remerge_diff
+        && medium_format
+        && !args.quiet
+        && !args.no_patch
+        && !args.name_only
+        && !args.name_status
+        && !args.raw
+        && !args.numstat
+        && args.stat.is_empty()
+        && !args.shortstat
+        && !args.summary
+        && !args.patch_with_stat
+        && !args.patch_with_raw;
+    if separate_merge_patch {
+        return show_commit_separate_merge(
+            out,
+            repo,
+            oid,
+            &commit,
+            args,
+            &config,
+            expand_tabs_in_log,
+            indent_heuristic,
+            signature_lines.as_deref(),
+        );
+    }
 
     let format = resolved_format.as_deref();
     match format {
@@ -1344,8 +1467,15 @@ fn show_commit(
     };
 
     let is_merge = commit.parents.len() > 1;
-    let default_merge_patch = is_merge && !args.diff_merges && !args.combined && !args.combined_cc;
-    let use_combined_format = args.combined || args.combined_cc || default_merge_patch;
+    // `--first-parent` forces a first-parent (single) diff for merges, suppressing the
+    // default dense-combined merge diff (git's `diff_merges_default_to_first_parent`).
+    let default_merge_patch = is_merge
+        && !args.diff_merges
+        && !args.combined
+        && !args.combined_cc
+        && !args.first_parent;
+    let use_combined_format =
+        (args.combined || args.combined_cc || default_merge_patch) && !args.first_parent;
     let combined_use_cc_word = args.combined_cc || default_merge_patch;
 
     // --name-only: just print file names

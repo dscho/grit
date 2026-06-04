@@ -744,8 +744,24 @@ fn effective_merge_diff_format(
     if !is_merge {
         return Ok(MergeDiffFormat::FirstParent);
     }
+    let base = effective_merge_diff_format_base(args, git_dir)?;
+    // git diff-merges.c `diff_merges_default_to_first_parent`: when `--first-parent` is given
+    // together with a separate (`-m`) merge format, `first_parent_merges` is set, so the merge
+    // is shown like first-parent (single diff, no `(from <parent>)` header).
+    if args.first_parent && base == MergeDiffFormat::Separate {
+        return Ok(MergeDiffFormat::FirstParent);
+    }
+    Ok(base)
+}
+
+fn effective_merge_diff_format_base(args: &Args, git_dir: &Path) -> Result<MergeDiffFormat> {
     if args.remerge_diff {
         return Ok(MergeDiffFormat::Remerge);
+    }
+    // `-m` resets any combine flag (git's `common_setup` -> `suppress`), so when `-m` is given
+    // alongside `-c`/`--cc` (as in `--cc -m -p` / `-c -m -p`) the separate format wins.
+    if args.merge_diff_m {
+        return log_diff_merges_default_format(git_dir);
     }
     if args.merge_diff_c {
         return Ok(MergeDiffFormat::Combined);
@@ -765,9 +781,6 @@ fn effective_merge_diff_format(
             return Ok(fmt);
         }
         anyhow::bail!("invalid value for '--diff-merges': '{s}'");
-    }
-    if args.merge_diff_m {
-        return log_diff_merges_default_format(git_dir);
     }
     if args.first_parent {
         return Ok(MergeDiffFormat::FirstParent);

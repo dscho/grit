@@ -521,19 +521,36 @@ pub fn format_parent_patch(
 
     let mut out = String::new();
     out.push_str(&format!("diff --git a/{path} b/{path}\n"));
-    if entry.old_mode != entry.new_mode {
-        out.push_str(&format!("index {old_abbrev}..{new_abbrev}\n"));
-        out.push_str(&format!("old mode {}\n", entry.old_mode));
-        out.push_str(&format!("new mode {}\n", entry.new_mode));
-    } else {
-        out.push_str(&format!(
-            "index {old_abbrev}..{new_abbrev} {}\n",
-            entry.new_mode
-        ));
-    }
+    // Header lines depend on whether the file was added / deleted / mode-changed / modified,
+    // matching git's `diff --git` body (added => `new file mode`, deleted => `deleted file mode`).
+    let (old_disp, new_disp) = match entry.status {
+        DiffStatus::Added => {
+            out.push_str(&format!("new file mode {}\n", entry.new_mode));
+            out.push_str(&format!("index {old_abbrev}..{new_abbrev}\n"));
+            ("/dev/null".to_string(), format!("b/{path}"))
+        }
+        DiffStatus::Deleted => {
+            out.push_str(&format!("deleted file mode {}\n", entry.old_mode));
+            out.push_str(&format!("index {old_abbrev}..{new_abbrev}\n"));
+            (format!("a/{path}"), "/dev/null".to_string())
+        }
+        _ => {
+            if entry.old_mode != entry.new_mode {
+                out.push_str(&format!("old mode {}\n", entry.old_mode));
+                out.push_str(&format!("new mode {}\n", entry.new_mode));
+                out.push_str(&format!("index {old_abbrev}..{new_abbrev}\n"));
+            } else {
+                out.push_str(&format!(
+                    "index {old_abbrev}..{new_abbrev} {}\n",
+                    entry.new_mode
+                ));
+            }
+            (format!("a/{path}"), format!("b/{path}"))
+        }
+    };
 
     if binary {
-        out.push_str(&format!("Binary files a/{path} and b/{path} differ\n"));
+        out.push_str(&format!("Binary files {old_disp} and {new_disp} differ\n"));
         return Some(out);
     }
 
@@ -547,12 +564,17 @@ pub fn format_parent_patch(
     } else {
         blob_text_for_diff(git_dir, config, path, &new_blob, use_textconv)
     };
-    let patch = crate::diff::unified_diff(
+    // Empty prefixes here because `old_disp`/`new_disp` already carry the `a/`/`b/` (or
+    // `/dev/null`) decoration computed from the file status above.
+    let patch = crate::diff::unified_diff_with_prefix(
         &old_t,
         &new_t,
-        path,
-        path,
+        &old_disp,
+        &new_disp,
         context,
+        0,
+        "",
+        "",
         true,
         config.quote_path_fully(),
     );
