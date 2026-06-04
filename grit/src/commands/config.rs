@@ -264,6 +264,7 @@ pub struct SetArgs {
     /// The configuration key.
     pub key: String,
     /// The value to set.
+    #[arg(allow_hyphen_values = true)]
     pub value: String,
 
     /// Replace all matching values.

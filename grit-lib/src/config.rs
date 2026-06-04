@@ -541,8 +541,9 @@ fn escape_subsection(s: &str) -> String {
 
 fn escape_value(s: &str) -> String {
     // Quote leading `-` so values are not mistaken for config options (Git does this for
-    // submodule paths like `-sub` in `.gitmodules`).
-    let needs_quoting = s.starts_with('-')
+    // submodule paths like `-sub` in `.gitmodules`), but leave signed numeric values bare.
+    let leading_dash_needs_quoting = s.starts_with('-') && parse_i64(s).is_err();
+    let needs_quoting = leading_dash_needs_quoting
         || s.starts_with(' ')
         || s.starts_with('\t')
         || s.ends_with(' ')
