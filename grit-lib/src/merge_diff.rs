@@ -460,6 +460,13 @@ pub fn diff_textconv_active(git_dir: &Path, config: &ConfigSet, path: &str) -> b
     diff_textconv_cmd_line(config, driver).is_some()
 }
 
+/// True when a path carries the `-diff` (or `diff=unset` / `binary`) attribute,
+/// which forces Git to emit `Binary files ... differ` regardless of content.
+#[must_use]
+pub fn diff_attr_forces_binary(git_dir: &Path, path: &str) -> bool {
+    matches!(attrs_for_repo_path(git_dir, path).diff_attr, DiffAttr::Unset)
+}
+
 /// Resolved external diff driver from a path's `diff=<name>` attribute.
 ///
 /// Mirrors Git's `userdiff_find_by_path` → `drv->external`: when a path has a

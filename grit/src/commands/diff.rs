@@ -7701,8 +7701,16 @@ fn write_patch_with_prefix(
             entry.old_mode.as_str(),
             entry.new_mode.as_str(),
         );
+        // A `-diff` (binary) attribute forces `Binary files ... differ`, even on
+        // text content (t4020 #18). Symlinks still get a textual target patch.
+        let attr_unset_binary = entry.old_mode != "120000"
+            && entry.new_mode != "120000"
+            && grit_lib::merge_diff::diff_attr_forces_binary(git_dir, path_for_attrs.as_str());
         if !textconv_patch
-            && (forced_binary || is_binary(&old_content_raw) || is_binary(&new_content_raw))
+            && (forced_binary
+                || attr_unset_binary
+                || is_binary(&old_content_raw)
+                || is_binary(&new_content_raw))
         {
             if show_binary {
                 // --binary: output a "GIT binary patch" block
