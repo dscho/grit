@@ -50,6 +50,15 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t3415-rebase-autosquash partial
+
+- Focus harness improved to 25/28 after final-fixup detection, interactive begin-empty replay, and
+  squash/fixup template cleanup changes. Remaining failures are tests 26, 27, and 28.
+- Adjacent verification: `./scripts/run-tests.sh t3415-rebase-autosquash.sh
+  t3420-rebase-autostash.sh t3418-rebase-continue.sh --verbose` keeps `t3420` and `t3418` green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing

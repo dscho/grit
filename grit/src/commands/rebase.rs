@@ -2005,12 +2005,10 @@ fn rebase_todo_word_is_fixup_or_squash(word: &str) -> bool {
     )
 }
 
-/// `is_final_fixup`: Git `sequencer.c` when `rebase -k` / `keep-empty` is in effect (`-ki` cases in
-/// t3415). Otherwise a hybrid: Git's trailing fixup/squash scan plus grit's rule that a later
-/// non-fixup pick blocks finalization (non-`-k` `--autosquash` / `-i` autosquash).
+/// Return whether the current fixup/squash is the last item in its contiguous fixup chain.
 fn is_final_fixup_in_todo(
     repo: &Repository,
-    rb_dir: &Path,
+    _rb_dir: &Path,
     todo_lines: &[&str],
     idx: usize,
     interactive: bool,
@@ -2046,11 +2044,7 @@ fn is_final_fixup_in_todo(
         break;
     }
 
-    if rebase_keep_empty(rb_dir) {
-        return true;
-    }
-
-    next_non_fixup_index(repo, todo_lines, idx, interactive).is_none()
+    true
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2405,6 +2399,27 @@ fn apply_commit_msg_cleanup(msg: &str, mode: &str) -> String {
         }
         _ => strip_comment_lines_template(msg),
     }
+}
+
+fn cleanup_squash_editor_message(msg: &str, config: &ConfigSet) -> String {
+    let normalized = msg.replace("\r\n", "\n");
+    let mut kept = Vec::new();
+    for line in normalized.lines() {
+        let trimmed = line.trim_start();
+        let skip = trimmed.starts_with("# This is a combination of ")
+            || trimmed.starts_with("# This is the ")
+            || trimmed.starts_with("# The commit message #")
+            || trimmed
+                .strip_prefix("# ")
+                .is_some_and(|rest| rest.starts_with("fixup!") || rest.starts_with("squash!"));
+        if !skip {
+            kept.push(line);
+        }
+    }
+    let mut cleaned = kept.join("\n");
+    cleaned.push('\n');
+    let cleaned = apply_commit_msg_cleanup(&cleaned, "whitespace");
+    apply_commit_msg_cleanup(&cleaned, rebase_commit_msg_cleanup(config))
 }
 
 fn update_squash_message_file(
@@ -4244,7 +4259,7 @@ Use '--' to separate paths from revisions, like this:\n\
     if args.no_ff {
         fs::write(rb_dir.join("force-rewrite"), "")?;
     }
-    if args.keep_empty {
+    if args.keep_empty || args.interactive {
         fs::write(rb_dir.join("keep-empty"), "")?;
     }
     // Persist the GPG/SSH signing decision so each pick (including those run from
@@ -6165,12 +6180,12 @@ fn cherry_pick_for_rebase(
                 let tmpl = fs::read_to_string(&fixup_path)?;
                 let after_editor =
                     run_commit_editor_for_template(repo, git_dir, &tmpl, "squash", None)?;
-                apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+                cleanup_squash_editor_message(&after_editor, &config)
             } else {
                 let tmpl = fs::read_to_string(rb_dir.join("message-squash"))?;
                 let after_editor =
                     run_commit_editor_for_template(repo, git_dir, &tmpl, "squash", None)?;
-                apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+                cleanup_squash_editor_message(&after_editor, &config)
             };
             let new_oid = commit_from_merged_index(
                 repo,
@@ -6197,12 +6212,12 @@ fn cherry_pick_for_rebase(
             let tmpl = fs::read_to_string(&fixup_path)?;
             let after_editor =
                 run_commit_editor_for_template(repo, git_dir, &tmpl, "squash", None)?;
-            apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+            cleanup_squash_editor_message(&after_editor, &config)
         } else {
             let tmpl = fs::read_to_string(&squash_path)?;
             let after_editor =
                 run_commit_editor_for_template(repo, git_dir, &tmpl, "squash", None)?;
-            apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+            cleanup_squash_editor_message(&after_editor, &config)
         };
         let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
         let new_oid = commit_from_merged_index(
@@ -6884,12 +6899,12 @@ fn do_continue() -> Result<()> {
                 let tmpl = fs::read_to_string(&fixup_path)?;
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
-                apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+                cleanup_squash_editor_message(&after_editor, &config)
             } else {
                 let tmpl = fs::read_to_string(rb_dir.join("message-squash"))?;
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
-                apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+                cleanup_squash_editor_message(&after_editor, &config)
             };
             let oid = commit_from_merged_index(
                 &repo,
@@ -6911,12 +6926,12 @@ fn do_continue() -> Result<()> {
                 let tmpl = fs::read_to_string(&fixup_path)?;
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
-                apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+                cleanup_squash_editor_message(&after_editor, &config)
             } else {
                 let tmpl = fs::read_to_string(&squash_path)?;
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
-                apply_commit_msg_cleanup(&after_editor, rebase_commit_msg_cleanup(&config))
+                cleanup_squash_editor_message(&after_editor, &config)
             };
             let oid = commit_from_merged_index(
                 &repo,
