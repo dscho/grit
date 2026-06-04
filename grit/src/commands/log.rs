@@ -13,7 +13,7 @@ use grit_lib::commit_graph_file::{
 use grit_lib::config::{parse_bool, parse_color, ConfigSet};
 use grit_lib::crlf::{get_file_attrs, load_gitattributes, DiffAttr};
 use grit_lib::diff::{
-    count_changes, diff_trees, diff_trees_show_tree_entries, format_raw,
+    count_changes, diff_trees, diff_trees_show_tree_entries, format_raw, format_raw_abbrev,
     indent_heuristic_from_config, unified_diff, zero_oid, DiffEntry, DiffStatus,
 };
 use grit_lib::diffstat::{terminal_columns, write_diffstat_block, DiffstatOptions, FileStatInput};
@@ -780,6 +780,26 @@ fn merge_commit_wants_diff(args: &Args, git_dir: &Path) -> Result<bool> {
     Ok(effective_merge_diff_format(args, true, git_dir)? != MergeDiffFormat::Off)
 }
 
+/// Whether merges force a diff even without `-p` (git's `merges_need_diff` / `merges_imply_patch`).
+///
+/// In git (diff-merges.c): any non-`off` `--diff-merges=<x>` value sets `merges_need_diff = 1`
+/// (via `common_setup`), and `-c`/`--cc`/`--dd`/`--remerge-diff` set `merges_imply_patch = 1`.
+/// Both cause `output_format` to default to PATCH so a merge shows its diff with no `-p`.
+/// The literal `-m` flag is special-cased to reset `merges_need_diff = 0`, so plain `-m` does
+/// NOT force a diff. `--first-parent` alone (no `--diff-merges`) also does not force one.
+fn merges_force_diff(args: &Args) -> bool {
+    if args.merge_diff_c || args.cc || args.merge_diff_dd || args.remerge_diff {
+        return true;
+    }
+    if args.no_diff_merges {
+        return false;
+    }
+    if let Some(ref s) = args.diff_merges {
+        return !matches!(s.trim(), "off" | "none");
+    }
+    false
+}
+
 /// Whether `git log` should run diff machinery for a commit (false for merge + `off` unless only `-m` without patch — then still false).
 /// `log.showroot` config (git default: true). When false, a root commit's diff against the
 /// empty tree is suppressed unless `--root` is given.
@@ -800,7 +820,10 @@ fn log_commit_needs_diff_output(args: &Args, info: &CommitInfo, git_dir: &Path) 
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces a merge to show its diff (git's
+        // `merges_need_diff`) even with no `-p`/`--stat`/etc.
+        || (info.parents.len() > 1 && merges_force_diff(args));
     if !wants_diff {
         return Ok(false);
     }
@@ -823,7 +846,19 @@ fn log_wants_patch_hunks(args: &Args, info: &CommitInfo, git_dir: &Path) -> Resu
         return Ok(false);
     }
     let is_merge = info.parents.len() > 1;
-    let patch = args.patch || args.patch_u || args.patch_with_stat;
+    let mut patch = args.patch || args.patch_u || args.patch_with_stat;
+    // git: `merges_need_diff` / `merges_imply_patch` default `output_format` to PATCH, so a
+    // merge shows its diff even without `-p` — but only when no other output format is selected.
+    if is_merge && !patch && merges_force_diff(args) {
+        let other_format = !args.stat.is_empty()
+            || args.name_only
+            || args.name_status
+            || args.raw
+            || args.shortstat;
+        if !other_format {
+            patch = true;
+        }
+    }
     if !patch {
         return Ok(false);
     }
@@ -2451,7 +2486,10 @@ fn run_rev_list_log(
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+        // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+        || merges_force_diff(args);
 
     let mut shown = 0usize;
     let parent_format_requested = log_parent_format_requested(args);
@@ -4933,7 +4971,10 @@ pub fn run(mut args: Args) -> Result<()> {
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+        // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+        || merges_force_diff(&args);
 
     let mut notes_cache = NotesMapCache::new(&repo);
     let flush_each = out.is_terminal();
@@ -5536,7 +5577,10 @@ pub fn run_no_walk(
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+        // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+        || merges_force_diff(&args);
 
     let mut notes_cache = NotesMapCache::new(repo);
     let use_color = log_resolve_stdout_color(args, &repo.git_dir);
@@ -6477,7 +6521,10 @@ fn run_reflog_walk(
             || args.cc
             || args.merge_diff_c
             || args.remerge_diff
-            || args.patch_with_stat;
+            || args.patch_with_stat
+            // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+            // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+            || merges_force_diff(args);
         if show_diff {
             write_commit_diff(
                 &mut out,
@@ -11205,10 +11252,21 @@ fn write_commit_diff_body(
     }
 
     if args.raw {
+        // git `log --raw` abbreviates OIDs (default 7) with a trailing `...` ellipsis,
+        // unless `--no-abbrev` was given (then full 40-hex, no ellipsis).
+        let raw_abbrev = if args.no_abbrev {
+            None
+        } else {
+            Some(parse_abbrev(&args.abbrev))
+        };
         for entry in list_raw_name {
-            writeln!(out, "{}", format_raw(entry))?;
+            match raw_abbrev {
+                Some(len) => writeln!(out, "{}", format_raw_abbrev(entry, len))?,
+                None => writeln!(out, "{}", format_raw(entry))?,
+            }
         }
-        writeln!(out)?;
+        // No trailing blank here: the blank line separating commits is emitted by the
+        // log walk's inter-commit separator (git's raw format prints no extra blank).
     }
 
     if wants_stat {
