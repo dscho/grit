@@ -597,7 +597,7 @@ t3403-rebase-skip	t3	yes	20	20	0	true	ok	0
 t3404-rebase-interactive	t3	yes	132	30	102	false	ok	0
 t3405-rebase-malformed	t3	yes	5	5	0	true	ok	0
 t3406-rebase-message	t3	yes	32	32	0	true	ok	0
-t3407-rebase-abort	t3	yes	17	15	2	false	ok	0
+t3407-rebase-abort	t3	yes	17	17	0	true	ok	0
 t3408-rebase-multi-line	t3	yes	2	2	0	true	ok	0
 t3409-rebase-environ	t3	yes	3	3	0	true	ok	0
 t3412-rebase-root	t3	yes	25	16	9	false	ok	0
@@ -716,7 +716,7 @@ t4034-diff-words	t4	yes	66	59	7	false	ok	0
 t4035-diff-quiet	t4	yes	23	23	0	true	ok	0
 t4036-format-patch-signer-mime	t4	yes	5	5	0	true	ok	0
 t4037-diff-r-t-dirs	t4	yes	2	2	0	true	ok	0
-t4038-diff-combined	t4	yes	26	6	19	false	ok	1
+t4038-diff-combined	t4	yes	25	6	19	false	ok	1
 t4039-diff-assume-unchanged	t4	yes	4	4	0	true	ok	0
 t4040-whitespace-status	t4	yes	11	11	0	true	ok	0
 t4041-diff-submodule-option	t4	yes	47	43	4	false	ok	0
@@ -1113,7 +1113,7 @@ t6412-merge-large-rename	t6	yes	10	10	0	true	ok	0
 t6413-merge-crlf	t6	yes	3	3	0	true	ok	0
 t6414-merge-rename-nocruft	t6	yes	3	3	0	true	ok	0
 t6415-merge-dir-to-symlink	t6	yes	24	13	11	false	ok	0
-t6416-recursive-corner-cases	t6	yes	40	36	1	false	ok	3
+t6416-recursive-corner-cases	t6	yes	37	36	1	false	ok	3
 t6417-merge-ours-theirs	t6	yes	7	7	0	true	ok	0
 t6418-merge-text-auto	t6	yes	11	7	4	false	ok	0
 t6419-merge-ignorecase	t6	yes	0	0	0	false	ok	0

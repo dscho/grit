@@ -33,8 +33,8 @@ use grit_lib::repo::Repository;
 use grit_lib::rev_list::{rev_list, split_revision_token, OrderingMode, RevListOptions};
 use grit_lib::rev_parse::{
     abbreviate_object_id, peel_to_commit_for_merge_base, resolve_revision,
-    resolve_revision_for_range_end, resolve_revision_without_index_dwim, split_triple_dot_range,
-    upstream_suffix_info,
+    resolve_revision_as_commit_without_index_dwim, resolve_revision_for_range_end,
+    split_triple_dot_range, upstream_suffix_info,
 };
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::whitespace_rule::{fix_blob_bytes, parse_whitespace_rule, WS_DEFAULT_RULE};
@@ -502,7 +502,7 @@ pub fn run(mut args: Args) -> Result<()> {
             .map(|s| if s == "-" { "@{-1}" } else { s })
             .unwrap_or("HEAD");
         pre_rebase_upstream_label = Some(uspec.to_owned());
-        let uoid = resolve_revision_without_index_dwim(&repo, uspec)
+        let uoid = resolve_revision_as_commit_without_index_dwim(&repo, uspec)
             .with_context(|| format!("bad revision '{uspec}'"))?
             .to_hex();
         args.upstream = Some(uoid);
@@ -3865,7 +3865,7 @@ Use '--' to separate paths from revisions, like this:\n\
         .root
     {
         let (onto, onto_label) = if let Some(ref onto_spec) = args.onto {
-            let oid = resolve_revision_without_index_dwim(&repo, onto_spec)
+            let oid = resolve_revision_as_commit_without_index_dwim(&repo, onto_spec)
                 .with_context(|| format!("bad revision '{onto_spec}'"))?;
             (oid, onto_spec.clone())
         } else {
@@ -3880,7 +3880,7 @@ Use '--' to separate paths from revisions, like this:\n\
         ("--root".to_owned(), onto, onto, onto, onto_label)
     } else {
         let upstream_spec = upstream_spec_str.clone();
-        let up_oid = resolve_revision_without_index_dwim(&repo, &upstream_spec)
+        let up_oid = resolve_revision_as_commit_without_index_dwim(&repo, &upstream_spec)
             .with_context(|| format!("bad revision '{upstream_spec}'"))?;
         let upstream_tip_oid = up_oid;
 
@@ -3902,7 +3902,7 @@ Use '--' to separate paths from revisions, like this:\n\
                     merge_base_from_triple_dot_onto(&repo, onto_spec, false, onto_spec.as_str())?;
                 (oid, onto_spec.clone())
             } else {
-                let oid = resolve_revision_without_index_dwim(&repo, onto_spec)
+                let oid = resolve_revision_as_commit_without_index_dwim(&repo, onto_spec)
                     .with_context(|| format!("bad revision '{onto_spec}'"))?;
                 (oid, onto_spec.clone())
             }

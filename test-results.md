@@ -1,3 +1,13 @@
+## 2026-06-04 — t3407-rebase-abort
+
+- Focus harness: `./scripts/run-tests.sh t3407-rebase-abort.sh --verbose` passes 17/17 after
+  rebase started peeling annotated-tag upstream and `--onto` arguments to commits before replay.
+- Adjacent verification: `./scripts/run-tests.sh t3407-rebase-abort.sh t3400-rebase.sh
+  t3402-rebase-merge.sh t3403-rebase-skip.sh t3406-rebase-message.sh
+  t3418-rebase-continue.sh t3422-rebase-incompatible-options.sh --verbose` all pass.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing

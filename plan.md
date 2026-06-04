@@ -134,6 +134,9 @@
     history through the content-merge path.
   - Completed: `t3405-rebase-malformed.sh` (5/5) after rerunning with current rebase behavior; no
     additional code changes were needed.
+  - Completed: `t3407-rebase-abort.sh` (17/17) after rebase now resolves upstream and `--onto`
+    commit-ish arguments by peeling annotated tags to commits before replay/state setup, fixing the
+    tag checkout abort cases for both apply and merge backends.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ---
