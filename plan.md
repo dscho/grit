@@ -76,6 +76,8 @@
     by honoring protected/global uploadpack filter config in protocol v2.
   - Opportunistic fetch-negotiator quick win: completed `t5554-noop-fetch-negotiator.sh` (1/1)
     by suppressing synthetic `have` trace lines under the noop negotiator.
+  - Opportunistic symlink pull/push quick win: completed `t5522-pull-symlink.sh` (4/4)
+    by normalizing cwd-prefixed pathspecs.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

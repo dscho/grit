@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5522-pull-symlink
+
+- Focus harness: `./scripts/run-tests.sh t5522-pull-symlink.sh --verbose` passes 4/4 after cwd-prefixed pathspec normalization.
+- Regression harness: `./scripts/run-tests.sh t1020-subdirectory.sh --verbose` passes 15/15.
+
+
 ## 2026-06-04 — t5554-noop-fetch-negotiator
 
 - Focus harness: `./scripts/run-tests.sh t5554-noop-fetch-negotiator.sh --verbose` passes 1/1 after suppressing synthetic `have` trace lines under the noop negotiator.
