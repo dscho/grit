@@ -701,23 +701,34 @@ pub fn run_whatchanged(argv: &[String]) -> Result<()> {
 
     // Revision tips: the positional `objects` are the starting commits for the
     // walk (default HEAD when none are given).
-    let mut tips: Vec<ObjectId> = Vec::new();
-    if opts.objects.is_empty() {
+    let positive_specs: Vec<String> = if opts.objects.is_empty() {
         let head = grit_lib::state::resolve_head(&repo.git_dir)?;
         match head.oid() {
-            Some(oid) => tips.push(*oid),
+            Some(oid) => vec![oid.to_hex()],
             None => return Ok(()),
         }
     } else {
-        for spec in &opts.objects {
-            let oid = resolve_revision(&repo, spec)
-                .with_context(|| format!("unknown revision: '{spec}'"))?;
-            tips.push(oid);
-        }
-    }
+        opts.objects.clone()
+    };
 
     let include_merges = opts.combined_patch;
-    let commits = whatchanged_walk(&repo.odb, &tips, include_merges)?;
+    // Use the shared rev-list walk so `whatchanged` orders commits exactly like
+    // `git log --raw` (reverse-chronological with topological tie-breaks).
+    let rl_opts = grit_lib::rev_list::RevListOptions {
+        ordering: grit_lib::rev_list::OrderingMode::Default,
+        ..grit_lib::rev_list::RevListOptions::default()
+    };
+    let rl = grit_lib::rev_list::rev_list(&repo, &positive_specs, &[], &rl_opts)
+        .map_err(|e| anyhow::anyhow!("rev-list failed: {e}"))?;
+    let mut commits: Vec<ObjectId> = Vec::new();
+    for oid in rl.commits {
+        let obj = repo.odb.read(&oid)?;
+        let commit = parse_commit(&obj.data)?;
+        // `whatchanged` skips merges (== `--no-merges`) unless combined.
+        if commit.parents.len() <= 1 || include_merges {
+            commits.push(oid);
+        }
+    }
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -3383,7 +3394,7 @@ fn format_commit_date(timestamp: i64, tz: &str) -> String {
             let h = abs / 3600;
             let m = (abs % 3600) / 60;
             return format!(
-                "{} {} {:2} {:02}:{:02}:{:02} {:4} {}{:02}{:02}",
+                "{} {} {} {:02}:{:02}:{:02} {:4} {}{:02}{:02}",
                 weekday,
                 month,
                 dt.day(),
