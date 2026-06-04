@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5519-push-alternates
+
+- Focus harness: `./scripts/run-tests.sh t5519-push-alternates.sh --verbose` passes 8/8 after pruning newly copied loose objects that are already available via remote alternates.
+- Regression harness: `./scripts/run-tests.sh t5519-push-alternates.sh t5529-push-errors.sh t5528-push-default.sh --verbose` passes all covered rows (`t5528` has one expected failure).
+
+
 ## 2026-06-04 — t5532-fetch-proxy
 
 - Focus harness: `./scripts/run-tests.sh t5532-fetch-proxy.sh --verbose` passes 5/5 after local `core.gitproxy` git:// fetch handling.

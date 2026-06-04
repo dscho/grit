@@ -80,6 +80,8 @@
     by normalizing cwd-prefixed pathspecs.
   - Opportunistic gitproxy quick win: completed `t5532-fetch-proxy.sh` (5/5) by
     honoring local `core.gitproxy` git:// fetches.
+  - Opportunistic push-alternates quick win: completed `t5519-push-alternates.sh` (8/8)
+    by pruning newly copied loose objects already available through remote alternates.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

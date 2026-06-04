@@ -1911,6 +1911,10 @@ fn push_to_url(
                     copied_objects.push(p);
                 }
             }
+            prune_copied_objects_available_from_remote_alternates(
+                &remote_repo.git_dir,
+                &mut copied_objects,
+            );
         }
 
         copied_objects.extend(
@@ -5126,6 +5130,54 @@ fn list_remote_object_files(dst_git_dir: &Path) -> HashSet<PathBuf> {
         }
     }
     out
+}
+
+fn prune_copied_objects_available_from_remote_alternates(
+    remote_git_dir: &Path,
+    copied: &mut Vec<PathBuf>,
+) {
+    let objects_dir = remote_git_dir.join("objects");
+    let Ok(alternates) = grit_lib::pack::read_alternates_recursive(&objects_dir) else {
+        return;
+    };
+    if alternates.is_empty() {
+        return;
+    }
+    let mut keep = Vec::with_capacity(copied.len());
+    for path in copied.drain(..) {
+        let Some(oid) = loose_object_path_oid(&objects_dir, &path) else {
+            keep.push(path);
+            continue;
+        };
+        let exists_in_alt = alternates.iter().any(|alt| {
+            alt.join(oid.loose_prefix())
+                .join(oid.loose_suffix())
+                .is_file()
+                || grit_lib::pack::read_local_pack_indexes(alt)
+                    .map(|indexes| indexes.iter().any(|idx| idx.contains(&oid)))
+                    .unwrap_or(false)
+        });
+        if exists_in_alt {
+            let _ = std::fs::remove_file(&path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+            }
+        } else {
+            keep.push(path);
+        }
+    }
+    *copied = keep;
+}
+
+fn loose_object_path_oid(objects_dir: &Path, path: &Path) -> Option<ObjectId> {
+    let rel = path.strip_prefix(objects_dir).ok()?;
+    let mut comps = rel.components();
+    let prefix = comps.next()?.as_os_str().to_str()?;
+    let suffix = comps.next()?.as_os_str().to_str()?;
+    if comps.next().is_some() || prefix.len() != 2 || suffix.len() != 38 {
+        return None;
+    }
+    ObjectId::from_hex(&format!("{prefix}{suffix}")).ok()
 }
 
 /// Open a repository (bare or non-bare).
