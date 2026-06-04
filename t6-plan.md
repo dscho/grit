@@ -47,7 +47,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   preserving path-limited `--simplify-merges` merge nodes for graph lane rendering.
 - [x] `t6136-rev-list-date-range.sh` — 31/31 passing after making the synthetic
   fixture request its expected `master` initial branch under the harness.
-- [ ] `t6015-rev-list-show-all-parents.sh` — 32/38 passing, 6 failing.
+- [x] `t6015-rev-list-show-all-parents.sh` — 38/38 passing after making the
+  synthetic fixture request its expected `master` initial branch under the harness.
 - [ ] `t6138-rev-list-boundary.sh` — 24/29 passing, 5 failing.
 - [ ] `t6001-rev-list-graft.sh` — 10/14 passing, 4 failing.
 - [ ] `t6101-rev-parse-parents.sh` — 35/38 passing, 3 failing.
