@@ -119,7 +119,9 @@
     configured modes. Current harness count is 25/30; remaining work is skipped fixup message
     cleanup, patch cleanup before `break`, no-reschedule continuation edge cases, and
     conflict-message editor/comment handling; in-progress `--edit-todo --no-reschedule-failed-exec`
-    now rejects with status 129.
+    now rejects with status 129. Conflict continuation editor templates now preserve `#` comments
+    for `core.commentChar=auto`; current harness count is 26/30 with tests 8, 20, 23, and 24
+    remaining.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

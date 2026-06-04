@@ -6658,8 +6658,13 @@ fn do_continue() -> Result<()> {
         };
         let raw_msg =
             commit_message_after_prepare_hook(&repo, git_dir, &message, hook_arg1, Some(":"))?;
-        let raw_msg = if rb_dir.join("stopped-sha").exists() {
-            run_commit_editor_for_template(&repo, git_dir, &raw_msg, hook_arg1, Some(":"))?
+        let raw_msg = if stopped_oid.is_some() {
+            let mut template = raw_msg.clone();
+            if !template.ends_with('\n') {
+                template.push('\n');
+            }
+            template.push_str("\n# Changes to be committed\n");
+            run_commit_editor_for_template(&repo, git_dir, &template, hook_arg1, Some(":"))?
         } else {
             raw_msg
         };
