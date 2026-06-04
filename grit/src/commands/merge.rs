@@ -24,7 +24,9 @@ use grit_lib::hooks::{
     run_commit_hook, run_hook, run_reference_transaction_committed_for_head_update, CommitHookEnv,
     HookResult,
 };
-use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
+use grit_lib::index::{
+    Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK, MODE_TREE,
+};
 use grit_lib::merge_base::is_ancestor;
 use grit_lib::merge_file::{self, ConflictStyle, MergeFavor, MergeInput};
 use grit_lib::objects::{
@@ -1541,7 +1543,7 @@ pub(crate) fn create_virtual_merge_base(
     for &next in &ordered_bases[1..] {
         // Find the merge base of current and next
         let sub_bases = grit_lib::merge_base::merge_bases_first_vs_rest(repo, current, &[next])?;
-        let sub_base_oid = if sub_bases.is_empty() {
+        let (sub_base_oid, sub_base_label_prefix) = if sub_bases.is_empty() {
             // No common ancestor — use an empty tree as base
             let empty_tree = repo.odb.write(ObjectKind::Tree, &[])?;
             let commit_data = CommitData {
@@ -1556,11 +1558,17 @@ pub(crate) fn create_virtual_merge_base(
                 raw_message: None,
             };
             let commit_bytes = serialize_commit(&commit_data);
-            repo.odb.write(ObjectKind::Commit, &commit_bytes)?
+            (
+                repo.odb.write(ObjectKind::Commit, &commit_bytes)?,
+                "empty tree".to_string(),
+            )
         } else if sub_bases.len() > 1 {
-            create_virtual_merge_base(repo, &sub_bases, favor, merge_renormalize)?
+            (
+                create_virtual_merge_base(repo, &sub_bases, favor, merge_renormalize)?,
+                "merged common ancestors".to_string(),
+            )
         } else {
-            sub_bases[0]
+            (sub_bases[0], short_oid(sub_bases[0]))
         };
 
         // Merge current and next using sub_base_oid as base.
@@ -1591,7 +1599,7 @@ pub(crate) fn create_virtual_merge_base(
             &theirs_entries,
             &head,
             "Temporary merge branch 2",
-            "merged common ancestors",
+            &sub_base_label_prefix,
             &current.to_hex(),
             &next.to_hex(),
             favor,
@@ -1670,6 +1678,32 @@ pub(crate) fn create_virtual_merge_base(
                 let Some(e2) = entries_at.iter().find(|e| e.stage() == 2).copied() else {
                     continue;
                 };
+                let e3 = entries_at.iter().find(|e| e.stage() == 3).copied();
+                if three_way
+                    && e2.mode == MODE_GITLINK
+                    && e3.is_some_and(|e| e.mode == MODE_GITLINK)
+                    && entries_at
+                        .iter()
+                        .find(|e| e.stage() == 1)
+                        .is_some_and(|e| e.mode == MODE_GITLINK)
+                {
+                    let Some(e1) = entries_at.iter().find(|e| e.stage() == 1).copied() else {
+                        continue;
+                    };
+                    push_entry(e1.clone())?;
+                    continue;
+                }
+                // Symlink add/add conflicts have no stable virtual-base winner; omitting
+                // the path lets the outer criss-cross merge surface stage 2/3 only.
+                if add_add
+                    && e3.is_some_and(|e| {
+                        (e2.mode == MODE_SYMLINK && e.mode == MODE_SYMLINK)
+                            || e2.mode == MODE_GITLINK
+                            || e.mode == MODE_GITLINK
+                    })
+                {
+                    continue;
+                }
                 let mut e = e2.clone();
                 if let Some(content) = conflict_content_map.get(&path) {
                     e.oid = repo.odb.write(ObjectKind::Blob, content)?;
@@ -1723,6 +1757,12 @@ pub(crate) fn create_virtual_merge_base(
                 }
             } else if let Some(e2) = entries_at.iter().find(|e| e.stage() == 2).copied() {
                 let mut e = e2.clone();
+                if let Some(content) = conflict_content_map.get(&path) {
+                    e.oid = repo.odb.write(ObjectKind::Blob, content)?;
+                }
+                push_entry(e)?;
+            } else if let Some(e3) = entries_at.iter().find(|e| e.stage() == 3).copied() {
+                let mut e = e3.clone();
                 if let Some(content) = conflict_content_map.get(&path) {
                     e.oid = repo.odb.write(ObjectKind::Blob, content)?;
                 }
@@ -2626,6 +2666,12 @@ Aborting"
             } else {
                 content.clone()
             };
+            if abs.is_dir() {
+                if grit_lib::worktree_cwd::cwd_would_be_removed_with_repo_path(wt, path) {
+                    bail!("Refusing to remove the current working directory:\n{path}\n");
+                }
+                fs::remove_dir_all(&abs)?;
+            }
             fs::write(&abs, &output)?;
         }
     }
@@ -3060,7 +3106,7 @@ fn bail_if_merge_would_overwrite_local_changes(
             continue;
         }
         let abs = work_tree.join(&rel);
-        let Ok(_meta) = fs::symlink_metadata(&abs) else {
+        let Ok(meta) = fs::symlink_metadata(&abs) else {
             continue;
         };
 
@@ -3083,10 +3129,13 @@ fn bail_if_merge_would_overwrite_local_changes(
                 && path.get(new_entry.path.len()) == Some(&b'/')
         });
         if !has_tracked_prefix && !replaces_tracked_dir {
+            if meta.file_type().is_dir() && is_empty_dir_for_submodule_placeholder(&abs) {
+                continue;
+            }
             // Git allows merging in a new submodule when the path is an empty
             // directory (e.g. `mkdir sub1` before pull adds the submodule).
             if new_entry.mode == 0o160000
-                && abs.is_dir()
+                && meta.file_type().is_dir()
                 && is_empty_dir_for_submodule_placeholder(&abs)
             {
                 continue;
@@ -3106,9 +3155,46 @@ fn bail_if_merge_would_overwrite_local_changes(
             continue;
         }
         let abs = work_tree.join(rel);
-        if fs::symlink_metadata(&abs).is_ok() {
-            overwrite_untracked.insert(rel.clone());
+        let Ok(meta) = fs::symlink_metadata(&abs) else {
+            continue;
+        };
+        if meta.file_type().is_dir() && is_empty_dir_for_submodule_placeholder(&abs) {
+            continue;
         }
+        if meta.file_type().is_dir() {
+            let mut has_untracked_descendant = false;
+            let mut stack = vec![(abs.clone(), rel.clone())];
+            while let Some((dir_abs, dir_rel)) = stack.pop() {
+                let Ok(entries) = fs::read_dir(&dir_abs) else {
+                    has_untracked_descendant = true;
+                    break;
+                };
+                for child in entries.flatten() {
+                    let child_name = child.file_name().to_string_lossy().to_string();
+                    let child_rel = format!("{dir_rel}/{child_name}");
+                    let child_abs = child.path();
+                    let Ok(child_meta) = fs::symlink_metadata(&child_abs) else {
+                        has_untracked_descendant = true;
+                        break;
+                    };
+                    if child_meta.file_type().is_dir() {
+                        stack.push((child_abs, child_rel));
+                        continue;
+                    }
+                    if !current_tracked_paths.contains(child_rel.as_bytes()) {
+                        has_untracked_descendant = true;
+                        break;
+                    }
+                }
+                if has_untracked_descendant {
+                    break;
+                }
+            }
+            if !has_untracked_descendant {
+                continue;
+            }
+        }
+        overwrite_untracked.insert(rel.clone());
     }
 
     // Also protect untracked files nested beneath directories that turn into
@@ -5126,6 +5212,12 @@ fn finish_octopus_merge_on_conflict(
             } else {
                 content.clone()
             };
+            if abs.is_dir() {
+                if grit_lib::worktree_cwd::cwd_would_be_removed_with_repo_path(wt, path) {
+                    bail!("Refusing to remove the current working directory:\n{path}\n");
+                }
+                fs::remove_dir_all(&abs)?;
+            }
             fs::write(&abs, &output)?;
         }
     }
@@ -5239,6 +5331,11 @@ fn resolve_conflict_labels(
 
     let base = if base_label_prefix == "empty tree" {
         "empty tree".to_string()
+    } else if theirs_name == "Temporary merge branch 2"
+        && (base_label_prefix == "merged common ancestors"
+            || base_label_prefix.chars().all(|c| c.is_ascii_hexdigit()))
+    {
+        base_label_prefix.to_string()
     } else if matches!(resolve_conflict_style(repo), ConflictStyle::ZealousDiff3)
         && base_label_prefix.chars().all(|c| c.is_ascii_hexdigit())
     {
@@ -5547,6 +5644,13 @@ fn detect_merge_renames(
             .unwrap_or(1000)
     };
     let zero_oid = ObjectId::zero();
+    let is_empty_regular_base = |entry: &IndexEntry| {
+        matches!(entry.mode, MODE_REGULAR | MODE_EXECUTABLE)
+            && repo
+                .odb
+                .read(&entry.oid)
+                .is_ok_and(|obj| obj.data.is_empty())
+    };
 
     // Build diff entries from base to side, handling the "add-source" pattern:
     // If base has path P with OID X, and side has path P with a DIFFERENT OID Y,
@@ -5566,6 +5670,9 @@ fn detect_merge_renames(
         // Find base entries whose OID appears at a different path in the side
         let mut exact_renames: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
         for (base_path, base_entry) in base {
+            if is_empty_regular_base(base_entry) {
+                continue;
+            }
             if let Some(side_entry) = side.get(base_path) {
                 // If the same blob is still present at the original path, this
                 // source was not renamed away; don't treat additional copies as
@@ -5669,6 +5776,9 @@ fn detect_merge_renames(
         let mut matched_targets: BTreeSet<Vec<u8>> = BTreeSet::new();
 
         for (base_path, base_entry) in base {
+            if is_empty_regular_base(base_entry) {
+                continue;
+            }
             if side.contains_key(base_path) {
                 // Path still exists in side — check if it's an add-source pattern
                 let side_entry = &side[base_path];
@@ -5724,6 +5834,12 @@ fn detect_merge_renames(
                 if let (Some(old), Some(new)) = (&e.old_path, &e.new_path) {
                     let old_bytes = old.as_bytes().to_vec();
                     let new_bytes = new.as_bytes().to_vec();
+                    if base
+                        .get(&old_bytes)
+                        .is_some_and(|entry| is_empty_regular_base(entry))
+                    {
+                        continue;
+                    }
                     if !map.contains_key(&old_bytes) && !matched_targets.contains(&new_bytes) {
                         map.insert(old_bytes, new_bytes.clone());
                         matched_targets.insert(new_bytes);
@@ -7037,7 +7153,12 @@ fn merge_trees(
             continue;
         }
         if let Some(oe) = ours_entries.get(ours_new_path) {
-            if oe.mode != MODE_TREE && path_has_tree_descendant(&theirs_entries, ours_new_path) {
+            let clean_theirs_directory_side = criss_cross_outer_merge
+                && path_descendants_match(&base, &theirs_entries, ours_new_path);
+            if oe.mode != MODE_TREE
+                && path_has_tree_descendant(&theirs_entries, ours_new_path)
+                && !clean_theirs_directory_side
+            {
                 // Their side has paths under our rename destination (e.g. `newfile/realfile`).
                 // A plain rename+content merge at `newfile` would clash with directory/file
                 // handling (t6422 rename/directory).
@@ -7109,15 +7230,18 @@ fn merge_trees(
                 } else {
                     // Both modified — try content merge at new path
                     let path_str = String::from_utf8_lossy(ours_new_path).to_string();
+                    let base_path_str = String::from_utf8_lossy(base_path).to_string();
+                    let ours_marker_label = format!("{ours_label}:{path_str}");
+                    let theirs_marker_label = format!("{their_name}:{base_path_str}");
                     match try_content_merge(
                         repo,
                         &path_str,
                         be,
                         oe,
                         te,
-                        ours_label,
+                        &ours_marker_label,
                         base_label,
-                        their_name,
+                        &theirs_marker_label,
                         favor,
                         diff_algorithm,
                         merge_renormalize,
@@ -7558,6 +7682,18 @@ fn merge_trees(
         if prepass_rr_sources.contains(base_path) {
             continue;
         }
+        if let Some(te) = theirs_entries.get(theirs_new_path) {
+            let clean_ours_directory_side = criss_cross_outer_merge
+                && path_descendants_match(&base, &ours_entries, theirs_new_path);
+            if te.mode != MODE_TREE
+                && path_has_tree_descendant(&ours_entries, theirs_new_path)
+                && !clean_ours_directory_side
+            {
+                // Our side has paths under their rename destination. Let the directory/file pass
+                // relocate the renamed file and stage the D/F conflict symmetrically with case 1.
+                continue;
+            }
+        }
         if handled_paths.contains(base_path) {
             // Already handled by ours rename of the same source path. If both sides renamed
             // that source to different destinations, we must still stage `rename/rename(1to2)`
@@ -7645,8 +7781,64 @@ fn merge_trees(
                                 auto_merge_hint_path: None,
                             });
                         } else {
-                            stage_entry(&mut index, oe, 2);
-                            stage_entry(&mut index, te, 3);
+                            let merged_entry = if let Some(be) = base.get(base_path) {
+                                let both_modified = oe.oid != be.oid && te.oid != be.oid;
+                                let merge_path = String::from_utf8_lossy(base_path).to_string();
+                                let ours_marker = format!("{ours_label}:{ours_tgt_utf}");
+                                let theirs_marker = format!("{their_name}:{theirs_tgt_utf}");
+                                if oe.oid == be.oid && oe.mode == be.mode {
+                                    te.clone()
+                                } else if te.oid == be.oid && te.mode == be.mode {
+                                    oe.clone()
+                                } else if oe.oid == te.oid && oe.mode == te.mode {
+                                    oe.clone()
+                                } else {
+                                    match try_content_merge(
+                                        repo,
+                                        &merge_path,
+                                        be,
+                                        oe,
+                                        te,
+                                        &ours_marker,
+                                        base_label,
+                                        &theirs_marker,
+                                        favor,
+                                        diff_algorithm,
+                                        merge_renormalize,
+                                        ignore_all_space,
+                                        ignore_space_change,
+                                        ignore_space_at_eol,
+                                        ignore_cr_at_eol,
+                                        if both_modified {
+                                            auto_merge_paths.as_deref_mut()
+                                        } else {
+                                            None
+                                        },
+                                    )? {
+                                        ContentMergeResult::Clean(oid, mode) => {
+                                            let mut e = oe.clone();
+                                            e.oid = oid;
+                                            e.mode = mode;
+                                            e
+                                        }
+                                        ContentMergeResult::Conflict(content)
+                                        | ContentMergeResult::BinaryConflict(content) => {
+                                            let oid = repo.odb.write(ObjectKind::Blob, &content)?;
+                                            let mut e = oe.clone();
+                                            e.oid = oid;
+                                            e
+                                        }
+                                    }
+                                }
+                            } else {
+                                oe.clone()
+                            };
+                            let mut ours_stage = merged_entry.clone();
+                            ours_stage.path = ours_target.clone();
+                            let mut theirs_stage = merged_entry.clone();
+                            theirs_stage.path = theirs_new_path.clone();
+                            stage_entry(&mut index, &ours_stage, 2);
+                            stage_entry(&mut index, &theirs_stage, 3);
                             if let Some(te_at_ours_target) = theirs_entries.get(ours_target) {
                                 if !base.contains_key(ours_target)
                                     && index.get(ours_target, 3).is_none()
@@ -7669,13 +7861,11 @@ fn merge_trees(
                                     });
                                 }
                             }
-                            if let Ok(obj) = repo.odb.read(&oe.oid) {
+                            if let Ok(obj) = repo.odb.read(&merged_entry.oid) {
                                 conflict_files.push((
                                     String::from_utf8_lossy(ours_target).to_string(),
-                                    obj.data,
+                                    obj.data.clone(),
                                 ));
-                            }
-                            if let Ok(obj) = repo.odb.read(&te.oid) {
                                 conflict_files.push((
                                     String::from_utf8_lossy(theirs_new_path).to_string(),
                                     obj.data,
@@ -7740,15 +7930,18 @@ fn merge_trees(
                 } else {
                     // Both modified — try content merge at new path
                     let path_str = String::from_utf8_lossy(theirs_new_path).to_string();
+                    let base_path_str = String::from_utf8_lossy(base_path).to_string();
+                    let ours_marker_label = format!("{ours_label}:{base_path_str}");
+                    let theirs_marker_label = format!("{their_name}:{path_str}");
                     match try_content_merge(
                         repo,
                         &path_str,
                         be,
                         oe,
                         te,
-                        ours_label,
+                        &ours_marker_label,
                         base_label,
-                        their_name,
+                        &theirs_marker_label,
                         favor,
                         diff_algorithm,
                         merge_renormalize,
@@ -7903,7 +8096,10 @@ fn merge_trees(
                             auto_merge_hint_path: None,
                         });
                     }
-                } else if path_has_tree_descendant(&ours_entries, theirs_new_path) {
+                } else if path_has_tree_descendant(&ours_entries, theirs_new_path)
+                    && !(criss_cross_outer_merge
+                        && path_descendants_match(&base, &ours_entries, theirs_new_path))
+                {
                     // Ours turned `theirs_new_path` into a directory (e.g. a directory rename put
                     // a subtree there) while theirs renamed a deleted-on-our-side file into it.
                     // git relocates the file to `theirs_new_path~THEIRS`, staging base (the rename
@@ -8074,6 +8270,7 @@ fn merge_trees(
         &base,
         criss_cross_outer_merge,
         &ours_renames,
+        &theirs_renames,
         &ours_entries,
         &theirs_entries,
         &mut index,
@@ -8379,7 +8576,11 @@ fn merge_trees(
                     oe,
                     te,
                     ours_label,
-                    base_label,
+                    same_path_criss_cross_base_label(
+                        base_label,
+                        base_label_prefix,
+                        criss_cross_outer_merge,
+                    ),
                     their_name,
                     favor,
                     diff_algorithm,
@@ -8581,39 +8782,20 @@ fn merge_trees(
             (None, Some(oe), Some(te)) => {
                 let path_str = String::from_utf8_lossy(path).to_string();
                 if oe.mode == MODE_GITLINK && te.mode == MODE_GITLINK {
-                    let z = zero_oid();
-                    let be = IndexEntry {
-                        ctime_sec: 0,
-                        ctime_nsec: 0,
-                        mtime_sec: 0,
-                        mtime_nsec: 0,
-                        dev: 0,
-                        ino: 0,
-                        mode: MODE_GITLINK,
-                        uid: 0,
-                        gid: 0,
-                        size: 0,
-                        oid: z,
-                        flags: path.len().min(0xFFF) as u16,
-                        flags_extended: None,
-                        path: path.to_vec(),
-                        base_index_pos: 0,
-                    };
-                    if try_merge_gitlink_entries(
-                        repo,
-                        &path_str,
-                        &be,
-                        oe,
-                        te,
-                        favor,
-                        &mut index,
-                        &mut has_conflicts,
-                        &mut conflict_descriptions,
-                        &mut submodule_merge_stdout,
-                        &mut submodule_merge_advice,
-                    )? {
-                        continue;
-                    }
+                    has_conflicts = true;
+                    remove_stage_zero_entry(&mut index, path);
+                    stage_entry(&mut index, oe, 2);
+                    stage_entry(&mut index, te, 3);
+                    conflict_descriptions.push(ConflictDescription {
+                        kind: "submodule",
+                        body: format!("Merge conflict in {path_str}"),
+                        subject_path: path_str.clone(),
+                        remerge_anchor_path: None,
+                        rename_rr_ours_dest: None,
+                        rename_rr_theirs_dest: None,
+                        auto_merge_hint_path: None,
+                    });
+                    continue;
                 }
                 match try_content_merge_add_add(
                     repo,
@@ -8734,15 +8916,15 @@ fn materialize_unmerged_entries_for_merge_tree_tree(
 
     for path in conflict_paths {
         let path_str = String::from_utf8_lossy(&path).into_owned();
-        let Some(stage2) = index.get(&path, 2).cloned() else {
+        let Some(stage_entry) = index.get(&path, 2).or_else(|| index.get(&path, 3)).cloned() else {
             continue;
         };
         let blob_oid = if let Some(content) = content_by_path.get(&path) {
             repo.odb.write(ObjectKind::Blob, content)?
         } else {
-            stage2.oid
+            stage_entry.oid
         };
-        let mut resolved = stage2;
+        let mut resolved = stage_entry;
         resolved.oid = blob_oid;
         resolved.flags &= 0x0FFF;
         index.remove(&path);
@@ -9216,6 +9398,7 @@ pub(crate) fn merge_trees_for_replay(
     ignore_cr_at_eol: bool,
     merge_directory_renames_mode: MergeDirectoryRenamesMode,
     rename_options: MergeRenameOptions,
+    forced_branch_labels: Option<(String, String)>,
 ) -> Result<ReplayTreeMergeResult> {
     let head = HeadState::Invalid;
     let result = merge_trees(
@@ -9237,7 +9420,7 @@ pub(crate) fn merge_trees_for_replay(
         ignore_cr_at_eol,
         merge_directory_renames_mode,
         rename_options,
-        None,
+        forced_branch_labels,
         false,
         None,
     )?;
@@ -9305,6 +9488,12 @@ fn try_content_merge(
         base_data = renormalize_merge_blob(&base_data);
         ours_data = renormalize_merge_blob(&ours_data);
         theirs_data = renormalize_merge_blob(&theirs_data);
+    }
+
+    if ours_label.starts_with("Temporary merge branch")
+        || theirs_label.starts_with("Temporary merge branch")
+    {
+        base_data = lengthen_conflict_marker_lines(&base_data, 2);
     }
 
     let base_driver_label = base_label.strip_suffix(":content").unwrap_or(base_label);
@@ -9574,6 +9763,54 @@ fn renormalize_merge_blob(data: &[u8]) -> Vec<u8> {
     grit_lib::crlf::crlf_to_lf(data)
 }
 
+fn lengthen_conflict_marker_lines(data: &[u8], extra: usize) -> Vec<u8> {
+    if extra == 0 || merge_file::is_binary(data) {
+        return data.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(data.len());
+    for line in data.split_inclusive(|byte| *byte == b'\n') {
+        if let Some(marker) = conflict_marker_line_kind(line) {
+            out.extend(std::iter::repeat_n(marker, extra));
+        }
+        out.extend_from_slice(line);
+    }
+    if !data.ends_with(b"\n") {
+        let tail = data.rsplit(|byte| *byte == b'\n').next().unwrap_or(data);
+        if tail.len() == data.len() {
+            return out;
+        }
+    }
+    out
+}
+
+fn conflict_marker_line_kind(line: &[u8]) -> Option<u8> {
+    let marker = *line.first()?;
+    if !matches!(marker, b'<' | b'|' | b'=' | b'>') {
+        return None;
+    }
+    let count = line.iter().take_while(|byte| **byte == marker).count();
+    if count < 7 {
+        return None;
+    }
+    match line.get(count) {
+        None | Some(b'\n' | b'\r' | b' ') => Some(marker),
+        _ => None,
+    }
+}
+
+fn same_path_criss_cross_base_label<'a>(
+    base_label: &'a str,
+    base_label_prefix: &'a str,
+    criss_cross_outer_merge: bool,
+) -> &'a str {
+    if criss_cross_outer_merge && base_label_prefix == "merged common ancestors" {
+        base_label_prefix
+    } else {
+        base_label
+    }
+}
+
 fn blobs_equivalent_after_renormalize(
     repo: &Repository,
     left: &IndexEntry,
@@ -9738,7 +9975,7 @@ fn conflict_submodule_vs_non_gitlink(
         rename_rr_theirs_dest: None,
         auto_merge_hint_path: None,
     });
-    if other.mode != MODE_GITLINK && other.mode != MODE_TREE {
+    if matches!(other.mode, MODE_REGULAR | MODE_EXECUTABLE) {
         if let Ok(obj) = repo.odb.read(&other.oid) {
             let conflict_path = format!("{path_str}~{file_conflict_suffix}");
             conflict_files.push((conflict_path, obj.data));
@@ -9760,6 +9997,7 @@ fn apply_directory_file_conflicts(
     base: &HashMap<Vec<u8>, IndexEntry>,
     merge_ort_style: bool,
     ours_renames: &HashMap<Vec<u8>, Vec<u8>>,
+    theirs_renames: &HashMap<Vec<u8>, Vec<u8>>,
     ours_entries: &HashMap<Vec<u8>, IndexEntry>,
     theirs_entries: &HashMap<Vec<u8>, IndexEntry>,
     index: &mut Index,
@@ -9794,6 +10032,9 @@ fn apply_directory_file_conflicts(
                 && oe.mode != MODE_GITLINK
                 && path_has_tree_descendant(theirs_entries, path)
                 && t.is_none()
+                && !base
+                    .get(path)
+                    .is_some_and(|be| be.oid == oe.oid && be.mode == oe.mode)
             {
                 df_cases.push((path.clone(), true));
             }
@@ -9803,6 +10044,9 @@ fn apply_directory_file_conflicts(
                 && te.mode != MODE_GITLINK
                 && path_has_tree_descendant(ours_entries, path)
                 && o.is_none()
+                && !base
+                    .get(path)
+                    .is_some_and(|be| be.oid == te.oid && be.mode == te.mode)
             {
                 df_cases.push((path.clone(), false));
             }
@@ -9821,110 +10065,197 @@ fn apply_directory_file_conflicts(
 
         let branch_desc = if file_is_ours { ours_label } else { their_name };
         let path_display = String::from_utf8_lossy(&path).into_owned();
-        let new_path_str = format!("{path_display}~{branch_desc}");
         let path_str = path_display.clone();
 
-        let body = format!(
-            "directory in the way of {} from {}; moving it to {} instead.",
-            path_display, branch_desc, new_path_str
-        );
-        conflict_descriptions.push(ConflictDescription {
-            kind: "file/directory",
-            body,
-            subject_path: new_path_str.clone(),
-            remerge_anchor_path: Some(path_display.clone()),
-            rename_rr_ours_dest: None,
-            rename_rr_theirs_dest: None,
-            auto_merge_hint_path: None,
-        });
+        let side_entries = if file_is_ours {
+            ours_entries
+        } else {
+            theirs_entries
+        };
+        let other_entries = if file_is_ours {
+            theirs_entries
+        } else {
+            ours_entries
+        };
+        let side_renames = if file_is_ours {
+            ours_renames
+        } else {
+            theirs_renames
+        };
+        let opposite_renames = if file_is_ours {
+            theirs_renames
+        } else {
+            ours_renames
+        };
+        let rename_source = side_renames
+            .iter()
+            .find(|(_, dest)| dest.as_slice() == path.as_slice())
+            .map(|(source, _)| source);
+        let clean_directory_side = path_descendants_match(base, other_entries, &path)
+            && !path_has_tree_descendant(side_entries, &path);
+        let new_path_str = if clean_directory_side {
+            path_display.clone()
+        } else {
+            format!("{path_display}~{branch_desc}")
+        };
+
+        if !clean_directory_side {
+            let body = format!(
+                "directory in the way of {} from {}; moving it to {} instead.",
+                path_display, branch_desc, new_path_str
+            );
+            conflict_descriptions.push(ConflictDescription {
+                kind: "file/directory",
+                body,
+                subject_path: new_path_str.clone(),
+                remerge_anchor_path: Some(path_display.clone()),
+                rename_rr_ours_dest: None,
+                rename_rr_theirs_dest: None,
+                auto_merge_hint_path: None,
+            });
+        }
 
         index.entries.retain(|e| e.path != path);
 
-        // When our side renamed a tracked file into `path` and their side still has that file
-        // at the old path (now a directory on their side), merge-ort three-way merges the blob
-        // at `path` with `base` + `theirs` at the rename source (t6422 rename/directory).
-        if file_is_ours {
-            if let Some((base_path, _)) = ours_renames
-                .iter()
-                .find(|(_, dest)| dest.as_slice() == path.as_slice())
+        // When either side renamed a tracked file into `path` and the other side still has that
+        // file at the old path, merge-ort three-way merges the renamed blob with the other side's
+        // source-path blob, then relocates the result because `path/` is occupied by a directory.
+        if let Some((base_path, _)) = side_renames
+            .iter()
+            .find(|(_, dest)| dest.as_slice() == path.as_slice())
+        {
+            if let (Some(be), Some(other_at_source)) =
+                (base.get(base_path), other_entries.get(base_path))
             {
-                if let (Some(be), Some(te_old)) =
-                    (base.get(base_path), theirs_entries.get(base_path))
-                {
-                    let base_path_str = String::from_utf8_lossy(base_path);
-                    let ours_merge_label = format!("{ours_label}:{path_str}");
-                    let theirs_merge_label = format!("{their_name}:{base_path_str}");
-                    match try_content_merge(
-                        repo,
-                        &path_str,
-                        be,
-                        file_entry,
-                        te_old,
-                        &ours_merge_label,
-                        "",
-                        &theirs_merge_label,
-                        favor,
-                        diff_algorithm,
-                        merge_renormalize,
-                        ignore_all_space,
-                        ignore_space_change,
-                        ignore_space_at_eol,
-                        ignore_cr_at_eol,
-                        auto_merge_paths.as_deref_mut(),
-                    )? {
-                        ContentMergeResult::Clean(merged_oid, mode) => {
-                            // The file is relocated to `path~SIDE` because the directory occupies
-                            // `path`; git records the unmerged stage-2 entry under the relocated
-                            // name (not bare `path`), matching `git ls-files -u` for the
-                            // rename/directory conflict (t6422 1a, t4069 file/directory).
+                let base_path_str = String::from_utf8_lossy(base_path);
+                let ours_for_merge = if file_is_ours {
+                    file_entry
+                } else {
+                    other_at_source
+                };
+                let theirs_for_merge = if file_is_ours {
+                    other_at_source
+                } else {
+                    file_entry
+                };
+                let ours_merge_label = if file_is_ours {
+                    format!("{ours_label}:{path_str}")
+                } else {
+                    format!("{ours_label}:{base_path_str}")
+                };
+                let theirs_merge_label = if file_is_ours {
+                    format!("{their_name}:{base_path_str}")
+                } else {
+                    format!("{their_name}:{path_str}")
+                };
+                if auto_merge_paths.is_none() {
+                    conflict_descriptions.push(ConflictDescription {
+                        kind: "info",
+                        body: format!("Auto-merging {path_str}"),
+                        subject_path: path_str.clone(),
+                        remerge_anchor_path: None,
+                        rename_rr_ours_dest: None,
+                        rename_rr_theirs_dest: None,
+                        auto_merge_hint_path: None,
+                    });
+                }
+                match try_content_merge(
+                    repo,
+                    &path_str,
+                    be,
+                    ours_for_merge,
+                    theirs_for_merge,
+                    &ours_merge_label,
+                    "",
+                    &theirs_merge_label,
+                    favor,
+                    diff_algorithm,
+                    merge_renormalize,
+                    ignore_all_space,
+                    ignore_space_change,
+                    ignore_space_at_eol,
+                    ignore_cr_at_eol,
+                    auto_merge_paths.as_deref_mut(),
+                )? {
+                    ContentMergeResult::Clean(merged_oid, mode) => {
+                        if clean_directory_side {
                             index.remove(&path);
+                            index.remove_descendants_under_path(&path_str);
                             let mut merged_entry = file_entry.clone();
-                            merged_entry.path = new_path_str.as_bytes().to_vec();
+                            merged_entry.path = path.clone();
                             merged_entry.oid = merged_oid;
                             merged_entry.mode = mode;
-                            stage_entry(index, &merged_entry, 2);
-                            let merged_obj = repo.odb.read(&merged_oid)?;
-                            conflict_files.push((new_path_str.clone(), merged_obj.data));
-                            *has_conflicts = true;
+                            index.add_or_replace(merged_entry);
                             continue;
                         }
-                        ContentMergeResult::Conflict(content)
-                        | ContentMergeResult::BinaryConflict(content) => {
-                            index.remove(&path);
-                            let tilde_path = new_path_str.as_bytes().to_vec();
-                            let mut be_here = be.clone();
-                            be_here.path = tilde_path.clone();
-                            stage_entry(index, &be_here, 1);
-                            let mut oe_here = file_entry.clone();
-                            oe_here.path = tilde_path.clone();
-                            stage_entry(index, &oe_here, 2);
-                            let mut te_here = te_old.clone();
-                            te_here.path = tilde_path.clone();
-                            stage_entry(index, &te_here, 3);
-                            conflict_files.push((new_path_str.clone(), content.clone()));
-                            conflict_descriptions.push(ConflictDescription {
-                                kind: "content",
-                                body: format!("Merge conflict in {path_str}"),
-                                subject_path: new_path_str.clone(),
-                                remerge_anchor_path: None,
-                                rename_rr_ours_dest: None,
-                                rename_rr_theirs_dest: None,
-                                auto_merge_hint_path: None,
-                            });
-                            *has_conflicts = true;
-                            continue;
-                        }
+                        // The file is relocated to `path~SIDE` because the directory occupies
+                        // `path`; git records the unmerged entry under the relocated name (not bare
+                        // `path`), matching `git ls-files -u` for rename/directory conflicts.
+                        index.remove(&path);
+                        let mut merged_entry = file_entry.clone();
+                        merged_entry.path = new_path_str.as_bytes().to_vec();
+                        merged_entry.oid = merged_oid;
+                        merged_entry.mode = mode;
+                        let stage = if file_is_ours { 2 } else { 3 };
+                        stage_entry(index, &merged_entry, stage);
+                        let merged_obj = repo.odb.read(&merged_oid)?;
+                        conflict_files.push((new_path_str.clone(), merged_obj.data));
+                        *has_conflicts = true;
+                        continue;
+                    }
+                    ContentMergeResult::Conflict(content)
+                    | ContentMergeResult::BinaryConflict(content) => {
+                        index.remove(&path);
+                        let tilde_path = new_path_str.as_bytes().to_vec();
+                        let mut be_here = be.clone();
+                        be_here.path = tilde_path.clone();
+                        stage_entry(index, &be_here, 1);
+                        let mut ours_here = ours_for_merge.clone();
+                        ours_here.path = tilde_path.clone();
+                        stage_entry(index, &ours_here, 2);
+                        let mut theirs_here = theirs_for_merge.clone();
+                        theirs_here.path = tilde_path.clone();
+                        stage_entry(index, &theirs_here, 3);
+                        conflict_files.push((new_path_str.clone(), content.clone()));
+                        conflict_descriptions.push(ConflictDescription {
+                            kind: "content",
+                            body: format!("Merge conflict in {path_str}"),
+                            subject_path: new_path_str.clone(),
+                            remerge_anchor_path: None,
+                            rename_rr_ours_dest: None,
+                            rename_rr_theirs_dest: None,
+                            auto_merge_hint_path: None,
+                        });
+                        *has_conflicts = true;
+                        continue;
                     }
                 }
             }
         }
+
+        if let Some(source) = rename_source {
+            if opposite_renames.contains_key(source) && index.get(source, 1).is_none() {
+                if let Some(be) = base.get(source) {
+                    stage_entry(index, be, 1);
+                }
+            }
+        }
+        let relocated_base_entry = base.get(&path).or_else(|| {
+            rename_source.and_then(|source| {
+                if opposite_renames.contains_key(source) {
+                    None
+                } else {
+                    base.get(source)
+                }
+            })
+        });
 
         if merge_ort_style {
             // merge-ort relocates the file to `path~SIDE` and records the unmerged
             // entry under that relocated name (not `path`, which is occupied by the
             // directory from the other side). `git add path~SIDE` then resolves it.
             let relocated = new_path_str.as_bytes().to_vec();
-            if let Some(be) = base.get(&path) {
+            if let Some(be) = relocated_base_entry {
                 let mut be_here = be.clone();
                 be_here.path = relocated.clone();
                 stage_entry(index, &be_here, 1);
@@ -9948,20 +10279,22 @@ fn apply_directory_file_conflicts(
                     "{new_path_str} deleted in {ours_label} and modified in {their_name}.  Version {their_name} of {new_path_str} left in tree."
                 )
             };
-            conflict_descriptions.push(ConflictDescription {
-                kind: "modify/delete",
-                body: md_body,
-                subject_path: new_path_str.clone(),
-                remerge_anchor_path: Some(path_display.clone()),
-                rename_rr_ours_dest: None,
-                rename_rr_theirs_dest: None,
-                auto_merge_hint_path: None,
-            });
+            if !clean_directory_side {
+                conflict_descriptions.push(ConflictDescription {
+                    kind: "modify/delete",
+                    body: md_body,
+                    subject_path: new_path_str.clone(),
+                    remerge_anchor_path: Some(path_display.clone()),
+                    rename_rr_ours_dest: None,
+                    rename_rr_theirs_dest: None,
+                    auto_merge_hint_path: None,
+                });
+            }
 
             // git also stages the base version (stage 1) at the relocated `path~SIDE`
             // path when the file existed in the merge base, so the modify/delete shows
             // both `1 path~SIDE` and `2/3 path~SIDE` in the conflicted-file listing.
-            if let Some(be) = base.get(&path) {
+            if let Some(be) = relocated_base_entry {
                 let mut be_here = be.clone();
                 be_here.path = new_path_str.as_bytes().to_vec();
                 stage_entry(index, &be_here, 1);

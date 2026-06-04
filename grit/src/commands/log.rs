@@ -159,12 +159,16 @@ pub struct Args {
     pub internal_remotes_pattern: Option<String>,
 
     /// Only show commits on the ancestry path between endpoints.
-    #[arg(long = "ancestry-path")]
+    #[arg(long = "ancestry-path", value_name = "REV", default_missing_value = "", num_args = 0..=1, require_equals = true)]
+    pub ancestry_path_args: Vec<String>,
+
+    /// Whether ancestry-path filtering is active after CLI normalization.
+    #[arg(skip)]
     pub ancestry_path: bool,
 
     /// Bottom commit for `--ancestry-path=<rev>` (parsed from argv in `run`, not clap).
     #[arg(skip)]
-    pub ancestry_path_bottom: Option<String>,
+    pub ancestry_path_bottoms: Vec<String>,
 
     /// Only show commits that are decorated (have refs).
     #[arg(long = "simplify-by-decoration")]
@@ -1813,7 +1817,7 @@ fn write_graph_interleaved_commit_msg(
             writeln!(out)?;
         }
         graph_show_remainder_lines(out, line_prefix, graph)?;
-        if newline_terminated {
+        if newline_terminated && trimmed.contains('\n') {
             writeln!(out)?;
         }
     } else if !newline_terminated && !body.is_empty() {
@@ -2010,12 +2014,29 @@ fn hydrate_log_options_from_raw_argv(args: &mut Args) {
         if let Some(rest) = arg.strip_prefix("--ancestry-path=") {
             args.ancestry_path = true;
             if !rest.is_empty() {
-                args.ancestry_path_bottom = Some(rest.to_owned());
+                args.ancestry_path_bottoms.push(rest.to_owned());
             }
         }
 
         i += 1;
     }
+}
+
+fn normalize_ancestry_path_arg(args: &mut Args) {
+    if !args.ancestry_path_args.is_empty() {
+        args.ancestry_path = true;
+        args.ancestry_path_bottoms.extend(
+            args.ancestry_path_args
+                .drain(..)
+                .filter(|value| !value.is_empty()),
+        );
+    }
+    if !args.ancestry_path_bottoms.is_empty() {
+        args.ancestry_path = true;
+    }
+    let mut seen = HashSet::new();
+    args.ancestry_path_bottoms
+        .retain(|value| seen.insert(value.clone()));
 }
 
 /// Resolve revision specs to commit OIDs, dropping specs that fail to resolve when
@@ -2416,11 +2437,11 @@ fn run_rev_list_log(
         all_refs: args.all || stdin_all_refs,
         first_parent: args.first_parent,
         ancestry_path: args.ancestry_path,
-        ancestry_path_bottoms: if let Some(ref b) = args.ancestry_path_bottom {
-            vec![resolve_revision_as_commit(repo, b.as_str())?]
-        } else {
-            Vec::new()
-        },
+        ancestry_path_bottoms: args
+            .ancestry_path_bottoms
+            .iter()
+            .map(|b| resolve_revision_as_commit(repo, b.as_str()).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?,
         skip: args.skip.unwrap_or(0),
         max_count: args.max_count,
         ordering,
@@ -2430,6 +2451,7 @@ fn run_rev_list_log(
         parent_rewrite: args.show_parents || log_parent_format_requested(args),
         sparse: args.sparse,
         simplify_merges: args.simplify_merges,
+        preserve_simplify_merges_graph_merges: args.graph,
         show_pulls: args.show_pulls,
         exclude_first_parent_only: args.exclude_first_parent_only,
         paths: combined_pathspecs.clone(),
@@ -2713,11 +2735,11 @@ fn run_graph_log(
         all_refs: args.all || stdin_all_refs,
         first_parent: args.first_parent,
         ancestry_path: args.ancestry_path,
-        ancestry_path_bottoms: if let Some(ref b) = args.ancestry_path_bottom {
-            vec![resolve_revision_as_commit(repo, b.as_str())?]
-        } else {
-            Vec::new()
-        },
+        ancestry_path_bottoms: args
+            .ancestry_path_bottoms
+            .iter()
+            .map(|b| resolve_revision_as_commit(repo, b.as_str()).map_err(anyhow::Error::from))
+            .collect::<Result<Vec<_>>>()?,
         simplify_by_decoration: false,
         skip: args.skip.unwrap_or(0),
         max_count: args.max_count,
@@ -2742,6 +2764,7 @@ fn run_graph_log(
         parent_rewrite: args.show_parents || log_parent_format_requested(&args),
         sparse: args.sparse,
         simplify_merges: args.simplify_merges,
+        preserve_simplify_merges_graph_merges: args.graph,
         show_pulls: args.show_pulls,
         exclude_first_parent_only: args.exclude_first_parent_only,
         paths: if args.follow {
@@ -2790,7 +2813,7 @@ fn run_graph_log(
         result.commits = simplified;
     }
 
-    if !combined_pathspecs.is_empty() && !args.full_history {
+    if !combined_pathspecs.is_empty() && !args.full_history && !args.simplify_merges {
         if args.sparse {
             let mut dense_options = options.clone();
             dense_options.sparse = false;
@@ -4451,6 +4474,7 @@ fn emit_bloom_perf_line(stats: &BloomWalkStats, path: &str) {
 /// Run the `log` command.
 pub fn run(mut args: Args) -> Result<()> {
     hydrate_log_options_from_raw_argv(&mut args);
+    normalize_ancestry_path_arg(&mut args);
 
     // `--tags`/`--remotes` are accepted as proper options (so they don't absorb
     // following `--decorate` etc. via the hyphen-tolerant positional list); turn
@@ -4581,14 +4605,6 @@ pub fn run(mut args: Args) -> Result<()> {
             }
         }
         args.log_output_encoding = enc;
-    }
-
-    for raw in std::env::args_os().map(|a| a.to_string_lossy().into_owned()) {
-        if let Some(rest) = raw.strip_prefix("--ancestry-path=") {
-            if !rest.is_empty() {
-                args.ancestry_path_bottom = Some(rest.to_owned());
-            }
-        }
     }
 
     let cfg = ConfigSet::load(Some(&repo.git_dir), true).context("loading git config")?;
@@ -8493,17 +8509,41 @@ fn run_symmetric_log(
         .context("failed to compute merge bases for symmetric range")?;
     let negative: Vec<String> = bases.iter().map(|b| b.to_hex()).collect();
 
+    let ordering = if args.topo_order || args.simplify_merges {
+        if args.author_date_order {
+            OrderingMode::AuthorDateTopo
+        } else {
+            OrderingMode::Topo
+        }
+    } else if args.date_order || args.author_date_order {
+        if args.author_date_order {
+            OrderingMode::AuthorDateWalk
+        } else {
+            OrderingMode::DateOrderWalk
+        }
+    } else {
+        OrderingMode::Default
+    };
+
     // `rev-list` resolves each positive spec; empty sides mean HEAD (same as parsing above).
     let positive = vec![lhs_spec.to_owned(), rhs_spec.to_owned()];
     let options = RevListOptions {
         left_right: true,
         left_only: args.left_only,
         right_only: args.right_only,
+        ancestry_path: args.ancestry_path,
+        ancestry_path_bottoms: args
+            .ancestry_path_bottoms
+            .iter()
+            .map(|bottom| {
+                resolve_revision_as_commit(repo, bottom.as_str()).map_err(anyhow::Error::from)
+            })
+            .collect::<Result<Vec<_>>>()?,
         symmetric_left: Some(lhs_oid),
         symmetric_right: Some(rhs_oid),
         boundary: args.boundary,
         first_parent: args.first_parent,
-        ordering: OrderingMode::Topo,
+        ordering,
         reverse: false,
         ..RevListOptions::default()
     };

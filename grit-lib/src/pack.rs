@@ -1358,6 +1358,7 @@ pub fn read_object_from_pack_bytes(
         .find(|e| e.oid.as_slice() == oid)
         .ok_or_else(|| Error::ObjectNotFound(oid_bytes_to_hex(oid)))?;
     let (kind, data) = read_pack_object_at(pack_bytes, entry.offset, idx, None, 0)?;
+    verify_packed_object_hash(kind, &data, oid)?;
     Ok(Object::new(kind, data))
 }
 
@@ -1371,6 +1372,25 @@ fn validate_pack_index_object_count(pack_bytes: &[u8], idx: &PackIndex) -> Resul
         return Err(Error::CorruptObject(format!(
             "pack object count mismatch: pack has {count}, index has {}",
             idx.entries.len()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_packed_object_hash(kind: ObjectKind, data: &[u8], expected_oid: &[u8]) -> Result<()> {
+    if expected_oid.len() != 20 {
+        return Ok(());
+    }
+    let header = format!("{kind} {}\0", data.len());
+    let mut hasher = Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(data);
+    let actual = hasher.finalize();
+    if actual.as_slice() != expected_oid {
+        return Err(Error::CorruptObject(format!(
+            "packed object {} hashes to {}",
+            oid_bytes_to_hex(expected_oid),
+            oid_bytes_to_hex(actual.as_slice())
         )));
     }
     Ok(())

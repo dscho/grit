@@ -30,20 +30,37 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
 - [x] `t6007-rev-list-cherry-pick-file.sh` — 23/23 passing after path-limited patch-id matching,
   `--cherry-mark` / `--cherry` marker/count semantics, duplicate patch-id matching, and empty-side
   symmetric range handling.
-- [ ] `t6012-rev-list-simplify.sh` — 26/42 passing, 16 failing.
-- [ ] `t6000-rev-list-misc.sh` — 9/23 passing, 14 failing.
-- [ ] `t6003-rev-list-topo-order.sh` — 23/36 passing, 13 failing.
-- [ ] `t6019-rev-list-ancestry-path.sh` — 5/18 passing, 13 failing.
-- [ ] `t6137-rev-parse-misc.sh` — 23/34 passing, 11 failing.
-- [ ] `t6016-rev-list-graph-simplify-history.sh` — 2/12 passing, 10 failing.
-- [ ] `t6136-rev-list-date-range.sh` — 24/31 passing, 7 failing.
-- [ ] `t6015-rev-list-show-all-parents.sh` — 32/38 passing, 6 failing.
-- [ ] `t6138-rev-list-boundary.sh` — 24/29 passing, 5 failing.
-- [ ] `t6001-rev-list-graft.sh` — 10/14 passing, 4 failing.
-- [ ] `t6101-rev-parse-parents.sh` — 35/38 passing, 3 failing.
-- [ ] `t6010-merge-base.sh` — 10/12 passing, 2 failing.
-- [ ] `t6011-rev-list-with-bad-commit.sh` — 5/6 passing, 1 failing.
-- [ ] `t6013-rev-list-reverse-parents.sh` — 2/3 passing, 1 failing.
+- [x] `t6012-rev-list-simplify.sh` — 42/42 passing after completing path-limited
+  `--simplify-merges --show-pulls` graph ordering.
+- [x] `t6000-rev-list-misc.sh` — 23/23 passing after completing path-limited object output,
+  symmetric left/right ordering, indexed object roots/exclusions, raw `--header`, `-z` records,
+  boundary incompatibility, and root replay for `rebase --force-rebase --root`.
+- [x] `t6003-rev-list-topo-order.sh` — 36/36 passing after matching Git's graph-order
+  `--topo-order` stack semantics and accepting raw numeric `--max-age` / `--min-age` cutoffs.
+- [x] `t6019-rev-list-ancestry-path.sh` — 18/18 passing after matching Git's
+  selected-range ancestry propagation, symmetric-log ancestry bottoms, path-limited ancestry-side
+  TREESAME merge pruning, simplify-merges ancestry preservation, and `checkout -b start --`
+  separator handling for the criss-cross setup.
+- [x] `t6137-rev-parse-misc.sh` — 34/34 passing after making the synthetic
+  fixture request its expected `master` initial branch under the harness.
+- [x] `t6016-rev-list-graph-simplify-history.sh` — 12/12 passing after
+  preserving path-limited `--simplify-merges` merge nodes for graph lane rendering.
+- [x] `t6136-rev-list-date-range.sh` — 31/31 passing after making the synthetic
+  fixture request its expected `master` initial branch under the harness.
+- [x] `t6015-rev-list-show-all-parents.sh` — 38/38 passing after making the
+  synthetic fixture request its expected `master` initial branch under the harness.
+- [x] `t6138-rev-list-boundary.sh` — 29/29 passing after making the synthetic
+  fixture request its expected `master` initial branch under the harness.
+- [x] `t6001-rev-list-graft.sh` — 14/14 passing after making path-limited
+  parent rewriting and graph ordering honor grafted parents.
+- [x] `t6101-rev-parse-parents.sh` — 38/38 passing after making `rev-list`
+  reuse the shared parent shorthand expansion for `^-` ranges.
+- [x] `t6010-merge-base.sh` — 12/12 passing after default multi-commit
+  `merge-base` used first-vs-rest semantics instead of octopus semantics.
+- [x] `t6011-rev-list-with-bad-commit.sh` — 6/6 passing after packed
+  object reads and fsck detect corrupt pack entries.
+- [x] `t6013-rev-list-reverse-parents.sh` — 3/3 passing after
+  `--reverse --boundary` prints boundary commits before the reversed commit stream.
 
 Completed rev-list/revision files: `t6004`, `t6005`, `t6007-rev-list-cherry-pick-status`,
 `t6008`, `t6009`, `t6011-rev-list-with-hierarchies`, `t6014`, `t6017`, `t6100`, `t6102`,
@@ -54,9 +71,14 @@ Completed rev-list/revision files: `t6004`, `t6005`, `t6007-rev-list-cherry-pick
 - [x] `t6423-merge-rename-directories.sh` — 80/82 passing, 0 failing, with 2 expected
   failures.
 - [x] `t6438-submodule-directory-file-conflicts.sh` — 56/56 passing.
-- [ ] `t6430-merge-recursive.sh` — 11/36 passing, 25 failing.
-- [ ] `t6402-merge-rename.sh` — 24/46 passing, 22 failing.
-- [ ] `t6416-recursive-corner-cases.sh` — 24/37 passing, 13 failing, with 3 expected failures.
+- [x] `t6430-merge-recursive.sh` — 36/36 passing after
+  normal checkout stopped applying the rebase-only submodule replacement refusal and
+  clean `merge-recursive` D/F auto-resolution kept the merged index while true
+  D/F conflicts still exit non-zero and use commit OID suffixes for relocated
+  conflicted files, alternate `GIT_INDEX_FILE` writes land in the selected index,
+  and unchanged-base file sides do not create D/F conflicts.
+- [x] `t6402-merge-rename.sh` — 46/46 passing.
+- [~] `t6416-recursive-corner-cases.sh` — 36/40 passing, 1 failing, with 3 expected failures.
 - [ ] `t6415-merge-dir-to-symlink.sh` — 13/24 passing, 11 failing.
 - [ ] `t6422-merge-rename-corner-cases.sh` — 11/20 passing, 9 failing, with 6 expected failures.
 - [ ] `t6430-merge-strategy-option.sh` — 0/6 passing, 6 failing.
@@ -89,11 +111,14 @@ Completed pathspec files: `t6130`, `t6132`, `t6133-pathspec-toplevel`, `t6134-*`
 
 ## Describe
 
-- [~] `t6120-describe.sh` — 54/103 passing, 49 failing. Claimed next because it has the
-  largest remaining t6 failing count; focusing describe reachability, tag selection, and output
-  compatibility.
+- [x] `t6120-describe.sh` — 105/105 passing. Improved describe candidate
+  selection/counting, describe-name rev parsing, inverse pattern/exact options, exact
+  `--contains` output, renamed annotated-tag handling, dirty/broken commit-ish rejection, `--all`
+  branch/remote pattern matching, `refs/original` describe candidates, and exact tag-object
+  name-rev output, broken absorbed-submodule dirty handling, blob describe lookup from `HEAD`,
+  and full-hash `--no-abbrev` fallback output.
 
-Completed describe/name files: `t6120-name-rev`.
+Completed describe/name files: `t6120-name-rev`, `t6120-describe`.
 
 ## Bundle, Object Reachability, And GC
 

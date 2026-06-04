@@ -6320,7 +6320,11 @@ fn cherry_pick_for_rebase(
     );
     let commit_data = CommitData {
         tree: tree_oid,
-        parents: vec![head_oid],
+        parents: if head_at_empty_tree {
+            Vec::new()
+        } else {
+            vec![head_oid]
+        },
         author,
         committer,
         author_raw,

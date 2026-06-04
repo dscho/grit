@@ -465,8 +465,10 @@ impl Odb {
         }
 
         // Fall back to pack files.
-        if let Ok(obj) = pack::read_object_from_packs(&self.objects_dir, oid) {
-            return Ok(obj);
+        match pack::read_object_from_packs(&self.objects_dir, oid) {
+            Ok(obj) => return Ok(obj),
+            Err(Error::ObjectNotFound(_)) => {}
+            Err(err) => return Err(err),
         }
 
         let midx_alt = self.config_git_dir.is_some() && self.core_multi_pack_index_enabled();
@@ -512,7 +514,11 @@ impl Odb {
                 return Ok(obj);
             }
         }
-        pack::read_object_from_packs(objects_dir, oid)
+        match pack::read_object_from_packs(objects_dir, oid) {
+            Ok(obj) => Ok(obj),
+            Err(Error::ObjectNotFound(_)) => Err(Error::ObjectNotFound(oid.to_hex())),
+            Err(err) => Err(err),
+        }
     }
 
     /// Hash raw content of a given kind and return the [`ObjectId`].

@@ -69,21 +69,40 @@ pub fn run(args: Args) -> Result<()> {
         ws.ignore_cr_at_eol,
         MergeDirectoryRenamesMode::FromConfig,
         rename_options,
+        Some((ours_oid.to_hex(), theirs_oid.to_hex())),
     )?;
 
-    let auto_resolvable_directory_file_merge = merge_result
+    let auto_resolved_directory_file_paths: Vec<Vec<u8>> = merge_result
         .conflict_descriptions
         .iter()
-        .any(|desc| desc.subject_path.contains("~HEAD"));
-    if merge_result.has_conflicts && auto_resolvable_directory_file_merge {
-        merge_result.index.entries = tree_to_index_entries(&repo, &theirs_tree, "")?;
+        .filter(|desc| desc.kind == "file/directory")
+        .map(|desc| desc.subject_path.as_bytes().to_vec())
+        .collect();
+    let only_auto_resolved_directory_file_conflicts = !auto_resolved_directory_file_paths
+        .is_empty()
+        && auto_resolved_directory_file_paths
+            .iter()
+            .all(|path| relocated_unmerged_entries_match(&merge_result.index, path))
+        && merge_result.conflict_descriptions.iter().all(|desc| {
+            auto_resolved_directory_file_paths
+                .iter()
+                .any(|path| desc.subject_path.as_bytes() == path.as_slice())
+        });
+    if merge_result.has_conflicts && only_auto_resolved_directory_file_conflicts {
+        merge_result.index.entries.retain(|entry| {
+            entry.stage() == 0
+                || !auto_resolved_directory_file_paths
+                    .iter()
+                    .any(|path| entry.path == *path)
+        });
         merge_result.index.sort();
         merge_result.conflict_descriptions.clear();
         merge_result.conflict_files.clear();
         merge_result.has_conflicts = false;
     }
 
-    repo.write_index(&mut merge_result.index)?;
+    let index_path = repo.index_path_for_env()?;
+    repo.write_index_at(&index_path, &mut merge_result.index)?;
     if let Some(ref wt) = repo.work_tree {
         remove_deleted_files(wt, &ours_entries, &merge_result.index)?;
         checkout_entries(&repo, wt, &merge_result.index)?;
@@ -129,6 +148,21 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn relocated_unmerged_entries_match(index: &grit_lib::index::Index, path: &[u8]) -> bool {
+    let entries = index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() != 0 && entry.path == path)
+        .collect::<Vec<_>>();
+    let Some(first) = entries.first() else {
+        return false;
+    };
+    entries.len() > 1
+        && entries
+            .iter()
+            .all(|entry| entry.oid == first.oid && entry.mode == first.mode)
 }
 
 /// Discover the repo for `merge-recursive` when using an alternate `GIT_WORK_TREE` (and

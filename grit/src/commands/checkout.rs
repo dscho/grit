@@ -702,6 +702,7 @@ pub fn run(mut args: Args) -> Result<()> {
         separator_at_end,
         args.switch_mode,
     );
+    let rest_positional_count = args.rest.iter().filter(|arg| arg.as_str() != "--").count();
 
     // Without `--`, `split_target_and_paths` treats the first token as tree-ish when there are
     // trailing arguments. A bare blob OID (e.g. stage `:A` from `git cat-file -p :A`) is a valid
@@ -801,7 +802,7 @@ pub fn run(mut args: Args) -> Result<()> {
             } else {
                 raw_new_branch.as_str()
             };
-            if !paths.is_empty() || args.rest.len() > 1 {
+            if !paths.is_empty() || rest_positional_count > 1 {
                 if args.track.is_some() {
                     bail!("'--track' cannot be used with updating paths");
                 }
@@ -902,7 +903,7 @@ pub fn run(mut args: Args) -> Result<()> {
     // Case: checkout -B <name> [<start_point>] (force create/reset)
     if let Some(ref force_branch_name) = args.force_branch {
         // -B takes at most one positional arg (start point)
-        if !paths.is_empty() || args.rest.len() > 1 {
+        if !paths.is_empty() || rest_positional_count > 1 {
             bail!("too many arguments for -B");
         }
         let result = force_create_and_switch_branch(
@@ -942,7 +943,7 @@ pub fn run(mut args: Args) -> Result<()> {
             target = Some(paths.remove(0));
         }
         // -b takes at most one positional arg (start point)
-        if !paths.is_empty() || args.rest.len() > 1 {
+        if !paths.is_empty() || rest_positional_count > 1 {
             if args.track.is_some() {
                 bail!("'--track' cannot be used with updating paths");
             }

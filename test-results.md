@@ -588,6 +588,306 @@
 
 - Focus harness: `./scripts/run-tests.sh --timeout 600 t5000-tar-tree.sh --verbose` passes 90/90 after archive filter streaming and archive option/pathspec/remote fixes.
 - Quality gates: `cargo fmt`, `cargo check`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed successfully; unrelated automatic clippy formatting outside the archive change was reverted before commit.
+## 2026-06-04 — t6416 nested virtual-base markers
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved
+  from 35/40 to 36/40 after recursive virtual-base merges started preserving Git-compatible
+  nested conflict marker labels and marker lengths.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6416 submodule criss-cross conflicts
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  32/40 to 35/40 after gitlink virtual-base conflicts and `ls-files -o` unmerged-gitlink
+  filtering matched the expected submodule conflict shape.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6416 symlink add/add virtual base
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  31/40 to 32/40 after symlink add/add conflicts stopped materializing a synthetic stage-1 entry
+  in recursive virtual merge bases.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6416 rename/rename(1to2) content
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  30/40 to 31/40 after rename/rename(1to2) conflicts started staging the once-merged content at
+  both destination paths.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` completed with the existing warning backlog; unrelated
+  fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6416 reverse D/F virtual-base rename
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  29/40 to 30/40 after the reverse rename/delete path stopped relocating files away from a clean
+  virtual-base directory side.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` completed with the existing warning backlog; unrelated
+  fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6416 recursive D/F virtual bases
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  26/40 to 29/40 after recursive virtual-base and `merge-tree --write-tree` materialization started
+  preserving stage-3-only directory/file conflict entries.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` completed with the existing warning backlog; unrelated
+  fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6402-merge-rename partial directory pathspecs
+
+- Focus harness: `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improved from 26/46
+  to 27/46 after partial-tree commits started honoring exact directory pathspec deletions.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6402-merge-rename empty files
+
+- Focus harness: `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improved from 25/46
+  to 26/46 after rename detection stopped following zero-byte regular/executable base blobs.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6402-merge-rename marker labels
+
+- Focus harness: `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improved from 23/46
+  to 25/46 after single-sided rename content conflicts started using path-qualified marker labels.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6430-merge-recursive completed
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 35/36
+  to 36/36 after D/F conflict detection ignored file sides that were unchanged from the merge base.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t3426-rebase-submodule.sh t2013-checkout-submodule.sh t6422-merge-rename-corner-cases.sh t6400-merge-df.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 36/36, `t3426` 11/29, `t2013` 62/74, `t6422` 12/26, `t6400` 7/7, and
+  `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6430-merge-recursive alternate index writes
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 33/36
+  to 35/36 after `merge-recursive` wrote its result index to the path selected by
+  `GIT_INDEX_FILE`.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t3426-rebase-submodule.sh t2013-checkout-submodule.sh t6422-merge-rename-corner-cases.sh t6400-merge-df.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 35/36, `t3426` 11/29, `t2013` 62/74, `t6422` 12/26, `t6400` 7/7, and
+  `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6430-merge-recursive D/F conflict suffixes
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 31/36
+  to 33/36 after `merge-recursive` used explicit commit OID side labels for relocated D/F conflict
+  paths and made auto-D/F cleanup suffix-agnostic.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t3426-rebase-submodule.sh t2013-checkout-submodule.sh t6422-merge-rename-corner-cases.sh t6400-merge-df.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 33/36, `t3426` 11/29, `t2013` 62/74, `t6422` 12/26, `t6400` 7/7, and
+  `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6430-merge-recursive true D/F conflicts
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 30/36
+  to 31/36 after auto-D/F cleanup required relocated unmerged stages to match before clearing
+  conflict state.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t6422-merge-rename-corner-cases.sh t6400-merge-df.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 31/36, `t6422` 12/26, `t6400` 7/7, and `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6430-merge-recursive clean D/F auto-resolution
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 28/36
+  to 30/36 after `merge-recursive` kept the merged index for clean D/F auto-resolution and removed
+  only the relocated `~HEAD` unmerged stages.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t6422-merge-rename-corner-cases.sh t6400-merge-df.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 30/36, `t6422` 12/26, `t6400` 7/7, and `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6430-merge-recursive checkout/submodule unblock
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 11/36
+  to 28/36 after normal checkout stopped applying the rebase-only submodule replacement refusal.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t3426-rebase-submodule.sh t2013-checkout-submodule.sh t7112-reset-submodule.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 28/36, `t3426` 11/29, `t2013` 62/74, `t7112` 78/82 with no failing tests, and
+  `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6013-rev-list-reverse-parents
+
+- Focus harness: `./scripts/run-tests.sh t6013-rev-list-reverse-parents.sh --verbose` passes 3/3
+  after `--reverse --boundary` emits boundary commits before the reversed commit stream.
+- Regression harness: `./scripts/run-tests.sh t6013-rev-list-reverse-parents.sh t6138-rev-list-boundary.sh t6001-rev-list-graft.sh t6101-rev-parse-parents.sh t6011-rev-list-with-bad-commit.sh t6012-rev-list-simplify.sh --verbose --timeout 180`
+  passes 3/3, 29/29, 14/14, 38/38, 6/6, and 42/42.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6011-rev-list-with-bad-commit
+
+- Focus harness: `./scripts/run-tests.sh t6011-rev-list-with-bad-commit.sh --verbose` passes 6/6
+  after packed object reads and fsck detect corrupt pack entries.
+- Regression harness: `./scripts/run-tests.sh t6011-rev-list-with-bad-commit.sh t6022-rev-list-missing.sh t6010-merge-base.sh t6101-rev-parse-parents.sh t7700-repack.sh --verbose --timeout 180`
+  passes t6011 6/6, t6022 40/40, t6010 12/12, and t6101 38/38; `t7700-repack.sh` remains at its
+  pre-existing tracked baseline of 40/47.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6010-merge-base
+
+- Focus harness: `./scripts/run-tests.sh t6010-merge-base.sh --verbose` passes 12/12 after
+  default multi-commit `merge-base` used first-vs-rest semantics instead of octopus semantics.
+- Regression harness: `./scripts/run-tests.sh t6010-merge-base.sh t6101-rev-parse-parents.sh t6600-test-reach.sh t6019-rev-list-ancestry-path.sh t6003-rev-list-topo-order.sh --verbose`
+  passes 12/12, 38/38, 47/47, 18/18, and 36/36.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6101-rev-parse-parents
+
+- Focus harness: `./scripts/run-tests.sh t6101-rev-parse-parents.sh --verbose` passes 38/38
+  after `rev-list` reused the shared parent shorthand expansion for `^-` ranges.
+- Regression harness: `./scripts/run-tests.sh t6101-rev-parse-parents.sh t6001-rev-list-graft.sh t6012-rev-list-simplify.sh t6016-rev-list-graph-simplify-history.sh t6111-rev-list-treesame.sh --verbose`
+  passes 38/38, 14/14, 42/42, 12/12, and 65/65.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6001-rev-list-graft
+
+- Focus harness: `./scripts/run-tests.sh t6001-rev-list-graft.sh --verbose` passes 14/14 after
+  path-limited parent rewriting and graph ordering were made graft-aware.
+- Regression harness: `./scripts/run-tests.sh t6001-rev-list-graft.sh t6012-rev-list-simplify.sh t6111-rev-list-treesame.sh t6016-rev-list-graph-simplify-history.sh t6015-rev-list-show-all-parents.sh --verbose`
+  passes 14/14, 42/42, 65/65, 12/12, and 38/38.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6138-rev-list-boundary
+
+- Focus harness: `./scripts/run-tests.sh t6138-rev-list-boundary.sh --verbose` passes 29/29
+  after the synthetic fixture explicitly requests its hard-coded `master` initial branch under the
+  harness.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` passed with the existing warning backlog; unrelated
+  fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this fixture-only
+  t6138 increment.
+
+## 2026-06-04 — t6015-rev-list-show-all-parents
+
+- Focus harness: `./scripts/run-tests.sh t6015-rev-list-show-all-parents.sh --verbose` passes
+  38/38 after the synthetic fixture explicitly requests its hard-coded `master` initial branch
+  under the harness.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` passed with the existing warning backlog; unrelated
+  fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this fixture-only
+  t6015 increment.
+
+## 2026-06-04 — t6136-rev-list-date-range
+
+- Focus harness: `./scripts/run-tests.sh t6136-rev-list-date-range.sh --verbose` passes 31/31
+  after the synthetic fixture explicitly requests its hard-coded `master` initial branch under the
+  harness.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty` passed with the existing warning backlog; unrelated
+  fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this fixture-only
+  t6136 increment.
+
+## 2026-06-04 — t6016-rev-list-graph-simplify-history
+
+- Focus harness: `./scripts/run-tests.sh t6016-rev-list-graph-simplify-history.sh` passes 12/12
+  after preserving path-limited `--simplify-merges` merge nodes for `log --graph` lane rendering.
+- Regression harness: `./scripts/run-tests.sh t6016-rev-list-graph-simplify-history.sh t6012-rev-list-simplify.sh t6111-rev-list-treesame.sh t6019-rev-list-ancestry-path.sh`
+  passes 12/12, 42/42, 65/65, and 18/18.
+- `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` passed with the existing
+  warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
+## 2026-06-04 — t6137-rev-parse-misc
+
+- Focus harness: `./scripts/run-tests.sh t6137-rev-parse-misc.sh` passes 34/34 after the
+  synthetic fixture explicitly requests its hard-coded `master` initial branch under the harness.
+- `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` passed with the existing
+  warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this fixture-only
+  t6137 increment.
 
 ## 2026-06-03 — t1300-config --config-env partial
 
@@ -2195,3 +2495,221 @@ Updated: 2026-06-01
 - Harness refresh: `./scripts/run-tests.sh t3405-rebase-malformed.sh` passed 5/5 with the current
   rebase implementation.
 - No code changes were required for this fixture.
+- t6120 describe selection/options focus: after matching Git's describe candidate commit-count
+  selection, describe-name rev parsing fallback, inverse describe options, exact annotated
+  `--contains` formatting, and renamed annotated-tag behavior, the direct verbose run reaches
+  `describe --dirty HEAD` and `./scripts/run-tests.sh t6120-describe.sh` improves from 54/103 to
+  86/105 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check
+  -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog remains), and `cargo test -p grit-lib --lib`.
+- t6120 describe dirty/all-ref focus: after making `--dirty`/`--broken` reject commit-ish
+  arguments, matching `--all --match/--exclude` against branch and remote short names, and adding
+  unfiltered `refs/original/*` candidates, the direct verbose run reaches `name-rev with exact
+  tags` and `./scripts/run-tests.sh t6120-describe.sh` improves from 86/105 to 91/105 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6120 name-rev tag-object focus: after adding direct names for annotated tag objects while
+  keeping peeled commits named as `<tag>^0`, the direct verbose run reaches `describe chokes on
+  severely broken submodules` and `./scripts/run-tests.sh t6120-describe.sh` improves from 91/105
+  to 92/105 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo
+  check -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo
+  clippy --fix --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics
+  remain), and `cargo test -p grit-lib --lib`.
+- t6120 broken submodule dirty focus: after making describe's dirty check error on broken
+  absorbed-submodule gitdirs while allowing `--broken` to append the broken suffix, the direct
+  verbose run reaches `describe a blob at a directly tagged commit` and
+  `./scripts/run-tests.sh t6120-describe.sh` improves from 92/105 to 95/105 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6120 blob describe focus: after adding blob lookup from `HEAD` and blob-specific error paths,
+  the direct verbose run reaches `--always with no refs falls back to commit hash` and
+  `./scripts/run-tests.sh t6120-describe.sh` improves from 95/105 to 102/105 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6120 final describe focus: after adding `--no-abbrev` full-hash fallback output and flipping
+  the two fixed `--candidates=2` expected-failure checks to success, the direct verbose run passes
+  all 105 tests and `./scripts/run-tests.sh t6120-describe.sh` records 105/105 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6012 baseline refresh: after claiming `t6012-rev-list-simplify.sh`, the official harness
+  records 33/42 instead of the stale 26/42 plan value, reflecting already-committed rev-list work
+  and refreshing `data/test-files.csv` plus dashboards. Full cargo validation was skipped because
+  this was a harness/progress refresh with no Rust code changes.
+- t6012 simplify-merges parent rewrite focus: after keeping all-TREESAME merge candidates through
+  the `--simplify-merges` full-history phase and rewriting merge parent lists through omitted
+  commits, the direct verbose run advances through tests 10-12 and
+  `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 33/42 to 36/42 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6012 simplify-merges author-date focus: after reordering simplified merge output with rewritten
+  parent edges and author-date ready-queue ordering, the direct verbose run advances through test
+  30 and `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 36/42 to 37/42 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6012 default show-pulls focus: after making the dense path-limited walk keep pull merges visible
+  without walking their non-TREESAME sides, the direct verbose run advances through test 32 and
+  `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 37/42 to 38/42 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6012 simplify-merges show-pulls focus: after preserving pull merges during simplify-merges even
+  when parent simplification collapses them to one rewritten edge, the direct verbose run advances
+  through test 39 and `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 38/42 to
+  39/42 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check
+  -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6012 simplify-merges ancestry focus: after keeping rewritten-root merge commits during
+  simplify-merges, the direct verbose run advances through test 41 and
+  `./scripts/run-tests.sh t6012-rev-list-simplify.sh` improves from 39/42 to 41/42 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6012 final graph simplify focus: after preserving the simplified rev-list order for graph mode
+  and suppressing the extra post-remainder blank line for single-line graph pretty output, the
+  direct debug run passes all 42 tests and `./scripts/run-tests.sh t6012-rev-list-simplify.sh`
+  records 42/42 with refreshed `data/test-files.csv` plus dashboards. The nearby
+  `./scripts/run-tests.sh t6016-rev-list-graph-simplify-history.sh` harness improves from 2/12 to
+  4/12. Also ran `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog and known failed auto-fix diagnostics remain), and `cargo test -p grit-lib --lib`.
+- t6000 path-limited objects focus: after filtering `rev-list --objects` output by pathspec and
+  recovering matching names for duplicate blob IDs, the direct debug run advances through test 9
+  and `./scripts/run-tests.sh t6000-rev-list-misc.sh` improves from 9/23 to 14/23 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6000 symmetric log ordering focus: after making the dedicated symmetric-log path use default
+  date ordering unless topo/date options request otherwise, the direct debug run advances through
+  test 10 and `./scripts/run-tests.sh t6000-rev-list-misc.sh` improves from 14/23 to 15/23 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog and known failed auto-fix diagnostics remain), and
+  `cargo test -p grit-lib --lib`.
+- t6000 indexed objects focus: after accepting `--indexed-objects`, collecting index blobs plus
+  valid child cache-tree nodes, and honoring `--not --indexed-objects` for object exclusions, the
+  direct debug run advances through test 13 and `./scripts/run-tests.sh
+  t6000-rev-list-misc.sh` improves from 15/23 to 17/23 with refreshed `data/test-files.csv` plus
+  dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog remains and unrelated auto-fixes were reverted), and `cargo test -p grit-lib --lib`.
+- t6000 raw header focus: after accepting `rev-list --header` and writing raw commit object bytes
+  plus NUL after each commit line, the direct debug run advances through test 18 and
+  `./scripts/run-tests.sh t6000-rev-list-misc.sh` improves from 17/23 to 18/23 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted), and
+  `cargo test -p grit-lib --lib`.
+- t6000 zero-terminated output focus: after making `rev-list -z` NUL-delimit commits, emit
+  `path=<path>` and `boundary=yes` metadata records, and reject `--boundary --maximal-only`, the
+  direct debug run passes 22/23 and `./scripts/run-tests.sh t6000-rev-list-misc.sh` improves from
+  18/23 to 22/23 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`,
+  `cargo check -p grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`,
+  `cargo clippy --fix --allow-dirty` (existing warning backlog remains and unrelated auto-fixes
+  were reverted), and `cargo test -p grit-lib --lib`.
+- t6000 root rebase focus: after allowing non-interactive `rebase --force-rebase --root` to replay
+  the first root commit with no parent, the direct debug run passes 23/23 and
+  `./scripts/run-tests.sh t6000-rev-list-misc.sh` records 23/23 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix
+  --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted), and
+  `cargo test -p grit-lib --lib`.
+- t6003 topo-order focus: after matching Git's graph-order `--topo-order` LIFO stack semantics and
+  accepting raw numeric `--max-age` / `--min-age` cutoffs, the direct debug run passes 36/36 and
+  `./scripts/run-tests.sh t6003-rev-list-topo-order.sh` improves from 23/36 to 36/36 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `./scripts/run-tests.sh
+  t6012-rev-list-simplify.sh` to confirm the nearby simplify-merges topo path remains 42/42,
+  plus `cargo fmt`, `cargo check -p grit-cli`, `cargo build -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog remains and unrelated auto-fixes were reverted), and `cargo test -p grit-lib --lib`.
+- t6019 ancestry-path parser focus: after teaching `git log` to accept `--ancestry-path=<rev>` and
+  repeated explicit ancestry pivots, the direct debug run advances through test 11 and
+  `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh` improves from 5/18 to 12/18 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog remains and unrelated auto-fixes were reverted),
+  and `cargo test -p grit-lib --lib`.
+- t6019 ancestry-path completion: after limiting ancestry descendant propagation to the selected
+  range, passing ancestry bottoms through symmetric `git log`, preserving/pruning path-limited
+  ancestry-side merges, and accepting `checkout -b <name> <start> --`, the direct debug run passes
+  all 18 tests and `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh` records 18/18 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p
+  grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing
+  warning backlog remains and unrelated auto-fixes were reverted), and
+  `cargo test -p grit-lib --lib`. Adjacent official harnesses
+  `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh t6012-rev-list-simplify.sh
+  t6111-rev-list-treesame.sh` pass 18/18, 42/42, and 65/65 after the final TREESAME helper split.
+- t6402 rename/directory conflict focus: after making relocated D/F rename content merges work in
+  both directions and preserving pre-render unmerged diff entries for `git diff --quiet` exit-code
+  decisions, `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improves from 27/46 to
+  28/46 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`,
+  `cargo check -p grit-cli`, `cargo build --release -p grit-cli`, `cargo test -p grit-lib --lib`,
+  and `cargo clippy --fix --allow-dirty` (existing warning backlog remains and unrelated
+  auto-fixes were reverted).
+- t6402 symmetric rename/D/F focus: after making their-side renames into our directory entries
+  defer to the D/F conflict pass, `./scripts/run-tests.sh t6402-merge-rename.sh --verbose`
+  improves from 28/46 to 40/46 with refreshed `data/test-files.csv` plus dashboards. Also ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo build --release -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` (existing warning backlog
+  remains and unrelated auto-fixes were reverted).
+- t6402 relocated rename/delete D/F focus: after staging the base blob from the rename source for
+  relocated D/F conflicts whose destination did not exist in the base tree,
+  `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improves from 40/46 to 41/46 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`,
+  `cargo check -p grit-cli`, `cargo build --release -p grit-cli`, `cargo test -p grit-lib --lib`,
+  and `cargo clippy --fix --allow-dirty` (existing warning backlog remains and unrelated
+  auto-fixes were reverted).
+- t6402 rename/rename D/F base-stage focus: after keeping the shared source base entry at the
+  original path for rename/rename(1to2) destinations that are both D/F-relocated,
+  `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improves from 41/46 to 42/46 with
+  refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`,
+  `cargo check -p grit-cli`, `cargo build --release -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty`; the existing warning
+  backlog remains and unrelated auto-fixes were reverted.
+- t6402 divergent pull exit-code focus: after returning Git's explicit 128 exit code for
+  divergent `pull` advice, `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improves
+  from 42/46 to 43/46 and `./scripts/run-tests.sh t7601-merge-pull-config.sh --verbose`
+  remains at 65/65. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty`; the existing warning backlog remains and unrelated
+  auto-fixes were reverted.
+- t6402 empty D/F directory materialization focus: after allowing merge D/F conflict
+  materialization to replace empty in-the-way directories, `./scripts/run-tests.sh
+  t6402-merge-rename.sh --verbose` improves from 43/46 to 44/46 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty`; the existing warning backlog remains and unrelated
+  auto-fixes were reverted.
+- t6402 clean rename/rename D/F focus: after staging rename/rename(1to2) D/F conflicts at the
+  real destination when the directory-side descendants match the base, `./scripts/run-tests.sh
+  t6402-merge-rename.sh --verbose` improves from 44/46 to 45/46 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo build --release -p grit-cli`, `cargo test -p grit-lib --lib`, and
+  `cargo clippy --fix --allow-dirty`; clippy reported failed auto-fix attempts in the existing
+  warning backlog, and unrelated auto-fixes were reverted before a final `cargo check -p grit-cli`
+  passed.
+- t6402 clean single-sided rename D/F focus: after keeping clean single-sided rename/directory
+  results at stage 0 when the directory side matches the base, `./scripts/run-tests.sh
+  t6402-merge-rename.sh --verbose` improves from 45/46 to 46/46 with refreshed
+  `data/test-files.csv` plus dashboards. Also ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and
+  `cargo clippy --fix --allow-dirty`; the existing warning backlog remains and unrelated
+  auto-fixes were reverted.
+- t6416 baseline refresh: after the completed merge D/F fixes, `./scripts/run-tests.sh
+  t6416-recursive-corner-cases.sh --verbose` now reports 26/40 passing with 11 failing and 3
+  expected failures, refreshing `data/test-files.csv` plus dashboards.

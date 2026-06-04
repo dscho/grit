@@ -254,6 +254,7 @@ pub fn run(args: Args) -> Result<()> {
     } else {
         HashSet::new()
     };
+    check_pack_objects(&objects_dir, &mut issues)?;
     let packed_ids = collect_packed_ids(&objects_dir)?;
     let shallow_boundaries = load_shallow_boundaries(repo.git_dir.as_path());
 
@@ -1199,6 +1200,26 @@ fn collect_packed_ids(objects_dir: &Path) -> Result<HashSet<ObjectId>> {
         }
     }
     Ok(ids)
+}
+
+fn check_pack_objects(objects_dir: &Path, issues: &mut Vec<Issue>) -> Result<()> {
+    let pack_dir = objects_dir.join("pack");
+    let rd = match fs::read_dir(&pack_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for ent in rd {
+        let ent = ent.map_err(|e| anyhow::anyhow!(e))?;
+        let path = ent.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("idx") {
+            continue;
+        }
+        if let Err(err) = verify_pack_and_collect(&path) {
+            issues.push(Issue::FsckMessage(err.to_string()));
+        }
+    }
+    Ok(())
 }
 
 /// `.idx` without a sibling `.pack` is a repository error (Git reports `bad object`; `t7700-repack`).

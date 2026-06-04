@@ -17,7 +17,7 @@ use crate::diff::zero_oid;
 use crate::error::{Error, Result};
 use crate::ident::{committer_unix_seconds_for_ordering, parse_signature_times};
 use crate::ignore::{parse_sparse_patterns_from_blob, path_in_sparse_checkout};
-use crate::index::Index;
+use crate::index::{CacheTreeNode, Index, MODE_GITLINK, MODE_TREE};
 use crate::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use crate::pack;
 use crate::patch_ids::{compute_patch_id, compute_patch_id_for_paths};
@@ -485,6 +485,8 @@ pub struct RevListOptions {
     pub sparse: bool,
     /// Further simplify history after path limiting (`--simplify-merges`).
     pub simplify_merges: bool,
+    /// Preserve path-limited simplify-merge nodes long enough for `log --graph` lane rendering.
+    pub preserve_simplify_merges_graph_merges: bool,
     /// Include "diverted" merge commits on the first-parent spine (`--show-pulls`).
     pub show_pulls: bool,
     /// When walking excluded commits, only follow the first parent (`--exclude-first-parent-only`).
@@ -523,8 +525,10 @@ pub struct RevListOptions {
     pub since_cutoff: Option<i64>,
     /// Include OIDs from all reflogs as extra commit tips (`git pack-objects --reflog`).
     pub include_reflog_entries: bool,
-    /// Include blob OIDs from the index as object roots (`git pack-objects --indexed-objects`).
+    /// Include index blobs and valid cache-tree nodes as object roots (`--indexed-objects`).
     pub include_indexed_objects: bool,
+    /// Exclude index blobs and valid cache-tree nodes as object roots (`--not --indexed-objects`).
+    pub exclude_indexed_objects: bool,
     /// When true with pathspecs, consult commit-graph Bloom filters (matches `core.commitGraph`).
     pub use_commit_graph_bloom: bool,
     /// `commitGraph.readChangedPaths` (default true).
@@ -569,6 +573,7 @@ impl Default for RevListOptions {
             parent_rewrite: false,
             sparse: false,
             simplify_merges: false,
+            preserve_simplify_merges_graph_merges: false,
             show_pulls: false,
             exclude_first_parent_only: false,
             filter: None,
@@ -588,6 +593,7 @@ impl Default for RevListOptions {
             since_cutoff: None,
             include_reflog_entries: false,
             include_indexed_objects: false,
+            exclude_indexed_objects: false,
             use_commit_graph_bloom: false,
             commit_graph_read_changed_paths: true,
             commit_graph_changed_paths_version: -1,
@@ -817,33 +823,28 @@ pub fn rev_list(
         include.extend(reflog_commit_tips(repo)?);
     }
 
-    let mut index_blob_roots: Vec<RootObject> = Vec::new();
-    if options.objects && options.include_indexed_objects && repo.work_tree.is_some() {
-        let index_path = repo.git_dir.join("index");
-        if index_path.is_file() {
-            let idx = Index::load(&index_path)?;
-            for e in &idx.entries {
-                if e.stage() != 0 {
-                    continue;
-                }
-                let path_str = String::from_utf8_lossy(&e.path).into_owned();
-                index_blob_roots.push(RootObject {
-                    oid: e.oid,
-                    input: format!(":{path_str}"),
-                    expected_kind: Some(ExpectedObjectKind::Blob),
-                    root_path: Some(path_str),
-                    wrap_with_tag: None,
-                });
-            }
-        }
-    }
+    let index_object_roots = if options.objects
+        && (options.include_indexed_objects || options.exclude_indexed_objects)
+    {
+        indexed_object_roots(repo)?
+    } else {
+        Vec::new()
+    };
 
-    let object_roots = if index_blob_roots.is_empty() {
+    let object_roots = if !options.include_indexed_objects || index_object_roots.is_empty() {
         object_roots
     } else {
         let mut merged = object_roots;
-        merged.extend(index_blob_roots);
+        merged.extend(index_object_roots.iter().cloned());
         merged
+    };
+    let negative_object_roots = if options.exclude_indexed_objects && !index_object_roots.is_empty()
+    {
+        let mut merged = negative_object_roots;
+        merged.extend(index_object_roots);
+        merged
+    } else {
+        negative_object_roots
     };
 
     if include.is_empty() && object_roots.is_empty() {
@@ -881,7 +882,7 @@ pub fn rev_list(
 
     let mut traversal_missing = Vec::new();
     let mut traversal_missing_seen = HashSet::new();
-    let (mut included, _discovery_order) = if include.is_empty() {
+    let (mut included, discovery_order) = if include.is_empty() {
         (HashSet::new(), Vec::new())
     } else if options.exclude_promisor_objects {
         walk_closure_ordered_excluding(&mut graph, &include, &excluded_promisor)?
@@ -934,6 +935,7 @@ pub fn rev_list(
             &excluded,
             &options.paths,
             options.sparse,
+            options.show_pulls,
         )?;
     }
 
@@ -1007,7 +1009,7 @@ pub fn rev_list(
                 date_order_walk(&mut graph, &included, author_dates)?
             }
         }
-        OrderingMode::Topo => topo_sort(&mut graph, &included, false)?,
+        OrderingMode::Topo => graph_order_topo_sort(&mut graph, &included, &discovery_order)?,
         OrderingMode::AuthorDateTopo => topo_sort(&mut graph, &included, true)?,
     };
 
@@ -1056,6 +1058,7 @@ pub fn rev_list(
                 path_effective_full,
                 options.sparse,
                 options.simplify_merges,
+                options.preserve_simplify_merges_graph_merges,
                 options.show_pulls,
                 options.parent_rewrite,
                 options.ancestry_path,
@@ -1072,7 +1075,16 @@ pub fn rev_list(
     }
 
     if !options.paths.is_empty() && options.simplify_merges && !ordered.is_empty() {
-        ordered = simplify_merges_commit_list(repo, &ordered, &options.paths, &excluded)?;
+        ordered = simplify_merges_commit_list(
+            repo,
+            &ordered,
+            &options.paths,
+            &excluded,
+            &effective_ancestry_path_bottoms,
+            options.ordering,
+            options.show_pulls,
+            options.preserve_simplify_merges_graph_merges,
+        )?;
     }
 
     // Git-style path-limited parent reordering (dense history and `--sparse` only). Pure
@@ -1380,6 +1392,23 @@ pub fn rev_list(
                 objs.retain(|(oid, _)| !excluded_promisor.contains(oid));
                 for segment in &mut segments {
                     segment.retain(|(oid, _)| !excluded_promisor.contains(oid));
+                }
+            }
+            if !options.paths.is_empty() && !omit_object_paths {
+                retain_objects_matching_pathspecs(&mut objs, &options.paths);
+                let mut seen_oids: HashSet<ObjectId> = objs.iter().map(|(oid, _)| *oid).collect();
+                for (oid, path) in
+                    collect_pathspec_matching_tree_objects(repo, &ordered, &options.paths)?
+                {
+                    if seen_oids.insert(oid) {
+                        objs.push((oid, path));
+                    }
+                }
+                for segment in &mut segments {
+                    retain_objects_matching_pathspecs(segment, &options.paths);
+                }
+                if !counts.is_empty() {
+                    counts = segments.iter().map(Vec::len).collect();
                 }
             }
             (objs, omit, miss, counts, segments)
@@ -2579,6 +2608,67 @@ struct RootObject {
     wrap_with_tag: Option<ObjectId>,
 }
 
+fn indexed_object_roots(repo: &Repository) -> Result<Vec<RootObject>> {
+    let Some(_) = &repo.work_tree else {
+        return Ok(Vec::new());
+    };
+    let index_path = repo.git_dir.join("index");
+    if !index_path.is_file() {
+        return Ok(Vec::new());
+    }
+
+    let idx = Index::load(&index_path)?;
+    let mut roots = Vec::new();
+    for e in &idx.entries {
+        if e.stage() != 0 || e.mode == MODE_GITLINK || e.mode == MODE_TREE {
+            continue;
+        }
+        let path_str = String::from_utf8_lossy(&e.path).into_owned();
+        roots.push(RootObject {
+            oid: e.oid,
+            input: format!(":{path_str}"),
+            expected_kind: Some(ExpectedObjectKind::Blob),
+            root_path: Some(path_str),
+            wrap_with_tag: None,
+        });
+    }
+
+    if let Some(cache_tree) = &idx.cache_tree {
+        push_index_cache_tree_child_roots(&mut roots, cache_tree, "");
+    }
+
+    Ok(roots)
+}
+
+fn push_index_cache_tree_child_roots(
+    roots: &mut Vec<RootObject>,
+    node: &CacheTreeNode,
+    parent_path: &str,
+) {
+    for child in &node.children {
+        let name = String::from_utf8_lossy(&child.name);
+        let path = if parent_path.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{parent_path}/{name}")
+        };
+
+        if child.entry_count >= 0 {
+            if let Some(oid) = child.oid {
+                roots.push(RootObject {
+                    oid,
+                    input: format!(":{path}"),
+                    expected_kind: Some(ExpectedObjectKind::Tree),
+                    root_path: Some(path.clone()),
+                    wrap_with_tag: None,
+                });
+            }
+        }
+
+        push_index_cache_tree_child_roots(roots, child, &path);
+    }
+}
+
 fn object_walk_print_commit_line(
     filter_provided_objects: bool,
     filter: Option<&ObjectFilter>,
@@ -3236,6 +3326,69 @@ fn topo_sort(
     Ok(out)
 }
 
+fn graph_order_topo_sort(
+    graph: &mut CommitGraph<'_>,
+    selected: &HashSet<ObjectId>,
+    discovery_order: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let mut child_count: HashMap<ObjectId, usize> = selected.iter().map(|&oid| (oid, 0)).collect();
+
+    for &oid in selected {
+        for parent in graph.parents_of(oid)? {
+            if !selected.contains(&parent) {
+                continue;
+            }
+            if let Some(count) = child_count.get_mut(&parent) {
+                *count += 1;
+            }
+        }
+    }
+
+    let discovery_rank: HashMap<ObjectId, usize> = discovery_order
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(rank, oid)| (oid, rank))
+        .collect();
+    let mut ready: Vec<ObjectId> = child_count
+        .iter()
+        .filter_map(|(&oid, &count)| (count == 0).then_some(oid))
+        .collect();
+
+    ready.sort_by(|&a, &b| {
+        graph
+            .committer_time(a)
+            .cmp(&graph.committer_time(b))
+            .then_with(|| {
+                discovery_rank
+                    .get(&b)
+                    .copied()
+                    .unwrap_or(usize::MAX)
+                    .cmp(&discovery_rank.get(&a).copied().unwrap_or(usize::MAX))
+            })
+            .then_with(|| a.cmp(&b))
+    });
+
+    let mut out = Vec::with_capacity(selected.len());
+    while let Some(oid) = ready.pop() {
+        out.push(oid);
+        for parent in graph.parents_of(oid)? {
+            if !selected.contains(&parent) {
+                continue;
+            }
+            if let Some(count) = child_count.get_mut(&parent) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ready.push(parent);
+                }
+            }
+        }
+    }
+
+    reorder_adjacent_merge_parent_blocks(graph, &mut out)?;
+    Ok(out)
+}
+
 fn reorder_adjacent_merge_parent_blocks(
     graph: &mut CommitGraph<'_>,
     ordered: &mut [ObjectId],
@@ -3297,31 +3450,111 @@ fn simplify_merges_commit_list(
     commits: &[ObjectId],
     paths: &[String],
     excluded: &HashSet<ObjectId>,
+    ancestry_path_bottoms: &[ObjectId],
+    ordering: OrderingMode,
+    show_pulls: bool,
+    preserve_graph_merges: bool,
 ) -> Result<Vec<ObjectId>> {
     let selected: HashSet<ObjectId> = commits.iter().copied().collect();
     let mut out = Vec::new();
+    let mut simplified_parents: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
     for oid in commits {
         let raw_parents = load_commit(repo, *oid)?.parents;
-        let direct: Vec<ObjectId> = raw_parents
-            .iter()
-            .copied()
-            .filter(|p| selected.contains(p))
-            .collect();
-        if raw_parents.len() > 1 && direct.len() <= 1 {
-            if path_merge_survives_simplify(repo, *oid, paths, excluded)? {
+        let rewritten = visible_parents_for_graph_lib(repo, *oid, &selected, false)?;
+        let path_survives =
+            path_merge_survives_simplify(repo, *oid, paths, excluded, ancestry_path_bottoms)?;
+        let pull_merge = show_pulls
+            && raw_parents.len() > 1
+            && path_merge_survives_simplify(repo, *oid, paths, excluded, &[])?;
+        if raw_parents.len() > 1 && rewritten.len() <= 1 {
+            if rewritten.is_empty() || pull_merge || path_survives {
+                simplified_parents.insert(*oid, rewritten);
                 out.push(*oid);
             }
             continue;
         }
-        if direct.len() <= 1 {
+        if rewritten.len() <= 1 {
+            simplified_parents.insert(*oid, rewritten);
             out.push(*oid);
             continue;
         }
-        let mut simplified = graph_simplify_parent_list_lib(repo, &selected, &direct)?;
+        let mut simplified = if preserve_graph_merges {
+            let treesame_rewritten = path_treesame_parents(repo, *oid, paths, &rewritten)?;
+            let all_rewritten_treesame =
+                !rewritten.is_empty() && treesame_rewritten.len() == rewritten.len();
+            if all_rewritten_treesame {
+                vec![rewritten[0]]
+            } else {
+                graph_simplify_parent_list_lib(repo, &selected, &rewritten, &treesame_rewritten)?
+            }
+        } else {
+            graph_simplify_parent_list_lib(repo, &selected, &rewritten, &HashSet::new())?
+        };
         simplified.sort_unstable();
         simplified.dedup();
-        if simplified.len() > 1 {
+        if simplified.len() > 1 || pull_merge {
+            simplified_parents.insert(*oid, simplified);
             out.push(*oid);
+        }
+    }
+    if ordering == OrderingMode::AuthorDateTopo {
+        return simplify_merges_author_date_order(repo, &out, &simplified_parents);
+    }
+    Ok(out)
+}
+
+fn simplify_merges_author_date_order(
+    repo: &Repository,
+    commits: &[ObjectId],
+    simplified_parents: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    let selected: HashSet<ObjectId> = commits.iter().copied().collect();
+    let mut child_count: HashMap<ObjectId, usize> =
+        commits.iter().copied().map(|oid| (oid, 0)).collect();
+    for parents in simplified_parents.values() {
+        for parent in parents {
+            if selected.contains(parent) {
+                if let Some(count) = child_count.get_mut(parent) {
+                    *count += 1;
+                }
+            }
+        }
+    }
+
+    let mut graph = CommitGraph::new(repo, false);
+    let mut ready = BinaryHeap::new();
+    for oid in commits {
+        if child_count.get(oid).copied().unwrap_or_default() == 0 {
+            ready.push(CommitDateKey {
+                oid: *oid,
+                date: graph.sort_key(*oid, true),
+            });
+        }
+    }
+
+    let mut out = Vec::with_capacity(commits.len());
+    let mut emitted = HashSet::new();
+    while let Some(item) = ready.pop() {
+        if !emitted.insert(item.oid) {
+            continue;
+        }
+        out.push(item.oid);
+        if let Some(parents) = simplified_parents.get(&item.oid) {
+            for parent in parents {
+                if !selected.contains(parent) {
+                    continue;
+                }
+                let Some(count) = child_count.get_mut(parent) else {
+                    continue;
+                };
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    ready.push(CommitDateKey {
+                        oid: *parent,
+                        date: graph.sort_key(*parent, true),
+                    });
+                }
+            }
         }
     }
     Ok(out)
@@ -3332,6 +3565,7 @@ fn path_merge_survives_simplify(
     oid: ObjectId,
     paths: &[String],
     excluded: &HashSet<ObjectId>,
+    ancestry_path_bottoms: &[ObjectId],
 ) -> Result<bool> {
     if paths.is_empty() {
         return Ok(false);
@@ -3345,12 +3579,14 @@ fn path_merge_survives_simplify(
     let mut treesame_parents = 0usize;
     let mut first_parent_differs = false;
     let mut differing_parent_is_excluded = false;
+    let mut differing_parent_oids = Vec::new();
     for (nth, parent_oid) in commit.parents.iter().enumerate() {
         let parent = load_commit(repo, *parent_oid)?;
         let parent_map: HashMap<String, ObjectId> =
             flatten_tree(repo, parent.tree, "")?.into_iter().collect();
         let differs = path_differs_for_specs(&commit_map, &parent_map, paths);
         if differs {
+            differing_parent_oids.push(*parent_oid);
             if nth == 0 {
                 first_parent_differs = true;
             }
@@ -3361,22 +3597,69 @@ fn path_merge_survives_simplify(
             treesame_parents += 1;
         }
     }
-    Ok(treesame_parents == 1 && (first_parent_differs || differing_parent_is_excluded))
+    if treesame_parents != 1 {
+        return Ok(false);
+    }
+    if first_parent_differs || differing_parent_is_excluded {
+        return Ok(true);
+    }
+    if !ancestry_path_bottoms.is_empty() {
+        let mut graph = CommitGraph::new(repo, false);
+        return treesame_parent_is_on_ancestry_bottom_side(
+            &mut graph,
+            &differing_parent_oids,
+            ancestry_path_bottoms,
+        );
+    }
+    Ok(false)
 }
 
 fn graph_simplify_parent_list_lib(
     repo: &Repository,
     selected: &HashSet<ObjectId>,
     parents: &[ObjectId],
+    protected_treesame: &HashSet<ObjectId>,
 ) -> Result<Vec<ObjectId>> {
     let mut out = Vec::new();
+    let protected_count = parents
+        .iter()
+        .filter(|parent| protected_treesame.contains(parent))
+        .count();
     for parent in parents {
         if parent_reachable_via_others_lib(repo, selected, *parent, parents)? {
+            if protected_count == 1 && protected_treesame.contains(parent) {
+                out.push(*parent);
+            }
             continue;
         }
         out.push(*parent);
     }
     Ok(out)
+}
+
+fn path_treesame_parents(
+    repo: &Repository,
+    oid: ObjectId,
+    paths: &[String],
+    parents: &[ObjectId],
+) -> Result<HashSet<ObjectId>> {
+    let mut treesame = HashSet::new();
+    if paths.is_empty() || parents.is_empty() {
+        return Ok(treesame);
+    }
+
+    let commit = load_commit(repo, oid)?;
+    let commit_map: HashMap<String, ObjectId> =
+        flatten_tree(repo, commit.tree, "")?.into_iter().collect();
+    for parent_oid in parents {
+        let parent = load_commit(repo, *parent_oid)?;
+        let parent_map: HashMap<String, ObjectId> =
+            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        if !path_differs_for_specs(&commit_map, &parent_map, paths) {
+            treesame.insert(*parent_oid);
+        }
+    }
+    Ok(treesame)
 }
 
 fn parent_reachable_via_others_lib(
@@ -3422,8 +3705,23 @@ fn load_raw_parents_lib(repo: &Repository, oid: ObjectId) -> Result<Vec<ObjectId
     Ok(load_commit(repo, oid)?.parents)
 }
 
-fn first_parent_of_commit_lib(repo: &Repository, oid: ObjectId) -> Result<Option<ObjectId>> {
-    let parents = load_raw_parents_lib(repo, oid)?;
+fn load_navigation_parents_lib(
+    repo: &Repository,
+    oid: ObjectId,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Vec<ObjectId>> {
+    if let Some(grafted) = grafts.get(&oid) {
+        return Ok(grafted.clone());
+    }
+    load_raw_parents_lib(repo, oid)
+}
+
+fn first_parent_of_commit_lib(
+    repo: &Repository,
+    oid: ObjectId,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
+) -> Result<Option<ObjectId>> {
+    let parents = load_navigation_parents_lib(repo, oid, grafts)?;
     Ok(parents.first().copied())
 }
 
@@ -3431,6 +3729,7 @@ fn first_parent_anchor_in_set_lib(
     repo: &Repository,
     start: ObjectId,
     anchors: &HashSet<ObjectId>,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
 ) -> Result<Option<ObjectId>> {
     let mut seen = HashSet::new();
     let mut cursor = Some(start);
@@ -3441,7 +3740,7 @@ fn first_parent_anchor_in_set_lib(
         if anchors.contains(&oid) {
             return Ok(Some(oid));
         }
-        cursor = first_parent_of_commit_lib(repo, oid)?;
+        cursor = first_parent_of_commit_lib(repo, oid, grafts)?;
     }
     Ok(None)
 }
@@ -3451,6 +3750,7 @@ fn collect_visible_parent_for_graph_lib(
     candidate: ObjectId,
     included: &HashSet<ObjectId>,
     first_parent_only: bool,
+    grafts: &HashMap<ObjectId, Vec<ObjectId>>,
     seen: &mut HashSet<ObjectId>,
     out: &mut Vec<ObjectId>,
 ) -> Result<()> {
@@ -3461,7 +3761,7 @@ fn collect_visible_parent_for_graph_lib(
         out.push(candidate);
         return Ok(());
     }
-    let mut parents = load_raw_parents_lib(repo, candidate)?;
+    let mut parents = load_navigation_parents_lib(repo, candidate, grafts)?;
     if parents.is_empty() {
         return Ok(());
     }
@@ -3469,7 +3769,15 @@ fn collect_visible_parent_for_graph_lib(
         parents.truncate(1);
     }
     for parent in parents {
-        collect_visible_parent_for_graph_lib(repo, parent, included, first_parent_only, seen, out)?;
+        collect_visible_parent_for_graph_lib(
+            repo,
+            parent,
+            included,
+            first_parent_only,
+            grafts,
+            seen,
+            out,
+        )?;
     }
     Ok(())
 }
@@ -3480,7 +3788,8 @@ fn visible_parents_for_graph_lib(
     included: &HashSet<ObjectId>,
     first_parent_only: bool,
 ) -> Result<Vec<ObjectId>> {
-    let mut direct = load_raw_parents_lib(repo, oid)?;
+    let grafts = crate::rev_parse::load_graft_parents(&repo.git_dir);
+    let mut direct = load_navigation_parents_lib(repo, oid, &grafts)?;
     if first_parent_only && direct.len() > 1 {
         direct.truncate(1);
     }
@@ -3492,6 +3801,7 @@ fn visible_parents_for_graph_lib(
             parent,
             included,
             first_parent_only,
+            &grafts,
             &mut seen,
             &mut out,
         )?;
@@ -3511,6 +3821,7 @@ fn reorder_path_limited_graph_commits(
     }
 
     let included: HashSet<ObjectId> = commits.iter().copied().collect();
+    let grafts = crate::rev_parse::load_graft_parents(&repo.git_dir);
     let mut chain = Vec::new();
     let mut chain_seen = HashSet::new();
     let mut cursor = Some(commits[0]);
@@ -3529,7 +3840,7 @@ fn reorder_path_limited_graph_commits(
         if chain_set.contains(oid) {
             continue;
         }
-        let anchor = first_parent_anchor_in_set_lib(repo, *oid, &chain_set)?;
+        let anchor = first_parent_anchor_in_set_lib(repo, *oid, &chain_set, &grafts)?;
         grouped.entry(anchor).or_default().push(*oid);
     }
 
@@ -3559,6 +3870,7 @@ fn expand_sparse_path_limited_graph_history(
 
     let mut expanded = Vec::new();
     let mut seen = HashSet::new();
+    let grafts = crate::rev_parse::load_graft_parents(&repo.git_dir);
     let mut push_unique = |oid: ObjectId, out: &mut Vec<ObjectId>| {
         if seen.insert(oid) {
             out.push(oid);
@@ -3570,7 +3882,7 @@ fn expand_sparse_path_limited_graph_history(
         let to = window[1];
         push_unique(from, &mut expanded);
 
-        let mut cursor = first_parent_of_commit_lib(repo, from)?;
+        let mut cursor = first_parent_of_commit_lib(repo, from, &grafts)?;
         let mut chain = Vec::new();
         let mut found_target = false;
         let mut local_seen = HashSet::new();
@@ -3583,7 +3895,7 @@ fn expand_sparse_path_limited_graph_history(
                 break;
             }
             chain.push(oid);
-            cursor = first_parent_of_commit_lib(repo, oid)?;
+            cursor = first_parent_of_commit_lib(repo, oid, &grafts)?;
         }
         if found_target {
             for oid in chain {
@@ -3594,14 +3906,14 @@ fn expand_sparse_path_limited_graph_history(
 
     if let Some(&last) = commits.last() {
         push_unique(last, &mut expanded);
-        let mut cursor = first_parent_of_commit_lib(repo, last)?;
+        let mut cursor = first_parent_of_commit_lib(repo, last, &grafts)?;
         let mut tail_seen = HashSet::new();
         while let Some(oid) = cursor {
             if !tail_seen.insert(oid) {
                 break;
             }
             push_unique(oid, &mut expanded);
-            cursor = first_parent_of_commit_lib(repo, oid)?;
+            cursor = first_parent_of_commit_lib(repo, oid, &grafts)?;
         }
     }
 
@@ -3614,6 +3926,7 @@ fn limit_to_ancestry(
     bottoms: &[ObjectId],
 ) -> Result<()> {
     let mut keep = HashSet::new();
+
     for &bottom in bottoms {
         let ancestors = walk_closure(graph, &[bottom])?;
         keep.extend(
@@ -3622,18 +3935,34 @@ fn limit_to_ancestry(
                 .copied()
                 .filter(|oid| selected.contains(oid)),
         );
+    }
 
+    let mut descendants: HashSet<ObjectId> = bottoms.iter().copied().collect();
+    loop {
+        let mut made_progress = false;
         for &candidate in selected.iter() {
-            if candidate == bottom {
-                keep.insert(candidate);
+            if descendants.contains(&candidate) {
                 continue;
             }
-            let closure = walk_closure(graph, &[candidate])?;
-            if closure.contains(&bottom) {
-                keep.insert(candidate);
+
+            let parents = graph.parents_of(candidate)?;
+            if parents.iter().any(|parent| descendants.contains(parent)) {
+                descendants.insert(candidate);
+                made_progress = true;
             }
         }
+
+        if !made_progress {
+            break;
+        }
     }
+
+    keep.extend(
+        descendants
+            .iter()
+            .copied()
+            .filter(|oid| selected.contains(oid)),
+    );
     selected.retain(|oid| keep.contains(oid));
     Ok(())
 }
@@ -3652,6 +3981,7 @@ fn commit_touches_paths(
     full_history: bool,
     sparse: bool,
     simplify_merges: bool,
+    preserve_simplify_merges_graph_merges: bool,
     show_pulls: bool,
     parent_rewrite: bool,
     ancestry_path: bool,
@@ -3784,12 +4114,20 @@ fn commit_touches_paths(
 
     if ancestry_path
         && !ancestry_path_bottoms.is_empty()
-        && (!parent_rewrite || treesame_parents != parents.len())
-        && treesame_parent_is_on_ancestry_bottom_side(
-            graph,
-            &treesame_parent_oids,
-            ancestry_path_bottoms,
-        )?
+        && if parent_rewrite {
+            treesame_parents != parents.len()
+                && treesame_parent_is_ancestry_bottom_or_ancestor(
+                    graph,
+                    &treesame_parent_oids,
+                    ancestry_path_bottoms,
+                )?
+        } else {
+            treesame_parent_is_on_ancestry_bottom_side(
+                graph,
+                &treesame_parent_oids,
+                ancestry_path_bottoms,
+            )?
+        }
     {
         return Ok(sparse);
     }
@@ -3801,21 +4139,38 @@ fn commit_touches_paths(
         return Ok(parent_rewrite || sparse);
     }
 
+    if show_pulls && first_parent_differs && treesame_parents > 0 {
+        return Ok(true);
+    }
+
     if !full_history && treesame_parents == 1 {
         return Ok(false);
     }
 
     if full_history && simplify_merges {
+        if preserve_simplify_merges_graph_merges {
+            return Ok(true);
+        }
         if treesame_parents == parents.len() {
-            return Ok(sparse);
+            return Ok(true);
         }
         if treesame_parents > 0 && !differs_any {
-            return Ok(sparse);
+            return Ok(true);
         }
         if show_pulls && first_parent_differs && treesame_parents > 0 {
             return Ok(true);
         }
         if treesame_parents == 1 {
+            if ancestry_path
+                && !ancestry_path_bottoms.is_empty()
+                && treesame_parent_is_on_ancestry_bottom_side(
+                    graph,
+                    &differing_parent_oids,
+                    ancestry_path_bottoms,
+                )?
+            {
+                return Ok(true);
+            }
             return Ok(first_parent_differs
                 || differing_parent_oids
                     .iter()
@@ -3844,6 +4199,29 @@ fn treesame_parent_is_on_ancestry_bottom_side(
         if treesame.contains(bottom) {
             return Ok(true);
         }
+        for parent in treesame_parents {
+            let parent_closure = walk_closure(graph, &[*parent])?;
+            if parent_closure.contains(bottom) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn treesame_parent_is_ancestry_bottom_or_ancestor(
+    graph: &mut CommitGraph<'_>,
+    treesame_parents: &[ObjectId],
+    bottoms: &[ObjectId],
+) -> Result<bool> {
+    if treesame_parents.is_empty() {
+        return Ok(false);
+    }
+    let treesame: HashSet<ObjectId> = treesame_parents.iter().copied().collect();
+    for bottom in bottoms {
+        if treesame.contains(bottom) {
+            return Ok(true);
+        }
         let bottom_closure = walk_closure(graph, &[*bottom])?;
         if bottom_closure.iter().any(|oid| treesame.contains(oid)) {
             return Ok(true);
@@ -3859,6 +4237,7 @@ fn walk_dense_path_limited_closure(
     excluded: &HashSet<ObjectId>,
     paths: &[String],
     sparse: bool,
+    show_pulls: bool,
 ) -> Result<HashSet<ObjectId>> {
     let mut walked = HashSet::new();
     let mut selected = HashSet::new();
@@ -3869,7 +4248,7 @@ fn walk_dense_path_limited_closure(
             continue;
         }
 
-        let action = dense_path_limited_action(repo, graph, oid, paths, sparse)?;
+        let action = dense_path_limited_action(repo, graph, oid, paths, sparse, show_pulls)?;
         if action.visible {
             selected.insert(oid);
         }
@@ -3895,6 +4274,7 @@ fn dense_path_limited_action(
     oid: ObjectId,
     paths: &[String],
     sparse: bool,
+    show_pulls: bool,
 ) -> Result<DensePathAction> {
     let commit = load_commit(repo, oid)?;
     let parents = graph.parents_of(oid)?;
@@ -3918,11 +4298,15 @@ fn dense_path_limited_action(
 
     let mut treesame = Vec::new();
     let mut differs_any = false;
-    for parent_oid in &parents {
+    let mut first_parent_differs = false;
+    for (nth, parent_oid) in parents.iter().enumerate() {
         let parent = load_commit(repo, *parent_oid)?;
         let parent_map: HashMap<String, ObjectId> =
             flatten_tree(repo, parent.tree, "")?.into_iter().collect();
         if path_differs_for_specs(&commit_map, &parent_map, paths) {
+            if nth == 0 {
+                first_parent_differs = true;
+            }
             differs_any = true;
         } else {
             treesame.push(*parent_oid);
@@ -3941,7 +4325,7 @@ fn dense_path_limited_action(
     let visible = if sparse {
         true
     } else if parents.len() > 1 {
-        treesame.is_empty()
+        treesame.is_empty() || (show_pulls && first_parent_differs && !treesame.is_empty())
     } else {
         differs_any
     };
@@ -5040,6 +5424,79 @@ fn excluded_object_root_ids(
     Ok(objects.into_iter().map(|(oid, _)| oid).collect())
 }
 
+fn retain_objects_matching_pathspecs(objects: &mut Vec<(ObjectId, String)>, pathspecs: &[String]) {
+    objects.retain(|(_, path)| {
+        path.is_empty()
+            || crate::pathspec::matches_pathspec_list(path, pathspecs)
+            || pathspecs
+                .iter()
+                .any(|spec| crate::pathspec::pathspec_wants_descent_into_tree(spec, path))
+    });
+}
+
+fn collect_pathspec_matching_tree_objects(
+    repo: &Repository,
+    commits: &[ObjectId],
+    pathspecs: &[String],
+) -> Result<Vec<(ObjectId, String)>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for commit_oid in commits {
+        let commit = load_commit(repo, *commit_oid)?;
+        collect_pathspec_matching_tree_objects_inner(
+            repo,
+            commit.tree,
+            "",
+            pathspecs,
+            &mut seen,
+            &mut out,
+        )?;
+    }
+    Ok(out)
+}
+
+fn collect_pathspec_matching_tree_objects_inner(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    prefix: &str,
+    pathspecs: &[String],
+    seen: &mut HashSet<ObjectId>,
+    out: &mut Vec<(ObjectId, String)>,
+) -> Result<()> {
+    let object = repo.odb.read(&tree_oid)?;
+    if object.kind != ObjectKind::Tree {
+        return Err(Error::CorruptObject(format!(
+            "object {tree_oid} is not a tree"
+        )));
+    }
+    let entries = parse_tree(&object.data)?;
+    for entry in entries {
+        if entry.mode == 0o160000 {
+            continue;
+        }
+        let name = String::from_utf8_lossy(&entry.name);
+        let path = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let is_tree = entry.mode == 0o040000;
+        let matches = crate::pathspec::matches_pathspec_list(&path, pathspecs);
+        let wants_descent = pathspecs
+            .iter()
+            .any(|spec| crate::pathspec::pathspec_wants_descent_into_tree(spec, &path));
+        if (matches || (is_tree && wants_descent)) && seen.insert(entry.oid) {
+            out.push((entry.oid, path.clone()));
+        }
+        if is_tree && wants_descent {
+            collect_pathspec_matching_tree_objects_inner(
+                repo, entry.oid, &path, pathspecs, seen, out,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Like [`collect_reachable_objects`], but also returns objects newly discovered per commit walk
 /// plus one trailing segment for `object_roots`.
 ///
@@ -5831,10 +6288,11 @@ fn collect_root_object(
             )?;
         }
         ObjectKind::Tree => {
+            let root_path = root.root_path.as_deref().unwrap_or("");
             collect_tree_objects_filtered(
                 repo,
                 root.oid,
-                "",
+                root_path,
                 0,
                 true,
                 None,

@@ -6,10 +6,12 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
-use grit_lib::diff::{diff_index_to_tree, diff_index_to_worktree};
+use grit_lib::diff::{
+    diff_index_to_tree, diff_index_to_worktree_with_options, DiffIndexToWorktreeOptions,
+};
 use grit_lib::error::Error;
 use grit_lib::index::Index;
-use grit_lib::objects::{parse_commit, parse_tag, ObjectId, ObjectKind};
+use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use grit_lib::refs::list_refs;
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse::resolve_revision;
@@ -40,10 +42,18 @@ pub struct Args {
     #[arg(long)]
     pub long: bool,
 
+    /// Do not force long output.
+    #[arg(long = "no-long", action = clap::ArgAction::SetTrue)]
+    pub no_long: bool,
+
     /// Use <n> digits (or as many as needed) to form the abbreviated object
     /// name. A value of 0 suppresses the long format.
     #[arg(long, default_value = "7")]
     pub abbrev: usize,
+
+    /// Show unabbreviated object names.
+    #[arg(long = "no-abbrev", action = clap::ArgAction::SetTrue)]
+    pub no_abbrev: bool,
 
     /// Instead of considering only the 10 most recent tags as candidates,
     /// consider this many. Increasing above 10 takes proportionally longer
@@ -63,7 +73,7 @@ pub struct Args {
     #[arg(long = "exclude")]
     pub exclude_pattern: Vec<String>,
 
-    /// Clear accumulated --exclude patterns.
+    /// Clear any previous --exclude patterns.
     #[arg(long = "no-exclude", action = clap::ArgAction::SetTrue)]
     pub no_exclude: bool,
 
@@ -71,7 +81,7 @@ pub struct Args {
     #[arg(long)]
     pub exact_match: bool,
 
-    /// Do not require an exact match.
+    /// Do not limit the search to exact matches.
     #[arg(long = "no-exact-match", action = clap::ArgAction::SetTrue)]
     pub no_exact_match: bool,
 
@@ -92,13 +102,13 @@ pub struct Args {
     /// Describe the working tree.  After the version string, append
     /// the given mark (default: "-dirty") if the working tree has
     /// local modifications.
-    #[arg(long, default_missing_value = "-dirty", num_args = 0..=1)]
+    #[arg(long, default_missing_value = "-dirty", num_args = 0..=1, require_equals = true)]
     pub dirty: Option<String>,
 
     /// Describe the working tree.  After the version string, append
     /// the given mark (default: "-broken") if the working tree cannot
     /// be described (e.g. HEAD points to a broken commit).
-    #[arg(long, default_missing_value = "-broken", num_args = 0..=1)]
+    #[arg(long, default_missing_value = "-broken", num_args = 0..=1, require_equals = true)]
     pub broken: Option<String>,
 }
 
@@ -107,11 +117,13 @@ pub struct Args {
 struct Candidate {
     /// The short tag name (e.g. `v1.0`).
     tag_name: String,
-    /// Tagged commit object ID.
+    /// Object ID of the selected tag's peeled commit.
     tag_oid: ObjectId,
-    /// Breadth-first walk distance from the target to this tag.
+    /// Ref name when the annotated tag object's embedded name differs.
+    misnamed_ref: Option<String>,
+    /// Number of commits between the tagged commit and the target.
     depth: usize,
-    /// Number of commits reachable from the target but not from this tag.
+    /// Number of commits reachable from the target but not from the tag.
     different_commits: usize,
 }
 
@@ -120,6 +132,7 @@ struct RefCandidate {
     name: String,
     annotated: bool,
     tagger_time: i64,
+    misnamed_ref: Option<String>,
 }
 
 /// Options controlling how a commit-ish is described.
@@ -175,8 +188,8 @@ impl DescribeOptions {
         Self {
             tags: args.tags,
             always: args.always,
-            long: args.long,
-            abbrev: args.abbrev,
+            long: args.long && !args.no_long,
+            abbrev: if args.no_abbrev { 40 } else { args.abbrev },
             candidates: args.candidates,
             match_pattern: if args.no_match {
                 Vec::new()
@@ -200,6 +213,10 @@ impl DescribeOptions {
 pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
 
+    if args.commit.is_some() && (args.dirty.is_some() || args.broken.is_some()) {
+        bail!("--dirty/--broken cannot be used with commit-ish arguments");
+    }
+
     // --broken: if HEAD cannot be resolved, output the broken suffix and return
     if args.broken.is_some() {
         let rev = args.commit.as_deref().unwrap_or("HEAD");
@@ -208,7 +225,7 @@ pub fn run(args: Args) -> Result<()> {
             Ok(oid) => {
                 if peel_to_commit(&repo, &oid).is_none() {
                     // HEAD is not a valid commit
-                    let abbrev = abbreviate(&oid, args.abbrev);
+                    let abbrev = abbreviate(&oid, if args.no_abbrev { 40 } else { args.abbrev });
                     println!("{abbrev}{broken_suffix}");
                     return Ok(());
                 }
@@ -226,19 +243,34 @@ pub fn run(args: Args) -> Result<()> {
     let resolved_oid =
         resolve_revision(&repo, rev).with_context(|| format!("Not a valid object name {rev}"))?;
 
-    // Peel to commit (in case user passed a tag name which resolves to a tag object)
-    let target_oid = peel_to_commit(&repo, &resolved_oid)
-        .ok_or_else(|| anyhow::anyhow!("Not a valid commit: {rev}"))?;
-
     let mut options = DescribeOptions::from_args(&args);
     apply_ordered_pattern_options_from_argv(&mut options);
 
+    // Peel to commit (in case user passed a tag name which resolves to a tag object), or describe
+    // a blob by finding the first reachable commit/path that contains it.
+    let target_oid = if let Some(commit_oid) = peel_to_commit(&repo, &resolved_oid) {
+        commit_oid
+    } else {
+        let obj = repo.odb.read(&resolved_oid)?;
+        if obj.kind == ObjectKind::Blob {
+            let description = describe_blob(&repo, &resolved_oid, &options)?;
+            println!("{description}");
+            return Ok(());
+        }
+        bail!("fatal: {rev} is neither a commit nor blob");
+    };
+
     // Determine the dirty suffix before formatting the final description.
     let dirty_suffix = if args.dirty.is_some() || args.broken.is_some() {
-        if is_worktree_dirty(&repo) {
-            args.dirty.as_deref().unwrap_or("-dirty").to_string()
-        } else {
-            String::new()
+        match is_worktree_dirty(&repo) {
+            Ok(true) if args.dirty.is_some() => {
+                args.dirty.as_deref().unwrap_or("-dirty").to_string()
+            }
+            Ok(_) => String::new(),
+            Err(_) if args.broken.is_some() => {
+                args.broken.as_deref().unwrap_or("-broken").to_string()
+            }
+            Err(err) => return Err(err.into()),
         }
     } else {
         String::new()
@@ -329,12 +361,12 @@ fn describe_commit(
     }
 
     // Check if the target commit itself is tagged (exact match).
-    if let Some(ref_name) = ref_map.get(&target_oid) {
-        if options.long {
+    if let Some(ref_candidate) = ref_map.get(&target_oid) {
+        if options.long || ref_candidate.misnamed_ref.is_some() {
             let abbrev = abbreviate(&target_oid, options.abbrev);
-            return Ok(format!("{ref_name}-0-g{abbrev}{dirty_suffix}"));
+            return Ok(format!("{}-0-g{abbrev}{dirty_suffix}", ref_candidate.name));
         } else {
-            return Ok(format!("{ref_name}{dirty_suffix}"));
+            return Ok(format!("{}{dirty_suffix}", ref_candidate.name));
         }
     }
 
@@ -354,6 +386,12 @@ fn describe_commit(
 
     match candidate {
         Some(c) => {
+            if let Some(ref_name) = c.misnamed_ref {
+                eprintln!(
+                    "warning: tag '{ref_name}' is externally known as '{}'",
+                    c.tag_name
+                );
+            }
             let abbrev = abbreviate(&target_oid, options.abbrev);
             Ok(format!(
                 "{}-{}-g{abbrev}{dirty_suffix}",
@@ -376,32 +414,113 @@ fn describe_commit(
     }
 }
 
+fn describe_blob(
+    repo: &Repository,
+    blob_oid: &ObjectId,
+    options: &DescribeOptions,
+) -> Result<String> {
+    let head = resolve_head(&repo.git_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "fatal: cannot search for blob '{}' on an unborn branch",
+            blob_oid.to_hex()
+        )
+    })?;
+    let head_oid = head.oid().ok_or_else(|| {
+        anyhow::anyhow!(
+            "fatal: cannot search for blob '{}' on an unborn branch",
+            blob_oid.to_hex()
+        )
+    })?;
+
+    let mut commits = Vec::new();
+    let mut queue = VecDeque::from([*head_oid]);
+    let mut seen = HashSet::from([*head_oid]);
+    while let Some(oid) = queue.pop_front() {
+        let Ok(obj) = repo.odb.read(&oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        let commit = parse_commit(&obj.data)?;
+        commits.push((oid, commit.tree));
+        for parent in commit.parents {
+            if seen.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+
+    for (commit_oid, tree_oid) in commits.into_iter().rev() {
+        if let Some(path) = find_blob_path_in_tree(repo, &tree_oid, blob_oid, "")? {
+            let commit_desc = describe_commit(repo, commit_oid, options, "")?;
+            return Ok(format!("{commit_desc}:{path}"));
+        }
+    }
+
+    bail!(
+        "fatal: blob '{}' not reachable from HEAD",
+        blob_oid.to_hex()
+    );
+}
+
+fn find_blob_path_in_tree(
+    repo: &Repository,
+    tree_oid: &ObjectId,
+    blob_oid: &ObjectId,
+    prefix: &str,
+) -> Result<Option<String>> {
+    let obj = repo.odb.read(tree_oid)?;
+    let entries = parse_tree(&obj.data)?;
+    for entry in entries {
+        let name = String::from_utf8_lossy(&entry.name);
+        let path = if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.oid == *blob_oid && entry.mode != grit_lib::index::MODE_TREE {
+            return Ok(Some(path));
+        }
+        if entry.mode == grit_lib::index::MODE_TREE {
+            if let Some(found) = find_blob_path_in_tree(repo, &entry.oid, blob_oid, &path)? {
+                return Ok(Some(found));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Check if the working tree has uncommitted changes.
 /// --contains: find the nearest tag that is a descendant of (contains) the target commit.
 /// Walk forward from each tag's commit to check if the target is an ancestor.
 fn describe_contains(
     repo: &Repository,
     target_oid: &ObjectId,
-    ref_map: &HashMap<ObjectId, String>,
+    ref_map: &HashMap<ObjectId, RefCandidate>,
 ) -> Result<String> {
     // For each tag, check if target is reachable from the tag commit.
     // Track the best (shortest path) tag.
-    let mut best: Option<(String, usize)> = None;
+    let mut best: Option<(RefCandidate, usize)> = None;
 
-    for (tag_oid, tag_name) in ref_map {
+    for (tag_oid, candidate) in ref_map {
         if let Some(depth) = ancestor_depth(repo, tag_oid, target_oid) {
             if best.as_ref().is_none_or(|(_, d)| depth < *d) {
-                best = Some((tag_name.clone(), depth));
+                best = Some((candidate.clone(), depth));
             }
         }
     }
 
     match best {
-        Some((name, depth)) => {
+        Some((candidate, depth)) => {
             if depth == 0 {
-                Ok(name)
+                if candidate.annotated {
+                    Ok(format!("{}^0", candidate.name))
+                } else {
+                    Ok(candidate.name)
+                }
             } else {
-                Ok(format!("{name}~{depth}"))
+                Ok(format!("{}~{depth}", candidate.name))
             }
         }
         None => {
@@ -439,41 +558,47 @@ fn ancestor_depth(repo: &Repository, descendant: &ObjectId, ancestor: &ObjectId)
     None
 }
 
-fn is_worktree_dirty(repo: &Repository) -> bool {
+fn is_worktree_dirty(repo: &Repository) -> grit_lib::error::Result<bool> {
     let workdir = match &repo.work_tree {
         Some(d) => d,
-        None => return false,
+        None => return Ok(false),
     };
     let head = match resolve_head(&repo.git_dir) {
         Ok(h) => h,
-        Err(_) => return true,
+        Err(_) => return Ok(true),
     };
     let index = match repo.load_index() {
         Ok(idx) => idx,
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
-        Err(_) => return true,
+        Err(e) => return Err(e),
     };
     let head_tree = match head.oid() {
         Some(oid) => match repo.odb.read(oid) {
             Ok(obj) => match parse_commit(&obj.data) {
                 Ok(c) => Some(c.tree),
-                Err(_) => return true,
+                Err(_) => return Ok(true),
             },
-            Err(_) => return true,
+            Err(_) => return Ok(true),
         },
         None => None,
     };
-    let staged =
-        diff_index_to_tree(&repo.odb, &index, head_tree.as_ref(), false).unwrap_or_default();
+    let staged = diff_index_to_tree(&repo.odb, &index, head_tree.as_ref(), false)?;
     if !staged.is_empty() {
-        return true;
+        return Ok(true);
     }
-    diff_index_to_worktree(&repo.odb, &index, workdir, false, false)
-        .map(|u| !u.is_empty())
-        .unwrap_or(true)
+    diff_index_to_worktree_with_options(
+        &repo.odb,
+        &index,
+        workdir,
+        DiffIndexToWorktreeOptions {
+            error_on_broken_gitlinks: true,
+            ..DiffIndexToWorktreeOptions::default()
+        },
+    )
+    .map(|u| !u.is_empty())
 }
 
-/// Build a map from commit OID → ref display name for all qualifying refs.
+/// Build a map from commit OID to ref metadata for all qualifying refs.
 ///
 /// - `use_all_tags`: include lightweight tags (not just annotated).
 /// - `use_all_refs`: include refs/heads/ and refs/remotes/ too (--all).
@@ -487,7 +612,7 @@ fn build_ref_map(
     use_all_refs: bool,
     patterns: &[String],
     exclude_patterns: &[String],
-) -> Result<HashMap<ObjectId, String>> {
+) -> Result<HashMap<ObjectId, RefCandidate>> {
     let mut map: HashMap<ObjectId, RefCandidate> = HashMap::new();
 
     // Collect all refs under refs/tags/ (loose)
@@ -543,17 +668,26 @@ fn build_ref_map(
                 // Annotated tag — peel to commit
                 if let Ok(tag_data) = parse_tag(&obj.data) {
                     if let Some(commit_oid) = peel_to_commit(repo, &tag_data.object) {
+                        let (display_name, misnamed_ref) = if use_all_refs {
+                            (short_name.clone(), None)
+                        } else {
+                            (
+                                tag_data.tag.clone(),
+                                (tag_data.tag != short_name).then(|| short_name.clone()),
+                            )
+                        };
                         insert_ref_candidate(
                             &mut map,
                             commit_oid,
                             RefCandidate {
-                                name: short_name.clone(),
+                                name: display_name,
                                 annotated: true,
                                 tagger_time: tag_data
                                     .tagger
                                     .as_deref()
                                     .and_then(tagger_timestamp)
                                     .unwrap_or(0),
+                                misnamed_ref,
                             },
                         );
                     }
@@ -569,6 +703,7 @@ fn build_ref_map(
                             name: short_name.clone(),
                             annotated: false,
                             tagger_time: 0,
+                            misnamed_ref: None,
                         },
                     );
                 }
@@ -584,17 +719,18 @@ fn build_ref_map(
             for (refname, oid) in &refs {
                 // Display name for --all is the refname with "refs/" stripped
                 let display = refname.strip_prefix("refs/").unwrap_or(refname).to_string();
+                let match_name = refname.strip_prefix(prefix).unwrap_or(refname);
 
                 if !patterns.is_empty()
                     && !patterns
                         .iter()
-                        .any(|p| crate::commands::tag::glob_matches(p, &display))
+                        .any(|p| crate::commands::tag::glob_matches(p, match_name))
                 {
                     continue;
                 }
                 if exclude_patterns
                     .iter()
-                    .any(|p| crate::commands::tag::glob_matches(p, &display))
+                    .any(|p| crate::commands::tag::glob_matches(p, match_name))
                 {
                     continue;
                 }
@@ -608,6 +744,27 @@ fn build_ref_map(
                             name: display.clone(),
                             annotated: false,
                             tagger_time: 0,
+                            misnamed_ref: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        if patterns.is_empty() && exclude_patterns.is_empty() {
+            let refs = list_refs(&repo.git_dir, "refs/original/").unwrap_or_default();
+            for (refname, oid) in &refs {
+                let display = refname.strip_prefix("refs/").unwrap_or(refname).to_string();
+
+                if let Some(commit_oid) = peel_to_commit(repo, oid) {
+                    insert_ref_candidate(
+                        &mut map,
+                        commit_oid,
+                        RefCandidate {
+                            name: display.clone(),
+                            annotated: false,
+                            tagger_time: 0,
+                            misnamed_ref: None,
                         },
                     );
                 }
@@ -615,10 +772,7 @@ fn build_ref_map(
         }
     }
 
-    Ok(map
-        .into_iter()
-        .map(|(oid, cand)| (oid, cand.name))
-        .collect())
+    Ok(map)
 }
 
 fn insert_ref_candidate(
@@ -699,7 +853,7 @@ fn peel_to_commit(repo: &Repository, oid: &ObjectId) -> Option<ObjectId> {
 fn bfs_find_tag(
     repo: &Repository,
     start: &ObjectId,
-    tag_map: &HashMap<ObjectId, String>,
+    tag_map: &HashMap<ObjectId, RefCandidate>,
     max_candidates: usize,
     first_parent: bool,
 ) -> Result<Option<Candidate>> {
@@ -749,14 +903,18 @@ fn bfs_find_tag(
 
             let parent_depth = depth + 1;
 
-            if let Some(tag_name) = tag_map.get(&parent_oid) {
-                let different_commits =
-                    count_reachable_difference(repo, start, &parent_oid, first_parent)?;
+            if let Some(tag_candidate) = tag_map.get(&parent_oid) {
                 candidates.push(Candidate {
-                    tag_name: tag_name.clone(),
+                    tag_name: tag_candidate.name.clone(),
                     tag_oid: parent_oid,
+                    misnamed_ref: tag_candidate.misnamed_ref.clone(),
                     depth: parent_depth,
-                    different_commits,
+                    different_commits: count_reachable_difference(
+                        repo,
+                        start,
+                        &parent_oid,
+                        first_parent,
+                    )?,
                 });
                 if candidates.len() >= max_candidates {
                     break;
@@ -770,14 +928,12 @@ fn bfs_find_tag(
         }
     }
 
-    // Pick the candidate with the fewest commits different from the target
-    // (`git log tag..target`), using walk distance and name only as stable tie-breakers.
-    candidates.sort_by(|a, b| {
-        a.different_commits
-            .cmp(&b.different_commits)
-            .then(a.depth.cmp(&b.depth))
-            .then(a.tag_name.cmp(&b.tag_name))
-            .then(a.tag_oid.cmp(&b.tag_oid))
+    candidates.sort_by(|left, right| {
+        left.different_commits
+            .cmp(&right.different_commits)
+            .then(left.depth.cmp(&right.depth))
+            .then(left.tag_name.cmp(&right.tag_name))
+            .then(left.tag_oid.cmp(&right.tag_oid))
     });
     Ok(candidates.into_iter().next())
 }
@@ -788,44 +944,34 @@ fn count_reachable_difference(
     base: &ObjectId,
     first_parent: bool,
 ) -> Result<usize> {
-    let base_reachable = collect_reachable_commits(repo, *base, first_parent)?;
-    let target_reachable = collect_reachable_commits(repo, *target, first_parent)?;
-    Ok(target_reachable
-        .iter()
-        .filter(|oid| !base_reachable.contains(oid))
-        .count())
+    let base_commits = collect_reachable_commits(repo, base, first_parent)?;
+    let target_commits = collect_reachable_commits(repo, target, first_parent)?;
+    Ok(target_commits.difference(&base_commits).count())
 }
 
 fn collect_reachable_commits(
     repo: &Repository,
-    start: ObjectId,
+    start: &ObjectId,
     first_parent: bool,
 ) -> Result<HashSet<ObjectId>> {
     let mut seen = HashSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(start);
-    seen.insert(start);
+    let mut queue = VecDeque::from([*start]);
 
     while let Some(oid) = queue.pop_front() {
-        let Ok(obj) = repo.odb.read(&oid) else {
+        if !seen.insert(oid) {
             continue;
-        };
+        }
+        let obj = repo.odb.read(&oid)?;
         if obj.kind != ObjectKind::Commit {
             continue;
         }
-        let Ok(commit) = parse_commit(&obj.data) else {
-            continue;
-        };
-        let parents = if first_parent {
-            commit.parents.into_iter().take(1).collect::<Vec<_>>()
+        let commit = parse_commit(&obj.data)?;
+        let parents: Box<dyn Iterator<Item = ObjectId>> = if first_parent {
+            Box::new(commit.parents.into_iter().take(1))
         } else {
-            commit.parents
+            Box::new(commit.parents.into_iter())
         };
-        for parent in parents {
-            if seen.insert(parent) {
-                queue.push_back(parent);
-            }
-        }
+        queue.extend(parents);
     }
 
     Ok(seen)

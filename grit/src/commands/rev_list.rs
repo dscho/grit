@@ -388,6 +388,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut path_mode = false;
     let mut default_rev: Option<String> = None;
     let mut no_commit_header = false;
+    let mut raw_commit_header = false;
     let mut use_color = false;
     let mut disk_usage_format: Option<DiskUsageFormat> = None;
     let mut show_parents = false;
@@ -458,6 +459,14 @@ pub fn run(args: Args) -> Result<()> {
                 "--end-of-options" => end_of_options = true,
                 "--objects" => options.objects = true,
                 "--objects-edge" | "--objects-edge-aggressive" => options.objects = true,
+                "--indexed-objects" => {
+                    options.objects = true;
+                    if not_mode {
+                        options.exclude_indexed_objects = true;
+                    } else {
+                        options.include_indexed_objects = true;
+                    }
+                }
                 "--use-bitmap-index" => use_bitmap_index = true,
                 "--test-bitmap" => test_bitmap = true,
                 "--unpacked" => unpacked_only = true,
@@ -752,6 +761,7 @@ pub fn run(args: Args) -> Result<()> {
                 }
                 "--filter-print-omitted" => options.filter_print_omitted = true,
                 "--filter-provided-objects" => options.filter_provided_objects = true,
+                "--header" => raw_commit_header = true,
                 "--no-commit-header" => no_commit_header = true,
                 "--commit-header" => no_commit_header = false,
                 "--oneline" => options.output_mode = OutputMode::Format("oneline".to_owned()),
@@ -807,25 +817,31 @@ pub fn run(args: Args) -> Result<()> {
                         }
                     }
                 }
-                "--until" | "--before" => {
+                "--until" | "--before" | "--min-age" => {
                     i += 1;
                     let Some(val) = args.args.get(i) else {
                         bail!("{arg} requires a date");
                     };
                     options.until_cutoff = Some(parse_rev_list_date(val)?);
                 }
-                _ if arg.starts_with("--until=") || arg.starts_with("--before=") => {
+                _ if arg.starts_with("--until=")
+                    || arg.starts_with("--before=")
+                    || arg.starts_with("--min-age=") =>
+                {
                     let val = arg.split_once('=').map(|(_, v)| v).unwrap_or_default();
                     options.until_cutoff = Some(parse_rev_list_date(val)?);
                 }
-                "--since" | "--after" => {
+                "--since" | "--after" | "--max-age" => {
                     i += 1;
                     let Some(val) = args.args.get(i) else {
                         bail!("{arg} requires a date");
                     };
                     options.since_cutoff = Some(parse_rev_list_date(val)?);
                 }
-                _ if arg.starts_with("--since=") || arg.starts_with("--after=") => {
+                _ if arg.starts_with("--since=")
+                    || arg.starts_with("--after=")
+                    || arg.starts_with("--max-age=") =>
+                {
                     let val = arg.split_once('=').map(|(_, v)| v).unwrap_or_default();
                     options.since_cutoff = Some(parse_rev_list_date(val)?);
                 }
@@ -1167,6 +1183,10 @@ pub fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
+    if options.boundary && options.maximal_only {
+        bail!("options '--boundary' and '--maximal-only' cannot be used together");
+    }
+
     let emit_record = |record: &str| {
         if zero_terminated {
             print!("{record}\0");
@@ -1178,8 +1198,11 @@ pub fn run(args: Args) -> Result<()> {
     let print_object = |oid: &grit_lib::objects::ObjectId, path: &str| {
         if options.no_object_names {
             emit_record(&oid.to_string());
-        } else if path == "\0" {
+        } else if zero_terminated {
             emit_record(&oid.to_string());
+            if !path.is_empty() {
+                emit_record(&format!("path={path}"));
+            }
         } else if path.is_empty() {
             if result.bitmap_object_format {
                 emit_record(&oid.to_string());
@@ -1191,7 +1214,20 @@ pub fn run(args: Args) -> Result<()> {
         }
     };
 
+    let print_boundary_commits = || {
+        for oid in &result.boundary_commits {
+            if zero_terminated {
+                emit_record(&oid.to_string());
+                emit_record("boundary=yes");
+            } else {
+                println!("-{oid}");
+            }
+        }
+    };
+
     let graft_parents = load_graft_parents(&repo.git_dir);
+    let selected_for_parent_rewrite: HashSet<ObjectId> = result.commits.iter().copied().collect();
+    let rewrite_path_limited_parents = !options.paths.is_empty();
 
     // Build the children decoration like Git's set_children(): iterate the output
     // commit list in order and, for each commit, prepend it to each of its parents'
@@ -1249,7 +1285,7 @@ pub fn run(args: Args) -> Result<()> {
             }
         };
         if object_type_commit_oid_only && matches!(&options.output_mode, OutputMode::OidOnly) {
-            println!("{oid}");
+            emit_record(&oid.to_string());
         } else {
             match &options.output_mode {
                 OutputMode::Format(fmt) => {
@@ -1261,9 +1297,15 @@ pub fn run(args: Args) -> Result<()> {
                     if (!no_commit_header || is_named_format) && !is_oneline {
                         let mut header = format!("commit {prefix}{oid}");
                         if show_parents {
-                            // Match Git: parent lines come from the commit object (and grafts), not
-                            // from "visible" parents after narrowing the walk (e.g. `-n 1`).
-                            let parents = commit_parents_for_output(&repo, *oid, &graft_parents)?;
+                            // Path-limited history rewrites parents through omitted commits. Other
+                            // narrowing, such as `-n`, still shows stored/grafted parents.
+                            let parents = commit_parents_for_output_mode(
+                                &repo,
+                                *oid,
+                                &graft_parents,
+                                rewrite_path_limited_parents,
+                                &selected_for_parent_rewrite,
+                            )?;
                             for parent in parents {
                                 header.push(' ');
                                 header.push_str(&parent.to_hex());
@@ -1299,32 +1341,58 @@ pub fn run(args: Args) -> Result<()> {
                     }
                 }
                 OutputMode::Parents => {
-                    // Same as Git `rev-list --parents`: always emit stored parent OIDs, even when
-                    // those parents are outside the selected commit set (`-n`, etc.).
-                    let parents = commit_parents_for_output(&repo, *oid, &graft_parents)?;
+                    // Path-limited history rewrites parents through omitted commits. Other
+                    // narrowing, such as `-n`, still shows stored/grafted parents.
+                    let parents = commit_parents_for_output_mode(
+                        &repo,
+                        *oid,
+                        &graft_parents,
+                        rewrite_path_limited_parents,
+                        &selected_for_parent_rewrite,
+                    )?;
                     let children = children_suffix(oid);
                     if parents.is_empty() {
-                        println!("{prefix}{oid}{children}");
+                        emit_record(&format!("{prefix}{oid}{children}"));
                     } else {
                         let rendered_parents = parents
                             .iter()
                             .map(ObjectId::to_hex)
                             .collect::<Vec<_>>()
                             .join(" ");
-                        println!("{prefix}{oid} {rendered_parents}{children}");
+                        emit_record(&format!("{prefix}{oid} {rendered_parents}{children}"));
                     }
                 }
                 _ => {
                     let rendered = render_commit(&repo, *oid, &options.output_mode, abbrev_len)?;
                     let children = children_suffix(oid);
-                    println!("{prefix}{rendered}{children}");
+                    emit_record(&format!("{prefix}{rendered}{children}"));
                 }
             }
+        }
+        if raw_commit_header {
+            let object = repo
+                .odb
+                .read(oid)
+                .with_context(|| format!("failed to read commit object {oid}"))?;
+            if object.kind != ObjectKind::Commit {
+                bail!("object {oid} is not a commit");
+            }
+            let mut stdout = std::io::stdout();
+            stdout
+                .write_all(&object.data)
+                .context("failed to write rev-list commit header")?;
+            stdout
+                .write_all(b"\0")
+                .context("failed to write rev-list commit header separator")?;
         }
         Ok(())
     };
 
     if !options.quiet {
+        if options.boundary && options.reverse {
+            print_boundary_commits();
+        }
+
         let interleaved_objects = options.objects
             && options.use_bitmap_index
             && result.per_commit_object_counts.is_empty()
@@ -1450,11 +1518,8 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
-    // Print boundary commits
-    if options.boundary {
-        for oid in &result.boundary_commits {
-            println!("-{oid}");
-        }
+    if options.boundary && (!options.reverse || options.quiet) {
+        print_boundary_commits();
     }
 
     Ok(())
@@ -1647,6 +1712,11 @@ fn parse_non_negative(text: &str, flag: &str) -> Result<usize> {
 
 fn parse_rev_list_date(s: &str) -> Result<i64> {
     let s = s.trim();
+    if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
+        return s
+            .parse::<i64>()
+            .with_context(|| format!("invalid date: '{s}'"));
+    }
     let mut approx_err = 0;
     let approx = approxidate_careful(s, Some(&mut approx_err));
     if approx_err == 0 {
@@ -1926,21 +1996,11 @@ fn run_rev_list_reflog_walk(
 }
 
 fn expand_parent_shorthand(repo: &Repository, spec: &str) -> Result<Vec<String>> {
-    if let Some(base) = spec.strip_suffix("^!") {
-        let base_spec = if base.is_empty() { "HEAD" } else { base };
-        let base_oid = grit_lib::rev_parse::resolve_revision(repo, base_spec)
-            .with_context(|| format!("bad revision '{base_spec}'"))?;
-        let object = repo.odb.read(&base_oid)?;
-        let commit = parse_commit(&object.data)?;
-
-        let mut expanded = Vec::with_capacity(commit.parents.len() + 1);
-        expanded.push(base_spec.to_string());
-        for parent in commit.parents {
-            expanded.push(format!("^{}", parent.to_hex()));
-        }
+    if let Some(expanded) =
+        grit_lib::rev_parse::expand_parent_shorthand_rev_parse_lines(repo, spec, false, None)?
+    {
         return Ok(expanded);
     }
-
     Ok(vec![spec.to_string()])
 }
 
@@ -2072,4 +2132,68 @@ fn commit_parents_for_output(
     let object = repo.odb.read(&oid)?;
     let commit = parse_commit(&object.data)?;
     Ok(commit.parents)
+}
+
+fn collect_visible_parents_for_output(
+    repo: &Repository,
+    candidate: ObjectId,
+    graft_parents: &HashMap<ObjectId, Vec<ObjectId>>,
+    selected: &HashSet<ObjectId>,
+    seen: &mut HashSet<ObjectId>,
+    out: &mut Vec<ObjectId>,
+) -> Result<()> {
+    if !seen.insert(candidate) {
+        return Ok(());
+    }
+    if selected.contains(&candidate) {
+        out.push(candidate);
+        return Ok(());
+    }
+
+    let mut parents = commit_parents_for_output(repo, candidate, graft_parents)?;
+    if parents.len() > 1 {
+        parents.truncate(1);
+    }
+    for parent in parents {
+        collect_visible_parents_for_output(repo, parent, graft_parents, selected, seen, out)?;
+    }
+    Ok(())
+}
+
+fn visible_parents_for_path_limited_output(
+    repo: &Repository,
+    oid: ObjectId,
+    graft_parents: &HashMap<ObjectId, Vec<ObjectId>>,
+    selected: &HashSet<ObjectId>,
+) -> Result<Vec<ObjectId>> {
+    let parents = commit_parents_for_output(repo, oid, graft_parents)?;
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for parent in parents {
+        collect_visible_parents_for_output(
+            repo,
+            parent,
+            graft_parents,
+            selected,
+            &mut seen,
+            &mut out,
+        )?;
+    }
+    let mut dedup = HashSet::new();
+    out.retain(|parent| dedup.insert(*parent));
+    Ok(out)
+}
+
+fn commit_parents_for_output_mode(
+    repo: &Repository,
+    oid: ObjectId,
+    graft_parents: &HashMap<ObjectId, Vec<ObjectId>>,
+    rewrite_path_limited_parents: bool,
+    selected: &HashSet<ObjectId>,
+) -> Result<Vec<ObjectId>> {
+    if rewrite_path_limited_parents {
+        visible_parents_for_path_limited_output(repo, oid, graft_parents, selected)
+    } else {
+        commit_parents_for_output(repo, oid, graft_parents)
+    }
 }

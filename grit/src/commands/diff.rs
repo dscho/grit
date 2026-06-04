@@ -3289,6 +3289,7 @@ pub fn run(mut args: Args) -> Result<()> {
         || args.patch_with_raw
         || args.patch_with_stat;
 
+    let has_entries_for_exit = !entries.is_empty();
     let mut conflict_combined_patches: Vec<String> = Vec::new();
     // Combined `diff --cc` for unmerged paths: required for conflicted index entries even when
     // `MERGE_HEAD` is absent (e.g. t4027 `update-index --index-info` submodule conflict).
@@ -3380,7 +3381,8 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
-    let has_diff = !entries.is_empty() || !conflict_combined_patches.is_empty();
+    let has_diff =
+        has_entries_for_exit || !entries.is_empty() || !conflict_combined_patches.is_empty();
 
     let stdout_is_tty = io::stdout().is_terminal();
     let use_color = diff_use_color(
