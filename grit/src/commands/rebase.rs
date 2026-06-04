@@ -6903,6 +6903,28 @@ fn do_continue() -> Result<()> {
         } else {
             head_oid
         };
+        if rb_dir.join("rebase-edit-continue").exists() && head_oid != amend_old_oid {
+            if !worktree_matches_head(&repo, git_dir)? {
+                bail!(
+                    "error: cannot rebase: You have unstaged changes.\n\
+                     Please commit or stash them."
+                );
+            }
+            let next_peek_amend =
+                peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 0, interactive_continue);
+            record_rebase_in_rewritten_pending(git_dir, &rb_dir, &amend_old_oid, next_peek_amend)?;
+            let _ = fs::remove_file(rb_dir.join("stopped-sha"));
+            let _ = fs::remove_file(rb_dir.join("rebase-amend-continue"));
+            let _ = fs::remove_file(rb_dir.join("rebase-edit-continue"));
+            return replay_remaining(
+                &repo,
+                &rb_dir,
+                autostash_continue,
+                backend_continue,
+                had_autostash_continue,
+                force_rewrite_continue,
+            );
+        }
         let amend_src_commit = repo
             .odb
             .read(&amend_old_oid)

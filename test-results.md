@@ -194,6 +194,13 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t3404-rebase-interactive edit auto-amend follow-up
+
+- Current focus harness remains 67/132 after `rebase --continue` learned to reject dirty
+  worktrees following a manual commit made during an `edit` stop, while clean manual amends can
+  resume.
+- Adjacent verification kept `t3418-rebase-continue.sh` green.
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing
