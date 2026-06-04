@@ -2981,6 +2981,21 @@ fn hex_decode_string(hex: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+fn load_rebase_merge_favor(rb_dir: &Path) -> MergeFavor {
+    let Ok(opts) = fs::read_to_string(rb_dir.join("strategy-opts")) else {
+        return MergeFavor::None;
+    };
+    for encoded in opts.lines() {
+        let opt = hex_decode_string(encoded).unwrap_or_else(|| encoded.to_owned());
+        match opt.trim_start_matches('-') {
+            "ours" => return MergeFavor::Ours,
+            "theirs" => return MergeFavor::Theirs,
+            _ => {}
+        }
+    }
+    MergeFavor::None
+}
+
 fn maybe_run_rebase_merge_strategy(
     repo: &Repository,
     git_dir: &Path,
@@ -5911,6 +5926,7 @@ fn cherry_pick_for_rebase(
         picked_subject: commit.message.lines().next().unwrap_or("replayed commit"),
         ignore_space_change: replay_opts.ignore_space_change,
     };
+    let merge_favor = load_rebase_merge_favor(rb_dir);
 
     let (mut merged_index, mut merge_conflict_files) = if ws_fix_rule.is_none() {
         let tree_merge = merge_trees_for_single_cherry_pick(
@@ -5924,7 +5940,7 @@ fn cherry_pick_for_rebase(
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("cherry-pick of root commit not supported"))?,
             &head_oid,
-            MergeFavor::None,
+            merge_favor,
         )?;
         let cf = tree_merge
             .conflict_files
@@ -5939,6 +5955,7 @@ fn cherry_pick_for_rebase(
             &ours_entries,
             &theirs_entries,
             &conflict_ctx,
+            merge_favor,
         )?;
         (merge_result.index, merge_result.conflict_files)
     };
@@ -7757,6 +7774,7 @@ fn three_way_merge_with_content(
     ours: &HashMap<Vec<u8>, IndexEntry>,
     theirs: &HashMap<Vec<u8>, IndexEntry>,
     conflict_ctx: &RebaseConflictContext,
+    favor: MergeFavor,
 ) -> Result<RebaseMergeResult> {
     let mut all_paths = BTreeSet::new();
     all_paths.extend(base.keys().cloned());
@@ -7823,6 +7841,7 @@ fn three_way_merge_with_content(
                     oe,
                     te,
                     conflict_ctx,
+                    favor,
                 )?;
             }
             (None, Some(oe), None) => {
@@ -7869,6 +7888,7 @@ fn content_merge_or_conflict(
     ours: &IndexEntry,
     theirs: &IndexEntry,
     ctx: &RebaseConflictContext<'_>,
+    favor: MergeFavor,
 ) -> Result<()> {
     if base.mode == 0o160000 || ours.mode == 0o160000 || theirs.mode == 0o160000 {
         stage_entry(index, base, 1);
@@ -7907,7 +7927,7 @@ fn content_merge_or_conflict(
         label_ours: ctx.label_ours(),
         label_base: &base_label,
         label_theirs: &path_str,
-        favor: Default::default(),
+        favor,
         style: ctx.style(repo),
         marker_size: 7,
         diff_algorithm: None,
