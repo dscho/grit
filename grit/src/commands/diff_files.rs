@@ -286,6 +286,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         &options,
                         options.abbrev,
                         options.indent_heuristic,
+                    options.no_prefix,
                     )?;
                 }
             }
@@ -385,7 +386,8 @@ pub fn run(mut args: Args) -> Result<()> {
                                 &options,
                                 options.abbrev,
                                 options.indent_heuristic,
-                            )?;
+                            options.no_prefix,
+                    )?;
                         }
                     }
                     OutputFormat::Stat => {
@@ -583,6 +585,8 @@ struct Options {
     /// Detect complete rewrites (`-B` / `--break-rewrites`) for summary/raw dissimilarity.
     break_rewrites: bool,
     indent_heuristic: bool,
+    /// `--no-prefix`: omit the `a/`/`b/` path prefixes in patch output.
+    no_prefix: bool,
     ignore_all_space: bool,
     ignore_space_change: bool,
     ignore_space_at_eol: bool,
@@ -644,6 +648,7 @@ fn parse_options(argv: &[String]) -> Result<Options> {
     let mut ignore_space_change = false;
     let mut ignore_space_at_eol = false;
     let mut ignore_blank_lines = false;
+    let mut no_prefix = false;
     let mut end_of_options = false;
 
     let mut idx = 0usize;
@@ -689,7 +694,8 @@ fn parse_options(argv: &[String]) -> Result<Options> {
                 "--ignore-space-at-eol" => ignore_space_at_eol = true,
                 "--ignore-blank-lines" => ignore_blank_lines = true,
                 // Silently accept diff options we don't fully implement yet
-                "--full-index" | "--no-ext-diff" | "--no-prefix" | "--no-abbrev" => {}
+                "--no-prefix" => no_prefix = true,
+                "--full-index" | "--no-ext-diff" | "--no-abbrev" => {}
                 "--indent-heuristic" | "--no-indent-heuristic" => {}
                 "-s" | "--no-patch" | "-p" | "--patch" | "-u" | "--raw" | "--stat"
                 | "--compact-summary" | "--numstat" | "--shortstat" | "--name-only"
@@ -821,6 +827,7 @@ fn parse_options(argv: &[String]) -> Result<Options> {
         reverse,
         break_rewrites,
         indent_heuristic: false,
+        no_prefix,
         ignore_all_space,
         ignore_space_change,
         ignore_space_at_eol,
@@ -1309,6 +1316,7 @@ fn print_patch_from_diff_entry(
     ws_opts: &Options,
     abbrev: Option<usize>,
     indent_heuristic: bool,
+    no_prefix: bool,
 ) -> Result<()> {
     let quote_path_fully = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
         .unwrap_or_default()
@@ -1323,17 +1331,18 @@ fn print_patch_from_diff_entry(
         .as_deref()
         .unwrap_or(entry.old_path.as_deref().unwrap_or(""));
 
+    let (src_prefix, dst_prefix) = if no_prefix { ("", "") } else { ("a/", "b/") };
     let old_label = match entry.status {
         DiffStatus::Added => "/dev/null".to_owned(),
-        _ => format!("a/{old_path}"),
+        _ => format!("{src_prefix}{old_path}"),
     };
     let new_label = match entry.status {
         DiffStatus::Deleted => "/dev/null".to_owned(),
-        _ => format!("b/{new_path}"),
+        _ => format!("{dst_prefix}{new_path}"),
     };
 
     let display_path = entry.path();
-    let mut header = format!("diff --git a/{old_path} b/{new_path}");
+    let mut header = format!("diff --git {src_prefix}{old_path} {dst_prefix}{new_path}");
     match entry.status {
         DiffStatus::Deleted => {
             header.push_str(&format!("\ndeleted file mode {}", entry.old_mode));
