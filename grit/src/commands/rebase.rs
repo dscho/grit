@@ -3554,7 +3554,14 @@ fn run_commit_editor_for_reword(
     git_dir: &Path,
     template: &str,
 ) -> Result<String> {
-    run_commit_editor_for_template(repo, git_dir, template, "commit", Some("HEAD"))
+    let mut edit_template = template.to_owned();
+    if !edit_template.ends_with("\n\n") {
+        if !edit_template.ends_with('\n') {
+            edit_template.push('\n');
+        }
+        edit_template.push('\n');
+    }
+    run_commit_editor_for_template(repo, git_dir, &edit_template, "commit", Some("HEAD"))
 }
 
 fn worktree_matches_head(repo: &Repository, git_dir: &Path) -> Result<bool> {
