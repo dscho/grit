@@ -6534,7 +6534,16 @@ fn finish_rebase(
 
         let finish_branch = format!("{ra} (finish): {head_name} onto {}", onto_oid.to_hex());
         let finish_head = format!("{ra} (finish): returning to {head_name}");
-        if old_branch_oid != new_tip {
+        let reflog_tip = fs::read_to_string(git_dir.join("logs").join(head_name))
+            .ok()
+            .and_then(|content| {
+                let line = content.lines().last()?;
+                let mut fields = line.split_whitespace();
+                let _old = fields.next()?;
+                let new_hex = fields.next()?;
+                ObjectId::from_hex(new_hex).ok()
+            });
+        if old_branch_oid != new_tip || reflog_tip != Some(new_tip) {
             let _ = append_reflog(
                 git_dir,
                 head_name,

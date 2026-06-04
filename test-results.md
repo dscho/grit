@@ -125,10 +125,13 @@
 
 ## 2026-06-04 — t3404-rebase-interactive branch reflog partial
 
-- Focus harness currently records 57/132 after no-op rebase finishes stopped appending branch
-  reflog entries that hide earlier reflog positions.
+- Focus harness currently records 59/132 after no-op rebase finishes stopped appending branch
+  reflog entries that hide earlier reflog positions, while meaningful rewritten-tip finishes still
+  append their branch reflog entry.
 - Adjacent verification: `./scripts/run-tests.sh t3404-rebase-interactive.sh t3400-rebase.sh
   t3200-branch.sh --verbose` keeps `t3400` and `t3200` green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
 ## 2026-06-03 — t3301-notes partial
 
