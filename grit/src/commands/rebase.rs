@@ -3924,6 +3924,9 @@ Use '--' to separate paths from revisions, like this:\n\
     } else {
         collect_rebase_todo_commits(&repo, head_oid, commits_upstream, filter_cherry_equivalents)?
     };
+    if filter_cherry_equivalents && upstream_tip_oid != upstream_oid {
+        commits = filter_redundant_patch_commits(&repo, upstream_tip_oid, &commits)?;
+    }
 
     // `--reset-author-date` / `--ignore-date` must still replay empty commits so author timestamps
     // are rewritten (t3436). Merge-replay scripts may reference empty merge commits.

@@ -1580,3 +1580,12 @@ Updated: 2026-06-01
   t3422-rebase-incompatible-options.sh t3400-rebase.sh` kept `t3418` and `t3422` green.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-04 — t3400-rebase cherry-pick fork-point partial
+
+- Focus harness improved from 23/39 to 30/39 after fork-point rebases also filtered patch-id
+  duplicates against the upstream tip history.
+- Related verification: `./scripts/run-tests.sh t3418-rebase-continue.sh
+  t3422-rebase-incompatible-options.sh t3400-rebase.sh` kept `t3418` and `t3422` green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).

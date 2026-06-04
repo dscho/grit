@@ -118,7 +118,8 @@
   - Current focus: `t3400-rebase.sh` (39 total, 21 passed) after `:/message` revision search now
     considers all refs, `git rebase -` resolves the previous-branch shorthand as `@{-1}`, and
     fork-point based default-upstream rebases skip preemptive no-op detection when upstream was
-    rewound. Current count: 23/39.
+    rewound. Cherry-pick/fork-point now filters patch-id duplicates against the upstream tip.
+    Current count: 30/39.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
