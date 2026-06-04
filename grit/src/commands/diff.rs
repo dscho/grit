@@ -3727,8 +3727,6 @@ pub fn run(mut args: Args) -> Result<()> {
         });
         if env_cfg_ext.is_some() || any_attr_driver {
             let mut sink = io::sink();
-            let empty_sm: HashMap<String, String> = HashMap::new();
-            let empty_gm: HashMap<String, String> = HashMap::new();
             let summary = write_patch_with_prefix(
                 &mut sink,
                 &repo,
@@ -7774,7 +7772,12 @@ fn write_patch_with_prefix(
         let attr_unset_binary = entry.old_mode != "120000"
             && entry.new_mode != "120000"
             && grit_lib::merge_diff::diff_attr_forces_binary(git_dir, path_for_attrs.as_str());
+        // A bare `diff` (set) attribute forces a textual diff even for NUL-bearing
+        // content (t4020 #65), overriding the content-based binary heuristic.
+        let attr_force_text =
+            grit_lib::merge_diff::diff_attr_forces_text(git_dir, path_for_attrs.as_str());
         if !textconv_patch
+            && !attr_force_text
             && (forced_binary
                 || attr_unset_binary
                 || is_binary(&old_content_raw)

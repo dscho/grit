@@ -467,6 +467,13 @@ pub fn diff_attr_forces_binary(git_dir: &Path, path: &str) -> bool {
     matches!(attrs_for_repo_path(git_dir, path).diff_attr, DiffAttr::Unset)
 }
 
+/// True when a path carries a bare `diff` (set) attribute, which forces Git to
+/// produce a textual diff even when the blob contains NUL bytes (t4020 #65).
+#[must_use]
+pub fn diff_attr_forces_text(git_dir: &Path, path: &str) -> bool {
+    matches!(attrs_for_repo_path(git_dir, path).diff_attr, DiffAttr::Set)
+}
+
 /// Resolved external diff driver from a path's `diff=<name>` attribute.
 ///
 /// Mirrors Git's `userdiff_find_by_path` → `drv->external`: when a path has a
