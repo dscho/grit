@@ -2795,3 +2795,11 @@ Updated: 2026-06-01
   `cargo clippy --fix --allow-dirty` (existing warning backlog remains; unrelated
   `filter_process.rs` auto-fix restored), `cargo test -p grit-lib --lib`,
   `cargo build --release -p grit-cli`, and `git diff --check`.
+- t6020 bundle core focus: bundle create now handles `--stdin`, `--ignore-missing`, quiet/progress
+  toggles, `-` stdout, and `^!` prerequisite expansion; bundle headers now retain prerequisites and
+  capabilities; verify/list-heads/unbundle can read `-`, verify prints Git-style ref/prerequisite
+  information and connectivity errors, and unbundle prints bundle heads after unpacking. Focused
+  `./scripts/run-tests.sh t6020-bundle-misc.sh --quiet` improves from 13/37 to 16/37. Ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
+  `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and `git diff --check`.

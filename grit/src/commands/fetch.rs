@@ -1136,6 +1136,7 @@ fn fetch_remote(
         crate::commands::bundle::run(crate::commands::bundle::Args {
             action: crate::commands::bundle::BundleAction::Unbundle(
                 crate::commands::bundle::UnbundleArgs {
+                    progress: false,
                     file: remote_path.to_string_lossy().to_string(),
                 },
             ),

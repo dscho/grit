@@ -2,6 +2,7 @@
 //!
 //! Implements create, verify, list-heads, and unbundle subcommands.
 
+use crate::explicit_exit::SilentNonZeroExit;
 use anyhow::{bail, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use grit_lib::git_date::approx::approxidate_careful;
@@ -38,6 +39,18 @@ pub enum BundleAction {
 
 #[derive(Debug, ClapArgs)]
 pub struct CreateArgs {
+    /// Suppress progress output.
+    #[arg(short = 'q', long = "quiet")]
+    pub quiet: bool,
+
+    /// Force progress output.
+    #[arg(long = "progress")]
+    pub progress: bool,
+
+    /// Re-enable progress output after --quiet.
+    #[arg(long = "no-quiet")]
+    pub no_quiet: bool,
+
     /// Output bundle file path.
     #[arg(value_name = "FILE")]
     pub file: String,
@@ -46,6 +59,14 @@ pub struct CreateArgs {
     #[arg(long = "version", value_name = "N")]
     pub version: Option<u8>,
 
+    /// Read revision arguments from standard input.
+    #[arg(long = "stdin")]
+    pub stdin: bool,
+
+    /// Ignore missing refs while parsing revision arguments.
+    #[arg(long = "ignore-missing")]
+    pub ignore_missing: bool,
+
     /// Revision arguments (refs, commit ranges, --all).
     #[arg(value_name = "REV", num_args = 0.., allow_hyphen_values = true, trailing_var_arg = true)]
     pub rev_list_args: Vec<String>,
@@ -53,6 +74,10 @@ pub struct CreateArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct VerifyArgs {
+    /// Suppress progress output.
+    #[arg(short = 'q', long = "quiet")]
+    pub quiet: bool,
+
     /// Bundle file to verify.
     #[arg(value_name = "FILE")]
     pub file: String,
@@ -67,6 +92,10 @@ pub struct ListHeadsArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct UnbundleArgs {
+    /// Force progress output.
+    #[arg(long = "progress")]
+    pub progress: bool,
+
     /// Bundle file to unbundle.
     #[arg(value_name = "FILE")]
     pub file: String,
@@ -92,21 +121,23 @@ fn run_create(args: CreateArgs) -> Result<()> {
     if version != 2 && version != 3 {
         bail!("unsupported bundle version {version}");
     }
+    let rev_args = collect_create_rev_args(&args)?;
 
-    let refs = collect_refs_for_bundle(&repo, &args.rev_list_args)?;
+    let refs = collect_refs_for_bundle(&repo, &rev_args, args.ignore_missing)?;
     if refs.is_empty() {
         bail!("refusing to create empty bundle");
     }
 
-    let (positive, negative) = parse_bundle_rev_list_args(&repo, &args.rev_list_args)?;
-    let cutoffs = parse_bundle_rev_cutoffs(&args.rev_list_args)?;
-    let max_count = parse_max_count_arg(&args.rev_list_args);
+    let (positive, negative) = parse_bundle_rev_list_args(&repo, &rev_args)?;
+    let cutoffs = parse_bundle_rev_cutoffs(&rev_args)?;
+    let max_count = parse_max_count_arg(&rev_args);
     let opts = RevListOptions {
         objects: true,
         boundary: !negative.is_empty() || cutoffs.since.is_some() || cutoffs.until.is_some(),
         max_count,
         since_cutoff: cutoffs.since,
         until_cutoff: cutoffs.until,
+        ignore_missing: args.ignore_missing,
         ..Default::default()
     };
     let listed =
@@ -197,9 +228,47 @@ fn run_create(args: CreateArgs) -> Result<()> {
     let pack_data = build_pack_data(&objects)?;
 
     // Write bundle file.
-    let mut out =
-        fs::File::create(&args.file).with_context(|| format!("cannot create {}", args.file))?;
+    if args.file == "-" {
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+        write_bundle(&mut out, version, &prerequisites, &refs, &pack_data)?;
+    } else {
+        let mut out =
+            fs::File::create(&args.file).with_context(|| format!("cannot create {}", args.file))?;
+        write_bundle(&mut out, version, &prerequisites, &refs, &pack_data)?;
+    }
 
+    if args.progress || (!args.quiet && !args.no_quiet && args.file != "-") {
+        eprintln!("Total {} (delta 0), reused 0 (delta 0)", objects.len());
+    }
+
+    Ok(())
+}
+
+fn collect_create_rev_args(args: &CreateArgs) -> Result<Vec<String>> {
+    let mut rev_args = Vec::new();
+    if args.stdin {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        rev_args.extend(
+            input
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToOwned::to_owned),
+        );
+    }
+    rev_args.extend(args.rev_list_args.iter().cloned());
+    Ok(rev_args)
+}
+
+fn write_bundle(
+    out: &mut dyn Write,
+    version: u8,
+    prerequisites: &[ObjectId],
+    refs: &BTreeMap<String, ObjectId>,
+    pack_data: &[u8],
+) -> Result<()> {
     if version == 3 {
         out.write_all(b"# v3 git bundle\n")?;
         out.write_all(b"@object-format=sha1\n")?;
@@ -207,31 +276,21 @@ fn run_create(args: CreateArgs) -> Result<()> {
         out.write_all(b"# v2 git bundle\n")?;
     }
 
-    for oid in &prerequisites {
-        let subject = commit_subject(&repo, oid).unwrap_or_default();
-        if subject.is_empty() {
-            writeln!(out, "-{}", oid.to_hex())?;
-        } else {
-            writeln!(out, "-{} {subject}", oid.to_hex())?;
-        }
+    for oid in prerequisites {
+        writeln!(out, "-{} ", oid.to_hex())?;
     }
-    // Write refs.
-    for (refname, oid) in &refs {
+    for (refname, oid) in refs {
         writeln!(out, "{} {}", oid.to_hex(), refname)?;
     }
-    out.write_all(b"\n")?; // blank line separates header from pack data
-
-    // Write pack data.
-    out.write_all(&pack_data)?;
-
-    eprintln!("Total {} (delta 0), reused 0 (delta 0)", objects.len());
-
+    out.write_all(b"\n")?;
+    out.write_all(pack_data)?;
     Ok(())
 }
 
 fn collect_refs_for_bundle(
     repo: &Repository,
     rev_args: &[String],
+    ignore_missing: bool,
 ) -> Result<BTreeMap<String, ObjectId>> {
     let mut refs = BTreeMap::new();
 
@@ -251,6 +310,10 @@ fn collect_refs_for_bundle(
     let mut i = 0usize;
     while i < rev_args.len() {
         let arg = &rev_args[i];
+        if option_takes_value(arg) {
+            i += 2;
+            continue;
+        }
         if arg == "--not" {
             i += 1;
             while i < rev_args.len() && rev_args[i] != "--not" {
@@ -262,29 +325,69 @@ fn collect_refs_for_bundle(
             i += 1;
             continue;
         }
-        let (pos_specs, _neg) = split_revision_token(arg);
-        let tip_spec = pos_specs.last().map(String::as_str).unwrap_or(arg.as_str());
-        let oid = resolve_ref(repo, tip_spec)
-            .with_context(|| format!("cannot resolve '{tip_spec}' (from '{arg}')"))?;
-        let full_name = if tip_spec.starts_with("refs/") || tip_spec == "HEAD" {
-            tip_spec.to_string()
-        } else if resolve_ref(repo, &format!("refs/heads/{tip_spec}")).is_ok() {
-            format!("refs/heads/{tip_spec}")
-        } else if resolve_ref(repo, &format!("refs/tags/{tip_spec}")).is_ok() {
-            format!("refs/tags/{tip_spec}")
-        } else {
-            tip_spec.to_string()
-        };
-        refs.insert(full_name, oid);
+        if let Some(tip_spec) = bundle_ref_tip_spec(arg) {
+            match resolve_ref(repo, &tip_spec) {
+                Ok(oid) => {
+                    let full_name = full_ref_name_for_tip(repo, &tip_spec);
+                    refs.insert(full_name, oid);
+                }
+                Err(e) if ignore_missing => {
+                    let _ = e;
+                }
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("cannot resolve '{tip_spec}' (from '{arg}')"));
+                }
+            }
+        }
         i += 1;
     }
 
     Ok(refs)
 }
 
+fn bundle_ref_tip_spec(arg: &str) -> Option<String> {
+    if arg.starts_with('^') {
+        return None;
+    }
+    if let Some(base) = arg.strip_suffix("^!") {
+        return Some(if base.is_empty() { "HEAD" } else { base }.to_string());
+    }
+    let (pos_specs, _neg) = split_revision_token(arg);
+    pos_specs.last().cloned()
+}
+
+fn full_ref_name_for_tip(repo: &Repository, tip_spec: &str) -> String {
+    if tip_spec.starts_with("refs/") || tip_spec == "HEAD" {
+        tip_spec.to_string()
+    } else if resolve_ref(repo, &format!("refs/heads/{tip_spec}")).is_ok() {
+        format!("refs/heads/{tip_spec}")
+    } else if resolve_ref(repo, &format!("refs/tags/{tip_spec}")).is_ok() {
+        format!("refs/tags/{tip_spec}")
+    } else {
+        tip_spec.to_string()
+    }
+}
+
 fn parse_max_count_arg(rev_args: &[String]) -> Option<usize> {
-    for arg in rev_args {
+    let mut i = 0usize;
+    while i < rev_args.len() {
+        let arg = &rev_args[i];
+        if arg == "--max-count" {
+            if let Some(value) = rev_args.get(i + 1).and_then(|v| v.parse::<usize>().ok()) {
+                return Some(value);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(value) = arg
+            .strip_prefix("--max-count=")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return Some(value);
+        }
         let Some(n) = arg.strip_prefix('-') else {
+            i += 1;
             continue;
         };
         if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) {
@@ -292,6 +395,7 @@ fn parse_max_count_arg(rev_args: &[String]) -> Option<usize> {
                 return Some(v);
             }
         }
+        i += 1;
     }
     None
 }
@@ -316,7 +420,12 @@ fn parse_bundle_rev_list_args(
     let mut i = 0usize;
     while i < rev_args.len() {
         let arg = &rev_args[i];
-        if arg == "--since" || arg == "--after" || arg == "--until" || arg == "--before" {
+        if arg == "--since"
+            || arg == "--after"
+            || arg == "--until"
+            || arg == "--before"
+            || option_takes_value(arg)
+        {
             i += 2;
             continue;
         }
@@ -336,7 +445,7 @@ fn parse_bundle_rev_list_args(
                     i += 1;
                     continue;
                 }
-                let (p, n) = split_revision_token(tok);
+                let (p, n) = split_bundle_revision_token(repo, tok)?;
                 negative.extend(p);
                 negative.extend(n);
                 i += 1;
@@ -347,7 +456,7 @@ fn parse_bundle_rev_list_args(
             i += 1;
             continue;
         }
-        let (p, n) = split_revision_token(arg);
+        let (p, n) = split_bundle_revision_token(repo, arg)?;
         positive.extend(p);
         negative.extend(n);
         i += 1;
@@ -366,6 +475,29 @@ fn parse_bundle_rev_list_args(
     }
 
     Ok((positive, negative))
+}
+
+fn option_takes_value(arg: &str) -> bool {
+    matches!(arg, "--max-count")
+}
+
+fn split_bundle_revision_token(
+    repo: &Repository,
+    token: &str,
+) -> Result<(Vec<String>, Vec<String>)> {
+    if let Some(base) = token.strip_suffix("^!") {
+        let base = if base.is_empty() { "HEAD" } else { base };
+        let oid = grit_lib::rev_parse::resolve_revision_as_commit_without_index_dwim(repo, base)
+            .with_context(|| format!("cannot resolve '{base}'"))?;
+        let obj = read_object(repo, &oid)?;
+        if obj.kind != ObjectKind::Commit {
+            return Ok((vec![base.to_string()], Vec::new()));
+        }
+        let commit = parse_commit(&obj.data).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let parents = commit.parents.into_iter().map(|p| p.to_hex()).collect();
+        return Ok((vec![base.to_string()], parents));
+    }
+    Ok(split_revision_token(token))
 }
 
 #[derive(Default)]
@@ -485,11 +617,12 @@ fn walk_refs_dir(
 // ---------------------------------------------------------------------------
 
 fn run_verify(args: VerifyArgs) -> Result<()> {
-    let data = fs::read(&args.file).with_context(|| format!("cannot read {}", args.file))?;
-    let (refs, pack_start) = parse_bundle_header(&data)?;
+    let repo = Repository::discover(None).ok();
+    let data = read_bundle_arg(&args.file)?;
+    let header = parse_bundle_header(&data)?;
 
     // Validate pack data.
-    let pack_data = &data[pack_start..];
+    let pack_data = &data[header.pack_start..];
     if pack_data.len() < 12 + 20 {
         bail!("bundle pack data too small");
     }
@@ -497,13 +630,60 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
         bail!("bundle does not contain valid pack data");
     }
 
-    eprintln!("The bundle contains {} ref(s)", refs.len());
-    for (refname, oid) in &refs {
-        eprintln!("{} {refname}", oid.to_hex());
+    if let Some(repo) = &repo {
+        if !header.prerequisites.is_empty() {
+            let prereq_oids: Vec<_> = header.prerequisites.iter().map(|(oid, _)| *oid).collect();
+            let missing: Vec<_> = prereq_oids
+                .iter()
+                .copied()
+                .filter(|oid| read_object(repo, oid).is_err())
+                .collect();
+            if !missing.is_empty() {
+                eprintln!("error: Repository lacks these prerequisite commits:");
+                for oid in missing {
+                    eprintln!("error: {} ", oid.to_hex());
+                }
+                return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
+            }
+            if !grit_lib::connectivity::bundle_prerequisites_connected_to_refs(repo, &prereq_oids)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                eprintln!("error: some prerequisite commits are not connected to the repository");
+                return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
+            }
+        }
     }
 
-    println!("{} is okay", args.file);
+    print_bundle_verify_info(&header);
+    if !args.quiet {
+        eprintln!("{} is okay", bundle_display_name(&args.file));
+    }
     Ok(())
+}
+
+fn print_bundle_verify_info(header: &BundleHeader) {
+    match header.refs.len() {
+        1 => println!("The bundle contains this ref:"),
+        n => println!("The bundle contains these {n} refs:"),
+    }
+    for (refname, oid) in &header.refs {
+        println!("{} {refname}", oid.to_hex());
+    }
+    match header.prerequisites.len() {
+        0 => println!("The bundle records a complete history."),
+        1 => println!("The bundle requires this ref:"),
+        n => println!("The bundle requires these {n} refs:"),
+    }
+    for (oid, comment) in &header.prerequisites {
+        println!("{} {comment}", oid.to_hex());
+    }
+    println!(
+        "The bundle uses this hash algorithm: {}",
+        header.object_format
+    );
+    if let Some(filter) = &header.filter {
+        println!("The bundle uses this filter: {filter}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,10 +691,10 @@ fn run_verify(args: VerifyArgs) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 fn run_list_heads(args: ListHeadsArgs) -> Result<()> {
-    let data = fs::read(&args.file).with_context(|| format!("cannot read {}", args.file))?;
-    let (refs, _) = parse_bundle_header(&data)?;
+    let data = read_bundle_arg(&args.file)?;
+    let header = parse_bundle_header(&data)?;
 
-    for (refname, oid) in &refs {
+    for (refname, oid) in &header.refs {
         println!("{} {refname}", oid.to_hex());
     }
     Ok(())
@@ -526,34 +706,35 @@ fn run_list_heads(args: ListHeadsArgs) -> Result<()> {
 
 fn run_unbundle(args: UnbundleArgs) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
-    let data = fs::read(&args.file).with_context(|| format!("cannot read {}", args.file))?;
-    let (refs, pack_start) = parse_bundle_header(&data)?;
+    let data = read_bundle_arg(&args.file)?;
+    let header = parse_bundle_header(&data)?;
 
-    let pack_data = &data[pack_start..];
+    let pack_data = &data[header.pack_start..];
     if pack_data.len() < 12 + 20 {
         bail!("bundle pack data too small");
+    }
+
+    let prereq_oids: Vec<_> = header.prerequisites.iter().map(|(oid, _)| *oid).collect();
+    if !grit_lib::connectivity::bundle_prerequisites_connected_to_refs(&repo, &prereq_oids)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        eprintln!("error: some prerequisite commits are not connected to the repository");
+        return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
     }
 
     // Use unpack-objects to extract into the ODB.
     let opts = grit_lib::unpack_objects::UnpackOptions {
         strict: false,
         dry_run: false,
-        quiet: false,
+        quiet: !args.progress,
         max_input_bytes: None,
     };
-    let count = grit_lib::unpack_objects::unpack_objects(&mut &pack_data[..], &repo.odb, &opts)
+    let _count = grit_lib::unpack_objects::unpack_objects(&mut &pack_data[..], &repo.odb, &opts)
         .map_err(|e| anyhow::anyhow!("unbundle failed: {e}"))?;
 
-    // Update refs.
-    for (refname, oid) in &refs {
-        let ref_path = repo.git_dir.join(refname);
-        if let Some(parent) = ref_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&ref_path, format!("{}\n", oid.to_hex()))?;
+    for (refname, oid) in &header.refs {
+        println!("{} {refname}", oid.to_hex());
     }
-
-    eprintln!("Unbundled {count} objects");
     Ok(())
 }
 
@@ -561,8 +742,33 @@ fn run_unbundle(args: UnbundleArgs) -> Result<()> {
 // shared helpers
 // ---------------------------------------------------------------------------
 
-/// Parse the bundle v2 header, returning refs and the byte offset where pack data starts.
-fn parse_bundle_header(data: &[u8]) -> Result<(BTreeMap<String, ObjectId>, usize)> {
+struct BundleHeader {
+    refs: BTreeMap<String, ObjectId>,
+    prerequisites: Vec<(ObjectId, String)>,
+    object_format: String,
+    filter: Option<String>,
+    pack_start: usize,
+}
+
+fn read_bundle_arg(file: &str) -> Result<Vec<u8>> {
+    if file == "-" {
+        let mut data = Vec::new();
+        std::io::stdin().read_to_end(&mut data)?;
+        return Ok(data);
+    }
+    fs::read(file).with_context(|| format!("cannot read {file}"))
+}
+
+fn bundle_display_name(file: &str) -> &str {
+    if file == "-" {
+        "<stdin>"
+    } else {
+        file
+    }
+}
+
+/// Parse the bundle header, returning refs/prerequisites and the pack byte offset.
+fn parse_bundle_header(data: &[u8]) -> Result<BundleHeader> {
     let header_v2 = b"# v2 git bundle\n";
     let header_v3 = b"# v3 git bundle\n";
     let mut pos = if data.starts_with(header_v2) {
@@ -573,6 +779,9 @@ fn parse_bundle_header(data: &[u8]) -> Result<(BTreeMap<String, ObjectId>, usize
         bail!("not a git bundle");
     };
     let mut refs = BTreeMap::new();
+    let mut prerequisites = Vec::new();
+    let mut object_format = "sha1".to_string();
+    let mut filter = None;
 
     loop {
         // Find end of line.
@@ -592,11 +801,20 @@ fn parse_bundle_header(data: &[u8]) -> Result<(BTreeMap<String, ObjectId>, usize
         let line_str = std::str::from_utf8(line).context("invalid UTF-8 in bundle header")?;
 
         // Prerequisite lines start with '-'.
-        if line_str.starts_with('-') {
+        if let Some(rest) = line_str.strip_prefix('-') {
+            let (hex, comment) = rest.split_once(' ').unwrap_or((rest, ""));
+            let oid = ObjectId::from_hex(hex)
+                .map_err(|e| anyhow::anyhow!("bad prerequisite oid in bundle header: {e}"))?;
+            prerequisites.push((oid, comment.to_string()));
             pos = eol + 1;
             continue;
         }
-        if line_str.starts_with('@') {
+        if let Some(cap) = line_str.strip_prefix('@') {
+            if let Some(value) = cap.strip_prefix("object-format=") {
+                object_format = value.to_string();
+            } else if let Some(value) = cap.strip_prefix("filter=") {
+                filter = Some(value.to_string());
+            }
             pos = eol + 1;
             continue;
         }
@@ -611,7 +829,13 @@ fn parse_bundle_header(data: &[u8]) -> Result<(BTreeMap<String, ObjectId>, usize
         pos = eol + 1;
     }
 
-    Ok((refs, pos))
+    Ok(BundleHeader {
+        refs,
+        prerequisites,
+        object_format,
+        filter,
+        pack_start: pos,
+    })
 }
 
 fn resolve_ref(repo: &Repository, refname: &str) -> Result<ObjectId> {
