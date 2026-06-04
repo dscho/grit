@@ -1250,21 +1250,6 @@ fn collect_cruft_pack_stdin_oids(repo: &Repository) -> Result<PackObjectList> {
     // `prepare_cruft_history`), and those objects must land in the cruft pack.
     oids.retain(|o| !fresh_oids.contains(o));
 
-    // Loose commits whose parent is already in the fresh (main + `--keep-pack`) packs are one
-    // step off the repacked graph — Git does not treat them as cruft (`t7700-repack` keep-pack).
-    oids.retain(|o| {
-        let Ok(obj) = read_object_from_repo(repo, o) else {
-            return true;
-        };
-        if obj.kind != ObjectKind::Commit {
-            return true;
-        }
-        let Ok(c) = parse_commit(&obj.data) else {
-            return true;
-        };
-        !c.parents.iter().any(|p| fresh_oids.contains(p))
-    });
-
     Ok(PackObjectList {
         oids: oids.into_iter().collect(),
         force_include: Vec::new(),
