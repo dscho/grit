@@ -4515,7 +4515,7 @@ fn run_no_index_dirs(args: Args, dir_a: &Path, dir_b: &Path) -> Result<()> {
         }
 
         has_diff = true;
-        let _label_a = format!("{}/{}", dir_a.display(), rel);
+        let label_a = format!("{}/{}", dir_a.display(), rel);
         let label_b = format!("{}/{}", dir_b.display(), rel);
 
         if args.name_only {
@@ -4529,6 +4529,46 @@ fn run_no_index_dirs(args: Args, dir_a: &Path, dir_b: &Path) -> Result<()> {
                 _ => "M",
             };
             writeln!(out, "{}\t{}", status, label_b)?;
+            continue;
+        }
+        if args.raw {
+            // `git diff --no-index --raw`: emit the raw plumbing line with all-zero OIDs (there
+            // are no objects in --no-index mode). Path shown is the second argument's side.
+            let mode_a = fa
+                .symlink_metadata()
+                .ok()
+                .and_then(|m| m.file_type().is_symlink().then_some("120000"))
+                .unwrap_or("100644");
+            let mode_b = fb
+                .symlink_metadata()
+                .ok()
+                .and_then(|m| m.file_type().is_symlink().then_some("120000"))
+                .unwrap_or("100644");
+            let (status, om, nm, path) = match (&data_a, &data_b) {
+                (None, Some(_)) => ("A", "000000", mode_b, label_b.as_str()),
+                (Some(_), None) => ("D", mode_a, "000000", label_a.as_str()),
+                _ => ("M", mode_a, mode_b, label_b.as_str()),
+            };
+            let raw_abbrev = if args.abbrev == Some(0) || args.no_abbrev {
+                40usize
+            } else if let Some(n) = args.abbrev {
+                n.clamp(4, 40)
+            } else {
+                7
+            };
+            let ell = if raw_abbrev < 40
+                && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").ok().as_deref() == Some("yes")
+            {
+                "..."
+            } else {
+                ""
+            };
+            let zeros = format!("{}{ell}", "0".repeat(raw_abbrev));
+            writeln!(
+                out,
+                ":{om} {nm} {zeros} {zeros} {status}\t{path}"
+            )?;
+            has_diff = true;
             continue;
         }
 
