@@ -6958,6 +6958,188 @@ fn merge_trees(
     // Sources handled by the colliding-1to2 pre-pass below; skipped by Case 1/Case 2.
     let mut prepass_rr_sources: BTreeSet<Vec<u8>> = BTreeSet::new();
 
+    // Pre-pass: different sources renamed to the same destination.
+    //
+    // In criss-cross merges the virtual base can contain conflicted blobs at both original
+    // sources. If ours renames one source to `m` while theirs renames the other source to `m`,
+    // Git first merges each original source against the side that kept it, then stages those two
+    // merged blobs as add/add stages 2/3 at the shared destination (without a stage 1).
+    {
+        let mut two_to_one: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+        for (ours_src, dest) in &ours_renames {
+            for (theirs_src, theirs_dest) in &theirs_renames {
+                if dest == theirs_dest && ours_src != theirs_src {
+                    two_to_one.push((dest.clone(), ours_src.clone(), theirs_src.clone()));
+                }
+            }
+        }
+        two_to_one.sort();
+        two_to_one.dedup();
+
+        for (dest, ours_src, theirs_src) in two_to_one {
+            if prepass_rr_sources.contains(&ours_src) || prepass_rr_sources.contains(&theirs_src) {
+                continue;
+            }
+
+            let (
+                Some(ours_base),
+                Some(ours_renamed),
+                Some(theirs_kept),
+                Some(theirs_base),
+                Some(ours_kept),
+                Some(theirs_renamed),
+            ) = (
+                base.get(&ours_src),
+                ours_entries.get(&dest),
+                theirs_entries.get(&ours_src),
+                base.get(&theirs_src),
+                ours_entries.get(&theirs_src),
+                theirs_entries.get(&dest),
+            )
+            else {
+                continue;
+            };
+
+            prepass_rr_sources.insert(ours_src.clone());
+            prepass_rr_sources.insert(theirs_src.clone());
+            handled_paths.insert(ours_src.clone());
+            handled_paths.insert(theirs_src.clone());
+            handled_paths.insert(dest.clone());
+            has_conflicts = true;
+
+            let dest_str = String::from_utf8_lossy(&dest).to_string();
+            let ours_src_str = String::from_utf8_lossy(&ours_src).to_string();
+            let theirs_src_str = String::from_utf8_lossy(&theirs_src).to_string();
+            let rr_base_label = same_path_criss_cross_base_label(
+                base_label,
+                base_label_prefix,
+                criss_cross_outer_merge,
+            );
+
+            let ours_stage_label = format!("{ours_label}:{dest_str}");
+            let ours_base_label = format!("{rr_base_label}:{ours_src_str}");
+            let theirs_kept_label = format!("{their_name}:{ours_src_str}");
+            let stage2 = match try_content_merge(
+                repo,
+                &dest_str,
+                ours_base,
+                ours_renamed,
+                theirs_kept,
+                &ours_stage_label,
+                &ours_base_label,
+                &theirs_kept_label,
+                favor,
+                diff_algorithm,
+                merge_renormalize,
+                ignore_all_space,
+                ignore_space_change,
+                ignore_space_at_eol,
+                ignore_cr_at_eol,
+                auto_merge_paths.as_deref_mut(),
+            )? {
+                ContentMergeResult::Clean(oid, mode) => {
+                    let mut e = ours_renamed.clone();
+                    e.oid = oid;
+                    e.mode = mode;
+                    e
+                }
+                ContentMergeResult::Conflict(content)
+                | ContentMergeResult::BinaryConflict(content) => {
+                    let content = lengthen_conflict_marker_lines_of_size(&content, 7, 1);
+                    let oid = repo.odb.write(ObjectKind::Blob, &content)?;
+                    let mut e = ours_renamed.clone();
+                    e.oid = oid;
+                    e
+                }
+            };
+
+            let ours_kept_label = format!("{ours_label}:{theirs_src_str}");
+            let theirs_base_label = format!("{rr_base_label}:{theirs_src_str}");
+            let theirs_stage_label = format!("{their_name}:{dest_str}");
+            let stage3 = match try_content_merge(
+                repo,
+                &dest_str,
+                theirs_base,
+                ours_kept,
+                theirs_renamed,
+                &ours_kept_label,
+                &theirs_base_label,
+                &theirs_stage_label,
+                favor,
+                diff_algorithm,
+                merge_renormalize,
+                ignore_all_space,
+                ignore_space_change,
+                ignore_space_at_eol,
+                ignore_cr_at_eol,
+                auto_merge_paths.as_deref_mut(),
+            )? {
+                ContentMergeResult::Clean(oid, mode) => {
+                    let mut e = theirs_renamed.clone();
+                    e.oid = oid;
+                    e.mode = mode;
+                    e
+                }
+                ContentMergeResult::Conflict(content)
+                | ContentMergeResult::BinaryConflict(content) => {
+                    let content = lengthen_conflict_marker_lines_of_size(&content, 7, 1);
+                    let oid = repo.odb.write(ObjectKind::Blob, &content)?;
+                    let mut e = theirs_renamed.clone();
+                    e.oid = oid;
+                    e
+                }
+            };
+
+            index.remove(&dest);
+            let mut s2 = stage2.clone();
+            s2.path = dest.clone();
+            stage_entry(&mut index, &s2, 2);
+            let mut s3 = stage3.clone();
+            s3.path = dest.clone();
+            stage_entry(&mut index, &s3, 3);
+
+            let empty_oid = repo.odb.write(ObjectKind::Blob, &[])?;
+            let mut empty_base = s2.clone();
+            empty_base.oid = empty_oid;
+            empty_base.mode = MODE_REGULAR;
+            empty_base.flags &= 0x0FFF;
+            let final_content = match try_content_merge(
+                repo,
+                &dest_str,
+                &empty_base,
+                &s2,
+                &s3,
+                ours_label,
+                rr_base_label,
+                their_name,
+                MergeFavor::None,
+                diff_algorithm,
+                merge_renormalize,
+                ignore_all_space,
+                ignore_space_change,
+                ignore_space_at_eol,
+                ignore_cr_at_eol,
+                auto_merge_paths.as_deref_mut(),
+            )? {
+                ContentMergeResult::Clean(oid, _) => repo.odb.read(&oid)?.data,
+                ContentMergeResult::Conflict(content)
+                | ContentMergeResult::BinaryConflict(content) => content,
+            };
+            conflict_files.push((dest_str.clone(), final_content));
+            conflict_descriptions.push(ConflictDescription {
+                kind: "rename/rename",
+                body: format!(
+                    "{ours_src_str} renamed to {dest_str} in {ours_label} and {theirs_src_str} renamed to {dest_str} in {their_name}."
+                ),
+                subject_path: dest_str.clone(),
+                remerge_anchor_path: Some(ours_src_str),
+                rename_rr_ours_dest: Some(dest_str.clone()),
+                rename_rr_theirs_dest: Some(dest_str),
+                auto_merge_hint_path: None,
+            });
+        }
+    }
+
     // Pre-pass: chains of rename/rename(1to2) whose destinations collide (t4301 mod6).
     //
     // When a single source path is renamed by both sides to *different* destinations
@@ -9763,6 +9945,18 @@ fn renormalize_merge_blob(data: &[u8]) -> Vec<u8> {
 }
 
 fn lengthen_conflict_marker_lines(data: &[u8], extra: usize) -> Vec<u8> {
+    lengthen_conflict_marker_lines_matching(data, None, extra)
+}
+
+fn lengthen_conflict_marker_lines_of_size(data: &[u8], size: usize, extra: usize) -> Vec<u8> {
+    lengthen_conflict_marker_lines_matching(data, Some(size), extra)
+}
+
+fn lengthen_conflict_marker_lines_matching(
+    data: &[u8],
+    only_size: Option<usize>,
+    extra: usize,
+) -> Vec<u8> {
     if extra == 0 || merge_file::is_binary(data) {
         return data.to_vec();
     }
@@ -9770,7 +9964,10 @@ fn lengthen_conflict_marker_lines(data: &[u8], extra: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
     for line in data.split_inclusive(|byte| *byte == b'\n') {
         if let Some(marker) = conflict_marker_line_kind(line) {
-            out.extend(std::iter::repeat_n(marker, extra));
+            let count = line.iter().take_while(|byte| **byte == marker).count();
+            if only_size.is_none_or(|size| size == count) {
+                out.extend(std::iter::repeat_n(marker, extra));
+            }
         }
         out.extend_from_slice(line);
     }

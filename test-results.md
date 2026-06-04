@@ -1,3 +1,16 @@
+## 2026-06-04 — t6416 recursive nested conflicts complete
+
+- Focus harness: `t6416-recursive-corner-cases.sh` now records 37/40 passing, 0 failing,
+  with 3 expected failures after adding criss-cross rename/rename(2to1) handling for two
+  virtual-base sources renamed to the same destination.
+- Adjacent harness: `t6402-merge-rename.sh` remains 46/46, `t6430-merge-recursive.sh`
+  remains 36/36, and `t6422-merge-rename-corner-cases.sh` improves to 14/20 with
+  6 expected failures.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`,
+  and `cargo test -p grit-lib --lib` completed; the library test run passed 238/238. The broad
+  pre-existing Clippy warning backlog remains, and unrelated `clippy --fix` cleanup in
+  `grit-lib/src/filter_process.rs` was restored.
+
 ## 2026-06-04 — t6416 post-main recovery
 
 - Focus harness: after fast-forwarding to `origin/main`, `./scripts/run-tests.sh

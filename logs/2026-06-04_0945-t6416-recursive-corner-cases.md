@@ -55,3 +55,15 @@ Progress:
   rename pairs after path-changing candidates. Re-ran `./scripts/run-tests.sh
   t6416-recursive-corner-cases.sh --verbose`; recovered to 36/40 passing, 1 failing, with
   3 expected failures. Remaining ordinary failure: 38.
+- Fixed the remaining nested-conflicts case by handling criss-cross rename/rename(2to1) where
+  different virtual-base sources are renamed to the same destination. Each source is merged against
+  the opposite side that kept it, staged as stage 2/3 at the shared destination without a stage 1,
+  and the worktree conflict is generated from those two staged blobs.
+- Verified with `GRIT_TEST_LIB_SUMMARY=1 ... bash t6416-recursive-corner-cases.sh`, which reports
+  `# Tests: 40  Pass: 37  Fail: 0  Skip: 0`. Traced `./scripts/run-tests.sh
+  t6416-recursive-corner-cases.sh --quiet` to confirm the CSV row now records 37/40 passing,
+  0 failing, with 3 expected failures.
+- Adjacent verification: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh
+  t6402-merge-rename.sh t6430-merge-recursive.sh t6422-merge-rename-corner-cases.sh --verbose
+  --timeout 180` kept `t6402` at 46/46 and `t6430` at 36/36; the same change improves
+  `t6422` to 14/20 with 6 expected failures.
