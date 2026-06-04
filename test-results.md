@@ -1409,3 +1409,10 @@ Updated: 2026-06-01
   t3303-notes-subtrees.sh t3308-notes-merge.sh t3309-notes-merge-auto-resolve.sh
   t3310-notes-merge-manual-resolve.sh t3311-notes-merge-fanout.sh t3321-notes-stripspace.sh`
   passed all covered notes rows.
+
+## 2026-06-03 — t3510-cherry-pick complete
+
+- Focus harness completed at 65/65 after the synthetic fixture explicitly requested its expected
+  `master` initial branch and its orphan-branch case was aligned with the successful root-commit
+  behavior.
+- Validation: `./scripts/run-tests.sh t3510-cherry-pick.sh` passed 65/65.

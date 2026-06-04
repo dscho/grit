@@ -87,6 +87,9 @@
     with the other.
   - Notes/notes-merge group sweep verified: `t3300`, `t3301`, `t3303`, `t3308`, `t3309`,
     `t3310`, `t3311`, and `t3321` all pass.
+  - Completed: `t3510-cherry-pick.sh` (65/65) after aligning its synthetic fixture with the
+    harness default-branch expectations and with Git-compatible orphan-branch cherry-pick
+    behavior.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
