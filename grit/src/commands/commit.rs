@@ -678,6 +678,7 @@ pub fn run(mut args: Args) -> Result<()> {
             config,
             sparse: sparse_state,
             include_sparse: false,
+            large_blobs: None,
         };
         Some(crate::commands::add::stage_pathspecs_for_commit(
             &repo,

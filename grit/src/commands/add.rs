@@ -32,6 +32,7 @@ use std::fs;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use crate::commands::apply;
 use crate::commands::commit::launch_commit_editor;
@@ -555,6 +556,9 @@ pub fn run(mut args: Args) -> Result<()> {
         config: config.clone(),
         sparse: sparse_state.clone(),
         include_sparse: args.sparse,
+        large_blobs: (!args.dry_run)
+            .then(|| LargeBlobBatch::from_config(&config).map(|batch| Rc::new(RefCell::new(batch))))
+            .flatten(),
     };
 
     // Exclude-only pathspec lists (`:(exclude)`, `:!`, …) are handled like plain `git add` for
@@ -887,6 +891,7 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     if !args.dry_run {
+        flush_large_blob_batch(&add_cfg, &repo)?;
         write_index_or_lock_err(&repo, &mut index, &index_path)?;
     }
 
@@ -1175,6 +1180,100 @@ pub(crate) struct AddConfig {
     pub config: ConfigSet,
     pub sparse: AddSparseState,
     pub include_sparse: bool,
+    pub large_blobs: Option<Rc<RefCell<LargeBlobBatch>>>,
+}
+
+/// Pending large blob objects that should be written as packfiles at the end of `git add`.
+pub(crate) struct LargeBlobBatch {
+    threshold: u64,
+    pack_size_limit: Option<u64>,
+    entries: Vec<(ObjectId, ObjectKind, Vec<u8>)>,
+    seen: HashSet<ObjectId>,
+}
+
+impl LargeBlobBatch {
+    fn from_config(config: &ConfigSet) -> Option<Self> {
+        let threshold = config_i64(config, "core.bigFileThreshold")
+            .or_else(|| config_i64(config, "core.bigfilethreshold"))?;
+        if threshold < 0 {
+            return None;
+        }
+        let pack_size_limit = config_i64(config, "pack.packSizeLimit")
+            .or_else(|| config_i64(config, "pack.packsizelimit"))
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|&v| v > 0);
+        Some(Self {
+            threshold: threshold as u64,
+            pack_size_limit,
+            entries: Vec::new(),
+            seen: HashSet::new(),
+        })
+    }
+
+    fn write_blob_or_queue(&mut self, odb: &Odb, data: &[u8]) -> Result<ObjectId> {
+        let oid = Odb::hash_object_data(ObjectKind::Blob, data);
+        if data.len() as u64 <= self.threshold || odb.exists(&oid) {
+            return odb
+                .write(ObjectKind::Blob, data)
+                .map_err(anyhow::Error::from);
+        }
+        if self.seen.insert(oid) {
+            self.entries.push((oid, ObjectKind::Blob, data.to_vec()));
+        }
+        Ok(oid)
+    }
+
+    fn flush(&mut self, repo: &Repository) -> Result<()> {
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        let entries = std::mem::take(&mut self.entries);
+        self.seen.clear();
+        if let Some(limit) = self.pack_size_limit {
+            let mut chunk = Vec::new();
+            let mut chunk_bytes = 0u64;
+            for entry in entries {
+                let entry_bytes = entry.2.len() as u64;
+                if !chunk.is_empty() && chunk_bytes.saturating_add(entry_bytes) > limit {
+                    crate::commands::pack_objects::write_full_object_pack(repo, &chunk)?;
+                    chunk.clear();
+                    chunk_bytes = 0;
+                }
+                chunk_bytes = chunk_bytes.saturating_add(entry_bytes);
+                chunk.push(entry);
+            }
+            if !chunk.is_empty() {
+                crate::commands::pack_objects::write_full_object_pack(repo, &chunk)?;
+            }
+        } else {
+            crate::commands::pack_objects::write_full_object_pack(repo, &entries)?;
+        }
+        Ok(())
+    }
+}
+
+fn config_i64(config: &ConfigSet, key: &str) -> Option<i64> {
+    config.get_i64(key).and_then(|r| r.ok())
+}
+
+fn write_staged_blob(
+    odb: &Odb,
+    _repo: &Repository,
+    data: &[u8],
+    add_cfg: &AddConfig,
+) -> Result<ObjectId> {
+    if let Some(batch) = &add_cfg.large_blobs {
+        return batch.borrow_mut().write_blob_or_queue(odb, data);
+    }
+    odb.write(ObjectKind::Blob, data)
+        .map_err(anyhow::Error::from)
+}
+
+fn flush_large_blob_batch(add_cfg: &AddConfig, repo: &Repository) -> Result<()> {
+    if let Some(batch) = &add_cfg.large_blobs {
+        batch.borrow_mut().flush(repo)?;
+    }
+    Ok(())
 }
 
 /// Stage pathspecs the same way `git commit <paths>` does (recursive dirs, CRLF clean, etc.).
@@ -3028,9 +3127,7 @@ pub(crate) fn stage_file(
         }
     };
 
-    let oid = odb
-        .write(ObjectKind::Blob, &data)
-        .map_err(anyhow::Error::from)?;
+    let oid = write_staged_blob(odb, repo, &data, add_cfg)?;
     let mut entry = entry_from_metadata(&meta, rel_path.as_bytes(), oid, final_mode);
     entry.mode = final_mode; // Ensure mode override sticks
     entry.set_assume_unchanged(false);

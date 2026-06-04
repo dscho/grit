@@ -928,6 +928,8 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             if skip_oid_verification || skip_refname_verification {
                 let oid = grit_lib::objects::ObjectId::from_hex(new_oid)
                     .with_context(|| format!("invalid object id '{new_oid}'"))?;
+                let old = grit_lib::objects::ObjectId::from_hex(old_oid)
+                    .with_context(|| format!("invalid object id '{old_oid}'"))?;
                 if grit_lib::reftable::is_reftable_repo(&git_dir) {
                     grit_lib::reftable::reftable_write_ref(&git_dir, refname, &oid, None, None)
                         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -938,6 +940,10 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                     }
                     std::fs::write(ref_path, format!("{new_oid}\n"))?;
                 }
+                let identity = commands::update_ref::resolve_reflog_identity(&repo);
+                let _ = grit_lib::refs::append_reflog(
+                    &git_dir, refname, &old, &oid, &identity, msg, true,
+                );
                 return Ok(());
             }
             dispatch("update-ref", &args, &GlobalOpts::default())
@@ -4802,9 +4808,10 @@ fn preprocess_log_args(rest: &[String]) -> Vec<String> {
         if arg.starts_with('-') && arg.len() > 1 && arg[1..].chars().all(|c| c.is_ascii_digit()) {
             result.push("-n".to_string());
             result.push(arg[1..].to_string());
-        } else if let Some(num) = arg.strip_prefix("-n").filter(|rest| {
-            !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
-        }) {
+        } else if let Some(num) = arg
+            .strip_prefix("-n")
+            .filter(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        {
             // Normalize `-n6` to `-n 6` so clap parses it as the max-count option
             // instead of letting the `allow_hyphen_values` revisions positional
             // swallow it (and every option that follows).
@@ -5518,10 +5525,8 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             commands::imap_send::run_from_argv(rest)
         }
         "index-pack" => {
-            let mut argv = rest.to_vec();
-            commands::index_pack::preprocess_argv(&mut argv);
-            commands::index_pack::normalize_argv_for_positional_pack(&mut argv);
-            commands::index_pack::run(parse_cmd_args(subcmd, &argv))
+            let args = commands::index_pack::parse_argv(rest.to_vec())?;
+            commands::index_pack::run(args)
         }
         "init" | "init-db" => commands::init::run(parse_cmd_args("init", rest), opts.bare),
         "interpret-trailers" => {
