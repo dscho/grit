@@ -225,6 +225,8 @@ pub fn run(args: Args) -> Result<()> {
                 dry_run: false,
                 verbose: false,
                 expire: Some(expire),
+                no_expire: false,
+                heads: Vec::new(),
                 no_progress: quiet_effective,
                 progress: false,
             })

@@ -30,11 +30,19 @@ pub struct Args {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
-    /// Only prune objects older than this time (default: 2 weeks ago).
+    /// Only prune objects older than this time.
     ///
     /// Accepts "now" to prune everything, or a duration like "2.weeks.ago".
     #[arg(long = "expire")]
     pub expire: Option<String>,
+
+    /// Do not apply an expiration grace period.
+    #[arg(long = "no-expire")]
+    pub no_expire: bool,
+
+    /// Extra heads to treat as reachable.
+    #[arg(value_name = "HEAD")]
+    pub heads: Vec<String>,
 
     /// Do not show progress (suppresses output to stderr).
     #[arg(long = "no-progress")]
@@ -57,14 +65,23 @@ pub fn run(args: Args) -> Result<()> {
         guard_against_corrupt_loose_refs(&repo.git_dir, &odb)?;
     }
 
-    let expire_policy = parse_expire_time(args.expire.as_deref())?;
+    let expire_policy = if args.no_expire {
+        ExpirePolicy::All
+    } else {
+        parse_expire_time(args.expire.as_deref())?
+    };
 
     // 1. Collect all reachable object IDs.
-    let reachable = collect_reachable(&repo, &odb, &objects_dir)
+    let mut reachable = collect_reachable(&repo, &odb, &objects_dir, &args.heads)
         .context("failed to collect reachable objects")?;
 
-    // 2. Enumerate all loose objects.
+    // 2. Enumerate all loose objects and treat recent loose objects as reachability roots.
     let loose = scan_loose_objects(&objects_dir)?;
+    if let ExpirePolicy::OlderThan(threshold) = expire_policy {
+        add_recent_loose_reachable(&odb, &loose, threshold, &mut reachable);
+    }
+
+    prune_stale_temporary_packs(&objects_dir, expire_policy, args.dry_run)?;
 
     // 3. Prune unreachable loose objects that are old enough.
     let mut pruned = 0usize;
@@ -190,21 +207,14 @@ enum ExpirePolicy {
 /// - `"never"` → do not prune unreachable loose objects
 fn parse_expire_time(expire: Option<&str>) -> Result<ExpirePolicy> {
     match expire {
-        None => {
-            let two_weeks = Duration::from_secs(14 * 24 * 60 * 60);
-            Ok(ExpirePolicy::OlderThan(
-                SystemTime::now()
-                    .checked_sub(two_weeks)
-                    .unwrap_or(SystemTime::UNIX_EPOCH),
-            ))
-        }
+        None => Ok(ExpirePolicy::All),
         Some("now") | Some("all") => Ok(ExpirePolicy::All),
         Some(s) if s.eq_ignore_ascii_case("never") => Ok(ExpirePolicy::Never),
         Some(s) => {
             if let Some(threshold) = parse_relative_time(s) {
                 Ok(ExpirePolicy::OlderThan(threshold))
             } else {
-                anyhow::bail!("unsupported --expire value: {s:?}");
+                anyhow::bail!("malformed expiration date: {s}");
             }
         }
     }
@@ -246,6 +256,7 @@ fn collect_reachable(
     repo: &Repository,
     odb: &Odb,
     _objects_dir: &Path,
+    extra_heads: &[String],
 ) -> Result<HashSet<ObjectId>> {
     let mut reachable = HashSet::new();
     let mut queue: VecDeque<ObjectId> = VecDeque::new();
@@ -260,6 +271,16 @@ fn collect_reachable(
         for (_, oid) in all_refs {
             queue.push_back(oid);
         }
+    }
+
+    for head in extra_heads {
+        let oid = if let Ok(oid) = ObjectId::from_hex(head) {
+            oid
+        } else {
+            grit_lib::rev_parse::resolve_revision(repo, head)
+                .map_err(|_| anyhow::anyhow!("fatal: bad revision '{head}'"))?
+        };
+        queue.push_back(oid);
     }
 
     // Seed from reflogs unless gc is doing an aggressive `--prune=now` pass after reflog expiry.
@@ -335,6 +356,85 @@ fn collect_reachable(
     }
 
     Ok(reachable)
+}
+
+fn add_recent_loose_reachable(
+    odb: &Odb,
+    loose: &[(ObjectId, std::path::PathBuf)],
+    threshold: SystemTime,
+    reachable: &mut HashSet<ObjectId>,
+) {
+    let mut queue = VecDeque::new();
+    for (oid, path) in loose {
+        let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if mtime >= threshold {
+            queue.push_back(*oid);
+        }
+    }
+
+    while let Some(oid) = queue.pop_front() {
+        if !reachable.insert(oid) {
+            continue;
+        }
+        let Ok(obj) = odb.read(&oid) else {
+            continue;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                if let Ok(commit) = parse_commit(&obj.data) {
+                    queue.push_back(commit.tree);
+                    queue.extend(commit.parents);
+                }
+            }
+            ObjectKind::Tree => {
+                if let Ok(entries) = parse_tree(&obj.data) {
+                    queue.extend(entries.into_iter().map(|entry| entry.oid));
+                }
+            }
+            ObjectKind::Tag => {
+                if let Ok(tag) = parse_tag(&obj.data) {
+                    queue.push_back(tag.object);
+                }
+            }
+            ObjectKind::Blob => {}
+        }
+    }
+}
+
+fn prune_stale_temporary_packs(
+    objects_dir: &Path,
+    expire_policy: ExpirePolicy,
+    dry_run: bool,
+) -> Result<()> {
+    let rd = match fs::read_dir(objects_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("tmp_") || !name.ends_with(".pack") {
+            continue;
+        }
+        let expired = match expire_policy {
+            ExpirePolicy::Never => false,
+            ExpirePolicy::All => true,
+            ExpirePolicy::OlderThan(threshold) => fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|mtime| mtime < threshold)
+                .unwrap_or(true),
+        };
+        if expired && !dry_run {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
 }
 
 /// Push the object id from a single-line file under `.git/` if present and valid hex.

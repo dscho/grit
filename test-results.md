@@ -2206,3 +2206,9 @@ Updated: 2026-06-01
 
 - Focus harness: `./scripts/run-tests.sh t5304-prune-packed.sh --verbose` passes 20/20 after wrapping cd-using test bodies so cwd state does not leak between cases.
 - No Rust code changed for this fixture repair.
+
+## 2026-06-04 — t5304-prune partial
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 17/32 after direct-prune expiration, extra-head, stale temporary pack, and recent-object reachability fixes.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
