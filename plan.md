@@ -151,6 +151,11 @@
   - Completed: `t3415-rebase-autosquash.sh` (28/28) after final fixup-chain detection, nested
     autosquash OID target handling, interactive empty-pick preservation, and squash/fixup template
     cleanup now match Git's autosquash behavior.
+  - Completed: `t3423-rebase-reword.sh` (3/3) after rerunning with the current reword editor
+    handling; no additional code changes were needed.
+  - Completed: `t3429-rebase-edit-todo.sh` (7/7) after rebase now re-reads todo edits made by
+    successful `exec` and editor-driven `--edit-todo` commands before trimming the completed
+    command.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ---

@@ -594,7 +594,7 @@ t3401-rebase-and-am-rename	t3	yes	10	10	0	true	ok	0
 t3401-rebase-basic	t3	yes	32	32	0	true	ok	0
 t3402-rebase-merge	t3	yes	13	13	0	true	ok	0
 t3403-rebase-skip	t3	yes	20	20	0	true	ok	0
-t3404-rebase-interactive	t3	yes	132	80	52	false	ok	0
+t3404-rebase-interactive	t3	yes	132	72	60	false	ok	0
 t3405-rebase-malformed	t3	yes	5	5	0	true	ok	0
 t3406-rebase-message	t3	yes	32	32	0	true	ok	0
 t3407-rebase-abort	t3	yes	17	17	0	true	ok	0
@@ -616,7 +616,7 @@ t3425-rebase-topology-merges	t3	yes	13	1	12	false	ok	0
 t3426-rebase-submodule	t3	yes	29	11	18	false	ok	0
 t3427-rebase-subtree	t3	yes	3	1	2	false	ok	0
 t3428-rebase-signoff	t3	yes	7	1	6	false	ok	0
-t3429-rebase-edit-todo	t3	yes	7	5	2	false	ok	0
+t3429-rebase-edit-todo	t3	yes	7	7	0	true	ok	0
 t3430-rebase-merges	t3	yes	34	2	32	false	ok	0
 t3431-rebase-fork-point	t3	yes	26	24	2	false	ok	0
 t3432-rebase-fast-forward	t3	yes	219	201	18	false	ok	0

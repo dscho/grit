@@ -290,6 +290,21 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t3423-rebase-reword
+
+- Focus harness: `./scripts/run-tests.sh t3423-rebase-reword.sh --verbose` passes 3/3 with the
+  current reword editor handling.
+
+## 2026-06-04 — t3429-rebase-edit-todo
+
+- Focus harness: `./scripts/run-tests.sh t3429-rebase-edit-todo.sh --verbose` passes 7/7 after
+  rebase started re-reading todo edits after successful exec/editor steps and root reword commits
+  stopped recording a synthetic zero parent.
+- Adjacent verification: `./scripts/run-tests.sh t3429-rebase-edit-todo.sh
+  t3412-rebase-root.sh t3423-rebase-reword.sh --verbose` keeps adjacent root/reword files green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing

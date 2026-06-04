@@ -5544,11 +5544,28 @@ fn replay_remaining(
                                 }
                             }
 
-                            let remaining: Vec<&str> = todo[i + 1..].to_vec();
-                            write_rebase_todo_file(repo, rb_dir, &(remaining.join("\n") + "\n"))?;
+                            let todo_after_step = read_rebase_todo_file(repo, rb_dir).ok();
+                            let remaining_body = if let Some(ref edited_todo) = todo_after_step {
+                                let edited_lines = rebase_todo_actionable_lines(edited_todo);
+                                let remaining = if edited_lines == todo {
+                                    todo[i + 1..].join("\n")
+                                } else if edited_lines.first().copied() == Some(todo[i]) {
+                                    edited_lines[1..].join("\n")
+                                } else {
+                                    edited_lines.join("\n")
+                                };
+                                if remaining.is_empty() {
+                                    String::new()
+                                } else {
+                                    remaining + "\n"
+                                }
+                            } else {
+                                let remaining: Vec<&str> = todo[i + 1..].to_vec();
+                                remaining.join("\n") + "\n"
+                            };
+                            write_rebase_todo_file(repo, rb_dir, &remaining_body)?;
                             fs::write(rb_dir.join("msgnum"), "1")?;
-                            let rem_body = remaining.join("\n") + "\n";
-                            let rem_n = count_rebase_todo_actionable_lines(&rem_body);
+                            let rem_n = count_rebase_todo_actionable_lines(&remaining_body);
                             fs::write(rb_dir.join("end"), rem_n.to_string())?;
                             continue 'rebase_loop;
                         }
@@ -6492,7 +6509,11 @@ fn cherry_pick_for_rebase(
                 );
             let pick_data = CommitData {
                 tree: tree_oid,
-                parents: vec![head_oid],
+                parents: if head_at_empty_tree {
+                    Vec::new()
+                } else {
+                    vec![head_oid]
+                },
                 author: author.clone(),
                 committer: committer.clone(),
                 author_raw,
@@ -6518,7 +6539,11 @@ fn cherry_pick_for_rebase(
             );
         let commit_data = CommitData {
             tree: tree_oid,
-            parents: vec![head_oid],
+            parents: if head_at_empty_tree {
+                Vec::new()
+            } else {
+                vec![head_oid]
+            },
             author,
             committer,
             author_raw,
