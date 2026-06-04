@@ -4906,6 +4906,12 @@ fn diff_cli_requests_unified_patch_alongside_stat(argv: &[String]) -> bool {
             emit = true;
             continue;
         }
+        // `--patch-with-raw` / `--patch-with-stat` request the unified patch alongside the
+        // raw/stat output (git's `--patch-with-*`).
+        if arg == "--patch-with-raw" || arg == "--patch-with-stat" {
+            emit = true;
+            continue;
+        }
         if arg == "--submodule" || arg.starts_with("--submodule=") {
             emit = true;
             continue;
