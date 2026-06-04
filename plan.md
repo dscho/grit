@@ -206,6 +206,27 @@
     validation, and `test-tool delta -p`.
   - Completed `t5313-pack-bounds-checks.sh` (9/9) after adding pack/index object-count
     validation and small-pack deletion-style OFS_DELTA generation.
+  - Completed `t5304-prune-packed.sh` (20/20) after wrapping cd-using synthetic test
+    bodies in subshells so `test_when_finished`/cwd state no longer leaks between cases.
+  - Completed `t5304-prune.sh` (32/32) after direct-prune expiration, extra-head, stale
+    temporary pack, recent loose reachability, malformed `gc.pruneExpire` diagnostics,
+    `gc --no-prune` / `--prune=never` repack handling, count-objects pack-garbage diagnostics,
+    shallow-file pruning, `gc.recentObjectsHook` reachability, gc invalid pack-index cleanup,
+    linked worktree HEAD/index/reflog reachability, missing-value `--expire` wording, gc
+    post-repack prune-packed cleanup, and local-clone loose-object mtime preservation.
+  - Completed `t5329-pack-objects-cruft.sh` (25/25) after adding `test-tool pack-mtimes`,
+    writing `.mtimes` sidecars for cruft packs, fixing fixture cleanup scope, accepting absolute
+    hyphenated prune dates, keeping one-step-off loose commits in direct cruft packs, adding cruft
+    expiration traversal, `--local` alternate dropping, empty cruft pack output, loose
+    materialization for `hash-object -w`, recentObjectsHook cruft roots, `repack --local`
+    forwarding before the pack-objects basename, and stale cruft pack cleanup.
+  - Refreshed adjacent clone-local row: `t5605-clone-local.sh` is back to 23/23 after rejecting
+    explicit nonexistent `.git` clone sources and routing custom `git-upload-pack` templates
+    through grit without the test-only dubious-owner override.
+  - Audited zero-count t5 rows and marked skipped: `t5570-git-daemon`, `t5608-clone-2gb`,
+    `t5700-protocol-v1`, `t5702-protocol-v2`, `t5731-protocol-v2-bundle-uri-git`, and
+    `t5811-proto-disable-git`. These rows are environment-gated or contain no runnable harness
+    assertions in this setup.
   - Completed `t5351-unpack-large-objects.sh` (7/7) after honoring large-object allocation
     limits, preserving existing packs during unpack, and emitting batch fsync counters.
   - Pack/index correctness subgroup complete: `t5300-pack-object`, `t5300-unpack-objects`,
@@ -222,12 +243,12 @@
     `tree:0`.
   - Completed `t5318-pack-objects-revs-exclude.sh` (9/9) after making the synthetic
     fixture explicitly initialize its expected `master` branch and clear old repo metadata.
-  - Partial `t5331-pack-objects-stdin.sh`: improved from 2/16 to 12/16 by adding
-    `--stdin-packs[=mode]` parsing/incompatibility diagnostics, alternate pack lookup, empty
-    output packs, duplicate packfile handling, and loose-object de-duplication. Continue here;
-    remaining failures are tests 8, 11, 12, and 13.
+  - Completed `t5331-pack-objects-stdin.sh` (16/16) after fixing `A..B` rev-stdin range
+    parsing, empty stdin-pack output pack/index creation, `--stdin-packs=follow` reachability
+    through unlisted packs without lazy fetching, promisor-pack exclusion diagnostics, and
+    tree-filtered local clone checkout hydration for the no-backfill trace case.
   - Completed `t5330-no-lazy-fetch-with-commit-graph.sh` (4/4) while investigating adjacent
-    pack selection work; `t5331-pack-objects-stdin.sh` remains the current focus.
+    pack selection work.
   - Opportunistic clone-options quick win: completed `t5606-clone-options.sh` (21/21)
     by fixing duplicate global-config cleanup in the synthetic fixture.
   - Opportunistic transport refresh: verified `t5404-tracking-branches.sh` (7/7); no code changes required.
@@ -282,8 +303,9 @@
     origin fixtures to accept checked-out branch updates safely.
   - Completed `t5312-prune-corruption.sh` (11/11) by making prune/repack fail safe on
     invalid or broken loose refs under ref paranoia.
-  - Partial progress on `t5537-fetch-shallow.sh`: now 14/16 after fixing update-shallow
-    submodule recursion handling; final repack/connectivity shallow cases remain.
+  - Partial progress on `t5537-fetch-shallow.sh`: now 15/16 after fixing update-shallow
+    submodule recursion handling and forwarding `repack -f` to `pack-objects --no-reuse-delta`;
+    final HTTP one-time-script shallow connectivity case remains.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
@@ -765,3 +787,7 @@ Only unskip if pursuing literal 100%:
 - i18n: `t0200`–`t0204` (gettext)
 - tracing: `t0210`–`t0213` (trace2)
 - other: `t0013-sha1dc`, `t0029-core-unsetenvvars`, `t0051-windows-named-pipe`, `t0612-reftable-jgit-compatibility`
+
+  - Partial `t5502-quickfetch.sh`: improved to 6/7 after count-objects alternate/empty-tree handling and repeated `-k` fetch parsing. Continue here; final failure still reports one local pack in the alternate-backed quickfetch case.
+
+  - Completed `t5502-quickfetch.sh` (7/7) after count-objects empty-tree/alternate-pack accounting and repeated `git fetch -k -k` parsing.

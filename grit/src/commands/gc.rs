@@ -17,6 +17,7 @@ use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::hooks::{run_hook, HookResult};
 use grit_lib::objects::ObjectId;
+use grit_lib::pack::read_pack_index;
 use grit_lib::promisor::{promisor_pack_object_ids, repo_treats_promisor_packs};
 use grit_lib::prune_packed::{prune_packed_objects, PrunePackedOptions};
 use grit_lib::reflog::{expire_reflog, expire_reflog_unreachable, list_reflog_refs};
@@ -100,6 +101,7 @@ pub struct Args {
 pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    validate_gc_prune_expire_config(&repo.git_dir, &cfg)?;
 
     let quiet = args.quiet && !args.no_quiet;
 
@@ -190,6 +192,15 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     run_repack_for_gc(&repo, &cfg, quiet_effective, &args)?;
+    prune_packed_objects(
+        &objects_dir,
+        PrunePackedOptions {
+            dry_run: false,
+            quiet: quiet_effective,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    clean_invalid_pack_garbage_for_gc(&objects_dir)?;
 
     if !args.skip_foreground_tasks && !args.auto {
         // Expire reflogs before pruning so unreachable objects that are retained only by old
@@ -225,6 +236,8 @@ pub fn run(args: Args) -> Result<()> {
                 dry_run: false,
                 verbose: false,
                 expire: Some(expire),
+                no_expire: false,
+                heads: Vec::new(),
                 no_progress: quiet_effective,
                 progress: false,
             })
@@ -245,6 +258,32 @@ pub fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+fn clean_invalid_pack_garbage_for_gc(objects_dir: &Path) -> Result<()> {
+    let pack_dir = objects_dir.join("pack");
+    let rd = match fs::read_dir(&pack_dir) {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("idx") {
+            continue;
+        }
+        let pack_path = path.with_extension("pack");
+        if pack_path.is_file() || read_pack_index(&path).is_ok() {
+            continue;
+        }
+        let keep_path = path.with_extension("keep");
+        let _ = fs::remove_file(&path);
+        if keep_path.is_file() {
+            let _ = fs::remove_file(keep_path);
+        }
+    }
+    Ok(())
+}
+
 fn reftable_auto_pack_needed(repo: &Repository) -> bool {
     if !grit_lib::reftable::is_reftable_repo(&repo.git_dir) {
         return false;
@@ -255,6 +294,46 @@ fn reftable_auto_pack_needed(repo: &Repository) -> bool {
 }
 
 /// Expire argument for `git prune` during `gc`: `None` means skip pruning (Git `never`).
+fn validate_gc_prune_expire_config(git_dir: &Path, cfg: &ConfigSet) -> Result<()> {
+    let Some(value) = cfg.get("gc.pruneexpire") else {
+        return Ok(());
+    };
+    if gc_prune_expire_value_is_valid(&value) {
+        return Ok(());
+    }
+    let config_path = git_dir.join("config");
+    let line = fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .position(|line| line.to_ascii_lowercase().contains("pruneexpire"))
+                .map(|idx| idx + 1)
+        })
+        .unwrap_or(1);
+    bail!(
+        "Invalid gc.pruneexpire: '{value}'\nfatal: bad config variable 'gc.pruneexpire' in file '.git/config' at line {line}"
+    )
+}
+
+fn gc_prune_expire_value_is_valid(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(normalized.as_str(), "now" | "all" | "never") || normalized.contains('-') {
+        return true;
+    }
+    let normalized = normalized.replace('.', " ");
+    let parts: Vec<&str> = normalized.split_whitespace().collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    if parts[0].parse::<u64>().is_err() {
+        return false;
+    }
+    matches!(
+        parts[1].trim_end_matches('s'),
+        "second" | "minute" | "hour" | "day" | "week" | "month" | "year"
+    )
+}
+
 fn gc_prune_expire_cli(args: &Args, cfg: &ConfigSet) -> Option<String> {
     let from_flag = match &args.prune {
         Some(Some(s)) if s.is_empty() => cfg.get("gc.pruneexpire").clone(),
@@ -551,7 +630,10 @@ fn run_repack_for_gc(
             .and_then(parse_byte_size_with_suffix);
         let max_cruft = max_cruft_cli.or(max_cruft_cfg);
 
-        if prune_expire == "now" && !(cruft_on && expire_to.is_some()) {
+        if gc_args.no_prune || prune_expire.eq_ignore_ascii_case("never") {
+            // `git gc --no-prune` / `--prune=never` must not loosen and then delete
+            // unreachable objects; leave the repack as the base `repack -d -l` pass.
+        } else if prune_expire == "now" && !(cruft_on && expire_to.is_some()) {
             repack_trace.push("-a".into());
             cmd.arg("-a");
         } else if cruft_on {
@@ -571,12 +653,9 @@ fn run_repack_for_gc(
                 cmd.arg(e);
             }
         } else {
-            // Git `add_repack_all_option`: `--expire-to` is only forwarded with `--cruft`, not with
-            // `-A` (t6500 `gc --no-cruft --expire-to` expects repack argv without `--expire-to`).
-            repack_trace.push("-A".into());
-            let uu = format!("--unpack-unreachable={prune_expire}");
-            repack_trace.push(uu.clone());
-            cmd.arg("-A").arg(uu);
+            // For expiring by date, let the subsequent `prune --expire=<date>` decide which
+            // loose unreachable objects to remove. Running `repack -A --unpack-unreachable` here
+            // in grit would drop too-new loose objects before prune can apply the grace period.
         }
 
         let keep = if gc_args.auto {

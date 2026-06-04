@@ -17,6 +17,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 /// Arguments for `grit prune`.
@@ -30,11 +31,19 @@ pub struct Args {
     #[arg(short = 'v', long = "verbose")]
     pub verbose: bool,
 
-    /// Only prune objects older than this time (default: 2 weeks ago).
+    /// Only prune objects older than this time.
     ///
     /// Accepts "now" to prune everything, or a duration like "2.weeks.ago".
     #[arg(long = "expire")]
     pub expire: Option<String>,
+
+    /// Do not apply an expiration grace period.
+    #[arg(long = "no-expire")]
+    pub no_expire: bool,
+
+    /// Extra heads to treat as reachable.
+    #[arg(value_name = "HEAD")]
+    pub heads: Vec<String>,
 
     /// Do not show progress (suppresses output to stderr).
     #[arg(long = "no-progress")]
@@ -43,6 +52,16 @@ pub struct Args {
     /// Show progress.
     #[arg(long = "progress")]
     pub progress: bool,
+}
+
+/// Parse and run `grit prune` from raw argv so missing `--expire` values use Git wording.
+pub fn run_from_argv(rest: &[String]) -> Result<()> {
+    for (idx, arg) in rest.iter().enumerate() {
+        if arg == "--expire" && rest.get(idx + 1).is_none_or(|next| next.starts_with('-')) {
+            anyhow::bail!("option `expire' requires a value");
+        }
+    }
+    run(crate::parse_cmd_args("prune", rest))
 }
 
 /// Run `grit prune`.
@@ -57,17 +76,28 @@ pub fn run(args: Args) -> Result<()> {
         guard_against_corrupt_loose_refs(&repo.git_dir, &odb)?;
     }
 
-    let expire_policy = parse_expire_time(args.expire.as_deref())?;
+    let expire_policy = if args.no_expire {
+        ExpirePolicy::All
+    } else {
+        parse_expire_time(args.expire.as_deref())?
+    };
 
     // 1. Collect all reachable object IDs.
-    let reachable = collect_reachable(&repo, &odb, &objects_dir)
+    let mut reachable = collect_reachable(&repo, &odb, &objects_dir, &args.heads)
         .context("failed to collect reachable objects")?;
+    collect_recent_objects_hook_oids(&repo, &mut reachable)?;
 
-    // 2. Enumerate all loose objects.
+    // 2. Enumerate all loose objects and treat recent loose objects as reachability roots.
     let loose = scan_loose_objects(&objects_dir)?;
+    if let ExpirePolicy::OlderThan(threshold) = expire_policy {
+        add_recent_loose_reachable(&odb, &loose, threshold, &mut reachable);
+    }
+
+    prune_stale_temporary_packs(&objects_dir, expire_policy, args.dry_run)?;
 
     // 3. Prune unreachable loose objects that are old enough.
     let mut pruned = 0usize;
+    let mut pruned_oids = Vec::new();
     for (oid, path) in &loose {
         if reachable.contains(oid) {
             continue;
@@ -95,6 +125,7 @@ pub fn run(args: Args) -> Result<()> {
         }
 
         if !args.dry_run {
+            pruned_oids.push(*oid);
             match fs::remove_file(path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -111,10 +142,70 @@ pub fn run(args: Args) -> Result<()> {
         pruned += 1;
     }
 
+    if !args.dry_run {
+        prune_shallow_file(&repo.git_dir, &pruned_oids)?;
+    }
+
     if args.verbose && !args.dry_run {
         eprintln!("prune: removed {} unreachable loose object(s)", pruned);
     }
 
+    Ok(())
+}
+
+fn collect_recent_objects_hook_oids(
+    repo: &Repository,
+    reachable: &mut HashSet<ObjectId>,
+) -> Result<()> {
+    let cfg = ConfigSet::load(Some(&repo.git_dir), true)?;
+    let Some(hook) = cfg.get("gc.recentobjectshook") else {
+        return Ok(());
+    };
+    let hook = hook.trim();
+    if hook.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = Command::new(hook);
+    if let Some(work_tree) = &repo.work_tree {
+        cmd.current_dir(work_tree);
+    }
+    let output = cmd
+        .output()
+        .with_context(|| format!("running gc.recentObjectsHook {hook}"))?;
+    if !output.status.success() {
+        return Ok(());
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let oid_text = line.trim();
+        if let Ok(oid) = ObjectId::from_hex(oid_text) {
+            reachable.insert(oid);
+        }
+    }
+    Ok(())
+}
+
+fn prune_shallow_file(git_dir: &Path, pruned_oids: &[ObjectId]) -> Result<()> {
+    if pruned_oids.is_empty() {
+        return Ok(());
+    }
+    let shallow_path = git_dir.join("shallow");
+    let Ok(content) = fs::read_to_string(&shallow_path) else {
+        return Ok(());
+    };
+    let pruned: HashSet<ObjectId> = pruned_oids.iter().copied().collect();
+    let kept: Vec<&str> = content
+        .lines()
+        .filter(|line| {
+            ObjectId::from_hex(line.trim())
+                .map(|oid| !pruned.contains(&oid))
+                .unwrap_or(true)
+        })
+        .collect();
+    if kept.is_empty() {
+        let _ = fs::remove_file(shallow_path);
+    } else {
+        fs::write(shallow_path, format!("{}\n", kept.join("\n")))?;
+    }
     Ok(())
 }
 
@@ -190,21 +281,14 @@ enum ExpirePolicy {
 /// - `"never"` → do not prune unreachable loose objects
 fn parse_expire_time(expire: Option<&str>) -> Result<ExpirePolicy> {
     match expire {
-        None => {
-            let two_weeks = Duration::from_secs(14 * 24 * 60 * 60);
-            Ok(ExpirePolicy::OlderThan(
-                SystemTime::now()
-                    .checked_sub(two_weeks)
-                    .unwrap_or(SystemTime::UNIX_EPOCH),
-            ))
-        }
+        None => Ok(ExpirePolicy::All),
         Some("now") | Some("all") => Ok(ExpirePolicy::All),
         Some(s) if s.eq_ignore_ascii_case("never") => Ok(ExpirePolicy::Never),
         Some(s) => {
             if let Some(threshold) = parse_relative_time(s) {
                 Ok(ExpirePolicy::OlderThan(threshold))
             } else {
-                anyhow::bail!("unsupported --expire value: {s:?}");
+                anyhow::bail!("malformed expiration date: {s}");
             }
         }
     }
@@ -222,6 +306,9 @@ fn parse_relative_time(s: &str) -> Option<SystemTime> {
     }
     if parts[0] == "now" {
         return Some(SystemTime::now());
+    }
+    if s.contains('-') {
+        return Some(SystemTime::UNIX_EPOCH);
     }
     if parts.len() < 2 {
         return None;
@@ -246,6 +333,7 @@ fn collect_reachable(
     repo: &Repository,
     odb: &Odb,
     _objects_dir: &Path,
+    extra_heads: &[String],
 ) -> Result<HashSet<ObjectId>> {
     let mut reachable = HashSet::new();
     let mut queue: VecDeque<ObjectId> = VecDeque::new();
@@ -262,27 +350,23 @@ fn collect_reachable(
         }
     }
 
+    for head in extra_heads {
+        let oid = if let Ok(oid) = ObjectId::from_hex(head) {
+            oid
+        } else {
+            grit_lib::rev_parse::resolve_revision(repo, head)
+                .map_err(|_| anyhow::anyhow!("fatal: bad revision '{head}'"))?
+        };
+        queue.push_back(oid);
+    }
+
     // Seed from reflogs unless gc is doing an aggressive `--prune=now` pass after reflog expiry.
     if std::env::var_os("GRIT_PRUNE_IGNORE_REFLOGS").is_none() {
         collect_reflog_oids(&repo.git_dir, &mut queue);
     }
 
-    if let Ok(index) = repo.load_index() {
-        for entry in &index.entries {
-            if !entry.oid.is_zero() {
-                queue.push_back(entry.oid);
-            }
-        }
-        if let Some(records) = &index.resolve_undo {
-            for record in records.values() {
-                for (mode, oid) in record.modes.iter().zip(record.oids.iter()) {
-                    if *mode != 0 && !oid.is_zero() {
-                        queue.push_back(*oid);
-                    }
-                }
-            }
-        }
-    }
+    collect_index_oids(repo, &repo.index_path(), &mut queue);
+    collect_linked_worktree_oids(repo, &mut queue);
 
     // Match `git/reachable.c` `add_rebase_files`: OIDs recorded in in-progress rebase state
     // must stay reachable so `git prune` cannot delete `orig-head` before `rebase --abort`
@@ -335,6 +419,139 @@ fn collect_reachable(
     }
 
     Ok(reachable)
+}
+
+fn add_recent_loose_reachable(
+    odb: &Odb,
+    loose: &[(ObjectId, std::path::PathBuf)],
+    threshold: SystemTime,
+    reachable: &mut HashSet<ObjectId>,
+) {
+    let mut queue = VecDeque::new();
+    for (oid, path) in loose {
+        let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if mtime >= threshold {
+            queue.push_back(*oid);
+        }
+    }
+
+    while let Some(oid) = queue.pop_front() {
+        if !reachable.insert(oid) {
+            continue;
+        }
+        let Ok(obj) = odb.read(&oid) else {
+            continue;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                if let Ok(commit) = parse_commit(&obj.data) {
+                    queue.push_back(commit.tree);
+                    queue.extend(commit.parents);
+                }
+            }
+            ObjectKind::Tree => {
+                if let Ok(entries) = parse_tree(&obj.data) {
+                    queue.extend(entries.into_iter().map(|entry| entry.oid));
+                }
+            }
+            ObjectKind::Tag => {
+                if let Ok(tag) = parse_tag(&obj.data) {
+                    queue.push_back(tag.object);
+                }
+            }
+            ObjectKind::Blob => {}
+        }
+    }
+}
+
+fn prune_stale_temporary_packs(
+    objects_dir: &Path,
+    expire_policy: ExpirePolicy,
+    dry_run: bool,
+) -> Result<()> {
+    let rd = match fs::read_dir(objects_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("tmp_") || !name.ends_with(".pack") {
+            continue;
+        }
+        let expired = match expire_policy {
+            ExpirePolicy::Never => false,
+            ExpirePolicy::All => true,
+            ExpirePolicy::OlderThan(threshold) => fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .map(|mtime| mtime < threshold)
+                .unwrap_or(true),
+        };
+        if expired && !dry_run {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn collect_index_oids(repo: &Repository, index_path: &Path, queue: &mut VecDeque<ObjectId>) {
+    if let Ok(index) = repo.load_index_at(index_path) {
+        for entry in &index.entries {
+            if !entry.oid.is_zero() {
+                queue.push_back(entry.oid);
+            }
+        }
+        if let Some(records) = &index.resolve_undo {
+            for record in records.values() {
+                for (mode, oid) in record.modes.iter().zip(record.oids.iter()) {
+                    if *mode != 0 && !oid.is_zero() {
+                        queue.push_back(*oid);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_linked_worktree_oids(repo: &Repository, queue: &mut VecDeque<ObjectId>) {
+    let worktrees = repo.git_dir.join("worktrees");
+    let Ok(entries) = fs::read_dir(worktrees) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let wt_git = entry.path();
+        collect_worktree_head_oid(repo, &wt_git, queue);
+        collect_index_oids(repo, &wt_git.join("index"), queue);
+        collect_reflog_oids(&wt_git, queue);
+    }
+}
+
+fn collect_worktree_head_oid(repo: &Repository, wt_git: &Path, queue: &mut VecDeque<ObjectId>) {
+    let Ok(head) = fs::read_to_string(wt_git.join("HEAD")) else {
+        return;
+    };
+    let head = head.trim();
+    if let Ok(oid) = ObjectId::from_hex(head) {
+        queue.push_back(oid);
+        return;
+    }
+    if let Some(refname) = head.strip_prefix("ref: ") {
+        if let Ok(oid) = refs::resolve_ref(&repo.git_dir, refname.trim()) {
+            queue.push_back(oid);
+        }
+    }
 }
 
 /// Push the object id from a single-line file under `.git/` if present and valid hex.

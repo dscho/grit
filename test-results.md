@@ -3057,3 +3057,115 @@ Updated: 2026-06-01
 - t6416 baseline refresh: after the completed merge D/F fixes, `./scripts/run-tests.sh
   t6416-recursive-corner-cases.sh --verbose` now reports 26/40 passing with 11 failing and 3
   expected failures, refreshing `data/test-files.csv` plus dashboards.
+
+## 2026-06-04 — t5331-pack-objects-stdin
+
+- Focus harness: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh --verbose` passes 16/16 after completing stdin-pack empty output, follow reachability, promisor exclusion, and no-backfill clone coverage.
+- Related verification: `./scripts/run-tests.sh t5300-pack-object.sh t5317-pack-objects-filter-objects.sh t5330-no-lazy-fetch-with-commit-graph.sh t5616-partial-clone.sh --verbose` passes 63/63, 33/33, 4/4, and 47/47 respectively.
+- Quality gates: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed; pre-existing warnings remain in unrelated files.
+
+## 2026-06-04 — t5304-prune-packed
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune-packed.sh --verbose` passes 20/20 after wrapping cd-using test bodies so cwd state does not leak between cases.
+- No Rust code changed for this fixture repair.
+
+## 2026-06-04 — t5304-prune partial
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 17/32 after direct-prune expiration, extra-head, stale temporary pack, and recent-object reachability fixes.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune gc-expire progress
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 20/32 after malformed `gc.pruneExpire` diagnostics and no-prune/never repack handling.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune pack-garbage progress
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 21/32 after `count-objects -v` pack-garbage diagnostics were aligned with Git.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune shallow/recent hook progress
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 23/32 after shallow-file pruning and `gc.recentObjectsHook` reachability support.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune gc garbage cleanup progress
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 24/32 after `gc` learned to clean invalid orphan pack indexes and sidecar keeps.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune worktree reachability progress
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 27/32 after linked worktree HEAD/index/reflog reachability roots were added.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune expire-option progress
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh --verbose` improved to 28/32 after missing-value `--expire` diagnostics were aligned.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 20/20 and 11/11.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5304-prune complete
+
+- Focus harness: `./scripts/run-tests.sh t5304-prune.sh t5605-clone-local.sh --verbose` passes 32/32 and 23/23 after gc/local-clone mtime and upload-pack-source fixes.
+- Related verification: `./scripts/run-tests.sh t5304-prune-packed.sh t5312-prune-corruption.sh t5606-clone-options.sh --verbose` passes 20/20, 11/11, and 21/21.
+- Quality gates: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+
+## 2026-06-04 — t5329-pack-objects-cruft partial
+
+- Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` improved to 14/25 after adding `test-tool pack-mtimes`, writing `.mtimes` sidecars for cruft packs, and fixing fixture cleanup scope.
+- Related verification: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh t5304-prune.sh --verbose` passes 16/16 and 32/32.
+- Quality gates: `cargo build --release -p grit-cli` and `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5329-pack-objects-cruft date progress
+
+- Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` improved to 15/25 after accepting absolute hyphenated prune dates such as `01-01-1980`.
+- Related verification: `./scripts/run-tests.sh t5304-prune.sh t5331-pack-objects-stdin.sh --verbose` passes 32/32 and 16/16.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5329-pack-objects-cruft loose-commit progress
+
+- Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` improved to 19/25 after one-step-off loose commits stopped being filtered from direct cruft packs.
+- Related verification: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh t5304-prune.sh --verbose` passes 16/16 and 32/32.
+- Quality gates: `cargo fmt`, `cargo build --release -p grit-cli`, `cargo check -p grit-cli`, and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+
+## 2026-06-04 — t5329-pack-objects-cruft expiration/recent progress
+
+- Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` improved to 23/25 after cruft expiration traversal, `--local`, empty cruft output, `hash-object -w` freshening, and recent-objects hook handling.
+- Related verification: `./scripts/run-tests.sh t5304-prune.sh t5331-pack-objects-stdin.sh t5605-clone-local.sh --verbose` passes 32/32, 16/16, and 23/23.
+- Quality gates: `cargo check -p grit-cli` and `cargo test -p grit-lib --lib` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5329-pack-objects-cruft complete
+
+- Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` passes 25/25 after `repack --local` forwarding and stale cruft pack cleanup were fixed.
+- Related verification: `./scripts/run-tests.sh t5304-prune.sh t5331-pack-objects-stdin.sh t5605-clone-local.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 32/32, 16/16, 23/23, 20/20, and 11/11.
+- Quality gates: `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+
+## 2026-06-04 — t5 zero-count row audit
+
+- Marked six zero-count t5 rows as skipped after audit: `t5570-git-daemon`, `t5608-clone-2gb`, `t5700-protocol-v1`, `t5702-protocol-v2`, `t5731-protocol-v2-bundle-uri-git`, and `t5811-proto-disable-git`.
+- Regenerated dashboards with `python3 scripts/generate-dashboard-from-test-files.py`; no Rust code changed.
+
+## 2026-06-04 — t5502-quickfetch partial
+
+- Focus harness: `./scripts/run-tests.sh t5502-quickfetch.sh --verbose` improved to 6/7 after count-objects alternate/empty-tree handling and repeated `-k` fetch parsing.
+- Related verification: `./scripts/run-tests.sh t5304-prune.sh t5300-unpack-objects.sh t5503-tagfollow.sh --verbose` passes 32/32, 23/23, and 12/12.
+- Quality gates: `cargo check -p grit-cli` and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+
+## 2026-06-04 — t5502-quickfetch complete
+
+- Focus harness: `./scripts/run-tests.sh t5502-quickfetch.sh --verbose` passes 7/7 after count-objects empty-tree/alternate-pack accounting and repeated fetch `-k` handling.
+- Related verification: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh t5331-pack-objects-stdin.sh t5304-prune.sh t5300-unpack-objects.sh t5503-tagfollow.sh --verbose` passes 25/25, 16/16, 32/32, 23/23, and 12/12.
+- Quality gates: `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+
+## 2026-06-04 — t5537-fetch-shallow progress
+
+- Focus harness: `./scripts/run-tests.sh t5537-fetch-shallow.sh --verbose` improved to 15/16 after `repack -f` started forwarding `--no-reuse-delta` to `pack-objects`.
+- Related verification: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh t5304-prune.sh --verbose` passes 25/25 and 32/32.
+- Quality gates: `cargo check -p grit-cli` and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
