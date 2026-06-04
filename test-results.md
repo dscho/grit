@@ -1689,3 +1689,6 @@ Updated: 2026-06-01
   `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and
   `cargo clippy --fix --allow-dirty`; the existing warning backlog remains and unrelated
   auto-fixes were reverted.
+- t6416 baseline refresh: after the completed merge D/F fixes, `./scripts/run-tests.sh
+  t6416-recursive-corner-cases.sh --verbose` now reports 26/40 passing with 11 failing and 3
+  expected failures, refreshing `data/test-files.csv` plus dashboards.
