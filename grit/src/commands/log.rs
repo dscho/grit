@@ -2322,6 +2322,15 @@ fn extract_log_cli_revision_specs(
                     Err(err) => return Err(err.into()),
                 },
             }
+        } else if !after_end_of_options
+            && !has_dashdash
+            && (rev == ".." || rev == "...")
+            && cwd_relative_path_exists(repo, rev)
+        {
+            // A bare `..` / `...` is the empty range `HEAD..HEAD`, but Git's
+            // setup_revisions prefers an existing path of that name (e.g. `..`
+            // naming the parent directory from a subdirectory).
+            implied_pathspecs.push(rev.clone());
         } else {
             match resolve_revision_as_commit(repo, rev) {
                 Ok(_) => {
@@ -2372,7 +2381,6 @@ fn extract_log_cli_revision_specs(
     if !implied_pathspecs.is_empty() {
         validate_pathspec_scope(repo, &implied_pathspecs)?;
     }
-
     Ok((revision_specs, implied_pathspecs))
 }
 
@@ -10654,6 +10662,21 @@ fn resolve_revision_as_commit_after_precompose(repo: &Repository, rev: &str) -> 
 /// Whether `token` names an existing path in the worktree or the index. Git's `verify_filename`
 /// uses this to decide that a token which fails to resolve as a revision is actually a pathspec
 /// (e.g. `git log ichi` where `ichi` is a tracked file, used by `--follow`).
+/// True when `token`, resolved relative to the current directory, names an
+/// existing path inside the work tree (used to prefer a `..`/`.` pathspec over
+/// the empty `HEAD..HEAD` range).
+fn cwd_relative_path_exists(repo: &Repository, token: &str) -> bool {
+    let Some(work_tree) = repo.work_tree.as_deref() else {
+        return false;
+    };
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    let candidate = normalize_path(&cwd.join(token));
+    let work_tree_norm = normalize_path(work_tree);
+    candidate.starts_with(&work_tree_norm) && candidate.exists()
+}
+
 fn token_names_existing_path(repo: &Repository, token: &str) -> bool {
     // Short exclude magic sigils `:^` / `:!` name a path via their suffix; git's verify_filename
     // accepts `:^sub` as a pathspec only when `sub` exists (`:^does-not-exist` is ambiguous).
