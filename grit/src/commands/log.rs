@@ -6903,7 +6903,7 @@ struct CommitInfo {
 type CommitQueueKey = (std::cmp::Reverse<i64>, u64, ObjectId);
 
 /// Decoration category for `git log --decorate` coloring (`color.decorate.*`).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum DecorationKind {
     Branch,
     RemoteBranch,
@@ -10549,16 +10549,15 @@ impl DecorationFilter {
     /// Mirror Git's `ref_filter_match` (log-tree.c). Returns true if `refname`
     /// (a full ref like `refs/heads/foo`) should be decorated.
     fn matches(&self, refname: &str) -> bool {
+        // `--decorate-refs-exclude` (command line) is checked first.
         for pat in &self.exclude {
             if decoration_pattern_matches(pat, refname) {
                 return false;
             }
         }
-        for pat in &self.exclude_config {
-            if decoration_pattern_matches(pat, refname) {
-                return false;
-            }
-        }
+        // An explicit `--decorate-refs` include is decisive and overrides the
+        // config-based `log.excludeDecoration` exclusions (matching Git's
+        // `ref_filter_match` ordering).
         if !self.include.is_empty() {
             for pat in &self.include {
                 if decoration_pattern_matches(pat, refname) {
@@ -10566,6 +10565,12 @@ impl DecorationFilter {
                 }
             }
             return false;
+        }
+        // `log.excludeDecoration` only applies when there is no include list.
+        for pat in &self.exclude_config {
+            if decoration_pattern_matches(pat, refname) {
+                return false;
+            }
         }
         true
     }
@@ -10834,8 +10839,11 @@ fn collect_decorations_inner(
     }
 
     for items in map.values_mut() {
+        // Dedup truly identical decorations (same refname). A tag and a branch
+        // that happen to share a short name (e.g. `tag: reach` and `reach`) are
+        // distinct and both shown, matching Git.
         let mut seen = HashSet::new();
-        items.retain(|it| seen.insert(it.display.clone()));
+        items.retain(|it| seen.insert((it.kind, it.display.clone(), it.refname.clone())));
         if hide_remote_update_noise {
             let branch_names: HashSet<String> = items
                 .iter()
