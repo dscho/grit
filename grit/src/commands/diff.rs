@@ -6792,6 +6792,27 @@ fn ext_diff_side(
             _tmp: None,
         });
     }
+    // Gitlinks: Git's `diff_populate_gitlink` puts `Subproject commit <hex>\n`
+    // into the temp blob rather than any tree/blob content (t4020 #72).
+    if mode == "160000" {
+        let content = format!("Subproject commit {}\n", oid.to_hex());
+        let base = path.rsplit('/').next().filter(|s| !s.is_empty());
+        let dir = tempfile::Builder::new()
+            .prefix("git-blob-")
+            .tempdir()
+            .context("temp dir for external diff")?;
+        let file_path = match base {
+            Some(b) => dir.path().join(b),
+            None => dir.path().join("blob"),
+        };
+        fs::write(&file_path, content.as_bytes())?;
+        return Ok(ExtDiffSide {
+            name: file_path.to_string_lossy().into_owned(),
+            hex: oid.to_hex(),
+            mode: mode.to_owned(),
+            _tmp: Some(dir),
+        });
+    }
     // Git's `reuse_worktree_file`: a regular worktree file is borrowed in place,
     // so the argv carries the real path; the OID is null because the file is not
     // a registered blob. Symlinks (and other non-regular content) still go to a
