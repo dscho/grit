@@ -48,8 +48,7 @@ pub struct ServerCaps {
 impl ServerCaps {
     /// Load advertised capabilities from repository config at `git_dir`.
     pub fn load(git_dir: &Path) -> Self {
-        let version = crate::version_string();
-        let agent = format!("agent=git/{version}-");
+        let agent = serve_agent_capability();
 
         let object_format = read_object_format(git_dir);
 
@@ -126,6 +125,33 @@ impl ServerCaps {
             || cap.starts_with("object-format=")
             || cap.starts_with("server-option=")
             || cap.starts_with("session-id=")
+    }
+}
+
+fn serve_agent_capability() -> String {
+    if let Ok(value) = std::env::var("GIT_USER_AGENT") {
+        if !value.trim().is_empty() {
+            return format!("agent={value}");
+        }
+    }
+    format!(
+        "agent=git/{}-{}",
+        crate::version_string(),
+        serve_agent_platform()
+    )
+}
+
+fn serve_agent_platform() -> &'static str {
+    match std::env::consts::OS {
+        "linux" => "Linux",
+        "macos" => "Darwin",
+        "windows" => "Windows",
+        "freebsd" => "FreeBSD",
+        "openbsd" => "OpenBSD",
+        "netbsd" => "NetBSD",
+        "dragonfly" => "DragonFly",
+        "solaris" => "SunOS",
+        other => other,
     }
 }
 

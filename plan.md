@@ -84,6 +84,8 @@
     by pruning newly copied loose objects already available through remote alternates.
   - Opportunistic atomic-push quick win: completed `t5543-atomic-push.sh` (13/13) by
     emulating local `--receive-pack` post-update failures and preserving literal HEAD reporting.
+  - Opportunistic serve-v2 quick win: completed `t5701-git-serve.sh` (25/25) by
+    advertising Git-compatible agent OS suffixes and honoring `GIT_USER_AGENT`.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

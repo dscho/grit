@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5701-git-serve
+
+- Focus harness: `./scripts/run-tests.sh t5701-git-serve.sh --verbose` passes 25/25 after serve-v2 agent capability suffix handling.
+- Regression harness: `./scripts/run-tests.sh t5701-git-serve.sh t5544-pack-objects-hook.sh t5554-noop-fetch-negotiator.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5543-atomic-push
 
 - Focus harness: `./scripts/run-tests.sh t5543-atomic-push.sh --verbose` passes 13/13 after local `--receive-pack` failure emulation and literal `HEAD` success reporting.
