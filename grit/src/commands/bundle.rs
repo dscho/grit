@@ -8,11 +8,11 @@ use clap::{Args as ClapArgs, Subcommand};
 use grit_lib::git_date::approx::approxidate_careful;
 use grit_lib::git_date::parse::parse_date_basic;
 use sha1::{Digest, Sha1};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 
-use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
+use grit_lib::objects::{parse_commit, parse_tag, ObjectId, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::{rev_list, split_revision_token, RevListOptions};
@@ -142,8 +142,9 @@ fn run_create(args: CreateArgs) -> Result<()> {
     };
     let listed =
         rev_list(&repo, &positive, &negative, &opts).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let prerequisites = listed.boundary_commits;
-    let mut oids = std::collections::BTreeSet::new();
+    let mut prerequisites = listed.boundary_commits;
+    sort_bundle_prerequisites(&repo, &mut prerequisites);
+    let mut oids = BTreeSet::new();
     for c in &listed.commits {
         oids.insert(*c);
     }
@@ -156,10 +157,10 @@ fn run_create(args: CreateArgs) -> Result<()> {
                 continue;
             }
             if let Ok(commit) = parse_commit(&obj.data) {
-                let mut tip_tree_objects = std::collections::BTreeSet::new();
+                let mut tip_tree_objects = BTreeSet::new();
                 walk_reachable(&repo, &commit.tree, &mut tip_tree_objects)?;
 
-                let mut parent_tree_objects = std::collections::BTreeSet::new();
+                let mut parent_tree_objects = BTreeSet::new();
                 for parent in &commit.parents {
                     let Ok(parent_obj) = read_object(&repo, parent) else {
                         continue;
@@ -220,6 +221,17 @@ fn run_create(args: CreateArgs) -> Result<()> {
                     }
                 }
             }
+        }
+        if cutoffs.since.is_some() || cutoffs.until.is_some() {
+            include_prerequisite_commit_roots(&repo, &prerequisites, &mut oids);
+            let included_commits = listed.commits.iter().copied().collect::<BTreeSet<_>>();
+            retain_refs_for_included_commits(
+                &repo,
+                &included_commits,
+                &cutoffs,
+                &mut refs,
+                &mut oids,
+            );
         }
     }
 
@@ -285,7 +297,7 @@ fn write_bundle(
     for oid in prerequisites {
         writeln!(out, "-{} ", oid.to_hex())?;
     }
-    for (refname, oid) in refs {
+    for (refname, oid) in bundle_refs_for_output(refs) {
         writeln!(out, "{} {}", oid.to_hex(), refname)?;
     }
     out.write_all(b"\n")?;
@@ -404,6 +416,118 @@ fn parse_max_count_arg(rev_args: &[String]) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn include_prerequisite_commit_roots(
+    repo: &Repository,
+    prerequisites: &[ObjectId],
+    oids: &mut BTreeSet<ObjectId>,
+) {
+    for oid in prerequisites {
+        let Ok(obj) = read_object(repo, oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        oids.insert(*oid);
+        if let Ok(commit) = parse_commit(&obj.data) {
+            oids.insert(commit.tree);
+        }
+    }
+}
+
+fn retain_refs_for_included_commits(
+    repo: &Repository,
+    included_commits: &BTreeSet<ObjectId>,
+    cutoffs: &BundleRevCutoffs,
+    refs: &mut BTreeMap<String, ObjectId>,
+    oids: &mut BTreeSet<ObjectId>,
+) {
+    refs.retain(|_, oid| ref_peels_to_included_commit(repo, oid, included_commits, cutoffs, oids));
+}
+
+fn ref_peels_to_included_commit(
+    repo: &Repository,
+    oid: &ObjectId,
+    included_commits: &BTreeSet<ObjectId>,
+    cutoffs: &BundleRevCutoffs,
+    oids: &mut BTreeSet<ObjectId>,
+) -> bool {
+    let Ok(obj) = read_object(repo, oid) else {
+        return false;
+    };
+    match obj.kind {
+        ObjectKind::Commit => included_commits.contains(oid),
+        ObjectKind::Tag => {
+            if oids.contains(oid) {
+                return true;
+            }
+            let Ok(tag) = parse_tag(&obj.data) else {
+                return false;
+            };
+            if tag
+                .tagger
+                .as_deref()
+                .is_some_and(|tagger| signature_time_is_in_cutoffs(tagger, cutoffs))
+            {
+                oids.insert(*oid);
+                return true;
+            }
+            if ref_peels_to_included_commit(repo, &tag.object, included_commits, cutoffs, oids) {
+                oids.insert(*oid);
+                true
+            } else {
+                false
+            }
+        }
+        ObjectKind::Tree | ObjectKind::Blob => false,
+    }
+}
+
+fn signature_time_is_in_cutoffs(sig: &str, cutoffs: &BundleRevCutoffs) -> bool {
+    let ts = parse_signature_time(sig);
+    if let Some(until) = cutoffs.until {
+        if ts > until {
+            return false;
+        }
+    }
+    if let Some(since) = cutoffs.since {
+        if ts < since {
+            return false;
+        }
+    }
+    true
+}
+
+fn sort_bundle_prerequisites(repo: &Repository, prerequisites: &mut [ObjectId]) {
+    prerequisites.sort_by(|a, b| {
+        commit_time(repo, b)
+            .cmp(&commit_time(repo, a))
+            .then_with(|| a.to_hex().cmp(&b.to_hex()))
+    });
+}
+
+fn commit_time(repo: &Repository, oid: &ObjectId) -> i64 {
+    let Ok(obj) = read_object(repo, oid) else {
+        return 0;
+    };
+    if obj.kind != ObjectKind::Commit {
+        return 0;
+    }
+    let Ok(commit) = parse_commit(&obj.data) else {
+        return 0;
+    };
+    parse_signature_time(&commit.committer)
+}
+
+fn parse_signature_time(sig: &str) -> i64 {
+    let parts: Vec<&str> = sig.rsplitn(3, ' ').collect();
+    if parts.len() >= 2 {
+        parts[1].parse::<i64>().unwrap_or(0)
+    } else {
+        0
+    }
 }
 
 fn commit_subject(repo: &Repository, oid: &ObjectId) -> Option<String> {
@@ -672,7 +796,7 @@ fn print_bundle_verify_info(header: &BundleHeader) {
         1 => println!("The bundle contains this ref:"),
         n => println!("The bundle contains these {n} refs:"),
     }
-    for (refname, oid) in &header.refs {
+    for (refname, oid) in bundle_refs_for_output(&header.refs) {
         println!("{} {refname}", oid.to_hex());
     }
     match header.prerequisites.len() {
@@ -698,7 +822,7 @@ fn run_list_heads(args: ListHeadsArgs) -> Result<()> {
     let data = read_bundle_arg(&args.file)?;
     let header = parse_bundle_header(&data)?;
 
-    for (refname, oid) in &header.refs {
+    for (refname, oid) in bundle_refs_for_output(&header.refs) {
         println!("{} {refname}", oid.to_hex());
     }
     Ok(())
@@ -769,6 +893,15 @@ fn bundle_display_name(file: &str) -> &str {
     } else {
         file
     }
+}
+
+fn bundle_refs_for_output(refs: &BTreeMap<String, ObjectId>) -> Vec<(&String, &ObjectId)> {
+    let mut ordered = Vec::with_capacity(refs.len());
+    ordered.extend(refs.iter().filter(|(name, _)| name.as_str() != "HEAD"));
+    if let Some(head) = refs.get_key_value("HEAD") {
+        ordered.push(head);
+    }
+    ordered
 }
 
 /// Parse the bundle header, returning refs/prerequisites and the pack byte offset.

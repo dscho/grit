@@ -2815,3 +2815,11 @@ Updated: 2026-06-01
   `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
   backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
   `cargo test -p grit-lib --lib`, and `git diff --check`.
+- t6020 cutoff bundle focus: `bundle create --since ... --all` now filters advertised refs to the
+  cutoff-included commits and annotated tags, emits `HEAD` after named refs, orders prerequisites by
+  committer time, and includes cutoff prerequisite commit roots so the non-delta pack has Git's
+  fixed thin-pack object count. Focused `./scripts/run-tests.sh t6020-bundle-misc.sh --quiet`
+  improves from 21/37 to 24/37. Ran `cargo fmt`, `cargo check -p grit-cli`, `cargo build
+  --release -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning backlog and failed
+  auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored), `cargo test -p
+  grit-lib --lib`, and `git diff --check`.
