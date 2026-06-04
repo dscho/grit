@@ -85,6 +85,8 @@
   - Completed: `t3303-notes-subtrees.sh` (23/23) after fast-import now concatenates duplicate
     notes that normalize to the same object id across fanout layouts instead of overwriting one
     with the other.
+  - Notes/notes-merge group sweep verified: `t3300`, `t3301`, `t3303`, `t3308`, `t3309`,
+    `t3310`, `t3311`, and `t3321` all pass.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

@@ -1402,3 +1402,10 @@ Updated: 2026-06-01
 - Harness refresh: `./scripts/run-tests.sh t3311-notes-merge-fanout.sh` passed 24/24 with the
   current notes merge and fanout handling fixes.
 - No code changes were required for this fixture.
+
+## 2026-06-03 — notes group sweep
+
+- Group verification: `./scripts/run-tests.sh t3300-funny-names.sh t3301-notes.sh
+  t3303-notes-subtrees.sh t3308-notes-merge.sh t3309-notes-merge-auto-resolve.sh
+  t3310-notes-merge-manual-resolve.sh t3311-notes-merge-fanout.sh t3321-notes-stripspace.sh`
+  passed all covered notes rows.
