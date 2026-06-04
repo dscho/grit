@@ -7022,9 +7022,10 @@ fn do_continue() -> Result<()> {
             } else {
                 hc.message.clone()
             };
-            let raw =
-                commit_message_after_prepare_hook(&repo, git_dir, &tmpl, "message", Some(":"))?;
-            let cleaned = apply_commit_msg_cleanup(&raw, rebase_commit_msg_cleanup(&config));
+            let after_editor =
+                run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
+            let cleaned = cleanup_squash_editor_message(&after_editor, &config);
+            let _ = fs::write(&fixup_path, &cleaned);
             commit_from_merged_index(
                 &repo,
                 git_dir,
@@ -7054,13 +7055,7 @@ fn do_continue() -> Result<()> {
             )?
         } else if todo_cmd == RebaseTodoCmd::Fixup {
             let fixup_path = rb_dir.join("message-fixup");
-            let squash_ctx = read_squash_ctx(&rb_dir);
-            let cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
-                let tmpl = fs::read_to_string(&fixup_path)?;
-                let raw =
-                    commit_message_after_prepare_hook(&repo, git_dir, &tmpl, "message", Some(":"))?;
-                cleanup_squash_editor_message(&raw, &config)
-            } else if fixup_path.exists() {
+            let cleaned = if fixup_path.exists() {
                 let tmpl = fs::read_to_string(&fixup_path)?;
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
