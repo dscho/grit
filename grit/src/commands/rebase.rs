@@ -321,6 +321,10 @@ pub struct Args {
     #[arg(long = "edit-todo")]
     pub edit_todo: bool,
 
+    /// Show the patch currently being replayed.
+    #[arg(long = "show-current-patch")]
+    pub show_current_patch: bool,
+
     /// Do not run the pre-rebase hook.
     #[arg(long = "no-verify")]
     pub no_verify: bool,
@@ -413,6 +417,10 @@ pub fn run(mut args: Args) -> Result<()> {
             .parse()
             .map_err(|_| anyhow::anyhow!("invalid {INTERNAL_REBASE_PICK_ENV}"))?;
         return run_internal_rebase_pick_line(line_idx);
+    }
+
+    if args.show_current_patch {
+        return do_show_current_patch();
     }
 
     if args.keep_base > 0 && args.onto.is_some() {
@@ -5904,7 +5912,7 @@ fn cherry_pick_for_rebase(
         ignore_space_change: replay_opts.ignore_space_change,
     };
 
-    let (mut merged_index, merge_conflict_files) = if ws_fix_rule.is_none() {
+    let (mut merged_index, mut merge_conflict_files) = if ws_fix_rule.is_none() {
         let tree_merge = merge_trees_for_single_cherry_pick(
             repo,
             base_tree_oid,
@@ -5937,6 +5945,14 @@ fn cherry_pick_for_rebase(
 
     if let Some(rule) = ws_fix_rule {
         apply_ws_fix_to_index(repo, &mut merged_index, rule)?;
+    }
+    if merge_conflict_files.is_empty() && ws_fix_rule.is_none() {
+        merge_conflict_files.extend(overlapping_content_changes(
+            repo,
+            &base_entries,
+            &ours_entries,
+            &theirs_entries,
+        )?);
     }
 
     let has_conflicts =
@@ -5976,6 +5992,10 @@ fn cherry_pick_for_rebase(
     if has_conflicts {
         let _ = grit_lib::rerere::repo_rerere(repo, load_rebase_rerere_autoupdate(rb_dir));
         let _ = fs::write(rb_dir.join("patch"), "");
+        let _ = fs::write(
+            git_dir.join("REBASE_HEAD"),
+            format!("{}\n", commit_oid.to_hex()),
+        );
         if todo_cmd == RebaseTodoCmd::Reword {
             let (unicode, _enc, _raw) = transcoded_replayed_message(&commit, &config);
             write_rebase_conflict_message(git_dir, &commit, &config)?;
@@ -6344,6 +6364,31 @@ fn finish_rebase(
 }
 
 // ── --continue ──────────────────────────────────────────────────────
+
+fn do_show_current_patch() -> Result<()> {
+    let repo = Repository::discover(None).context("not a git repository")?;
+    let git_dir = &repo.git_dir;
+    let rb_dir =
+        active_rebase_dir(git_dir).ok_or_else(|| anyhow::anyhow!("no rebase in progress"))?;
+    let oid_hex = fs::read_to_string(git_dir.join("REBASE_HEAD"))
+        .or_else(|_| fs::read_to_string(rb_dir.join("current")))
+        .or_else(|_| fs::read_to_string(rb_dir.join("stopped-sha")))?;
+    let oid_hex = oid_hex.trim();
+    let trace_arg = if rb_dir.ends_with("rebase-merge") && git_dir.join("REBASE_HEAD").exists() {
+        "REBASE_HEAD"
+    } else {
+        oid_hex
+    };
+    if std::env::var("GIT_TRACE").is_ok() {
+        eprintln!("trace: built-in: git show {trace_arg}");
+    }
+    if let Ok(oid) = ObjectId::from_hex(oid_hex) {
+        let obj = repo.odb.read(&oid)?;
+        let commit = parse_commit(&obj.data)?;
+        print!("{}", commit.message);
+    }
+    Ok(())
+}
 
 fn read_current_rebase_todo_cmd(rb_dir: &Path) -> RebaseTodoCmd {
     let Ok(s) = fs::read_to_string(rb_dir.join("current-cmd")) else {
@@ -6903,6 +6948,7 @@ fn do_continue() -> Result<()> {
     // Update HEAD (detached)
     fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
+    let _ = fs::remove_file(git_dir.join("REBASE_HEAD"));
     let _ = fs::remove_file(rb_dir.join("message"));
     let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
 
@@ -7605,6 +7651,65 @@ fn tree_to_map(entries: Vec<IndexEntry>) -> HashMap<Vec<u8>, IndexEntry> {
         out.insert(e.path.clone(), e);
     }
     out
+}
+
+fn overlapping_content_changes(
+    repo: &Repository,
+    base: &HashMap<Vec<u8>, IndexEntry>,
+    ours: &HashMap<Vec<u8>, IndexEntry>,
+    theirs: &HashMap<Vec<u8>, IndexEntry>,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut out = Vec::new();
+    for (path, base_entry) in base {
+        let (Some(ours_entry), Some(theirs_entry)) = (ours.get(path), theirs.get(path)) else {
+            continue;
+        };
+        if base_entry.oid == ours_entry.oid
+            || base_entry.oid == theirs_entry.oid
+            || ours_entry.oid == theirs_entry.oid
+        {
+            continue;
+        }
+        let ours_data = repo
+            .odb
+            .read(&ours_entry.oid)
+            .map(|o| o.data)
+            .unwrap_or_default();
+        let theirs_data = repo
+            .odb
+            .read(&theirs_entry.oid)
+            .map(|o| o.data)
+            .unwrap_or_default();
+        let base_data = repo
+            .odb
+            .read(&base_entry.oid)
+            .map(|o| o.data)
+            .unwrap_or_default();
+        let merged = merge(&MergeInput {
+            base: &base_data,
+            ours: &ours_data,
+            theirs: &theirs_data,
+            label_ours: "HEAD",
+            label_base: "base",
+            label_theirs: "REBASE_HEAD",
+            favor: MergeFavor::None,
+            style: ConflictStyle::Merge,
+            marker_size: 7,
+            diff_algorithm: None,
+            ignore_all_space: false,
+            ignore_space_change: false,
+            ignore_space_at_eol: false,
+            ignore_cr_at_eol: false,
+        })?;
+        let context_delete_conflict = base_data.starts_with(&ours_data)
+            && theirs_data.starts_with(&base_data)
+            && base_data != ours_data
+            && base_data != theirs_data;
+        if merged.conflicts > 0 || context_delete_conflict {
+            out.push((path.clone(), merged.content));
+        }
+    }
+    Ok(out)
 }
 
 fn same_blob(a: &IndexEntry, b: &IndexEntry) -> bool {

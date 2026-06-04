@@ -115,13 +115,12 @@
     strategy-option replay, rerere autoupdate persistence, failed-exec rescheduling semantics,
     conflict editor templates, interactive fixup/squash skip message state, and patch cleanup
     before `break`.
-  - Current focus: `t3400-rebase.sh` (39 total, 21 passed) after `:/message` revision search now
-    considers all refs, `git rebase -` resolves the previous-branch shorthand as `@{-1}`, and
-    fork-point based default-upstream rebases skip preemptive no-op detection when upstream was
-    rewound. Cherry-pick/fork-point now filters patch-id duplicates against the upstream tip.
-    Quiet mode, linked-worktree branch occupancy checks, and `--update-refs` worktree comment
-    generation are now handled. Notes rewrite avoids duplicating identical note blobs across
-    repeated rewrites. Current count: 37/39.
+  - Completed: `t3400-rebase.sh` (39/39) after `:/message` revision search now considers all
+    refs, `git rebase -` resolves the previous-branch shorthand as `@{-1}`, fork-point/default
+    upstream replay is fixed, quiet mode is persisted, notes rewrite avoids duplicating identical
+    note blobs, linked-worktree branch occupancy is enforced, `--update-refs` worktree comments use
+    the configured comment character, and `--show-current-patch`/`REBASE_HEAD` conflict handling is
+    implemented.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

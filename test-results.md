@@ -1616,3 +1616,12 @@ Updated: 2026-06-01
   t3301-notes.sh` kept `t3418` and `t3301` green.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-04 — t3400-rebase complete
+
+- Focus harness completed at 39/39 after `--show-current-patch`/`REBASE_HEAD` support,
+  context-overlap rebase conflict detection, and `--update-refs` todo comment parsing were fixed.
+- Related verification: `./scripts/run-tests.sh t3400-rebase.sh t3418-rebase-continue.sh
+  t3422-rebase-incompatible-options.sh t3301-notes.sh` passed all four files.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
