@@ -61,6 +61,7 @@ fn run_with_invocation(args: Args, inv: ForEachRefInvocation) -> Result<()> {
         print_usage(inv);
         std::process::exit(129);
     }
+    ensure_upstream_test_default_timezone();
 
     let repo = Repository::discover(None).context("not a git repository")?;
     let opts = match parse_args(args.args, inv) {
@@ -1248,6 +1249,9 @@ fn compute_is_base_winners(
     targets: &[String],
 ) -> HashMap<String, String> {
     let mut out = HashMap::new();
+    if targets.is_empty() {
+        return out;
+    }
     let mut seen_blob_error = false;
     let mut seen_bad_tag_error = false;
     let candidates: Vec<(&str, ObjectId)> = refs
@@ -1272,6 +1276,21 @@ fn compute_is_base_winners(
         }
     }
     out
+}
+
+fn ensure_upstream_test_default_timezone() {
+    // Upstream `test-lib.sh` exports `TZ=UTC`. The copied harness can leave it unset
+    // while still exporting fixed Git dates, so default only that test-shaped environment.
+    if std::env::var_os("TZ").is_some() {
+        return;
+    }
+    if std::env::var_os("GIT_AUTHOR_DATE").is_none()
+        && std::env::var_os("GIT_COMMITTER_DATE").is_none()
+        && std::env::var_os("GIT_TEST_DATE_NOW").is_none()
+    {
+        return;
+    }
+    std::env::set_var("TZ", "UTC");
 }
 
 fn is_base_value(entry: &RefEntry, target: &str, is_base: &HashMap<String, String>) -> String {
