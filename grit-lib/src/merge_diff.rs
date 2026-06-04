@@ -72,6 +72,7 @@ pub fn combined_merge_parent_blob_paths(
     odb: &Odb,
     merge_path: &str,
     parent_trees: &[ObjectId],
+    result_tree: &ObjectId,
     rename_threshold: u32,
 ) -> Option<Vec<String>> {
     if parent_trees.len() < 2 {
@@ -93,7 +94,11 @@ pub fn combined_merge_parent_blob_paths(
         if !per_parent[i].is_empty() {
             continue;
         }
-        let entries = diff_trees(odb, Some(t), None, merge_path).ok()?;
+        // Run the *full* per-parent diff (not restricted to `merge_path`): the rename source is a
+        // path that was deleted relative to this parent, so it lives outside `merge_path`. Git's
+        // `find_paths_generic` likewise runs a full rename-detecting diff against each parent and
+        // intersects on the result path.
+        let entries = diff_trees(odb, Some(t), Some(result_tree), "").ok()?;
         let with_rn = detect_renames(odb, None, entries, rename_threshold);
         let mut found: Option<String> = None;
         for e in with_rn {
@@ -117,6 +122,71 @@ pub fn combined_merge_parent_blob_paths(
         any_rename = true;
     }
     any_rename.then_some(per_parent)
+}
+
+/// Mode of the blob at `path` in `tree`, or `None` if missing / not a blob.
+fn blob_mode_at_path(odb: &Odb, tree: &ObjectId, path: &str) -> Option<u32> {
+    let mut current = *tree;
+    let parts: Vec<&str> = path.split('/').collect();
+    for (pi, part) in parts.iter().enumerate() {
+        let obj = odb.read(&current).ok()?;
+        let entries = crate::objects::parse_tree(&obj.data).ok()?;
+        let found = entries
+            .iter()
+            .find(|e| std::str::from_utf8(&e.name).ok() == Some(*part))?;
+        if pi + 1 == parts.len() {
+            return Some(found.mode);
+        }
+        if found.mode != 0o040000 {
+            return None;
+        }
+        current = found.oid;
+    }
+    None
+}
+
+/// Enrich a combined diff path with per-parent rename info (`-M`/`-C`).
+///
+/// For each parent that the merge-tree walk classified as `Added` (the result name does not exist
+/// in that parent), run a full rename-detecting diff against that parent. If the result path is the
+/// target of a rename, rewrite that parent side to `Renamed`, fill in the source blob's mode/OID,
+/// and record the source name. This mirrors git's `find_paths_generic`, which intersects per-parent
+/// rename-detecting diffs (producing `RR` with all source names under `--combined-all-paths`).
+pub fn enrich_combined_path_renames(
+    odb: &Odb,
+    path: &mut crate::combined_tree_diff::CombinedDiffPath,
+    parent_trees: &[ObjectId],
+    result_tree: &ObjectId,
+    rename_threshold: u32,
+) {
+    use crate::combined_tree_diff::CombinedParentStatus;
+    if parent_trees.len() != path.parents.len() {
+        return;
+    }
+    let Some(parent_paths) =
+        combined_merge_parent_blob_paths(odb, &path.path, parent_trees, result_tree, rename_threshold)
+    else {
+        return;
+    };
+    for (i, side) in path.parents.iter_mut().enumerate() {
+        if side.status != CombinedParentStatus::Added {
+            continue;
+        }
+        let src = &parent_paths[i];
+        if src.is_empty() || src == &path.path {
+            continue;
+        }
+        let (Some(oid), Some(mode)) = (
+            blob_oid_at_path(odb, &parent_trees[i], src),
+            blob_mode_at_path(odb, &parent_trees[i], src),
+        ) else {
+            continue;
+        };
+        side.status = CombinedParentStatus::Renamed;
+        side.oid = oid;
+        side.mode = mode;
+        side.rename_from = Some(src.clone());
+    }
 }
 
 /// All blob paths in `tree_oid`, depth-first in Git tree entry order (for `diff` / `log`
@@ -634,10 +704,14 @@ fn push_combined_file_headers(
     let b_prefix = "b/";
     if combined_all_paths {
         for (i, p) in parent_paths.iter().enumerate() {
-            if parent_sides
-                .get(i)
-                .is_some_and(|s| s.status == crate::combined_tree_diff::CombinedParentStatus::Added)
-            {
+            // Show `/dev/null` only when this parent genuinely lacks the path (a true add). When a
+            // per-parent rename was detected, `parent_paths[i]` holds the renamed-from path (which
+            // the parent *does* have), so emit that name even though the merge-tree walk classified
+            // the result side as "Added".
+            let added_no_rename = parent_sides.get(i).is_some_and(|s| {
+                s.status == crate::combined_tree_diff::CombinedParentStatus::Added
+            }) && (p.is_empty() || p == merge_path);
+            if added_no_rename {
                 out.push_str("--- /dev/null\n");
             } else {
                 let line = format_diff_path_with_prefix(a_prefix, p, quote_path_fully);
@@ -701,10 +775,19 @@ pub fn format_combined_textconv_patch(
     let mut parent_oids = Vec::with_capacity(parent_trees.len());
     for (i, t) in parent_trees.iter().enumerate() {
         let p = parent_paths[i];
-        let b = read_blob_at_path(odb, t, p)?;
-        let oid = blob_oid_at_path(odb, t, p)?;
-        parent_blobs.push(b);
-        parent_oids.push(oid);
+        // A parent that lacks the path contributes /dev/null (empty content, zero OID): the path
+        // was added relative to that parent. Git still emits the combined patch (`AA`/`new file`),
+        // so do not bail out here.
+        match blob_oid_at_path(odb, t, p) {
+            Some(oid) => {
+                parent_blobs.push(read_blob(odb, &oid));
+                parent_oids.push(oid);
+            }
+            None => {
+                parent_blobs.push(Vec::new());
+                parent_oids.push(ObjectId::zero());
+            }
+        }
     }
     let result_blob = read_blob_at_path(odb, result_tree, path)?;
     let roid = blob_oid_at_path(odb, result_tree, path)?;

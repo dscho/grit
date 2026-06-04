@@ -11,8 +11,9 @@ use clap::Args as ClapArgs;
 use encoding_rs::Encoding;
 use grit_lib::combined_diff_patch::CombinedDiffWsOptions;
 use grit_lib::combined_tree_diff::{
-    combined_diff_paths_filtered, combined_diff_paths_trees, format_combined_raw_line,
-    CombinedDiffPath, CombinedParentStatus, CombinedTreeDiffOptions,
+    combined_diff_paths_filtered, combined_diff_paths_trees, combined_raw_meta,
+    format_combined_raw_line, format_combined_raw_line_all_paths, CombinedDiffPath,
+    CombinedParentStatus, CombinedTreeDiffOptions,
 };
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::delta_encode::{encode_lcp_delta, encode_prefix_extension_delta};
@@ -25,8 +26,8 @@ use grit_lib::merge_base::{
     merge_base_for_diff_two_commits, merge_bases_first_vs_rest, MergeBaseForDiffError,
 };
 use grit_lib::merge_diff::{
-    combined_diff_paths, combined_merge_parent_blob_paths, format_combined_textconv_patch,
-    is_binary_for_diff,
+    combined_diff_paths, combined_merge_parent_blob_paths, enrich_combined_path_renames,
+    format_combined_textconv_patch, is_binary_for_diff,
 };
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
@@ -859,7 +860,7 @@ fn run_multi_tree_combined(
         tree_in_recursive: false,
     };
     let parent_opts: Vec<Option<ObjectId>> = parent_trees.iter().copied().map(Some).collect();
-    let paths = combined_diff_paths_trees(odb, merge_tree, &parent_opts, &walk, None)?;
+    let mut paths = combined_diff_paths_trees(odb, merge_tree, &parent_opts, &walk, None)?;
     let has_diff = !paths.is_empty();
     if opts.quiet || !has_diff {
         return Ok(has_diff);
@@ -880,13 +881,28 @@ fn run_multi_tree_combined(
     };
     let rename_thresh = opts.find_renames.unwrap_or(50);
 
+    if opts.combined_all_paths && opts.find_renames.is_some() {
+        for p in &mut paths {
+            enrich_combined_path_renames(odb, p, parent_trees, merge_tree, rename_thresh);
+        }
+    }
+
     for p in &paths {
         match opts.format {
             OutputFormat::Raw => {
                 if opts.nul_terminated {
-                    write_combined_raw_z(out, None, p, opts.abbrev)?;
+                    write_combined_raw_z(out, None, p, opts.abbrev, opts.combined_all_paths)?;
                 } else {
-                    writeln!(out, "{}", format_combined_raw_line(p, opts.abbrev))?;
+                    writeln!(
+                        out,
+                        "{}",
+                        format_combined_raw_line_all_paths(
+                            p,
+                            opts.abbrev,
+                            opts.combined_all_paths,
+                            quote_fully,
+                        )
+                    )?;
                 }
             }
             OutputFormat::NameOnly | OutputFormat::NameStatus => {
@@ -894,7 +910,13 @@ fn run_multi_tree_combined(
             }
             OutputFormat::Patch => {
                 let parent_blob_paths = if opts.combined_all_paths && opts.find_renames.is_some() {
-                    combined_merge_parent_blob_paths(odb, &p.path, parent_trees, rename_thresh)
+                    combined_merge_parent_blob_paths(
+                        odb,
+                        &p.path,
+                        parent_trees,
+                        merge_tree,
+                        rename_thresh,
+                    )
                 } else {
                     None
                 };
@@ -2004,6 +2026,35 @@ fn print_combined_merge_output(
         .unwrap_or_default()
         .quote_path_fully();
 
+    // With `-M`/`--combined-all-paths`, reclassify per-parent `Added` sides as renames so the raw
+    // line shows `R` and all source names (git's `find_paths_generic`). Work on an owned copy.
+    let enriched_storage: Option<Vec<CombinedDiffPath>> =
+        if opts.combined_all_paths && opts.find_renames.is_some() {
+            let rename_thresh = opts.find_renames.unwrap_or(50);
+            let mut parent_trees = Vec::with_capacity(parent_commits.len());
+            for p in parent_commits {
+                parent_trees.push(commit_tree(odb, p)?);
+            }
+            if parent_trees.len() >= 2 {
+                let mut owned = paths.to_vec();
+                for p in &mut owned {
+                    enrich_combined_path_renames(
+                        odb,
+                        p,
+                        &parent_trees,
+                        merge_tree,
+                        rename_thresh,
+                    );
+                }
+                Some(owned)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let paths: &[CombinedDiffPath] = enriched_storage.as_deref().unwrap_or(paths);
+
     // Git computes `--stat`/`--summary` for a combined diff as an ordinary diff
     // against the FIRST parent (combine-diff.c: `diff_tree_oid(&parents->oid[0],
     // oid, ...)` under STAT_FORMAT_MASK), not from the combined-interesting paths.
@@ -2039,13 +2090,23 @@ fn print_combined_merge_output(
     }
 
     if want_raw {
-        let hex_storage = commit_oid.map(|o| o.to_hex());
-        let commit_hex = hex_storage.as_deref();
+        // The commit-id header (NUL- or newline-terminated) is already emitted by the per-commit
+        // caller, so do not prepend it here.
+        let _ = commit_oid;
         for p in paths {
             if opts.nul_terminated {
-                write_combined_raw_z(out, commit_hex, p, abbrev_len)?;
+                write_combined_raw_z(out, None, p, abbrev_len, opts.combined_all_paths)?;
             } else {
-                writeln!(out, "{}", format_combined_raw_line(p, abbrev_len))?;
+                writeln!(
+                    out,
+                    "{}",
+                    format_combined_raw_line_all_paths(
+                        p,
+                        abbrev_len,
+                        opts.combined_all_paths,
+                        quote_fully,
+                    )
+                )?;
             }
         }
     }
@@ -2076,7 +2137,13 @@ fn print_combined_merge_output(
             }
             for p in paths {
                 let parent_blob_paths = if opts.combined_all_paths && opts.find_renames.is_some() {
-                    combined_merge_parent_blob_paths(odb, &p.path, &parent_trees, rename_thresh)
+                    combined_merge_parent_blob_paths(
+                        odb,
+                        &p.path,
+                        &parent_trees,
+                        merge_tree,
+                        rename_thresh,
+                    )
                 } else {
                     None
                 };
@@ -2112,14 +2179,29 @@ fn write_combined_raw_z(
     commit_hex: Option<&str>,
     p: &CombinedDiffPath,
     abbrev_len: Option<usize>,
+    combined_all_paths: bool,
 ) -> Result<()> {
     if let Some(h) = commit_hex {
         out.write_all(h.as_bytes())?;
         out.write_all(b"\0")?;
     }
-    let line = format_combined_raw_line(p, abbrev_len);
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\0")?;
+    if combined_all_paths {
+        // NUL-separated raw (unquoted) output: metadata, then one source name per parent, then the
+        // merge path. Build the metadata directly (names contain tabs, so we cannot split on `\t`).
+        out.write_all(combined_raw_meta(p, abbrev_len).as_bytes())?;
+        out.write_all(b"\0")?;
+        for side in &p.parents {
+            let name = side.rename_from.as_deref().unwrap_or(&p.path);
+            out.write_all(name.as_bytes())?;
+            out.write_all(b"\0")?;
+        }
+        out.write_all(p.path.as_bytes())?;
+        out.write_all(b"\0")?;
+    } else {
+        let line = format_combined_raw_line(p, abbrev_len);
+        out.write_all(line.as_bytes())?;
+        out.write_all(b"\0")?;
+    }
     Ok(())
 }
 
@@ -2142,6 +2224,7 @@ fn print_combined_paths(
                         CombinedParentStatus::Added => 'A',
                         CombinedParentStatus::Modified => 'M',
                         CombinedParentStatus::Deleted => 'D',
+                        CombinedParentStatus::Renamed => 'R',
                     })
                     .collect();
                 writeln!(out, "{letters}\t{}", p.path)?;
@@ -3251,7 +3334,12 @@ fn write_commit_header(
             writeln!(out)?;
         }
     } else if !opts.no_commit_id {
-        writeln!(out, "{oid}")?;
+        // In `-z` raw mode git NUL-terminates the bare commit-id header instead of using a newline.
+        if opts.nul_terminated && opts.format == OutputFormat::Raw {
+            write!(out, "{oid}\0")?;
+        } else {
+            writeln!(out, "{oid}")?;
+        }
     }
     Ok(false)
 }

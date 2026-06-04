@@ -2779,6 +2779,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         &repo.odb,
                         &p.path,
                         &parent_trees,
+                        &merge_tree,
                         rename_thresh,
                     )
                 } else {
