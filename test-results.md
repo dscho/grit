@@ -2830,3 +2830,9 @@ Updated: 2026-06-01
   grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning backlog and failed auto-fix
   attempts remain; unrelated `filter_process.rs` auto-fix restored), `cargo test -p grit-lib
   --lib`, and `git diff --check`.
+- t6020 all-exclusions tag focus: `bundle create --all` with negative revisions now filters
+  advertised refs to included commit refs and annotated tag refs, and writes the kept tag objects.
+  Focused `./scripts/run-tests.sh t6020-bundle-misc.sh --quiet` improves from 26/37 to 27/37. Ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo build --release -p grit-cli`, `cargo clippy
+  --fix --allow-dirty` (existing warning backlog and failed auto-fix attempts remain; unrelated
+  `filter_process.rs` auto-fix restored), `cargo test -p grit-lib --lib`, and `git diff --check`.

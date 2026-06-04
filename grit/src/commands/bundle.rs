@@ -122,6 +122,7 @@ fn run_create(args: CreateArgs) -> Result<()> {
         bail!("unsupported bundle version {version}");
     }
     let rev_args = collect_create_rev_args(&args)?;
+    let include_all = rev_args.iter().any(|arg| arg == "--all");
 
     let mut refs = collect_refs_for_bundle(&repo, &rev_args, args.ignore_missing)?;
     if refs.is_empty() {
@@ -236,6 +237,11 @@ fn run_create(args: CreateArgs) -> Result<()> {
                 &mut refs,
                 &mut oids,
             );
+        }
+        if include_all && !negative.is_empty() && cutoffs.since.is_none() && cutoffs.until.is_none()
+        {
+            let included_commits = listed.commits.iter().copied().collect::<BTreeSet<_>>();
+            retain_all_refs_after_exclusions(&repo, &included_commits, &mut refs, &mut oids);
         }
     }
 
@@ -449,6 +455,27 @@ fn retain_refs_for_included_commits(
     oids: &mut BTreeSet<ObjectId>,
 ) {
     refs.retain(|_, oid| ref_peels_to_included_commit(repo, oid, included_commits, cutoffs, oids));
+}
+
+fn retain_all_refs_after_exclusions(
+    repo: &Repository,
+    included_commits: &BTreeSet<ObjectId>,
+    refs: &mut BTreeMap<String, ObjectId>,
+    oids: &mut BTreeSet<ObjectId>,
+) {
+    refs.retain(|_, oid| {
+        let Ok(obj) = read_object(repo, oid) else {
+            return false;
+        };
+        match obj.kind {
+            ObjectKind::Commit => included_commits.contains(oid),
+            ObjectKind::Tag => {
+                oids.insert(*oid);
+                true
+            }
+            ObjectKind::Tree | ObjectKind::Blob => oids.contains(oid),
+        }
+    });
 }
 
 fn ref_peels_to_included_commit(
