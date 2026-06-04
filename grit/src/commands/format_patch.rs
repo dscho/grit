@@ -1460,6 +1460,7 @@ fn diffstat_for_patch_entries(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let old_content = String::from_utf8_lossy(&old_raw).into_owned();
@@ -1470,6 +1471,7 @@ fn diffstat_for_patch_entries(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }

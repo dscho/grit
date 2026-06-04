@@ -9157,6 +9157,14 @@ fn write_compact_summary(
     let mut total_del = 0usize;
     for entry in entries {
         if entry.status == DiffStatus::Unmerged {
+            // git lists unmerged paths as ` <name> | Unmerged` (not counted as changed).
+            files.push(FileStatInput {
+                path_display: compact_summary_display_path(entry, quote_path_fully),
+                insertions: 0,
+                deletions: 0,
+                is_binary: false,
+                is_unmerged: true,
+            });
             continue;
         }
         let old_raw = read_content_raw(odb, &entry.old_oid);
@@ -9200,6 +9208,7 @@ fn write_compact_summary(
             insertions: ins,
             deletions: del,
             is_binary: binary,
+            is_unmerged: false,
         });
     }
 
@@ -9353,6 +9362,14 @@ fn write_stat(
     let mut files: Vec<FileStatInput> = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         if entry.status == DiffStatus::Unmerged {
+            // git lists unmerged paths as ` <name> | Unmerged` (not counted).
+            files.push(FileStatInput {
+                path_display: display_paths[i].clone(),
+                insertions: 0,
+                deletions: 0,
+                is_binary: false,
+                is_unmerged: true,
+            });
             continue;
         }
         let old_raw = read_content_raw(odb, &entry.old_oid);
@@ -9377,6 +9394,7 @@ fn write_stat(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let (ins, del) = if mode_only {
@@ -9398,6 +9416,7 @@ fn write_stat(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }

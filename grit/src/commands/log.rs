@@ -11727,6 +11727,7 @@ fn log_print_stat_summary(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let (old_content, new_content) = log_read_blob_pair(odb, entry)?;
@@ -11736,6 +11737,7 @@ fn log_print_stat_summary(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }

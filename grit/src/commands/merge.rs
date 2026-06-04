@@ -10179,6 +10179,7 @@ fn print_diffstat(repo: &Repository, entries: &[DiffEntry], compact: bool) {
             insertions: s.insertions,
             deletions: s.deletions,
             is_binary: s.is_binary,
+            is_unmerged: false,
         })
         .collect();
 
