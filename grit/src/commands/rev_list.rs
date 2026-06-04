@@ -2027,21 +2027,11 @@ fn run_rev_list_reflog_walk(
 }
 
 fn expand_parent_shorthand(repo: &Repository, spec: &str) -> Result<Vec<String>> {
-    if let Some(base) = spec.strip_suffix("^!") {
-        let base_spec = if base.is_empty() { "HEAD" } else { base };
-        let base_oid = grit_lib::rev_parse::resolve_revision(repo, base_spec)
-            .with_context(|| format!("bad revision '{base_spec}'"))?;
-        let object = repo.odb.read(&base_oid)?;
-        let commit = parse_commit(&object.data)?;
-
-        let mut expanded = Vec::with_capacity(commit.parents.len() + 1);
-        expanded.push(base_spec.to_string());
-        for parent in commit.parents {
-            expanded.push(format!("^{}", parent.to_hex()));
-        }
+    if let Some(expanded) =
+        grit_lib::rev_parse::expand_parent_shorthand_rev_parse_lines(repo, spec, false, None)?
+    {
         return Ok(expanded);
     }
-
     Ok(vec![spec.to_string()])
 }
 

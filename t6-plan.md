@@ -53,7 +53,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   fixture request its expected `master` initial branch under the harness.
 - [x] `t6001-rev-list-graft.sh` — 14/14 passing after making path-limited
   parent rewriting and graph ordering honor grafted parents.
-- [ ] `t6101-rev-parse-parents.sh` — 35/38 passing, 3 failing.
+- [x] `t6101-rev-parse-parents.sh` — 38/38 passing after making `rev-list`
+  reuse the shared parent shorthand expansion for `^-` ranges.
 - [ ] `t6010-merge-base.sh` — 10/12 passing, 2 failing.
 - [ ] `t6011-rev-list-with-bad-commit.sh` — 5/6 passing, 1 failing.
 - [ ] `t6013-rev-list-reverse-parents.sh` — 2/3 passing, 1 failing.

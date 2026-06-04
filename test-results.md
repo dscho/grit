@@ -1,3 +1,15 @@
+## 2026-06-04 — t6101-rev-parse-parents
+
+- Focus harness: `./scripts/run-tests.sh t6101-rev-parse-parents.sh --verbose` passes 38/38
+  after `rev-list` reused the shared parent shorthand expansion for `^-` ranges.
+- Regression harness: `./scripts/run-tests.sh t6101-rev-parse-parents.sh t6001-rev-list-graft.sh t6012-rev-list-simplify.sh t6016-rev-list-graph-simplify-history.sh t6111-rev-list-treesame.sh --verbose`
+  passes 38/38, 14/14, 42/42, 12/12, and 65/65.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated fmt/clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
 ## 2026-06-04 — t6001-rev-list-graft
 
 - Focus harness: `./scripts/run-tests.sh t6001-rev-list-graft.sh --verbose` passes 14/14 after
