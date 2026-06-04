@@ -123,6 +123,9 @@
     implemented.
   - Completed: `t3401-rebase-basic.sh` (32/32) after its synthetic cherry-pick/rebase-like
     fixture explicitly requests the `master` initial branch it assumes.
+  - Completed: `t3402-rebase-merge.sh` (13/13) after rebase merge learned strategy-favor replay,
+    orphan `-Xtheirs` replay, context-overlap conflict detection for show-current-patch/reapply
+    cases, and partial-clone base-blob hydration.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

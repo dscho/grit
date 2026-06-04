@@ -5917,6 +5917,12 @@ fn cherry_pick_for_rebase(
     let base_entries = tree_to_map(tree_to_index_entries(repo, &base_tree_oid, "")?);
     let ours_entries = tree_to_map(tree_to_index_entries(repo, &head_tree_oid, "")?);
     let theirs_entries = tree_to_map(tree_to_index_entries(repo, &commit_tree_oid, "")?);
+    for entry in base_entries.values() {
+        if repo.odb.read(&entry.oid).is_err() {
+            let _ =
+                crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object(repo, entry.oid);
+        }
+    }
     if let Some(wt) = repo.work_tree.as_deref() {
         bail_if_df_merge_would_remove_cwd(wt, &base_entries, &ours_entries, &theirs_entries)?;
     }
@@ -5929,25 +5935,39 @@ fn cherry_pick_for_rebase(
     let merge_favor = load_rebase_merge_favor(rb_dir);
 
     let (mut merged_index, mut merge_conflict_files) = if ws_fix_rule.is_none() {
-        let tree_merge = merge_trees_for_single_cherry_pick(
-            repo,
-            base_tree_oid,
-            head_tree_oid,
-            commit_tree_oid,
-            commit_oid,
-            commit
-                .parents
-                .first()
-                .ok_or_else(|| anyhow::anyhow!("cherry-pick of root commit not supported"))?,
-            &head_oid,
-            merge_favor,
-        )?;
-        let cf = tree_merge
-            .conflict_files
-            .into_iter()
-            .map(|(p, c)| (p.into_bytes(), c))
-            .collect::<Vec<_>>();
-        (tree_merge.index, cf)
+        if commit.parents.is_empty() && merge_favor == MergeFavor::Theirs {
+            let mut idx = Index::new();
+            idx.entries = theirs_entries.values().cloned().collect();
+            idx.sort();
+            (idx, Vec::new())
+        } else {
+            let tree_merge = merge_trees_for_single_cherry_pick(
+                repo,
+                base_tree_oid,
+                head_tree_oid,
+                commit_tree_oid,
+                commit_oid,
+                commit
+                    .parents
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("cherry-pick of root commit not supported"))?,
+                &head_oid,
+                merge_favor,
+            )?;
+            if tree_merge.has_conflicts && merge_favor == MergeFavor::Theirs {
+                let mut idx = Index::new();
+                idx.entries = theirs_entries.values().cloned().collect();
+                idx.sort();
+                (idx, Vec::new())
+            } else {
+                let cf = tree_merge
+                    .conflict_files
+                    .into_iter()
+                    .map(|(p, c)| (p.into_bytes(), c))
+                    .collect::<Vec<_>>();
+                (tree_merge.index, cf)
+            }
+        }
     } else {
         let merge_result = three_way_merge_with_content(
             repo,
@@ -5963,7 +5983,7 @@ fn cherry_pick_for_rebase(
     if let Some(rule) = ws_fix_rule {
         apply_ws_fix_to_index(repo, &mut merged_index, rule)?;
     }
-    if merge_conflict_files.is_empty() && ws_fix_rule.is_none() {
+    if merge_conflict_files.is_empty() && ws_fix_rule.is_none() && merge_favor == MergeFavor::None {
         merge_conflict_files.extend(overlapping_content_changes(
             repo,
             &base_entries,
@@ -7718,7 +7738,7 @@ fn overlapping_content_changes(
             ignore_space_at_eol: false,
             ignore_cr_at_eol: false,
         })?;
-        let context_delete_conflict = base_data.starts_with(&ours_data)
+        let context_delete_conflict = !contains_subslice(&ours_data, &base_data)
             && theirs_data.starts_with(&base_data)
             && base_data != ours_data
             && base_data != theirs_data;
@@ -7727,6 +7747,13 @@ fn overlapping_content_changes(
         }
     }
     Ok(out)
+}
+
+fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn same_blob(a: &IndexEntry, b: &IndexEntry) -> bool {
@@ -7904,9 +7931,18 @@ fn content_merge_or_conflict(
         return Ok(());
     }
 
-    let base_obj = repo.odb.read(&base.oid)?;
-    let ours_obj = repo.odb.read(&ours.oid)?;
-    let theirs_obj = repo.odb.read(&theirs.oid)?;
+    let base_obj = repo.odb.read(&base.oid).or_else(|_| {
+        let _ = crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object(repo, base.oid);
+        repo.odb.read(&base.oid)
+    })?;
+    let ours_obj = repo.odb.read(&ours.oid).or_else(|_| {
+        let _ = crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object(repo, ours.oid);
+        repo.odb.read(&ours.oid)
+    })?;
+    let theirs_obj = repo.odb.read(&theirs.oid).or_else(|_| {
+        let _ = crate::commands::promisor_hydrate::try_lazy_fetch_promisor_object(repo, theirs.oid);
+        repo.odb.read(&theirs.oid)
+    })?;
 
     if grit_lib::merge_file::is_binary(&base_obj.data)
         || grit_lib::merge_file::is_binary(&ours_obj.data)
