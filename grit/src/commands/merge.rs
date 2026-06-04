@@ -9980,27 +9980,35 @@ fn apply_directory_file_conflicts(
             }
         }
 
+        let side_renames = if file_is_ours {
+            ours_renames
+        } else {
+            theirs_renames
+        };
+        let opposite_renames = if file_is_ours {
+            theirs_renames
+        } else {
+            ours_renames
+        };
+        let rename_source = side_renames
+            .iter()
+            .find(|(_, dest)| dest.as_slice() == path.as_slice())
+            .map(|(source, _)| source);
+        if let Some(source) = rename_source {
+            if opposite_renames.contains_key(source) && index.get(source, 1).is_none() {
+                if let Some(be) = base.get(source) {
+                    stage_entry(index, be, 1);
+                }
+            }
+        }
         let relocated_base_entry = base.get(&path).or_else(|| {
-            let side_renames = if file_is_ours {
-                ours_renames
-            } else {
-                theirs_renames
-            };
-            let opposite_renames = if file_is_ours {
-                theirs_renames
-            } else {
-                ours_renames
-            };
-            side_renames
-                .iter()
-                .find(|(_, dest)| dest.as_slice() == path.as_slice())
-                .and_then(|(source, _)| {
-                    if opposite_renames.contains_key(source) {
-                        None
-                    } else {
-                        base.get(source)
-                    }
-                })
+            rename_source.and_then(|source| {
+                if opposite_renames.contains_key(source) {
+                    None
+                } else {
+                    base.get(source)
+                }
+            })
         });
 
         if merge_ort_style {
