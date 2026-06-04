@@ -116,7 +116,9 @@
     conflict editor templates, interactive fixup/squash skip message state, and patch cleanup
     before `break`.
   - Current focus: `t3400-rebase.sh` (39 total, 21 passed) after `:/message` revision search now
-    considers all refs and `git rebase -` resolves the previous-branch shorthand as `@{-1}`.
+    considers all refs, `git rebase -` resolves the previous-branch shorthand as `@{-1}`, and
+    fork-point based default-upstream rebases skip preemptive no-op detection when upstream was
+    rewound. Current count: 23/39.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

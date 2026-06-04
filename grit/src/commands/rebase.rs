@@ -3855,8 +3855,7 @@ Use '--' to separate paths from revisions, like this:\n\
     // `rebase --keep-base` with fork-point uses a different upstream OID for the replay list than
     // the branch tip; preemptive fast-forward detection wrongly treats the branch as up-to-date
     // (t3431 `--fork-point --keep-base`).
-    let skip_preemptive_ff_for_keep_base_fork_point =
-        args.keep_base > 0 && upstream_tip_oid != upstream_oid;
+    let skip_preemptive_ff_for_keep_base_fork_point = upstream_tip_oid != upstream_oid;
 
     if allow_preemptive_ff
         && !root_rebase_no_onto
