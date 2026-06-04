@@ -28,8 +28,10 @@ use grit_lib::line_log::{
 };
 use grit_lib::mailmap::{load_mailmap_table, MailmapTable};
 use grit_lib::merge_base::is_ancestor;
+use grit_lib::combined_diff_patch::CombinedDiffWsOptions;
 use grit_lib::merge_diff::{
-    blob_text_for_diff, blob_text_for_diff_with_oid, diff_textconv_active, is_binary_for_diff,
+    blob_text_for_diff, blob_text_for_diff_with_oid, diff_textconv_active,
+    format_combined_textconv_patch, is_binary_for_diff,
 };
 use grit_lib::objects::{parse_commit, parse_tag, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
@@ -11129,6 +11131,7 @@ fn write_commit_diff(
                 patch_context,
                 indent_heuristic,
                 leading_blank,
+                None,
             )?;
         }
         return Ok(());
@@ -11182,6 +11185,16 @@ fn write_commit_diff(
         entries.clone()
     };
 
+    // For combined (`-c`/`--cc`) merge patches, log must render true combined
+    // (`@@@`) hunks rather than a first-parent unified diff. Pass the merge tree
+    // and parent commit OIDs so write_commit_diff_body can build them.
+    let combined_merge_ctx: Option<(ObjectId, Vec<ObjectId>)> =
+        if combined_style && info.parents.len() >= 2 {
+            Some((info.tree, info.parents.clone()))
+        } else {
+            None
+        };
+
     write_commit_diff_body(
         out,
         odb,
@@ -11196,6 +11209,7 @@ fn write_commit_diff(
         patch_context,
         indent_heuristic,
         leading_blank,
+        combined_merge_ctx.as_ref(),
     )?;
 
     Ok(())
@@ -11245,6 +11259,7 @@ fn write_commit_diff_body(
     patch_context: usize,
     indent_heuristic: bool,
     leading_blank: bool,
+    combined_merge_ctx: Option<&(ObjectId, Vec<ObjectId>)>,
 ) -> Result<()> {
     let combined_style = merge_diff_is_combined_style(args, treat_as_merge_for_format, git_dir)?;
     let entries_owned: Vec<DiffEntry> = entries.to_vec();
@@ -11314,7 +11329,11 @@ fn write_commit_diff_body(
     }
 
     if wants_stat {
-        if has_patch {
+        // Combined (`-c`/`--cc`) merge diffs compute the stat from the first parent
+        // and separate it from the message with a blank line, not the `---` marker
+        // that precedes a normal unified patch's diffstat (git diff_tree_combined).
+        let combined_merge_stat = combined_style && combined_merge_ctx.is_some();
+        if has_patch && !combined_merge_stat {
             writeln!(out, "---")?;
         } else {
             writeln!(out)?;
@@ -11354,20 +11373,105 @@ fn write_commit_diff_body(
 
     if show_patch {
         let config = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
-        for entry in list_patch {
-            log_write_patch_entry(
+        if let Some((merge_tree, parent_commits)) = combined_merge_ctx.filter(|_| combined_style) {
+            log_write_combined_patches(
                 out,
                 odb,
                 git_dir,
                 &config,
-                entry,
+                list_patch,
+                merge_tree,
+                parent_commits,
                 args,
                 patch_context,
-                indent_heuristic,
             )?;
+        } else {
+            for entry in list_patch {
+                log_write_patch_entry(
+                    out,
+                    odb,
+                    git_dir,
+                    &config,
+                    entry,
+                    args,
+                    patch_context,
+                    indent_heuristic,
+                )?;
+            }
         }
     }
 
+    Ok(())
+}
+
+/// Render true combined (`@@@`) patches for a `-c`/`--cc` merge commit in `git log`,
+/// mirroring diff-tree's `print_combined_merge_output` patch path.
+#[allow(clippy::too_many_arguments)]
+fn log_write_combined_patches(
+    out: &mut impl Write,
+    odb: &Odb,
+    git_dir: &Path,
+    config: &ConfigSet,
+    list_patch: &[DiffEntry],
+    merge_tree: &ObjectId,
+    parent_commits: &[ObjectId],
+    args: &Args,
+    patch_context: usize,
+) -> Result<()> {
+    if parent_commits.len() < 2 {
+        return Ok(());
+    }
+    let dense = merge_diff_is_dense_combined(args, true, git_dir)?;
+    let abbrev = if args.no_abbrev {
+        40usize
+    } else {
+        parse_abbrev(&args.abbrev)
+    };
+    let quote_fully = config.quote_path_fully();
+    // `git log` does not currently plumb the diff whitespace flags into combined
+    // patches; default to no whitespace normalization (matches the non-combined path).
+    let ws = CombinedDiffWsOptions::default();
+    let mut parent_trees = Vec::with_capacity(parent_commits.len());
+    for p in parent_commits {
+        let obj = odb.read(p)?;
+        let commit = parse_commit(&obj.data)?;
+        parent_trees.push(commit.tree);
+    }
+    // Build the combined parent sides for each interesting path so the combined
+    // patch shows the correct per-parent index OIDs.
+    let walk = CombinedTreeDiffOptions {
+        recursive: true,
+        tree_in_recursive: false,
+    };
+    let cpaths =
+        combined_diff_paths_filtered(odb, merge_tree, parent_commits, &walk, None)?;
+    for entry in list_patch {
+        let path = entry.path();
+        let parent_sides = cpaths
+            .iter()
+            .find(|p| p.path == path)
+            .map(|p| p.parents.clone())
+            .unwrap_or_default();
+        if let Some(patch) = format_combined_textconv_patch(
+            git_dir,
+            config,
+            odb,
+            path,
+            &parent_trees,
+            merge_tree,
+            abbrev,
+            patch_context,
+            dense,
+            false,
+            ws,
+            false,
+            None,
+            &parent_sides,
+            quote_fully,
+        ) {
+            write!(out, "{patch}")?;
+        }
+    }
     Ok(())
 }
 
