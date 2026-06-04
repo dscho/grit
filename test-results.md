@@ -1,4 +1,9 @@
 
+## 2026-06-04 — t5405-send-pack-rewind
+
+- Focus harness: `./scripts/run-tests.sh t5405-send-pack-rewind.sh --verbose` passes 3/3; no code changes required.
+
+
 ## 2026-06-04 — t5541-remote-subcommands / t5506-remote-groups
 
 - Focus/regression harness: `./scripts/run-tests.sh t5506-remote-groups.sh t5541-remote-subcommands.sh --verbose` passes 9/9 and 5/5 after remote update fetch argv wiring was fixed.
