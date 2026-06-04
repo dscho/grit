@@ -1562,3 +1562,12 @@ Updated: 2026-06-01
   t3422-rebase-incompatible-options.sh t3650-replay-basics.sh` passed all three files.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-04 — t3400-rebase message-search/upstream partial
+
+- Focus harness improved to 21/39 after `:/message` search began considering all refs and
+  `git rebase -` began resolving the previous-branch shorthand as `@{-1}`.
+- Related verification: `./scripts/run-tests.sh t3418-rebase-continue.sh
+  t3422-rebase-incompatible-options.sh t3400-rebase.sh` kept `t3418` and `t3422` green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).

@@ -470,12 +470,19 @@ pub fn run(mut args: Args) -> Result<()> {
     };
     if args.branch.is_some() {
         let repo = Repository::discover(None).context("not a git repository")?;
-        let uspec = args.upstream.as_deref().unwrap_or("HEAD");
+        let uspec = args
+            .upstream
+            .as_deref()
+            .map(|s| if s == "-" { "@{-1}" } else { s })
+            .unwrap_or("HEAD");
         pre_rebase_upstream_label = Some(uspec.to_owned());
         let uoid = resolve_revision_without_index_dwim(&repo, uspec)
             .with_context(|| format!("bad revision '{uspec}'"))?
             .to_hex();
         args.upstream = Some(uoid);
+    }
+    if args.upstream.as_deref() == Some("-") {
+        args.upstream = Some("@{-1}".to_owned());
     }
 
     // Fix up the reflog so @{-N} isn't polluted by the internal checkout.

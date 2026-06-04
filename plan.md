@@ -115,6 +115,8 @@
     strategy-option replay, rerere autoupdate persistence, failed-exec rescheduling semantics,
     conflict editor templates, interactive fixup/squash skip message state, and patch cleanup
     before `break`.
+  - Current focus: `t3400-rebase.sh` (39 total, 21 passed) after `:/message` revision search now
+    considers all refs and `git rebase -` resolves the previous-branch shorthand as `@{-1}`.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

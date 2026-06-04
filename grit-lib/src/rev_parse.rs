@@ -3559,6 +3559,13 @@ fn resolve_commit_message_search(
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(start_oid);
     visited.insert(start_oid);
+    if let Ok(refs) = crate::refs::list_refs(&repo.git_dir, "refs/") {
+        for (_name, oid) in refs {
+            if visited.insert(oid) {
+                queue.push_back(oid);
+            }
+        }
+    }
 
     while let Some(oid) = queue.pop_front() {
         let obj = match repo.read_replaced(&oid) {
