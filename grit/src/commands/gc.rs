@@ -653,9 +653,11 @@ fn run_repack_for_gc(
                 cmd.arg(e);
             }
         } else {
-            // For expiring by date, let the subsequent `prune --expire=<date>` decide which
-            // loose unreachable objects to remove. Running `repack -A --unpack-unreachable` here
-            // in grit would drop too-new loose objects before prune can apply the grace period.
+            repack_trace.push("-A".into());
+            cmd.arg("-A");
+            let unpack_arg = format!("--unpack-unreachable={prune_expire}");
+            repack_trace.push(unpack_arg.clone());
+            cmd.arg(unpack_arg);
         }
 
         let keep = if gc_args.auto {
@@ -1014,10 +1016,13 @@ fn run_commit_graph_for_gc(
     if let Some(flag) = progress_flag {
         cmd.arg(flag);
     }
+    if quiet {
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    }
     let status = cmd
         .status()
         .context("failed to run grit commit-graph write for gc")?;
-    if !status.success() {
+    if !status.success() && !quiet {
         eprintln!("warning: commit-graph write returned non-zero status");
     }
     Ok(())

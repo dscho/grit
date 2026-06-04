@@ -3304,3 +3304,39 @@ Updated: 2026-06-01
 - Focus harness: `./scripts/run-tests.sh t5537-fetch-shallow.sh --verbose` improved to 15/16 after `repack -f` started forwarding `--no-reuse-delta` to `pack-objects`.
 - Related verification: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh t5304-prune.sh --verbose` passes 25/25 and 32/32.
 - Quality gates: `cargo check -p grit-cli` and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+- t6500 gc focus: auto-gc incremental repacks now avoid repacking already packed objects and prune
+  their loose copies, `--non-empty --cruft` avoids empty cruft packs, non-cruft `gc` forwards
+  `-A --unpack-unreachable=<expire>`, and chmtime helpers handle relative `=<offset>` timestamps on
+  macOS. Focused `./scripts/run-tests.sh t6500-gc.sh --quiet` improves from the merged-main 30/35
+  baseline to 35/35.
+- Quality gates: `cargo fmt -- --check`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`,
+  and `git diff --check` completed; `cargo test -p grit-lib --lib` is still blocked by the unrelated
+  `ignore::gitignore_glob_tests::{dir_star_extension_matches_nested_path,nested_dir_star_extension}`
+  failures in `grit-lib/src/ignore.rs`.
+
+## 2026-06-04 — t6133-pathspec-rev-dwim complete
+
+- Focus harness: `./scripts/run-tests.sh t6133-pathspec-rev-dwim.sh --quiet` passes 6/6 after
+  noisy `@{now ...}` reflog date selectors started resolving as revisions instead of falling
+  through to pathspec ambiguity.
+- Related verification: `./scripts/run-tests.sh t6135-pathspec-with-attrs.sh t6137-pathspec-wildcards-literal.sh --quiet`
+  keeps both pathspec fixtures green at 37/37 and 25/25. `./scripts/run-tests.sh t0101-at-syntax.sh
+  t1411-reflog-show.sh t1507-rev-parse-upstream.sh t1508-at-combinations.sh --quiet` keeps `t0101`
+  and `t1507` green; `t1411` remains 16/17 and `t1508` remains 33/35.
+- Quality gates: `cargo fmt -- --check`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`,
+  and `git diff --check` completed; `cargo test -p grit-lib --lib` is still blocked by the unrelated
+  `ignore::gitignore_glob_tests::{dir_star_extension_matches_nested_path,nested_dir_star_extension}`
+  failures in `grit-lib/src/ignore.rs`.
+
+## 2026-06-04 — t6501-freshen-objects complete
+
+- Focus harness: `./scripts/run-tests.sh t6501-freshen-objects.sh --quiet` passes 42/42 after
+  `pack-objects --unpack-unreachable=<expire>` started preserving recent loose objects, tree writes
+  freshen referenced child objects, and quiet `gc` stopped surfacing non-fatal commit-graph diagnostics
+  for intentionally broken unreachable objects.
+- Related verification: `./scripts/run-tests.sh t6500-gc.sh t5329-pack-objects-cruft.sh --quiet`
+  keeps `t6500-gc.sh` at 35/35 and `t5329-pack-objects-cruft.sh` at 25/25.
+- Quality gates: `cargo fmt -- --check`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`,
+  and `git diff --check` completed; `cargo test -p grit-lib --lib` is still blocked by the unrelated
+  `ignore::gitignore_glob_tests::{dir_star_extension_matches_nested_path,nested_dir_star_extension}`
+  failures in `grit-lib/src/ignore.rs`.
