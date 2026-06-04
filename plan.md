@@ -78,6 +78,8 @@
   - Completed: `t3308-notes-merge.sh` (19/19) after rejecting revision-syntax/colon-bearing
     active notes refs for merge operations and allowing fully qualified non-notes source refs such
     as `refs/remote-notes/origin/x` to merge without being expanded under `refs/notes/`.
+  - Completed: `t3311-notes-merge-fanout.sh` (24/24) after rerunning with the current notes merge
+    and fanout handling fixes; no additional code changes were needed.
   - Completed opportunistic notes-adjacent fixture: `t3300-funny-names.sh` (21/21) after rerunning
     with the current diff/path quoting code; no additional code changes were needed.
   - Completed: `t3303-notes-subtrees.sh` (23/23) after fast-import now concatenates duplicate
