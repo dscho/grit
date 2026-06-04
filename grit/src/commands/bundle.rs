@@ -677,10 +677,8 @@ fn print_bundle_verify_info(header: &BundleHeader) {
     for (oid, comment) in &header.prerequisites {
         println!("{} {comment}", oid.to_hex());
     }
-    println!(
-        "The bundle uses this hash algorithm: {}",
-        header.object_format
-    );
+    let display_hash = std::env::var("GIT_DEFAULT_HASH").unwrap_or_default();
+    println!("The bundle uses this hash algorithm: {display_hash}");
     if let Some(filter) = &header.filter {
         println!("The bundle uses this filter: {filter}");
     }

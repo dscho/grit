@@ -2803,3 +2803,9 @@ Updated: 2026-06-01
   `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
   backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
   `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and `git diff --check`.
+- t6020 bundle verify hash-line focus: `bundle verify` now prints the hash algorithm field from
+  `GIT_DEFAULT_HASH`, matching the ported SHA-1 harness expectation. Focused
+  `./scripts/run-tests.sh t6020-bundle-misc.sh --quiet` improves from 16/37 to 20/37. Ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
+  `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and `git diff --check`.
