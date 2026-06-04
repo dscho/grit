@@ -90,6 +90,10 @@
   - Completed: `t3510-cherry-pick.sh` (65/65) after aligning its synthetic fixture with the
     harness default-branch expectations and with Git-compatible orphan-branch cherry-pick
     behavior.
+  - Completed: `t3512-cherry-pick-submodule.sh` (15/15) after refreshing cherry-pick stat cache
+    for clean checkouts, preserving submodule working trees when gitlinks are removed/updated, and
+    rejecting submodule-to-file/directory replacements that would overwrite populated submodule
+    directories.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

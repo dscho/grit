@@ -1416,3 +1416,13 @@ Updated: 2026-06-01
   `master` initial branch and its orphan-branch case was aligned with the successful root-commit
   behavior.
 - Validation: `./scripts/run-tests.sh t3510-cherry-pick.sh` passed 65/65.
+
+## 2026-06-03 — t3512-cherry-pick-submodule complete
+
+- Focus harness completed at 15/15 after cherry-pick checkout refreshed clean index stat metadata,
+  preserved populated submodule worktrees for gitlink removals/updates, and rejected
+  submodule-to-file/directory replacements.
+- Related verification: `./scripts/run-tests.sh t3512-cherry-pick-submodule.sh
+  t3510-cherry-pick.sh` passed both files.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
