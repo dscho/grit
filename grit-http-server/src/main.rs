@@ -21,7 +21,10 @@ use axum::{
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "grit-http-server", about = "Git smart HTTP server powered by grit")]
+#[command(
+    name = "grit-http-server",
+    about = "Git smart HTTP server powered by grit"
+)]
 struct Args {
     /// Root directory containing bare repositories
     #[arg(short, long, default_value = ".")]
@@ -44,9 +47,8 @@ impl AppState {
             return Err((StatusCode::BAD_REQUEST, "invalid repository path").into_response());
         }
         let path = self.root.join(repo);
-        grit_protocol::validate_repo_path(&path).map_err(|_| {
-            (StatusCode::NOT_FOUND, "repository not found").into_response()
-        })
+        grit_protocol::validate_repo_path(&path)
+            .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())
     }
 }
 
@@ -64,7 +66,10 @@ fn no_cache_headers(builder: axum::http::response::Builder) -> axum::http::respo
     builder
         .header(header::EXPIRES, "Fri, 01 Jan 1980 00:00:00 GMT")
         .header(header::PRAGMA, "no-cache")
-        .header(header::CACHE_CONTROL, "no-cache, max-age=0, must-revalidate")
+        .header(
+            header::CACHE_CONTROL,
+            "no-cache, max-age=0, must-revalidate",
+        )
 }
 
 // GET /:repo/info/refs?service=git-upload-pack or git-receive-pack
@@ -157,7 +162,10 @@ async fn receive_pack_rpc(
 
     match grit_protocol::receive_pack::stateless_rpc(&repo_path, &body) {
         Ok(data) => no_cache_headers(axum::http::Response::builder())
-            .header(header::CONTENT_TYPE, "application/x-git-receive-pack-result")
+            .header(
+                header::CONTENT_TYPE,
+                "application/x-git-receive-pack-result",
+            )
             .body(axum::body::Body::from(data))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Err(e) => {

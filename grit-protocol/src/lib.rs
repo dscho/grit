@@ -7,8 +7,8 @@
 //! Future work: replace subprocess calls with in-process protocol handling
 //! once the core protocol logic is libified with generic Read/Write streams.
 
-pub mod upload_pack;
 pub mod receive_pack;
+pub mod upload_pack;
 
 use std::path::{Path, PathBuf};
 

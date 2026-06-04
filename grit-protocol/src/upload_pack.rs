@@ -12,10 +12,7 @@ use std::process::{Command, Stdio};
 ///
 /// Returns the raw pkt-line advertisement bytes suitable for wrapping
 /// in an HTTP response with service header.
-pub fn advertise_refs(
-    repo_path: &Path,
-    protocol_version: Option<u8>,
-) -> Result<Vec<u8>> {
+pub fn advertise_refs(repo_path: &Path, protocol_version: Option<u8>) -> Result<Vec<u8>> {
     let grit = crate::grit_executable();
     let mut cmd = Command::new(&grit);
     cmd.arg("upload-pack")
@@ -56,12 +53,9 @@ pub fn stateless_rpc(
 
     if protocol_version == Some(2) {
         // Protocol v2 uses serve-v2 --stateless-rpc
-        cmd.arg("serve-v2")
-            .arg("--stateless-rpc");
+        cmd.arg("serve-v2").arg("--stateless-rpc");
     } else {
-        cmd.arg("upload-pack")
-            .arg("--stateless-rpc")
-            .arg(repo_path);
+        cmd.arg("upload-pack").arg("--stateless-rpc").arg(repo_path);
     }
 
     cmd.stdin(Stdio::piped())

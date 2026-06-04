@@ -2099,13 +2099,7 @@ impl ConfigSet {
                 // fatal error (t0001 #102 `re-init reads matching includeIf.onbranch`). A missing
                 // include target is silently skipped (`from_path` -> `Ok(None)`).
                 if let Some(inc_file) = ConfigFile::from_path(&resolved, file.scope)? {
-                    Self::merge_with_includes(
-                        set,
-                        &inc_file,
-                        process_includes,
-                        depth + 1,
-                        ctx,
-                    )?;
+                    Self::merge_with_includes(set, &inc_file, process_includes, depth + 1, ctx)?;
                 }
             }
         }

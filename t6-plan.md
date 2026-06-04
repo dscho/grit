@@ -89,7 +89,9 @@ Completed pathspec files: `t6130`, `t6132`, `t6133-pathspec-toplevel`, `t6134-*`
 
 ## Describe
 
-- [ ] `t6120-describe.sh` — 54/103 passing, 49 failing.
+- [~] `t6120-describe.sh` — 54/103 passing, 49 failing. Claimed next because it has the
+  largest remaining t6 failing count; focusing describe reachability, tag selection, and output
+  compatibility.
 
 Completed describe/name files: `t6120-name-rev`.
 

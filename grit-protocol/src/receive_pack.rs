@@ -94,10 +94,7 @@ pub fn advertise_refs(repo_path: &Path) -> Result<Vec<u8>> {
 ///
 /// Takes the request body (pkt-line commands + pack data) and returns
 /// the response (report-status).
-pub fn stateless_rpc(
-    repo_path: &Path,
-    request_body: &[u8],
-) -> Result<Vec<u8>> {
+pub fn stateless_rpc(repo_path: &Path, request_body: &[u8]) -> Result<Vec<u8>> {
     let grit = crate::grit_executable();
     let mut cmd = Command::new(&grit);
     cmd.arg("receive-pack")

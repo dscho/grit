@@ -1944,24 +1944,38 @@ fn try_resolve_describe_name(repo: &Repository, spec: &str) -> Result<Option<Obj
         return Ok(None);
     }
     let hex_lower = hex_abbrev.to_ascii_lowercase();
-    let tag_oid = match refs::resolve_ref(&repo.git_dir, &format!("refs/tags/{tag_name}"))
-        .or_else(|_| refs::resolve_ref(&repo.git_dir, tag_name))
-    {
-        Ok(o) => o,
-        Err(_) => return Ok(None),
-    };
-    let tag_commit = peel_to_commit_for_merge_base(repo, tag_oid)?;
-    let mut candidates: Vec<ObjectId> = find_abbrev_matches(repo, &hex_lower)?
+    let mut abbrev_candidates: Vec<ObjectId> = find_abbrev_matches(repo, &hex_lower)?
         .into_iter()
         .filter(|oid| {
             repo.odb
                 .read(oid)
-                .map(|o| o.kind == ObjectKind::Commit)
-                .unwrap_or(false)
-                && describe_generation_count(repo, *oid, tag_commit).ok() == Some(gen)
+                .is_ok_and(|o| o.kind == ObjectKind::Commit)
         })
         .collect();
-    candidates.sort_by_key(|o| o.to_hex());
+    abbrev_candidates.sort_by_key(|o| o.to_hex());
+
+    if let Ok(tag_oid) = refs::resolve_ref(&repo.git_dir, &format!("refs/tags/{tag_name}"))
+        .or_else(|_| refs::resolve_ref(&repo.git_dir, tag_name))
+    {
+        let tag_commit = peel_to_commit_for_merge_base(repo, tag_oid)?;
+        let mut candidates: Vec<ObjectId> = abbrev_candidates
+            .iter()
+            .copied()
+            .filter(|oid| describe_generation_count(repo, *oid, tag_commit).ok() == Some(gen))
+            .collect();
+        candidates.sort_by_key(|o| o.to_hex());
+        match candidates.len() {
+            1 => return Ok(Some(candidates[0])),
+            n if n > 1 => {
+                return Err(Error::InvalidRef(format!(
+                    "short object ID {hex_abbrev} is ambiguous"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let candidates = abbrev_candidates;
     match candidates.len() {
         0 => Err(Error::ObjectNotFound(spec.to_owned())),
         1 => Ok(Some(candidates[0])),

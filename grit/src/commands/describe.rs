@@ -15,6 +15,7 @@ use grit_lib::repo::Repository;
 use grit_lib::rev_parse::resolve_revision;
 use grit_lib::state::resolve_head;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs;
 use std::path::Path;
 
@@ -54,13 +55,25 @@ pub struct Args {
     #[arg(long = "match")]
     pub match_pattern: Vec<String>,
 
+    /// Clear accumulated --match patterns.
+    #[arg(long = "no-match", action = clap::ArgAction::SetTrue)]
+    pub no_match: bool,
+
     /// Do not consider tags matching the given glob(7) pattern.
     #[arg(long = "exclude")]
     pub exclude_pattern: Vec<String>,
 
+    /// Clear accumulated --exclude patterns.
+    #[arg(long = "no-exclude", action = clap::ArgAction::SetTrue)]
+    pub no_exclude: bool,
+
     /// Only output exact matches (a tag directly references the commit).
     #[arg(long)]
     pub exact_match: bool,
+
+    /// Do not require an exact match.
+    #[arg(long = "no-exact-match", action = clap::ArgAction::SetTrue)]
+    pub no_exact_match: bool,
 
     /// Display the first-parent chain only.
     #[arg(long)]
@@ -94,8 +107,12 @@ pub struct Args {
 struct Candidate {
     /// The short tag name (e.g. `v1.0`).
     tag_name: String,
-    /// Number of commits between the tagged commit and the target.
+    /// Tagged commit object ID.
+    tag_oid: ObjectId,
+    /// Breadth-first walk distance from the target to this tag.
     depth: usize,
+    /// Number of commits reachable from the target but not from this tag.
+    different_commits: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -161,9 +178,17 @@ impl DescribeOptions {
             long: args.long,
             abbrev: args.abbrev,
             candidates: args.candidates,
-            match_pattern: args.match_pattern.clone(),
-            exclude_pattern: args.exclude_pattern.clone(),
-            exact_match: args.exact_match,
+            match_pattern: if args.no_match {
+                Vec::new()
+            } else {
+                args.match_pattern.clone()
+            },
+            exclude_pattern: if args.no_exclude {
+                Vec::new()
+            } else {
+                args.exclude_pattern.clone()
+            },
+            exact_match: args.exact_match && !args.no_exact_match,
             first_parent: args.first_parent,
             all: args.all,
             contains: args.contains,
@@ -205,7 +230,8 @@ pub fn run(args: Args) -> Result<()> {
     let target_oid = peel_to_commit(&repo, &resolved_oid)
         .ok_or_else(|| anyhow::anyhow!("Not a valid commit: {rev}"))?;
 
-    let options = DescribeOptions::from_args(&args);
+    let mut options = DescribeOptions::from_args(&args);
+    apply_ordered_pattern_options_from_argv(&mut options);
 
     // Determine the dirty suffix before formatting the final description.
     let dirty_suffix = if args.dirty.is_some() || args.broken.is_some() {
@@ -222,6 +248,43 @@ pub fn run(args: Args) -> Result<()> {
     println!("{description}");
 
     Ok(())
+}
+
+fn apply_ordered_pattern_options_from_argv(options: &mut DescribeOptions) {
+    let argv: Vec<String> = env::args().collect();
+    let Some(describe_idx) = argv.iter().position(|arg| arg == "describe") else {
+        return;
+    };
+
+    let mut match_pattern = Vec::new();
+    let mut exclude_pattern = Vec::new();
+    let mut i = describe_idx + 1;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if let Some(value) = arg.strip_prefix("--match=") {
+            match_pattern.push(value.to_owned());
+        } else if arg == "--match" {
+            if let Some(value) = argv.get(i + 1) {
+                match_pattern.push(value.to_owned());
+                i += 1;
+            }
+        } else if arg == "--no-match" {
+            match_pattern.clear();
+        } else if let Some(value) = arg.strip_prefix("--exclude=") {
+            exclude_pattern.push(value.to_owned());
+        } else if arg == "--exclude" {
+            if let Some(value) = argv.get(i + 1) {
+                exclude_pattern.push(value.to_owned());
+                i += 1;
+            }
+        } else if arg == "--no-exclude" {
+            exclude_pattern.clear();
+        }
+        i += 1;
+    }
+
+    options.match_pattern = match_pattern;
+    options.exclude_pattern = exclude_pattern;
 }
 
 /// Describe a resolved object using Git-compatible `describe` semantics.
@@ -294,7 +357,7 @@ fn describe_commit(
             let abbrev = abbreviate(&target_oid, options.abbrev);
             Ok(format!(
                 "{}-{}-g{abbrev}{dirty_suffix}",
-                c.tag_name, c.depth
+                c.tag_name, c.different_commits
             ))
         }
         None => {
@@ -687,9 +750,13 @@ fn bfs_find_tag(
             let parent_depth = depth + 1;
 
             if let Some(tag_name) = tag_map.get(&parent_oid) {
+                let different_commits =
+                    count_reachable_difference(repo, start, &parent_oid, first_parent)?;
                 candidates.push(Candidate {
                     tag_name: tag_name.clone(),
+                    tag_oid: parent_oid,
                     depth: parent_depth,
+                    different_commits,
                 });
                 if candidates.len() >= max_candidates {
                     break;
@@ -703,9 +770,65 @@ fn bfs_find_tag(
         }
     }
 
-    // Pick the candidate with the smallest depth (nearest tag)
-    candidates.sort_by_key(|c| c.depth);
+    // Pick the candidate with the fewest commits different from the target
+    // (`git log tag..target`), using walk distance and name only as stable tie-breakers.
+    candidates.sort_by(|a, b| {
+        a.different_commits
+            .cmp(&b.different_commits)
+            .then(a.depth.cmp(&b.depth))
+            .then(a.tag_name.cmp(&b.tag_name))
+            .then(a.tag_oid.cmp(&b.tag_oid))
+    });
     Ok(candidates.into_iter().next())
+}
+
+fn count_reachable_difference(
+    repo: &Repository,
+    target: &ObjectId,
+    base: &ObjectId,
+    first_parent: bool,
+) -> Result<usize> {
+    let base_reachable = collect_reachable_commits(repo, *base, first_parent)?;
+    let target_reachable = collect_reachable_commits(repo, *target, first_parent)?;
+    Ok(target_reachable
+        .iter()
+        .filter(|oid| !base_reachable.contains(oid))
+        .count())
+}
+
+fn collect_reachable_commits(
+    repo: &Repository,
+    start: ObjectId,
+    first_parent: bool,
+) -> Result<HashSet<ObjectId>> {
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(start);
+    seen.insert(start);
+
+    while let Some(oid) = queue.pop_front() {
+        let Ok(obj) = repo.odb.read(&oid) else {
+            continue;
+        };
+        if obj.kind != ObjectKind::Commit {
+            continue;
+        }
+        let Ok(commit) = parse_commit(&obj.data) else {
+            continue;
+        };
+        let parents = if first_parent {
+            commit.parents.into_iter().take(1).collect::<Vec<_>>()
+        } else {
+            commit.parents
+        };
+        for parent in parents {
+            if seen.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+
+    Ok(seen)
 }
 
 /// Abbreviate an OID to `n` hex characters.
