@@ -272,18 +272,23 @@ fn ll_diff_tree_paths(
 
         if cmp == std::cmp::Ordering::Equal {
             if let Some(te) = t_cur {
-                let mut skip_emit = true;
+                // Combined-diff intersection rule (git tree-diff.c ll_diff_tree_paths,
+                // cmp == 0 branch): skip the path when it is identical to *some* parent
+                // that has it at p[imin]. A path is only interesting for a combined diff
+                // if it differs from every parent. (find_copies_harder is not modelled
+                // here, matching the fast multitree path.)
+                let mut skip_emit = false;
                 for i in 0..nparent {
+                    // p[i] > p[imin]: path absent in this parent -> "+t" in D(T,Pi).
                     if parent_neq[i] {
                         continue;
                     }
-                    let Some(pe) = tp_entries[i].get(tp_idx[i]) else {
-                        skip_emit = false;
-                        break;
-                    };
-                    if pe.oid != te.oid || pe.mode != te.mode {
-                        skip_emit = false;
-                        break;
+                    if let Some(pe) = tp_entries[i].get(tp_idx[i]) {
+                        if pe.oid == te.oid && pe.mode == te.mode {
+                            // diff(t, pi) == empty: result matches this parent -> skip.
+                            skip_emit = true;
+                            break;
+                        }
                     }
                 }
 
@@ -394,7 +399,10 @@ fn ll_diff_tree_paths(
             }
             ti += 1;
         } else {
-            let skip_emit_tp = (0..nparent).all(|i| parent_neq[i]);
+            // git tree-diff.c (t > p[imin] branch): "-p[imin]" is only in D(T,Pi)
+            // when *every* parent has the path at p[imin] (deleted from all of them).
+            // Skip when any parent lacks it (parent_neq[i] set).
+            let skip_emit_tp = (0..nparent).any(|i| parent_neq[i]);
             if !skip_emit_tp {
                 if let Some(pe) = p_min {
                     let name = std::str::from_utf8(&pe.name).unwrap_or("");

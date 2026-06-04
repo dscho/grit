@@ -2647,7 +2647,25 @@ pub fn run(mut args: Args) -> Result<()> {
     if revs.len() == 1 {
         if revs[0].ends_with("^!") {
             let expanded = expand_rev_token_circ_bang(&repo, &revs[0])?;
-            if expanded.len() >= 2 {
+            if expanded.len() > 2 {
+                // Merge commit: `rev^!` excludes all parents, which produces a
+                // combined diff (merge result against every parent), defaulting
+                // to the dense `--cc` format like git.
+                let commit_oid = resolve_revision(&repo, &expanded[0])
+                    .with_context(|| format!("unknown revision: '{}'", expanded[0]))?;
+                let mut new_revs = vec![commit_oid.to_hex()];
+                for p in &expanded[1..] {
+                    let parent_spec = p.strip_prefix('^').unwrap_or(p.as_str());
+                    let parent_oid = resolve_revision(&repo, parent_spec)
+                        .with_context(|| format!("unknown revision: '{parent_spec}'"))?;
+                    new_revs.push(parent_oid.to_hex());
+                }
+                revs = new_revs;
+                if !want_combined_diff {
+                    want_combined_diff = true;
+                    combined_diff_dense = true;
+                }
+            } else if expanded.len() == 2 {
                 let parent_spec = expanded[1]
                     .strip_prefix('^')
                     .unwrap_or(expanded[1].as_str());
