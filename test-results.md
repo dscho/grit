@@ -8,6 +8,13 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t3412-rebase-root
+
+- Focus harness: `./scripts/run-tests.sh t3412-rebase-root.sh --verbose` passes 25/25 with the
+  current binary; no additional code changes were needed.
+- Quality gates were not rerun for this CSV/dashboard-only refresh; the previous t3407 gates still
+  cover the current code revision.
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing

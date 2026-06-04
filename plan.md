@@ -137,6 +137,8 @@
   - Completed: `t3407-rebase-abort.sh` (17/17) after rebase now resolves upstream and `--onto`
     commit-ish arguments by peeling annotated tags to commits before replay/state setup, fixing the
     tag checkout abort cases for both apply and merge backends.
+  - Completed: `t3412-rebase-root.sh` (25/25) after rerunning with the current binary; the prior
+    root-rebase implementation and recent commit-ish peeling fixes left the stale CSV row green.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ---

@@ -600,7 +600,7 @@ t3406-rebase-message	t3	yes	32	32	0	true	ok	0
 t3407-rebase-abort	t3	yes	17	17	0	true	ok	0
 t3408-rebase-multi-line	t3	yes	2	2	0	true	ok	0
 t3409-rebase-environ	t3	yes	3	3	0	true	ok	0
-t3412-rebase-root	t3	yes	25	16	9	false	ok	0
+t3412-rebase-root	t3	yes	25	25	0	true	ok	0
 t3413-rebase-hook	t3	yes	15	15	0	true	ok	0
 t3415-rebase-autosquash	t3	yes	28	24	4	false	ok	0
 t3416-rebase-onto-threedots	t3	yes	18	17	1	false	ok	0
