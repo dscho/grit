@@ -227,8 +227,13 @@ pub struct Args {
     pub date: Option<String>,
 
     /// Walk the reflog instead of the commit ancestry chain.
-    #[arg(short = 'g', long = "walk-reflogs", alias = "reflog")]
+    #[arg(short = 'g', long = "walk-reflogs")]
     pub walk_reflogs: bool,
+
+    /// Add every reflog entry as an additional starting commit (like `--all`,
+    /// but over reflogs). Unlike `--walk-reflogs`, output is ordinary commits.
+    #[arg(long = "reflog")]
+    pub reflog: bool,
 
     /// Show unified diff (patch) after each commit.
     #[arg(short = 'p', long = "patch")]
@@ -1413,6 +1418,7 @@ fn run_line_log(
             &repo.odb,
             parent_override.as_deref(),
             true,
+            None,
             None,
             None,
             None,
@@ -2686,6 +2692,7 @@ fn run_rev_list_log(
                 None,
                 None,
                 None,
+                None,
             )?;
         }
 
@@ -3072,6 +3079,7 @@ fn run_graph_log(
                         &repo.odb,
                         Some(node.parents.as_slice()),
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -3705,6 +3713,7 @@ fn render_graph_commit_text(
                 use_mailmap,
                 args.expand_tabs_in_log,
                 None,
+                None,
             );
         }
         if fmt.contains('%') {
@@ -3724,6 +3733,7 @@ fn render_graph_commit_text(
                 mailmap,
                 use_mailmap,
                 args.expand_tabs_in_log,
+                None,
                 None,
             );
         }
@@ -4867,6 +4877,39 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let merged_argv = merge_log_revision_argv(&repo, &args)?;
+    // `%S` (source) needs each commit labeled with the named revision it was
+    // reached from. Only build the map when the format actually uses `%S`.
+    let format_uses_percent_s = args
+        .format
+        .as_deref()
+        .map(|fmt| {
+            let template = fmt
+                .strip_prefix("format:")
+                .or_else(|| fmt.strip_prefix("tformat:"))
+                .unwrap_or(fmt);
+            // A real `%S` placeholder (not `%%S` literal). Scan for an odd run of
+            // `%` immediately before `S`.
+            let bytes = template.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    let mut pct = 0;
+                    while i < bytes.len() && bytes[i] == b'%' {
+                        pct += 1;
+                        i += 1;
+                    }
+                    if pct % 2 == 1 && i < bytes.len() && bytes[i] == b'S' {
+                        return true;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            false
+        })
+        .unwrap_or(false);
+    let mut percent_s_source_map: std::collections::HashMap<ObjectId, String> =
+        std::collections::HashMap::new();
     // Determine starting points and excluded commits (alternate / remote-tracking first; else
     // merged argv + stdin, matching Git `setup_revisions` for pseudo-options stripped before clap).
     let (mut start_oids, exclude_oids) = if args.alternate_refs {
@@ -4898,8 +4941,54 @@ pub fn run(mut args: Args) -> Result<()> {
         let mut start_oids = resolve_specs_to_commits_ignoring_missing(&repo, &pos_s, &args)?;
         let mut exclude_oids = resolve_specs_to_commits_ignoring_missing(&repo, &neg_s, &args)?;
 
+        if format_uses_percent_s {
+            // Label each commit with the named positive revision it was reached
+            // from. Each positive spec (in command-line order) seeds the walk
+            // with its own display name as the `%S` source.
+            // Seed from the *original* command-line specs so each side of a
+            // symmetric range `A...B` is labeled with its own name (positive
+            // splitting of `..`/`...` would otherwise drop the name).
+            let mut named_specs: Vec<String> = Vec::new();
+            for spec in &argv_specs {
+                if grit_lib::rev_list::is_symmetric_diff(spec) {
+                    if let Some((lhs, rhs)) = grit_lib::rev_list::split_symmetric_diff(spec) {
+                        named_specs.push(lhs);
+                        named_specs.push(rhs);
+                        continue;
+                    }
+                }
+                // Plain positive spec (skip `^neg` and `A..B` exclusion forms).
+                if !spec.starts_with('^') && grit_lib::rev_parse::split_double_dot_range(spec).is_none()
+                {
+                    named_specs.push(spec.clone());
+                }
+            }
+            let mut tips: Vec<(ObjectId, String)> = Vec::new();
+            for spec in &named_specs {
+                if let Ok(oid) = resolve_revision(&repo, spec) {
+                    // Peel annotated tags to the underlying commit so the walk
+                    // can follow parents; the label stays the spec name.
+                    let commit_oid = peel_to_commit_for_merge_base(&repo, oid).unwrap_or(oid);
+                    tips.push((commit_oid, spec.clone()));
+                }
+            }
+            percent_s_source_map =
+                build_named_source_map(&repo.odb, &tips, args.first_parent);
+        }
+
         if args.all {
             start_oids.extend(collect_all_ref_oids(&repo.git_dir)?);
+        }
+        if args.reflog {
+            // `--reflog` adds every reflog entry's old/new OID as a pending tip
+            // (Git's `add_reflogs_to_pending`); rev-list then dedupes and sorts.
+            let mut reflog_oids: Vec<ObjectId> =
+                grit_lib::reflog::all_reflog_oids(&repo.git_dir)?
+                    .into_iter()
+                    .collect();
+            // Stable order so dedupe/tie-breaks are deterministic.
+            reflog_oids.sort_by(|a, b| a.to_hex().cmp(&b.to_hex()));
+            start_oids.extend(reflog_oids);
         }
         if stdin_all_refs {
             stdin_merged_all_refs = true;
@@ -4915,6 +5004,7 @@ pub fn run(mut args: Args) -> Result<()> {
         let rev_input_given = !pos_s.is_empty()
             || !neg_s.is_empty()
             || args.all
+            || args.reflog
             || args.branches.is_some()
             || stdin_all_refs
             || (args.read_stdin && args.ignore_missing)
@@ -5216,6 +5306,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     None,
                     source_for_oneline,
+                    percent_s_source_map.get(&oid).map(|s| s.as_str()),
                 )?;
             }
 
@@ -5426,6 +5517,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     None,
                     source_for_oneline,
+                    percent_s_source_map.get(oid).map(|s| s.as_str()),
                 )?;
             }
 
@@ -5849,6 +5941,7 @@ pub fn run_no_walk(
                 &repo.odb,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -8736,6 +8829,20 @@ fn run_symmetric_log(
         None
     };
 
+    // `%S` for a symmetric range labels each side's commits with its ref name.
+    let percent_s_source_map: std::collections::HashMap<ObjectId, String> = {
+        let template = args.format.as_deref().unwrap_or("");
+        if template.contains("%S") {
+            let tips = vec![
+                (lhs_oid, lhs_spec.to_owned()),
+                (rhs_oid, rhs_spec.to_owned()),
+            ];
+            build_named_source_map(&repo.odb, &tips, args.first_parent)
+        } else {
+            std::collections::HashMap::new()
+        }
+    };
+
     for (i, oid) in ordered.iter().enumerate() {
         if i > 0 && log_wants_blank_line_between_commits(args) {
             writeln!(out)?;
@@ -8769,6 +8876,7 @@ fn run_symmetric_log(
             log_marker,
             None,
             None,
+            percent_s_source_map.get(oid).map(|s| s.as_str()),
         )?;
     }
 
@@ -8848,6 +8956,7 @@ fn format_commit(
     log_marker: Option<char>,
     merge_from_parent: Option<&ObjectId>,
     source_for_oneline: Option<&str>,
+    percent_s_source: Option<&str>,
 ) -> Result<()> {
     let hex = oid.to_hex();
     let abbrev_len = if args.no_abbrev {
@@ -8973,6 +9082,7 @@ fn format_commit(
                 use_mailmap,
                 et,
                 signature_ref,
+                percent_s_source,
             );
             let bytes = encode_log_str(&formatted, args.log_output_encoding.as_deref());
             if is_tformat {
@@ -9211,6 +9321,7 @@ fn format_commit(
                 use_mailmap,
                 et,
                 signature_ref,
+                percent_s_source,
             );
             let bytes = encode_log_str(&formatted, args.log_output_encoding.as_deref());
             out.write_all(&bytes)?;
@@ -9236,6 +9347,7 @@ fn format_commit(
                 use_mailmap,
                 et,
                 signature_ref,
+                percent_s_source,
             );
             writeln!(out, "{formatted}")?;
         }
@@ -9412,6 +9524,7 @@ fn apply_format_string(
     use_mailmap: bool,
     expand_tabs_in_log: usize,
     signature: Option<&grit_lib::signing::SignatureCheck>,
+    percent_s_source: Option<&str>,
 ) -> String {
     let hex = oid.to_hex();
     let commit_color = || {
@@ -9444,6 +9557,9 @@ fn apply_format_string(
         align: Align,
         trunc: Trunc,
         absolute: bool,
+        /// `%>>` (flush_left_and_steal): right-align but first reclaim trailing
+        /// spaces from the already-emitted output when the value overflows.
+        steal: bool,
     }
     // Git-style display width of a single character: control characters render
     // with zero columns, wide characters with two, everything else with one.
@@ -9568,6 +9684,7 @@ fn apply_format_string(
     fn parse_col_spec(
         chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
         align: Align,
+        steal: bool,
     ) -> Option<ColSpec> {
         // Check for | (absolute column) variant
         let absolute = if chars.peek() == Some(&'|') {
@@ -9635,6 +9752,7 @@ fn apply_format_string(
             align,
             trunc,
             absolute,
+            steal,
         })
     }
 
@@ -9651,7 +9769,7 @@ fn apply_format_string(
             if chars.peek() == Some(&'<') {
                 let mut probe = chars.clone();
                 probe.next(); // consume '<'
-                if let Some(spec) = parse_col_spec(&mut probe, Align::Left) {
+                if let Some(spec) = parse_col_spec(&mut probe, Align::Left, false) {
                     chars = probe;
                     pending_col = Some(spec);
                 } else {
@@ -9664,12 +9782,13 @@ fn apply_format_string(
                 probe.next(); // consume '>'
                 let parsed = if probe.peek() == Some(&'<') {
                     probe.next();
-                    parse_col_spec(&mut probe, Align::Center)
+                    parse_col_spec(&mut probe, Align::Center, false)
                 } else if probe.peek() == Some(&'>') {
                     probe.next();
-                    parse_col_spec(&mut probe, Align::Right)
+                    // `%>>` is flush_left_and_steal: right-align with stealing.
+                    parse_col_spec(&mut probe, Align::Right, true)
                 } else {
-                    parse_col_spec(&mut probe, Align::Right)
+                    parse_col_spec(&mut probe, Align::Right, false)
                 };
                 if let Some(spec) = parsed {
                     chars = probe;
@@ -9936,6 +10055,15 @@ fn apply_format_string(
                         ));
                     } else {
                         result.push_str(subj);
+                    }
+                }
+                Some('S') => {
+                    chars.next();
+                    // Source: the named revision this commit was reached from
+                    // (only populated when `git log --source`-style tracking is
+                    // active for the given command-line revisions).
+                    if let Some(src) = percent_s_source {
+                        result.push_str(src);
                     }
                 }
                 Some('f') => {
@@ -10245,8 +10373,12 @@ fn apply_format_string(
                 _ => result.push('%'),
             }
             // Apply add/space/del magic to the just-produced placeholder output.
-            if magic != Magic::None {
-                let produced_empty = result.len() == magic_start;
+            // Git (pretty.c format_commit_item) applies the column padding to the
+            // placeholder *first*, then inserts the magic char OUTSIDE the padded
+            // column. So when a column is pending, defer the magic until after the
+            // padding step below (inserting at `col_start`); otherwise apply it now.
+            let produced_empty = result.len() == magic_start;
+            if magic != Magic::None && pending_col.is_none() {
                 match magic {
                     Magic::AddLf => {
                         if !produced_empty {
@@ -10278,24 +10410,67 @@ fn apply_format_string(
             if let Some(spec) = pending_col.take() {
                 let added = result[col_start..].to_owned();
                 result.truncate(col_start);
-                if spec.absolute {
-                    // Absolute column: pad from start of current line to target column
+                // `%>>` (flush_left_and_steal): when the value overflows the
+                // column, reclaim trailing spaces already emitted on this line
+                // and credit them to the padding budget (Git pretty.c).
+                let mut effective_width = if spec.absolute {
                     let line_start = result.rfind('\n').map(|p| p + 1).unwrap_or(0);
                     let current_col = display_width(&result[line_start..]);
-                    let target_width = spec.width.saturating_sub(current_col);
+                    spec.width.saturating_sub(current_col)
+                } else {
+                    spec.width
+                };
+                if spec.steal {
+                    let line_start = result.rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    let added_w = display_width(&added);
+                    while added_w > effective_width
+                        && result.len() > line_start
+                        && result.as_bytes()[result.len() - 1] == b' '
+                    {
+                        result.pop();
+                        effective_width += 1;
+                    }
+                }
+                if spec.absolute {
                     let mut adjusted_spec = ColSpec {
-                        width: target_width,
+                        width: effective_width,
                         align: spec.align,
                         trunc: spec.trunc,
                         absolute: false,
+                        steal: false,
                     };
                     // For absolute positioning, ensure minimum width matches the value length
-                    if target_width < display_width(&added) {
+                    if effective_width < display_width(&added) {
                         adjusted_spec.width = display_width(&added);
                     }
                     result.push_str(&apply_col(&adjusted_spec, &added));
                 } else {
-                    result.push_str(&apply_col(&spec, &added));
+                    let adjusted_spec = ColSpec {
+                        width: effective_width,
+                        align: spec.align,
+                        trunc: spec.trunc,
+                        absolute: false,
+                        steal: false,
+                    };
+                    result.push_str(&apply_col(&adjusted_spec, &added));
+                }
+                // Deferred magic: applied OUTSIDE the padded column (Git
+                // pretty.c inserts the magic char before the whole padded run).
+                if magic != Magic::None && !produced_empty {
+                    match magic {
+                        Magic::AddLf => result.insert(col_start, '\n'),
+                        Magic::AddSp => result.insert(col_start, ' '),
+                        Magic::DelLf => {
+                            let mut cut = col_start;
+                            while cut > 0 && result.as_bytes()[cut - 1] == b'\n' {
+                                cut -= 1;
+                            }
+                            if cut < col_start {
+                                result.replace_range(cut..col_start, "");
+                            }
+                        }
+                        Magic::None => {}
+                    }
                 }
             }
         } else {
@@ -10809,50 +10984,48 @@ impl DecorationFilter {
     }
 }
 
-/// Match a single `--decorate-refs[-exclude]` pattern against a full refname,
-/// trying the abbreviations Git's `ref_rev_parse_rules` would (full name and
-/// the name with `refs/`, `refs/tags/`, `refs/heads/`, `refs/remotes/` stripped).
+/// Normalize a `--decorate-refs[-exclude]` / `log.excludeDecoration` pattern the
+/// way Git's `normalize_glob_ref` (refs.c) does: prepend `refs/` unless it already
+/// starts with `refs/` or is exactly `HEAD`, then strip a single trailing `/`.
+fn normalize_glob_ref(pattern: &str) -> String {
+    let mut out = String::new();
+    if !pattern.starts_with("refs/") && pattern != "HEAD" {
+        out.push_str("refs/");
+    }
+    out.push_str(pattern);
+    if out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
+/// Match a single (already-normalized) `--decorate-refs[-exclude]` pattern against
+/// a full refname, mirroring Git's `match_ref_pattern` (log-tree.c): glob patterns
+/// use `wildmatch`; non-glob patterns match as a prefix at a component boundary.
 fn decoration_pattern_matches(pattern: &str, refname: &str) -> bool {
     let has_glob = pattern.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
-    let mut candidates = vec![refname];
-    for prefix in [
-        "refs/",
-        "refs/tags/",
-        "refs/heads/",
-        "refs/remotes/",
-    ] {
-        if let Some(rest) = refname.strip_prefix(prefix) {
-            candidates.push(rest);
-        }
-    }
-    for cand in candidates {
-        if has_glob {
-            if grit_lib::wildmatch::wildmatch(
-                pattern.as_bytes(),
-                cand.as_bytes(),
-                grit_lib::wildmatch::WM_PATHNAME,
-            ) {
-                return true;
-            }
+    if has_glob {
+        grit_lib::wildmatch::wildmatch(pattern.as_bytes(), refname.as_bytes(), 0)
+    } else {
+        // `skip_prefix(refname, pattern, &rest) && (!*rest || *rest == '/')`.
+        if let Some(rest) = refname.strip_prefix(pattern) {
+            rest.is_empty() || rest.starts_with('/')
         } else {
-            // Prefix match at a component boundary (`item->util` case).
-            if cand == pattern
-                || (cand.starts_with(pattern)
-                    && cand.as_bytes().get(pattern.len()) == Some(&b'/'))
-            {
-                return true;
-            }
+            false
         }
     }
-    false
 }
 
 /// Build the decoration filter from command-line args and `log.excludeDecoration`
 /// config.
 fn build_decoration_filter(args: &Args, git_dir: &Path) -> DecorationFilter {
     let mut filter = DecorationFilter {
-        include: args.decorate_refs.clone(),
-        exclude: args.decorate_refs_exclude.clone(),
+        include: args.decorate_refs.iter().map(|p| normalize_glob_ref(p)).collect(),
+        exclude: args
+            .decorate_refs_exclude
+            .iter()
+            .map(|p| normalize_glob_ref(p))
+            .collect(),
         exclude_config: Vec::new(),
     };
     // `--clear-decorations` drops the config-based exclusions (and Git's default
@@ -10862,7 +11035,7 @@ fn build_decoration_filter(args: &Args, git_dir: &Path) -> DecorationFilter {
             for value in cfg.get_all("log.excludeDecoration") {
                 let v = value.trim();
                 if !v.is_empty() {
-                    filter.exclude_config.push(v.to_owned());
+                    filter.exclude_config.push(normalize_glob_ref(v));
                 }
             }
         }
@@ -11542,6 +11715,7 @@ fn write_commit_diff(
                 false,
                 None,
                 Some(parent_oid),
+                None,
                 None,
             )?;
             write_commit_diff_body(
@@ -12733,6 +12907,85 @@ fn follow_filter(
     }
 
     Ok(result)
+}
+
+/// Build a map from commit OID → source name for the `%S` placeholder, seeded
+/// from the named positive revisions given on the command line.
+///
+/// Git propagates each commit's "source" from the named ref it was reached
+/// from, walking in commit-date order so that, when two tips both reach a
+/// commit, the tip whose traversal arrives first (highest committer date)
+/// wins. We mirror that with a date-ordered priority queue: pop the
+/// highest-dated pending commit, fix its label, then enqueue its parents with
+/// the same label (an already-labeled commit keeps its first label).
+fn build_named_source_map(
+    odb: &Odb,
+    tips: &[(ObjectId, String)],
+    first_parent: bool,
+) -> std::collections::HashMap<ObjectId, String> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    // Heap entry ordered by committer time (desc), then OID for determinism.
+    struct Entry {
+        time: i64,
+        oid: ObjectId,
+        label: String,
+    }
+    impl PartialEq for Entry {
+        fn eq(&self, other: &Self) -> bool {
+            self.time == other.time && self.oid == other.oid
+        }
+    }
+    impl Eq for Entry {}
+    impl Ord for Entry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.time
+                .cmp(&other.time)
+                .then_with(|| self.oid.cmp(&other.oid))
+        }
+    }
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut source_map: std::collections::HashMap<ObjectId, String> =
+        std::collections::HashMap::new();
+    let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
+    for (oid, label) in tips {
+        heap.push(Entry {
+            time: read_commit_timestamp(odb, oid),
+            oid: *oid,
+            label: label.clone(),
+        });
+    }
+    while let Some(Entry { oid, label, .. }) = heap.pop() {
+        if source_map.contains_key(&oid) {
+            continue;
+        }
+        source_map.insert(oid, label.clone());
+        if let Ok(obj) = odb.read(&oid) {
+            if let Ok(commit) = parse_commit(&obj.data) {
+                let parents: &[ObjectId] = if first_parent {
+                    commit.parents.first().map(std::slice::from_ref).unwrap_or(&[])
+                } else {
+                    &commit.parents
+                };
+                for p in parents {
+                    if !source_map.contains_key(p) {
+                        heap.push(Entry {
+                            time: read_commit_timestamp(odb, p),
+                            oid: *p,
+                            label: label.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    source_map
 }
 
 /// Build a map from commit OID → source ref name for --source.
