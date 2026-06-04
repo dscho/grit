@@ -462,6 +462,7 @@ dependencies = [
  "base64",
  "clap",
  "encoding_rs",
+ "filetime",
  "flate2",
  "grit-lib",
  "hex",

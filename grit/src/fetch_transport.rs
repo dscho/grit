@@ -753,7 +753,29 @@ pub(crate) fn spawn_upload_pack_with_proto(
             .with_context(|| format!("failed to spawn grit upload-pack for {}", rp));
     };
 
-    let (_leading_env, _after_env) = parse_leading_shell_env_assignments(cmd_template);
+    let (leading_env, after_env) = parse_leading_shell_env_assignments(cmd_template);
+
+    if after_env == "git-upload-pack" || after_env.ends_with("/git-upload-pack") {
+        let mut c = Command::new(grit_executable());
+        strip_trace2_env(&mut c);
+        c.arg("upload-pack")
+            .arg(rp.as_ref())
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_TRACE_PACKET")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for (key, value) in leading_env {
+            if key != "GIT_TEST_ASSUME_DIFFERENT_OWNER" {
+                c.env(key, value);
+            }
+        }
+        apply_proto_env(&mut c);
+        return c
+            .spawn()
+            .with_context(|| format!("failed to spawn grit upload-pack for {}", rp));
+    }
 
     let trimmed = cmd_template.trim();
     if trimmed == "grit-upload-pack" || trimmed.ends_with("/grit-upload-pack") {

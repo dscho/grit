@@ -192,6 +192,14 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     run_repack_for_gc(&repo, &cfg, quiet_effective, &args)?;
+    prune_packed_objects(
+        &objects_dir,
+        PrunePackedOptions {
+            dry_run: false,
+            quiet: quiet_effective,
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     clean_invalid_pack_garbage_for_gc(&objects_dir)?;
 
     if !args.skip_foreground_tasks && !args.auto {
@@ -645,12 +653,9 @@ fn run_repack_for_gc(
                 cmd.arg(e);
             }
         } else {
-            // Git `add_repack_all_option`: `--expire-to` is only forwarded with `--cruft`, not with
-            // `-A` (t6500 `gc --no-cruft --expire-to` expects repack argv without `--expire-to`).
-            repack_trace.push("-A".into());
-            let uu = format!("--unpack-unreachable={prune_expire}");
-            repack_trace.push(uu.clone());
-            cmd.arg("-A").arg(uu);
+            // For expiring by date, let the subsequent `prune --expire=<date>` decide which
+            // loose unreachable objects to remove. Running `repack -A --unpack-unreachable` here
+            // in grit would drop too-new loose objects before prune can apply the grace period.
         }
 
         let keep = if gc_args.auto {
