@@ -533,6 +533,26 @@ pub fn path_has_gitattribute(
     is_dir: bool,
     attr_name: &str,
 ) -> bool {
+    matches!(
+        path_gitattribute_value(rules, path, is_dir, attr_name).as_deref(),
+        Some(value) if value != "unset"
+    )
+}
+
+/// Return the final value assigned to `attr_name` for `path`.
+///
+/// `rules` is the ordered set of parsed attribute rules, `path` is repository-relative, `is_dir`
+/// selects directory-only pattern handling, and `attr_name` is the attribute to query.
+///
+/// Returns `"set"`, `"unset"`, or an explicit string value. `None` means the attribute is
+/// unspecified after all matching rules are applied.
+#[must_use]
+pub fn path_gitattribute_value(
+    rules: &[AttrRule],
+    path: &str,
+    is_dir: bool,
+    attr_name: &str,
+) -> Option<String> {
     let mut last: Option<&str> = None;
     for rule in rules {
         if attr_rule_matches(rule, path, is_dir) {
@@ -543,10 +563,7 @@ pub fn path_has_gitattribute(
             }
         }
     }
-    match last {
-        None | Some("unset") => false,
-        Some(_) => true,
-    }
+    last.map(str::to_string)
 }
 
 /// Whether `rule` matches `rel_path` given directory vs file context (Git `path_matches`).

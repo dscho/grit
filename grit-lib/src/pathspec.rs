@@ -7,7 +7,7 @@
 
 use std::borrow::Cow;
 
-use crate::crlf::path_has_gitattribute;
+use crate::crlf::path_gitattribute_value;
 use crate::crlf::AttrRule;
 use crate::error::{Error, Result as LibResult};
 use crate::precompose_config::pathspec_precompose_enabled;
@@ -143,8 +143,27 @@ struct PathspecMagic {
     /// `:(top)` / short `:/` — paths are relative to repo root.
     top: bool,
     prefix: Option<String>,
-    /// `:(attr:NAME)` — match paths that have gitattribute `NAME` set.
-    attr_name: Option<String>,
+    /// `:(attr:...)` requirements.
+    attr_requirements: Vec<AttrRequirement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttrRequirement {
+    Set(String),
+    Unset(String),
+    Unspecified(String),
+    Value(String, String),
+}
+
+impl AttrRequirement {
+    fn name(&self) -> &str {
+        match self {
+            AttrRequirement::Set(name)
+            | AttrRequirement::Unset(name)
+            | AttrRequirement::Unspecified(name)
+            | AttrRequirement::Value(name, _) => name,
+        }
+    }
 }
 
 fn parse_maybe_bool(v: &str) -> Option<bool> {
@@ -206,12 +225,173 @@ pub fn validate_global_pathspec_flags() -> Result<(), String> {
     Ok(())
 }
 
+fn is_valid_attr_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn split_attr_expr(expr: &str) -> Result<Vec<String>, String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut in_value = false;
+    let mut escaped = false;
+
+    for ch in expr.chars() {
+        if escaped {
+            if ch.is_ascii_whitespace() {
+                return Err(
+                    "Escape character '\\' not allowed as last character in attr value".to_string(),
+                );
+            }
+            if ch != ',' {
+                return Err("Escape character '\\' not allowed for value matching".to_string());
+            }
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_value && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '=' {
+            in_value = true;
+            cur.push(ch);
+            continue;
+        }
+        if ch.is_ascii_whitespace() {
+            if !cur.is_empty() {
+                parts.push(cur);
+                cur = String::new();
+            }
+            in_value = false;
+            continue;
+        }
+        cur.push(ch);
+    }
+
+    if escaped {
+        return Err(
+            "Escape character '\\' not allowed as last character in attr value".to_string(),
+        );
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    Ok(parts)
+}
+
+fn parse_attr_requirements(expr: &str) -> Result<Vec<AttrRequirement>, String> {
+    if expr.trim().is_empty() {
+        return Err("empty attr magic is invalid".to_string());
+    }
+    let mut out = Vec::new();
+    for token in split_attr_expr(expr)? {
+        if let Some(name) = token.strip_prefix('-') {
+            if name.contains('=') {
+                return Err("invalid attribute name".to_string());
+            }
+            if !is_valid_attr_name(name) {
+                return Err(format!("{name} is not a valid attribute name"));
+            }
+            out.push(AttrRequirement::Unset(name.to_string()));
+        } else if let Some(name) = token.strip_prefix('!') {
+            if name.contains('=') {
+                return Err("invalid attribute name".to_string());
+            }
+            if !is_valid_attr_name(name) {
+                return Err(format!("{name} is not a valid attribute name"));
+            }
+            out.push(AttrRequirement::Unspecified(name.to_string()));
+        } else if let Some((name, value)) = token.split_once('=') {
+            if !is_valid_attr_name(name) {
+                return Err(format!("{name} is not a valid attribute name"));
+            }
+            if value.is_empty() {
+                return Err("empty attribute value is not allowed".to_string());
+            }
+            out.push(AttrRequirement::Value(name.to_string(), value.to_string()));
+        } else {
+            if !is_valid_attr_name(&token) {
+                return Err(format!("{token} is not a valid attribute name"));
+            }
+            out.push(AttrRequirement::Set(token));
+        }
+    }
+    if out.is_empty() {
+        return Err("empty attr magic is invalid".to_string());
+    }
+    Ok(out)
+}
+
+/// Validate `:(attr:...)` pathspec magic in `specs`.
+///
+/// Returns `Ok(())` when all attribute magic is parseable. Returns a Git-style error string for
+/// unsupported or malformed attribute magic.
+pub fn validate_attr_pathspecs(specs: &[String]) -> Result<(), String> {
+    for spec in specs {
+        if literal_global() || !spec.starts_with(":(") {
+            continue;
+        }
+        let Some(rest) = spec.strip_prefix(":(") else {
+            continue;
+        };
+        let Some(close) = rest.find(')') else {
+            continue;
+        };
+        let magic_part = &rest[..close];
+        let mut attr_count = 0usize;
+        for token in split_long_magic_tokens(magic_part) {
+            let Some(expr) = token.trim().strip_prefix("attr:") else {
+                continue;
+            };
+            attr_count += 1;
+            if attr_count > 1 {
+                return Err("Only one 'attr:' specification is allowed.".to_string());
+            }
+            parse_attr_requirements(expr)?;
+        }
+    }
+    Ok(())
+}
+
+fn split_long_magic_tokens(magic_part: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut cur = String::new();
+    let mut escaped = false;
+    for ch in magic_part.chars() {
+        if escaped {
+            cur.push('\\');
+            cur.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == ',' {
+            tokens.push(cur.trim().to_string());
+            cur.clear();
+            continue;
+        }
+        cur.push(ch);
+    }
+    if escaped {
+        cur.push('\\');
+    }
+    tokens.push(cur.trim().to_string());
+    tokens
+}
+
 fn parse_long_magic(rest_after_paren: &str) -> Option<(PathspecMagic, &str)> {
     let close = rest_after_paren.find(')')?;
     let magic_part = &rest_after_paren[..close];
     let tail = &rest_after_paren[close + 1..];
     let mut magic = PathspecMagic::default();
-    for raw in magic_part.split(',') {
+    for raw in split_long_magic_tokens(magic_part) {
         let token = raw.trim();
         if token.is_empty() {
             continue;
@@ -220,9 +400,9 @@ fn parse_long_magic(rest_after_paren: &str) -> Option<(PathspecMagic, &str)> {
             magic.prefix = Some(p.to_string());
             continue;
         }
-        if let Some(name) = token.strip_prefix("attr:") {
-            if !name.is_empty() {
-                magic.attr_name = Some(name.to_string());
+        if let Some(expr) = token.strip_prefix("attr:") {
+            if let Ok(reqs) = parse_attr_requirements(expr) {
+                magic.attr_requirements = reqs;
             }
             continue;
         }
@@ -559,6 +739,32 @@ fn pathspec_match_one_positive(path: &str, magic: PathspecMagic, raw_pattern: &s
     pathspec_matches_tail(pattern, path_for_match, magic)
 }
 
+fn attr_requirements_match(
+    requirements: &[AttrRequirement],
+    attr_rules: &[AttrRule],
+    path: &str,
+    is_dir: bool,
+    mode: u32,
+) -> bool {
+    requirements.iter().all(|req| {
+        let value = if req.name() == "builtin_objectmode" {
+            if mode == 0 {
+                None
+            } else {
+                Some(format!("{mode:06o}"))
+            }
+        } else {
+            path_gitattribute_value(attr_rules, path, is_dir, req.name())
+        };
+        match req {
+            AttrRequirement::Set(_) => value.as_deref() == Some("set"),
+            AttrRequirement::Unset(_) => value.as_deref() == Some("unset"),
+            AttrRequirement::Unspecified(_) => value.is_none(),
+            AttrRequirement::Value(_, expected) => value.as_deref() == Some(expected.as_str()),
+        }
+    })
+}
+
 fn matches_pathspec_element_with_context(
     spec: &str,
     path: &str,
@@ -572,8 +778,8 @@ fn matches_pathspec_element_with_context(
     if magic.literal && magic.glob {
         return false;
     }
-    if magic.attr_name.is_some() {
-        return pathspec_matches(spec, path);
+    if !magic.attr_requirements.is_empty() {
+        return false;
     }
     if magic.literal || magic.glob || magic.icase {
         return pathspec_matches(spec, path);
@@ -604,7 +810,7 @@ fn pathspec_exclude_element_matches_with_context(
     if magic.literal && magic.glob {
         return false;
     }
-    if magic.attr_name.is_some() {
+    if !magic.attr_requirements.is_empty() {
         // Attribute pathspecs need `.gitattributes` context; use
         // [`matches_pathspec_list_for_object`] for those.
         return false;
@@ -751,10 +957,16 @@ fn matches_pathspec_exclude_for_object(
     }
     let ctx = context_from_mode_bits(mode);
     let is_dir_for_attr = path.ends_with('/') || ctx.is_directory || ctx.is_git_submodule;
-    if let Some(ref attr) = magic.attr_name {
-        if !path_has_gitattribute(attr_rules, path, is_dir_for_attr, attr) {
-            return false;
-        }
+    if !magic.attr_requirements.is_empty()
+        && !attr_requirements_match(
+            &magic.attr_requirements,
+            attr_rules,
+            path,
+            is_dir_for_attr,
+            mode,
+        )
+    {
+        return false;
     }
     let pattern = strip_top_magic(raw_pattern);
     let path_for_match = if let Some(prefix) = magic.prefix.as_deref() {
@@ -1040,10 +1252,16 @@ pub fn matches_ls_tree_pathspec(
     let ctx = context_from_mode_bits(mode);
     let is_dir_for_attr = path.ends_with('/') || ctx.is_directory || ctx.is_git_submodule;
 
-    if let Some(ref attr) = magic.attr_name {
-        if !path_has_gitattribute(attr_rules, path, is_dir_for_attr, attr) {
-            return false;
-        }
+    if !magic.attr_requirements.is_empty()
+        && !attr_requirements_match(
+            &magic.attr_requirements,
+            attr_rules,
+            path,
+            is_dir_for_attr,
+            mode,
+        )
+    {
+        return false;
     }
 
     let pattern = strip_top_magic(raw_pattern);
@@ -1123,10 +1341,16 @@ pub fn matches_pathspec_for_object(
     let ctx = context_from_mode_bits(mode);
     let is_dir_for_attr = path.ends_with('/') || ctx.is_directory || ctx.is_git_submodule;
 
-    if let Some(ref attr) = magic.attr_name {
-        if !path_has_gitattribute(attr_rules, path, is_dir_for_attr, attr) {
-            return false;
-        }
+    if !magic.attr_requirements.is_empty()
+        && !attr_requirements_match(
+            &magic.attr_requirements,
+            attr_rules,
+            path,
+            is_dir_for_attr,
+            mode,
+        )
+    {
+        return false;
     }
 
     let pattern = strip_top_magic(raw_pattern);

@@ -2765,3 +2765,14 @@ Updated: 2026-06-01
   Ran `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
   backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
   and `cargo test -p grit-lib --lib`.
+- t6135 attr pathspec parsing focus: after adding typed `:(attr:...)` requirements for set, unset,
+  unspecified, and value matches, preserving escaped comma values, validating malformed attr
+  magic, rejecting attr magic from `check-ignore`, and loading nested `.gitattributes` for
+  `ls-files`, the direct `t6135-pathspec-with-attrs.sh` run improves from 7/37 to 25/37.
+  `./scripts/run-tests.sh t6135-pathspec-with-attrs.sh --quiet` records 25/37 with refreshed CSV
+  and dashboards. Merged current `main` first, rebuilt release, and re-ran the focused harness from
+  that merged baseline. Also re-ran the traced `t6416-recursive-corner-cases.sh` refresh to keep its
+  expected-failure accounting at 40 total, 37 passing, 0 failing, 3 expected failures. Ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
+  `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and `git diff --check`.

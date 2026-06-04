@@ -341,6 +341,13 @@ fn validate_args(args: &ParsedArgs) -> Result<()> {
     if args.non_matching && !args.verbose {
         bail!("--non-matching is only valid with --verbose");
     }
+    if args
+        .paths
+        .iter()
+        .any(|path| path.starts_with(":(attr:") || path.contains(",attr:"))
+    {
+        bail!("pathspec magic not supported by this command: 'attr'");
+    }
     Ok(())
 }
 

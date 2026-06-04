@@ -420,6 +420,9 @@ pub fn run(args: Args) -> Result<()> {
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
+    if let Err(message) = grit_lib::pathspec::validate_attr_pathspecs(&pathspec_display) {
+        anyhow::bail!("{message}");
+    }
     if pathspec_filter.is_empty() && !cwd_prefix.is_empty() && !args.full_name {
         pathspec_filter.push(Pathspec::Literal(cwd_prefix.clone()));
         pathspec_display.push(".".to_string());
@@ -459,6 +462,9 @@ pub fn run(args: Args) -> Result<()> {
         &resolved_pathspec_strings,
         cwd_for_resolve.as_deref(),
     );
+    let pathspec_uses_attrs = pathspec_lib_strings
+        .iter()
+        .any(|spec| spec.starts_with(":(attr:") || spec.contains(",attr:"));
 
     // For `--error-unmatch`, Git matches pathspecs separately against index output vs untracked
     // output (`-c` vs `-o`). A pathspec that only hits tracked files does not satisfy `-o`.
@@ -580,11 +586,23 @@ pub fn run(args: Args) -> Result<()> {
             // Filter by pathspec (Git `match_pathspec`: positives ORed, then excludes subtracted).
             if !pathspec_filter.is_empty() {
                 let path_str = String::from_utf8_lossy(&entry.path);
+                let path_attrs;
+                let attrs_for_pathspec = if pathspec_uses_attrs {
+                    path_attrs = grit_lib::crlf::load_gitattributes_for_checkout(
+                        work_tree,
+                        path_str.as_ref(),
+                        &index,
+                        &repo.odb,
+                    );
+                    path_attrs.as_slice()
+                } else {
+                    &attrs_for_eol
+                };
                 if !grit_lib::pathspec::matches_pathspec_set_for_object_ls_tree(
                     &pathspec_lib_strings,
                     path_str.as_ref(),
                     entry.mode,
-                    &attrs_for_eol,
+                    attrs_for_pathspec,
                 ) {
                     continue;
                 }
