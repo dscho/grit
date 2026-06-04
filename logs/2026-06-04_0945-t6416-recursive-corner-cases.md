@@ -16,3 +16,8 @@ Progress:
   29/40 passing, 8 failing, with 3 expected failures. Newly passing: D1/E1, D1/E2,
   and E2/D1 directory/file criss-cross cases. Remaining ordinary failures: 13, 17, 28,
   30, 32, 34, 38, and 40.
+- Fixed the reverse rename/delete direction so a clean virtual-base directory side does not
+  force the renamed file to `a~SIDE`; it remains staged at `a` like Git.
+- Ran `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose`; improved to
+  30/40 passing, 7 failing, with 3 expected failures. Newly passing: E1/D1. Remaining
+  ordinary failures: 17, 28, 30, 32, 34, 38, and 40.

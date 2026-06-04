@@ -7986,7 +7986,10 @@ fn merge_trees(
                             auto_merge_hint_path: None,
                         });
                     }
-                } else if path_has_tree_descendant(&ours_entries, theirs_new_path) {
+                } else if path_has_tree_descendant(&ours_entries, theirs_new_path)
+                    && !(criss_cross_outer_merge
+                        && path_descendants_match(&base, &ours_entries, theirs_new_path))
+                {
                     // Ours turned `theirs_new_path` into a directory (e.g. a directory rename put
                     // a subtree there) while theirs renamed a deleted-on-our-side file into it.
                     // git relocates the file to `theirs_new_path~THEIRS`, staging base (the rename
