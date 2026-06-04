@@ -1,3 +1,15 @@
+## 2026-06-04 — t6416 submodule criss-cross conflicts
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  32/40 to 35/40 after gitlink virtual-base conflicts and `ls-files -o` unmerged-gitlink
+  filtering matched the expected submodule conflict shape.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
 ## 2026-06-04 — t6416 symlink add/add virtual base
 
 - Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from

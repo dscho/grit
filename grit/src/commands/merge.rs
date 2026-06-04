@@ -1653,14 +1653,29 @@ pub(crate) fn create_virtual_merge_base(
                 let Some(e2) = entries_at.iter().find(|e| e.stage() == 2).copied() else {
                     continue;
                 };
+                let e3 = entries_at.iter().find(|e| e.stage() == 3).copied();
+                if three_way
+                    && e2.mode == MODE_GITLINK
+                    && e3.is_some_and(|e| e.mode == MODE_GITLINK)
+                    && entries_at
+                        .iter()
+                        .find(|e| e.stage() == 1)
+                        .is_some_and(|e| e.mode == MODE_GITLINK)
+                {
+                    let Some(e1) = entries_at.iter().find(|e| e.stage() == 1).copied() else {
+                        continue;
+                    };
+                    push_entry(e1.clone())?;
+                    continue;
+                }
                 // Symlink add/add conflicts have no stable virtual-base winner; omitting
                 // the path lets the outer criss-cross merge surface stage 2/3 only.
                 if add_add
-                    && e2.mode == MODE_SYMLINK
-                    && entries_at
-                        .iter()
-                        .find(|e| e.stage() == 3)
-                        .is_some_and(|e| e.mode == MODE_SYMLINK)
+                    && e3.is_some_and(|e| {
+                        (e2.mode == MODE_SYMLINK && e.mode == MODE_SYMLINK)
+                            || e2.mode == MODE_GITLINK
+                            || e.mode == MODE_GITLINK
+                    })
                 {
                     continue;
                 }
@@ -8733,39 +8748,20 @@ fn merge_trees(
             (None, Some(oe), Some(te)) => {
                 let path_str = String::from_utf8_lossy(path).to_string();
                 if oe.mode == MODE_GITLINK && te.mode == MODE_GITLINK {
-                    let z = zero_oid();
-                    let be = IndexEntry {
-                        ctime_sec: 0,
-                        ctime_nsec: 0,
-                        mtime_sec: 0,
-                        mtime_nsec: 0,
-                        dev: 0,
-                        ino: 0,
-                        mode: MODE_GITLINK,
-                        uid: 0,
-                        gid: 0,
-                        size: 0,
-                        oid: z,
-                        flags: path.len().min(0xFFF) as u16,
-                        flags_extended: None,
-                        path: path.to_vec(),
-                        base_index_pos: 0,
-                    };
-                    if try_merge_gitlink_entries(
-                        repo,
-                        &path_str,
-                        &be,
-                        oe,
-                        te,
-                        favor,
-                        &mut index,
-                        &mut has_conflicts,
-                        &mut conflict_descriptions,
-                        &mut submodule_merge_stdout,
-                        &mut submodule_merge_advice,
-                    )? {
-                        continue;
-                    }
+                    has_conflicts = true;
+                    remove_stage_zero_entry(&mut index, path);
+                    stage_entry(&mut index, oe, 2);
+                    stage_entry(&mut index, te, 3);
+                    conflict_descriptions.push(ConflictDescription {
+                        kind: "submodule",
+                        body: format!("Merge conflict in {path_str}"),
+                        subject_path: path_str.clone(),
+                        remerge_anchor_path: None,
+                        rename_rr_ours_dest: None,
+                        rename_rr_theirs_dest: None,
+                        auto_merge_hint_path: None,
+                    });
+                    continue;
                 }
                 match try_content_merge_add_add(
                     repo,
@@ -9891,7 +9887,7 @@ fn conflict_submodule_vs_non_gitlink(
         rename_rr_theirs_dest: None,
         auto_merge_hint_path: None,
     });
-    if other.mode != MODE_GITLINK && other.mode != MODE_TREE {
+    if matches!(other.mode, MODE_REGULAR | MODE_EXECUTABLE) {
         if let Ok(obj) = repo.odb.read(&other.oid) {
             let conflict_path = format!("{path_str}~{file_conflict_suffix}");
             conflict_files.push((conflict_path, obj.data));

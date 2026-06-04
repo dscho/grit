@@ -32,3 +32,11 @@ Progress:
 - Ran `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose`; improved to
   32/40 passing, 5 failing, with 3 expected failures. Newly passing: symlink add/add. Remaining
   ordinary failures: 30, 32, 34, 38, and 40.
+- Fixed submodule modify/modify, submodule add/add, and submodule-vs-symlink add/add criss-cross
+  handling by preserving/omitting gitlink virtual-base entries appropriately, staging gitlink
+  add/add conflicts without a fake stage 1, suppressing unmerged gitlink directories from
+  `ls-files -o`, and avoiding extra symlink side files for submodule-vs-symlink conflicts.
+- Ran `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose`; improved to
+  35/40 passing, 2 failing, with 3 expected failures. Newly passing: submodule modify/modify,
+  submodule add/add, and conflicting entry types (submodule vs symlink). Remaining ordinary
+  failures: 38 and 40.

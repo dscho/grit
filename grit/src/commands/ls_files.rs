@@ -865,6 +865,12 @@ pub fn run(args: Args) -> Result<()> {
     if show_others {
         let indexed_paths: BTreeSet<Vec<u8>> =
             index.entries.iter().map(|e| e.path.clone()).collect();
+        let indexed_gitlink_paths: BTreeSet<Vec<u8>> = index
+            .entries
+            .iter()
+            .filter(|e| e.mode == grit_lib::index::MODE_GITLINK)
+            .map(|e| e.path.clone())
+            .collect();
         let mut untracked = Vec::new();
         // With `--ignored --directory`, Git collapses a directory to `dir/` only when the
         // directory itself is ignored; directories that merely *contain* ignored files are
@@ -879,6 +885,7 @@ pub fn run(args: Args) -> Result<()> {
             work_tree,
             work_tree,
             &indexed_paths,
+            &indexed_gitlink_paths,
             &mut untracked,
             true,
             walk_emit_empty,
@@ -1132,6 +1139,12 @@ pub fn run(args: Args) -> Result<()> {
     if args.killed {
         let indexed_paths: BTreeSet<Vec<u8>> =
             index.entries.iter().map(|e| e.path.clone()).collect();
+        let indexed_gitlink_paths: BTreeSet<Vec<u8>> = index
+            .entries
+            .iter()
+            .filter(|e| e.mode == grit_lib::index::MODE_GITLINK)
+            .map(|e| e.path.clone())
+            .collect();
         // Sorted list of stage-0 tracked names for prefix / immediate-successor lookups.
         let mut cache_names: Vec<&[u8]> = index
             .entries
@@ -1146,6 +1159,7 @@ pub fn run(args: Args) -> Result<()> {
             work_tree,
             work_tree,
             &indexed_paths,
+            &indexed_gitlink_paths,
             &mut untracked,
             true,
             false, // no --directory collapsing: killed needs the full file list
@@ -1723,6 +1737,7 @@ fn walk_worktree(
     root: &std::path::Path,
     dir: &std::path::Path,
     indexed: &BTreeSet<Vec<u8>>,
+    indexed_gitlinks: &BTreeSet<Vec<u8>>,
     out: &mut Vec<Vec<u8>>,
     is_root: bool,
     emit_empty_directories: bool,
@@ -1789,6 +1804,9 @@ fn walk_worktree(
                 added = true;
             }
         } else if ft.is_dir() {
+            if indexed_gitlinks.contains(&rel_bytes) {
+                continue;
+            }
             let dot_git = path.join(".git");
             let is_own_git_dir = dot_git_marks_git_repository(&dot_git)
                 && dot_git_is_own_repository(&dot_git, own_git_dir);
@@ -1833,6 +1851,7 @@ fn walk_worktree(
                 root,
                 &path,
                 indexed,
+                indexed_gitlinks,
                 out,
                 false,
                 emit_empty_directories,
