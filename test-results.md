@@ -1553,3 +1553,12 @@ Updated: 2026-06-01
 - Remaining `t3418` failures are still tests 8, 20, 23, and 24.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-04 — t3418-rebase-continue complete
+
+- Focus harness completed at 30/30 after final squash/fixup editor invocation and cleanup,
+  non-interactive failed-exec todo retention, and `rebase-merge/patch` creation/removal were fixed.
+- Related verification: `./scripts/run-tests.sh t3418-rebase-continue.sh
+  t3422-rebase-incompatible-options.sh t3650-replay-basics.sh` passed all three files.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).

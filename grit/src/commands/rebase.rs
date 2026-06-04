@@ -2096,18 +2096,23 @@ fn drop_last_squash_message_section(rb_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cleanup_head_message_after_fixup_skip(repo: &Repository, git_dir: &Path) -> Result<()> {
+fn cleanup_head_message_after_fixup_skip(
+    repo: &Repository,
+    git_dir: &Path,
+    raw_override: Option<String>,
+) -> Result<()> {
     let head = resolve_head(git_dir)?;
     let Some(head_oid) = head.oid().copied() else {
         return Ok(());
     };
     let obj = repo.odb.read(&head_oid)?;
     let commit = parse_commit(&obj.data)?;
-    if !commit.message.starts_with("# This is a combination of") {
+    let raw_message = raw_override.unwrap_or_else(|| commit.message.clone());
+    if !raw_message.starts_with("# This is a combination of") {
         return Ok(());
     }
     let message = String::from_utf8_lossy(&grit_lib::stripspace::process(
-        commit.message.as_bytes(),
+        raw_message.as_bytes(),
         &grit_lib::stripspace::Mode::StripComments("#".to_string()),
     ))
     .into_owned();
@@ -5264,13 +5269,13 @@ fn replay_remaining(
                                          hint:   grit rebase --continue",
                                             global_exec
                                         );
-                                        let mut remaining: Vec<String> = Vec::new();
+                                        let mut remaining: Vec<String> =
+                                            vec![format!("exec {global_exec}")];
                                         if reschedule {
                                             eprintln!(
                                                 "hint: '{}' has been rescheduled",
                                                 global_exec
                                             );
-                                            remaining.push(format!("exec {global_exec}"));
                                         }
                                         remaining.extend(
                                             todo[i + 1..].iter().map(|line| (*line).to_owned()),
@@ -5873,6 +5878,7 @@ fn cherry_pick_for_rebase(
 
     if has_conflicts {
         let _ = grit_lib::rerere::repo_rerere(repo, load_rebase_rerere_autoupdate(rb_dir));
+        let _ = fs::write(rb_dir.join("patch"), "");
         if todo_cmd == RebaseTodoCmd::Reword {
             let (unicode, _enc, _raw) = transcoded_replayed_message(&commit, &config);
             write_rebase_conflict_message(git_dir, &commit, &config)?;
@@ -6932,7 +6938,25 @@ fn do_skip() -> Result<()> {
                 .iter()
                 .all(|line| line.trim().is_empty() || line.trim().starts_with('#'))
             {
-                cleanup_head_message_after_fixup_skip(&repo, git_dir)?;
+                let edited_message = if skipped_cmd == RebaseTodoCmd::Squash {
+                    let squash_msg = fs::read_to_string(rb_dir.join("message-squash")).ok();
+                    if squash_msg
+                        .as_deref()
+                        .is_some_and(|msg| msg.contains("# This is the commit message #3:"))
+                    {
+                        match squash_msg {
+                            Some(msg) => Some(run_commit_editor_for_template(
+                                &repo, git_dir, &msg, "squash", None,
+                            )?),
+                            None => None,
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                cleanup_head_message_after_fixup_skip(&repo, git_dir, edited_message)?;
             }
         }
         fs::write(rb_dir.join("msgnum"), "1")?;

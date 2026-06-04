@@ -111,17 +111,10 @@
     glued `-C<n>` preprocessing to advance the parser, and making apply-backend options respect
     `--no-rebase-merges`/`--no-update-refs` overrides while still reporting config-specific
     incompatibility advice.
-  - Current focus: `t3418-rebase-continue.sh`; initial parsing partial accepts attached
-    `-X<option>`, `-o`, rerere autoupdate, and reschedule-failed-exec flags so direct runs reach
-    behavior assertions instead of option parsing failures. Rerere autoupdate continuation state
-    is now persisted and direct tests 10-19 pass; merge strategy option replay and interactive
-    merge todo comment parsing are fixed, and failed exec rescheduling now works for requested /
-    configured modes. Current harness count is 25/30; remaining work is skipped fixup message
-    cleanup, patch cleanup before `break`, no-reschedule continuation edge cases, and
-    conflict-message editor/comment handling; in-progress `--edit-todo --no-reschedule-failed-exec`
-    now rejects with status 129. Conflict continuation editor templates now preserve `#` comments
-    for `core.commentChar=auto`; current harness count is 26/30 with tests 8, 20, 23, and 24
-    remaining.
+  - Completed: `t3418-rebase-continue.sh` (30/30) after fixing continuation option parsing,
+    strategy-option replay, rerere autoupdate persistence, failed-exec rescheduling semantics,
+    conflict editor templates, interactive fixup/squash skip message state, and patch cleanup
+    before `break`.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
