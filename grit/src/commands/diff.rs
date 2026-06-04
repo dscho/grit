@@ -3499,6 +3499,7 @@ pub fn run(mut args: Args) -> Result<()> {
         if args.patch_with_raw && show_unified_patch && !args.raw {
             write_raw(&mut out, &entries, oid_len, !args.cached && revs.len() <= 1)?;
             need_blank_before_patch = true;
+            wrote_output = true;
         }
         if args.patch_with_stat && show_unified_patch && !stat_block_active {
             write_stat(
@@ -3520,6 +3521,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 diff_algo_cli,
             )?;
             need_blank_before_patch = true;
+            wrote_output = true;
         }
         if show_unified_patch {
             if need_blank_before_patch && wrote_output {
