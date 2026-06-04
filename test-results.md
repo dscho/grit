@@ -1475,3 +1475,15 @@ Updated: 2026-06-01
   is not green yet.
 - Regression verification: `./scripts/run-tests.sh t3422-rebase-incompatible-options.sh
   t3650-replay-basics.sh` passed both files.
+
+## 2026-06-04 — t3418-rebase-continue rerere partial
+
+- Direct `t3418-rebase-continue.sh --verbose` now passes the rerere autoupdate continuation block
+  (tests 10-19) after rebase persisted rerere autoupdate mode and recorded resolved postimages
+  during `--continue`.
+- Remaining direct failures: merge strategy option replay, skipped fixup message cleanup, patch
+  cleanup before `break`, and rescheduled exec behavior. The file is still not green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+- Regression verification: `./scripts/run-tests.sh t3422-rebase-incompatible-options.sh
+  t3650-replay-basics.sh` passed both files.

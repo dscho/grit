@@ -113,8 +113,9 @@
     incompatibility advice.
   - Current focus: `t3418-rebase-continue.sh`; initial parsing partial accepts attached
     `-X<option>`, `-o`, rerere autoupdate, and reschedule-failed-exec flags so direct runs reach
-    behavior assertions instead of option parsing failures, but continuation behavior still needs
-    fixes.
+    behavior assertions instead of option parsing failures. Rerere autoupdate continuation state
+    is now persisted and direct tests 10-19 pass; remaining work is merge strategy option replay,
+    skipped fixup message cleanup, patch cleanup before `break`, and rescheduled exec behavior.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

@@ -2819,6 +2819,16 @@ fn load_rebase_ignore_whitespace(rb_dir: &Path) -> bool {
     rb_dir.join("ignore-whitespace").exists()
 }
 
+fn load_rebase_rerere_autoupdate(rb_dir: &Path) -> grit_lib::rerere::RerereAutoupdate {
+    if rb_dir.join("rerere-autoupdate").exists() {
+        grit_lib::rerere::RerereAutoupdate::Yes
+    } else if rb_dir.join("no-rerere-autoupdate").exists() {
+        grit_lib::rerere::RerereAutoupdate::No
+    } else {
+        grit_lib::rerere::RerereAutoupdate::FromConfig
+    }
+}
+
 fn load_rebase_replay_commit_opts(rb_dir: &Path) -> RebaseReplayCommitOpts {
     RebaseReplayCommitOpts {
         ignore_space_change: load_rebase_ignore_whitespace(rb_dir),
@@ -3991,6 +4001,18 @@ Use '--' to separate paths from revisions, like this:\n\
 
     if args.ignore_whitespace {
         fs::write(rb_dir.join("ignore-whitespace"), "")?;
+    }
+    if args.rerere_autoupdate {
+        fs::write(rb_dir.join("rerere-autoupdate"), "")?;
+    }
+    if args.no_rerere_autoupdate {
+        fs::write(rb_dir.join("no-rerere-autoupdate"), "")?;
+    }
+    if args.reschedule_failed_exec {
+        fs::write(rb_dir.join("reschedule-failed-exec"), "")?;
+    }
+    if args.no_reschedule_failed_exec {
+        fs::write(rb_dir.join("no-reschedule-failed-exec"), "")?;
     }
     if args.committer_date_is_author_date {
         fs::write(rb_dir.join("cdate_is_adate"), "")?;
@@ -5639,7 +5661,7 @@ fn cherry_pick_for_rebase(
     }
 
     if has_conflicts {
-        let _ = grit_lib::rerere::repo_rerere(repo, grit_lib::rerere::RerereAutoupdate::FromConfig);
+        let _ = grit_lib::rerere::repo_rerere(repo, load_rebase_rerere_autoupdate(rb_dir));
         if todo_cmd == RebaseTodoCmd::Reword {
             let (unicode, _enc, _raw) = transcoded_replayed_message(&commit, &config);
             write_rebase_conflict_message(git_dir, &commit, &config)?;
@@ -6311,6 +6333,7 @@ fn do_continue() -> Result<()> {
              hint: fix conflicts and then run 'grit rebase --continue'"
         );
     }
+    let _ = grit_lib::rerere::repo_rerere(&repo, load_rebase_rerere_autoupdate(&rb_dir));
 
     // Commit the current cherry-pick
     let current_hex = fs::read_to_string(rb_dir.join("current"))?;
