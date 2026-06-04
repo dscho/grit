@@ -6318,7 +6318,13 @@ fn cherry_pick_for_rebase(
 
         if todo_cmd == RebaseTodoCmd::Fixup {
             let fixup_path = rb_dir.join("message-fixup");
-            let cleaned = if fixup_path.exists() {
+            let squash_ctx = read_squash_ctx(rb_dir);
+            let cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
+                let tmpl = fs::read_to_string(&fixup_path)?;
+                let raw =
+                    commit_message_after_prepare_hook(repo, git_dir, &tmpl, "message", Some(":"))?;
+                cleanup_squash_editor_message(&raw, &config)
+            } else if fixup_path.exists() {
                 let tmpl = fs::read_to_string(&fixup_path)?;
                 let after_editor =
                     run_commit_editor_for_template(repo, git_dir, &tmpl, "squash", None)?;
@@ -7048,7 +7054,13 @@ fn do_continue() -> Result<()> {
             )?
         } else if todo_cmd == RebaseTodoCmd::Fixup {
             let fixup_path = rb_dir.join("message-fixup");
-            let cleaned = if fixup_path.exists() {
+            let squash_ctx = read_squash_ctx(&rb_dir);
+            let cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
+                let tmpl = fs::read_to_string(&fixup_path)?;
+                let raw =
+                    commit_message_after_prepare_hook(&repo, git_dir, &tmpl, "message", Some(":"))?;
+                cleanup_squash_editor_message(&raw, &config)
+            } else if fixup_path.exists() {
                 let tmpl = fs::read_to_string(&fixup_path)?;
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
