@@ -116,6 +116,13 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t3404-rebase-interactive current status
+
+- Re-ran `./scripts/run-tests.sh t3404-rebase-interactive.sh --verbose` with test identity env
+  unset; current result remains 59/132.
+- Current first failure is test 30: `git rebase -v -i --onto new-branch1 HEAD^` succeeds instead
+  of stopping for the expected conflict before `--continue`.
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing
