@@ -1501,9 +1501,17 @@ fn diff_tree_vs_worktree(
                         };
                         // Use zero OID for worktree side — the blob is not
                         // in the object database, matching git's behaviour.
+                        // Exception: a gitlink (submodule directory checked out where the index
+                        // records a blob) keeps its resolved submodule HEAD so `--submodule`
+                        // patch rendering shows the real right-side commit (blob→submodule
+                        // typechange, t4060 #17). Raw plumbing re-zeros it elsewhere.
                         let wt_placeholder = Snapshot {
                             mode: worktree_snapshot.mode,
-                            oid: zero_oid(),
+                            oid: if worktree_snapshot.mode == MODE_GITLINK {
+                                worktree_snapshot.oid
+                            } else {
+                                zero_oid()
+                            },
                         };
                         merged.insert(
                             path.clone(),
