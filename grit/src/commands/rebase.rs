@@ -5160,6 +5160,18 @@ fn replay_remaining(
                         // `todo[i..]` here would re-add the exec and loop forever (t5407 `-i (exec)`).
                         std::process::exit(code);
                     }
+                    if !worktree_matches_head(repo, git_dir)? {
+                        eprintln!(
+                            "execution succeeded: {} but left changes to the index and/or the working tree",
+                            exec_cmd
+                        );
+                        eprintln!("warning: execution succeeded: {}", exec_cmd);
+                        eprintln!(
+                            "hint: You can fix the problem, and then run\n\
+                         hint:   grit rebase --continue"
+                        );
+                        std::process::exit(1);
+                    }
                     continue 'rebase_loop;
                 }
                 RebaseReplayStep::MergeReuseMessage {
