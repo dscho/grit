@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5561-http-backend
+
+- Focus harness: `./scripts/run-tests.sh t5561-http-backend.sh --verbose` passes 14/14 after `/smart_noexport` export handling and accurate CGI access-log status/size fields.
+- Regression harness: `./scripts/run-tests.sh t5561-http-backend.sh t5562-http-backend-content-length.sh t5541-http-push-smart.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5410-receive-pack
 
 - Focus harness: `./scripts/run-tests.sh t5410-receive-pack.sh --verbose` passes 5/5 after receive-pack advertises local duplicate refs by refname and reserves `.have` for alternate refs.

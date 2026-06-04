@@ -355,10 +355,22 @@ fn send_redirect(stream: &mut TcpStream, status: u16, location: &str) -> Result<
 
 fn log_access(config: &Config, method: &str, path: &str, query: &str, status: u16) {
     use std::fs::OpenOptions;
-    let line = if query.is_empty() {
-        format!("{} {} HTTP/1.1 {} 1", method, path, status)
+    let size_field = if status != 200
+        || method.eq_ignore_ascii_case("POST")
+        || path.ends_with("/objects/info/alternates")
+        || path.ends_with("/objects/info/http-alternates")
+    {
+        "-"
     } else {
-        format!("{} {}?{} HTTP/1.1 {} 1", method, path, query, status)
+        "1"
+    };
+    let line = if query.is_empty() {
+        format!("{} {} HTTP/1.1 {} {size_field}", method, path, status)
+    } else {
+        format!(
+            "{} {}?{} HTTP/1.1 {} {size_field}",
+            method, path, query, status
+        )
     };
     if let Ok(mut f) = OpenOptions::new()
         .create(true)
@@ -447,38 +459,23 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> Result<(), Strin
     for pfx in &["/auth/smart", "/auth-push/smart", "/auth-fetch/smart"] {
         if req.path.starts_with(&format!("{}/", pfx)) {
             let r = handle_smart_http_with_path(&mut stream, &req, config, pfx);
-            log_access(
-                config,
-                &req.method,
-                &req.path,
-                &req.query,
-                if r.is_ok() { 200 } else { 500 },
-            );
-            return r;
+            let status = r.as_ref().copied().unwrap_or(500);
+            log_access(config, &req.method, &req.path, &req.query, status);
+            return r.map(|_| ());
         }
     }
     if req.path.starts_with("/custom_auth/") {
         let r = handle_custom_auth_smart(&mut stream, &req, config);
-        log_access(
-            config,
-            &req.method,
-            &req.path,
-            &req.query,
-            if r.is_ok() { 200 } else { 500 },
-        );
-        return r;
+        let status = r.as_ref().copied().unwrap_or(500);
+        log_access(config, &req.method, &req.path, &req.query, status);
+        return r.map(|_| ());
     }
     // Route: /one_time_script/<repo> -> git-http-backend CGI output transformed once.
     if req.path.starts_with("/one_time_script/") {
         let r = handle_one_time_script_smart(&mut stream, &req, config);
-        log_access(
-            config,
-            &req.method,
-            &req.path,
-            &req.query,
-            if r.is_ok() { 200 } else { 500 },
-        );
-        return r;
+        let status = r.as_ref().copied().unwrap_or(500);
+        log_access(config, &req.method, &req.path, &req.query, status);
+        return r.map(|_| ());
     }
     if req.path.starts_with("/error_git_upload_pack/smart/")
         && (req.path.contains("git-upload-pack") || req.query.contains("service=git-upload-pack"))
@@ -537,13 +534,22 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> Result<(), Strin
             return r;
         }
         let r = handle_smart_http(&mut stream, &req, config);
-        log_access(
-            config,
-            &req.method,
-            &req.path,
-            &req.query,
-            if r.is_ok() { 200 } else { 500 },
-        );
+        let status = r.as_ref().copied().unwrap_or(500);
+        log_access(config, &req.method, &req.path, &req.query, status);
+        return r.map(|_| ());
+    }
+
+    // Route: /smart_noexport/<repo>/<path> → dumb HTTP static files gated by
+    // git-daemon-export-ok, matching Apache's SetEnvIf-requested CGI setup in
+    // the upstream http-backend tests.
+    if req.path.starts_with("/smart_noexport/") {
+        let r = serve_git_export_checked_static(&mut stream, config, &req.path, "/smart_noexport");
+        let status = if r.is_ok() {
+            export_checked_status(config, &req.path, "/smart_noexport")
+        } else {
+            500
+        };
+        log_access(config, &req.method, &req.path, &req.query, status);
         return r;
     }
 
@@ -868,7 +874,61 @@ fn guess_content_type(path: &str) -> String {
     }
 }
 
-fn handle_smart_http(stream: &mut TcpStream, req: &Request, config: &Config) -> Result<(), String> {
+fn export_checked_status(config: &Config, request_path: &str, prefix: &str) -> u16 {
+    let Some((repo_rel, file_rel)) = split_export_checked_path(request_path, prefix) else {
+        return 404;
+    };
+    let repo_path = config.root.join(repo_rel);
+    if !repo_path.join("git-daemon-export-ok").is_file() {
+        return 404;
+    }
+    let full_path = repo_path.join(file_rel);
+    if full_path.is_file() {
+        200
+    } else {
+        404
+    }
+}
+
+fn serve_git_export_checked_static(
+    stream: &mut TcpStream,
+    config: &Config,
+    request_path: &str,
+    prefix: &str,
+) -> Result<(), String> {
+    let Some((repo_rel, file_rel)) = split_export_checked_path(request_path, prefix) else {
+        return send_response(stream, 404, "Not Found", &[], b"Not Found\n");
+    };
+    let repo_path = config.root.join(&repo_rel);
+    if !repo_path.join("git-daemon-export-ok").is_file() {
+        return send_response(stream, 404, "Not Found", &[], b"Not Found\n");
+    }
+    let rel_path = format!("{repo_rel}/{file_rel}");
+    serve_static_file(stream, config, &rel_path)
+}
+
+fn split_export_checked_path(request_path: &str, prefix: &str) -> Option<(String, String)> {
+    let rest = request_path.strip_prefix(prefix)?.trim_start_matches('/');
+    let marker = ".git/";
+    let idx = rest.find(marker)?;
+    let repo_end = idx + marker.len() - 1;
+    let repo_rel = rest[..repo_end].to_owned();
+    let file_rel = rest[repo_end + 1..].to_owned();
+    if repo_rel.is_empty()
+        || file_rel.is_empty()
+        || repo_rel.contains("..")
+        || file_rel.contains("..")
+    {
+        return None;
+    }
+    Some((repo_rel, file_rel))
+}
+
+fn handle_smart_http(
+    stream: &mut TcpStream,
+    req: &Request,
+    config: &Config,
+) -> Result<u16, String> {
     handle_smart_http_with_path(stream, req, config, "/smart")
 }
 
@@ -877,7 +937,7 @@ fn handle_smart_http_with_path(
     req: &Request,
     config: &Config,
     prefix: &str,
-) -> Result<(), String> {
+) -> Result<u16, String> {
     let output = run_smart_http_cgi_output(req, config, prefix)?;
     parse_and_send_cgi_response(stream, &output)
 }
@@ -961,7 +1021,7 @@ fn handle_one_time_script_smart(
     stream: &mut TcpStream,
     req: &Request,
     config: &Config,
-) -> Result<(), String> {
+) -> Result<u16, String> {
     let script_path = one_time_script_path(config);
     let cgi_output = run_smart_http_cgi_output(req, config, "/one_time_script")?;
     if !script_path.exists() {
@@ -1010,17 +1070,18 @@ fn handle_custom_auth_smart(
     stream: &mut TcpStream,
     req: &Request,
     config: &Config,
-) -> Result<(), String> {
+) -> Result<u16, String> {
     let auth_id = custom_auth_id(req, config).unwrap_or_else(|| "default".to_string());
     let (status, headers) = custom_auth_challenge(config, &auth_id)?;
     if status != 200 {
-        return send_response_raw(
+        send_response_raw(
             stream,
             status,
             status_text(status),
             &headers,
             b"Authentication required\n",
-        );
+        )?;
+        return Ok(status);
     }
     handle_smart_http_with_path(stream, req, config, "/custom_auth")
 }
@@ -1210,7 +1271,7 @@ fn repo_exists_under_root(root: &Path, smart_path: &str) -> bool {
     root.join(repo_component).is_dir()
 }
 
-fn parse_and_send_cgi_response(stream: &mut TcpStream, cgi_output: &[u8]) -> Result<(), String> {
+fn parse_and_send_cgi_response(stream: &mut TcpStream, cgi_output: &[u8]) -> Result<u16, String> {
     // Find the header/body separator (blank line: \r\n\r\n or \n\n)
     let mut header_end = None;
     let mut body_start = None;
@@ -1237,7 +1298,8 @@ fn parse_and_send_cgi_response(stream: &mut TcpStream, cgi_output: &[u8]) -> Res
         (Some(he), Some(bs)) => (&cgi_output[..he], &cgi_output[bs..]),
         _ => {
             // No headers found, treat everything as body
-            return send_response(stream, 200, "OK", &[], cgi_output);
+            send_response(stream, 200, "OK", &[], cgi_output)?;
+            return Ok(200);
         }
     };
 
@@ -1280,7 +1342,7 @@ fn parse_and_send_cgi_response(stream: &mut TcpStream, cgi_output: &[u8]) -> Res
         .map_err(|e| e.to_string())?;
     stream.write_all(body).map_err(|e| e.to_string())?;
     stream.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(status_code)
 }
 
 fn send_response(

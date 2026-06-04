@@ -88,6 +88,8 @@
     advertising Git-compatible agent OS suffixes and honoring `GIT_USER_AGENT`.
   - Opportunistic receive-pack quick win: completed `t5410-receive-pack.sh` (5/5) by
     reserving `.have` advertisements for alternate refs only.
+  - Opportunistic http-backend quick win: completed `t5561-http-backend.sh` (14/14) by
+    adding `/smart_noexport` export checks and accurate smart HTTP access logging.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
