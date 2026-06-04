@@ -1041,6 +1041,17 @@ fn run_one_commit(repo: &Repository, opts: &Options, out: &mut impl Write) -> Re
                     let entries = diff_with_opts(&repo.odb, old_side, new_side, opts)?;
                     let filtered = filter_entries(&repo.odb, &repo, entries, opts)?;
                     has_diff = !filtered.is_empty();
+                    if opts.check {
+                        // `--check` runs the whitespace/conflict-marker check instead of
+                        // emitting raw/patch output: print the commit header, then the check.
+                        if !opts.quiet {
+                            write_commit_header(out, &oid, &obj.data, opts, None)?;
+                        }
+                        let prepared =
+                            prepare_diff_tree_entries(&repo.odb, filtered, opts, None);
+                        run_diff_tree_whitespace_check(repo, &prepared, opts)?;
+                        return Ok(has_diff);
+                    }
                     if !opts.quiet && (has_diff || opts.pretty.is_some()) {
                         // `git diff-tree --root <commit>` prints the bare commit OID header
                         // line first (gated only on --no-commit-id), exactly like the

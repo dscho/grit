@@ -989,6 +989,24 @@ pub fn load_gitattributes_bare(
             }
         }
     }
+    // Without a work tree, Git reads tracked `.gitattributes` from the index (Git
+    // `read_attr_from_index`), so e.g. `git -C .git diff-tree --check` still honours a
+    // committed `* -whitespace` attribute. Prepend index rules so work-tree-equivalent
+    // ordering (closer paths win) is preserved relative to info/global.
+    if let Ok(index) = Index::load(&repo.git_dir.join("index")) {
+        if let Ok(mut from_index) =
+            load_gitattributes_from_index(&index, &repo.odb, &repo.git_dir)
+        {
+            // info/global attributes are lower priority than per-tree `.gitattributes`,
+            // so place the index rules ahead of what we have collected so far.
+            from_index.rules.append(&mut merged.rules);
+            merged.rules = from_index.rules;
+            for (k, v) in from_index.macros.defs.drain() {
+                merged.macros.defs.entry(k).or_insert(v);
+            }
+            merged.warnings.append(&mut from_index.warnings);
+        }
+    }
     Ok(merged)
 }
 
