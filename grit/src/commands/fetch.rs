@@ -329,7 +329,13 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
-    let recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
+    let mut recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
+    if Repository::open(&git_dir, None)
+        .map(|repo| repo.is_bare())
+        .unwrap_or(false)
+    {
+        recurse_mode = None;
+    }
     if recurse_mode.is_some() {
         crate::fetch_submodule_record::begin_fetch_submodule_record(&git_dir);
     }

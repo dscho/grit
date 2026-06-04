@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5311-pack-bitmaps-shallow
+
+- Focus harness: `./scripts/run-tests.sh t5311-pack-bitmaps-shallow.sh --verbose` passes 6/6 after bare fetch no longer runs default submodule recursion.
+- Regression harness: `./scripts/run-tests.sh t5311-pack-bitmaps-shallow.sh t5501-fetch-push-alternates.sh t5519-push-alternates.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5501-fetch-push-alternates
 
 - Focus harness: `./scripts/run-tests.sh t5501-fetch-push-alternates.sh --verbose` passes 3/3 after shared-alternate object transfer pruning.
