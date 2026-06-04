@@ -41,7 +41,7 @@ pub struct Args {
     pub delete_old: bool,
 
     /// Pass `--local` to pack-objects (accepted for compat).
-    #[arg(short = 'l')]
+    #[arg(short = 'l', long = "local")]
     pub local: bool,
 
     /// Pack everything into a single pack (Git `-a`).
@@ -471,6 +471,9 @@ pub fn run(args: Args) -> Result<()> {
             if let Some(v) = args.name_hash_version {
                 cmd.arg(format!("--name-hash-version={v}"));
             }
+            if args.local {
+                cmd.arg("--local");
+            }
 
             cmd.arg(base);
 
@@ -501,10 +504,6 @@ pub fn run(args: Args) -> Result<()> {
 
             if repo_treats_promisor_packs(&repo.git_dir, &cfg) {
                 cmd.arg("--exclude-promisor-objects");
-            }
-
-            if args.local {
-                cmd.arg("--local");
             }
 
             if main_phase {
@@ -792,6 +791,9 @@ pub fn run(args: Args) -> Result<()> {
                 &extra_objects_dirs,
                 simple_full_repack,
             )?;
+            if args.cruft {
+                remove_old_cruft_packs_not_in_keep(&pack_dir_abs, &keep)?;
+            }
             prune_packed_objects(&repo.git_dir.join("objects"), PrunePackedOptions::default())
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             prune_hidden_loose_objects_for_shallow_repo(&repo)?;
@@ -1834,6 +1836,39 @@ fn remove_generated_pack_family(pack_dir: &Path, hash: &str) {
     let _ = fs::remove_file(pack_dir.join(format!("{stem}.pack")));
     let _ = fs::remove_file(pack_dir.join(format!("{stem}.idx")));
     remove_pack_sidecars(pack_dir, &stem);
+}
+
+fn remove_old_cruft_packs_not_in_keep(pack_dir: &Path, keep_names: &[String]) -> Result<()> {
+    let keep: HashSet<String> = keep_names
+        .iter()
+        .map(|name| {
+            let base = pack_basename(name);
+            base.strip_suffix(".pack").unwrap_or(base).to_string()
+        })
+        .collect();
+    let rd = match fs::read_dir(pack_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in rd {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("mtimes") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if keep.contains(stem) {
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(pack_dir.join(format!("{stem}.pack")));
+        let _ = fs::remove_file(pack_dir.join(format!("{stem}.idx")));
+        remove_pack_sidecars(pack_dir, stem);
+    }
+    Ok(())
 }
 
 pub(crate) fn remove_superseded_packs_multi(
