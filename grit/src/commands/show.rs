@@ -1003,6 +1003,29 @@ fn show_commit(
             .and_then(|r| r.ok())
             .unwrap_or(true);
 
+    // Git's `log-tree.c` rule: when a verbose header is followed by BOTH a diffstat
+    // and a patch (`--patch-with-stat`), it emits a `---` line (no extra blank)
+    // between the message and the stat, instead of the usual blank line.
+    let header_stat_patch_dashes = {
+        let will_show_raw = args.patch_with_raw || (args.raw && !args.numstat);
+        let will_show_stat =
+            args.patch_with_stat || (!args.stat.is_empty() && !args.numstat && !will_show_raw);
+        let will_show_patch = !args.quiet
+            && !args.no_patch
+            && (args.patch
+                || args.binary
+                || args.patch_with_raw
+                || args.patch_with_stat
+                || (!args.raw
+                    && args.stat.is_empty()
+                    && !args.shortstat
+                    && !args.summary
+                    && !args.numstat
+                    && !args.name_only
+                    && !args.name_status));
+        will_show_stat && will_show_patch && !will_show_raw && !args.numstat
+    };
+
     let format = resolved_format.as_deref();
     match format {
         Some(fmt) if fmt.starts_with("format:") || fmt.starts_with("tformat:") => {
@@ -1117,10 +1140,18 @@ fn show_commit(
                         writeln!(out, "    {line}")?;
                     }
                 } else if root_diff_shown {
-                    writeln!(out)?;
+                    if header_stat_patch_dashes {
+                        writeln!(out, "---")?;
+                    } else {
+                        writeln!(out)?;
+                    }
                 }
             } else if root_diff_shown {
-                writeln!(out)?;
+                if header_stat_patch_dashes {
+                    writeln!(out, "---")?;
+                } else {
+                    writeln!(out)?;
+                }
             }
         }
         Some("email") => {
@@ -1459,14 +1490,16 @@ fn show_commit(
             args.stat_count,
             &config,
         )?;
-        // `--summary` (and `--patch-with-stat`, which implies it) emits create/delete mode,
-        // mode-change, and rename/copy lines after the diffstat.
-        if args.summary || args.patch_with_stat {
+        // `--summary` emits create/delete mode, mode-change, and rename/copy lines after the
+        // diffstat. `--patch-with-stat` alone does NOT imply `--summary`.
+        if args.summary {
             write_show_summary_lines(out, &diff_entries)?;
         }
         if !show_patch {
             return Ok(());
         }
+        // A blank line separates the stat/summary block from the following patch.
+        writeln!(out)?;
     }
 
     if !show_patch {
