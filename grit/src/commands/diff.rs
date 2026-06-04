@@ -7567,13 +7567,51 @@ fn write_patch_with_prefix(
                 } else {
                     None
                 };
+                // Git's `prep_temp_blob` runs `convert_to_working_tree` on each
+                // blob temp file, so e.g. `core.autocrlf` LF→CRLF applies to the
+                // bytes the driver sees (t4020 #69). Borrowed worktree files are
+                // already in working-tree form and are left untouched.
+                let conv_cfg = grit_lib::crlf::ConversionConfig::from_config(config);
+                let attr_rules = grit_lib::crlf::load_gitattributes(
+                    work_tree.unwrap_or_else(|| git_dir.parent().unwrap_or(git_dir)),
+                );
+                let convert_blob = |raw: &[u8], rel: &str, oid: &ObjectId| -> Vec<u8> {
+                    let fa = grit_lib::crlf::get_file_attrs(&attr_rules, rel, false, config);
+                    let oid_hex = oid.to_hex();
+                    grit_lib::crlf::convert_to_worktree_eager(
+                        raw,
+                        rel,
+                        &conv_cfg,
+                        &fa,
+                        Some(&oid_hex),
+                        None,
+                    )
+                    .unwrap_or_else(|_| raw.to_vec())
+                };
+                let old_conv: Vec<u8> = if entry.old_mode == "000000"
+                    || entry.old_mode == "160000"
+                    || entry.old_mode == "120000"
+                {
+                    old_content_raw.clone()
+                } else {
+                    convert_blob(&old_content_raw, path_for_attrs.as_str(), &entry.old_oid)
+                };
+                let new_conv: Vec<u8> = if new_borrow.is_some()
+                    || entry.new_mode == "000000"
+                    || entry.new_mode == "160000"
+                    || entry.new_mode == "120000"
+                {
+                    new_content_raw.clone()
+                } else {
+                    convert_blob(&new_content_raw, path_for_attrs.as_str(), &entry.new_oid)
+                };
                 match run_external_diff_for_patch(
                     out,
                     ext,
                     display,
                     other,
-                    &old_content_raw,
-                    &new_content_raw,
+                    &old_conv,
+                    &new_conv,
                     &entry.old_oid,
                     &entry.new_oid,
                     &entry.old_mode,
