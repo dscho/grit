@@ -363,6 +363,12 @@ pub fn preprocess_rebase_argv(rest: &[String]) -> Vec<String> {
             i += 1;
             continue;
         }
+        if arg.len() > 2 && arg.starts_with("-x") && !arg.starts_with("--") {
+            out.push("-x".to_string());
+            out.push(arg[2..].to_string());
+            i += 1;
+            continue;
+        }
         if arg == "-r" {
             if i + 1 < rest.len() {
                 let next = rest[i + 1].as_str();
@@ -695,6 +701,14 @@ fn validate_compat_syntax(args: &Args) -> Result<()> {
             bail!(
                 "unrecognized empty type '{empty}'; valid values are \"drop\", \"keep\", and \"stop\"."
             );
+        }
+    }
+    if let Some(ref exec_cmd) = args.exec {
+        if exec_cmd.is_empty() || exec_cmd.trim().is_empty() {
+            bail!("empty exec command");
+        }
+        if exec_cmd.contains('\n') {
+            bail!("exec commands cannot contain newlines");
         }
     }
     Ok(())
@@ -4160,7 +4174,7 @@ Use '--' to separate paths from revisions, like this:\n\
                         let _ = stash::pop_autostash_if_top(&repo, oid);
                     }
                 }
-                bail!("there was a problem with the editor");
+                bail!("nothing to do");
             }
             print_branch_up_to_date(&head);
             if let Some(ref oid) = autostash_oid {

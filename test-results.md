@@ -78,6 +78,16 @@
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
 
+## 2026-06-04 — t3404-rebase-interactive todo/exec partial
+
+- Focus harness improved to 54/132 after comments-only todo edits report `nothing to do`, glued
+  `-x<cmd>` is parsed as an exec command, and invalid exec strings are rejected before up-to-date
+  short-circuiting.
+- Adjacent verification: `./scripts/run-tests.sh t3404-rebase-interactive.sh
+  t3415-rebase-autosquash.sh t3418-rebase-continue.sh --verbose` keeps `t3415` and `t3418` green.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing
