@@ -86,6 +86,8 @@
     emulating local `--receive-pack` post-update failures and preserving literal HEAD reporting.
   - Opportunistic serve-v2 quick win: completed `t5701-git-serve.sh` (25/25) by
     advertising Git-compatible agent OS suffixes and honoring `GIT_USER_AGENT`.
+  - Opportunistic receive-pack quick win: completed `t5410-receive-pack.sh` (5/5) by
+    reserving `.have` advertisements for alternate refs only.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

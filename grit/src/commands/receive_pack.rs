@@ -629,7 +629,7 @@ fn advertise_refs_phase(repo: &Repository, extra_have: &HashSet<ObjectId>) -> Re
             if !seen_have.insert(*oid) {
                 continue;
             }
-            ".have".to_owned()
+            refname.clone()
         };
         if first {
             let line = format!("{} {display}\0{caps}\n", oid.to_hex());

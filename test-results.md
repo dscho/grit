@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5410-receive-pack
+
+- Focus harness: `./scripts/run-tests.sh t5410-receive-pack.sh --verbose` passes 5/5 after receive-pack advertises local duplicate refs by refname and reserves `.have` for alternate refs.
+- Regression harness: `./scripts/run-tests.sh t5410-receive-pack.sh t5546-receive-limits.sh t5507-remote-environment.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5701-git-serve
 
 - Focus harness: `./scripts/run-tests.sh t5701-git-serve.sh --verbose` passes 25/25 after serve-v2 agent capability suffix handling.
