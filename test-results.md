@@ -1,4 +1,9 @@
 
+## 2026-06-04 — t5551-http-fetch-smart refresh
+
+- Harness refresh: `./scripts/run-tests.sh t5551-http-fetch-smart.sh --verbose` reports a successful row (31/37 with 6 expected TODO failures).
+
+
 ## 2026-06-04 — t5619-clone-local-ambiguous-transport
 
 - Focus harness: `./scripts/run-tests.sh t5619-clone-local-ambiguous-transport.sh --verbose` passes 2/2 after HTTP submodule operations stay on grit and use a clean system-git clone delegate.

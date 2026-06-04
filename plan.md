@@ -100,6 +100,7 @@
     rejecting dash-prefixed relative fetch paths before upload-pack.
   - Opportunistic ambiguous-transport quick win: completed `t5619-clone-local-ambiguous-transport.sh` (2/2) by
     keeping HTTP submodule operations on grit while delegating their HTTP clone step cleanly.
+  - Refreshed `t5551-http-fetch-smart.sh` to complete (31/37 with 6 expected TODO failures).
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
