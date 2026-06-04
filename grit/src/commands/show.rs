@@ -405,8 +405,16 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let rev_strings: Vec<&str> = rev_strings_owned.iter().map(|s| s.as_str()).collect();
-    let compact_multi_subject =
-        (args.quiet || args.no_patch) && args.format.as_deref() == Some("%s");
+    // `--name-only` / `--name-status` with a user `--format` string terminate each entry
+    // themselves (tformat semantics), so git emits no blank line between successive commits.
+    let user_format_name_listing = (args.name_only || args.name_status)
+        && args
+            .format
+            .as_deref()
+            .is_some_and(|f| !matches!(f, "medium" | "short" | "full" | "fuller" | "reference" | "oneline" | "raw" | "email"));
+    let compact_multi_subject = ((args.quiet || args.no_patch)
+        && args.format.as_deref() == Some("%s"))
+        || user_format_name_listing;
 
     let notes_map = load_notes_map(&repo);
 
@@ -1150,6 +1158,14 @@ fn show_commit(
     }
 
     let format = resolved_format.as_deref();
+    // User `--format=<string>` (incl. `format:` / `tformat:`) emits no built-in trailing blank;
+    // git inserts one blank line between that header and the following diff body.
+    let user_format_header = matches!(
+        format,
+        Some(f) if f.starts_with("format:")
+            || f.starts_with("tformat:")
+            || !matches!(f, "medium" | "short" | "full" | "fuller" | "reference" | "oneline" | "raw" | "email")
+    );
     match format {
         Some(fmt) if fmt.starts_with("format:") || fmt.starts_with("tformat:") => {
             let _template = fmt
@@ -1466,6 +1482,23 @@ fn show_commit(
         diff_entries
     };
 
+    // Limit the displayed diff to the given pathspecs (`git show <rev> -- <path>...`).
+    let diff_entries = if pathspecs.is_empty() {
+        diff_entries
+    } else {
+        diff_entries
+            .into_iter()
+            .filter(|e| {
+                let new_p = e.new_path.as_deref().unwrap_or("");
+                let old_p = e.old_path.as_deref().unwrap_or("");
+                (!new_p.is_empty()
+                    && grit_lib::pathspec::path_allowed_by_pathspec_list(pathspecs, new_p))
+                    || (!old_p.is_empty()
+                        && grit_lib::pathspec::path_allowed_by_pathspec_list(pathspecs, old_p))
+            })
+            .collect()
+    };
+
     let is_merge = commit.parents.len() > 1;
     // `--first-parent` forces a first-parent (single) diff for merges, suppressing the
     // default dense-combined merge diff (git's `diff_merges_default_to_first_parent`).
@@ -1477,6 +1510,12 @@ fn show_commit(
     let use_combined_format =
         (args.combined || args.combined_cc || default_merge_patch) && !args.first_parent;
     let combined_use_cc_word = args.combined_cc || default_merge_patch;
+
+    // Separate a user `--format` header from the following name-only / name-status list with a
+    // blank line (git's behavior). Patch/stat sections emit their own leading separator below.
+    if user_format_header && (args.name_only || args.name_status) && !diff_entries.is_empty() {
+        writeln!(out)?;
+    }
 
     // --name-only: just print file names
     if args.name_only {
