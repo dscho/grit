@@ -1,3 +1,13 @@
+## 2026-06-04 — t6137-rev-parse-misc
+
+- Focus harness: `./scripts/run-tests.sh t6137-rev-parse-misc.sh` passes 34/34 after the
+  synthetic fixture explicitly requests its hard-coded `master` initial branch under the harness.
+- `cargo build --release -p grit-cli`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` passed with the existing
+  warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this fixture-only
+  t6137 increment.
+
 ## 2026-06-03 — t1300-config --config-env partial
 
 - Focus harness improved from 366/497 to 372/497 after adding global `--config-env` support, including keys containing `=`. Remaining failures are broader config parsing/formatting/type edge cases.

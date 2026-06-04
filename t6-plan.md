@@ -41,7 +41,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   selected-range ancestry propagation, symmetric-log ancestry bottoms, path-limited ancestry-side
   TREESAME merge pruning, simplify-merges ancestry preservation, and `checkout -b start --`
   separator handling for the criss-cross setup.
-- [ ] `t6137-rev-parse-misc.sh` — 23/34 passing, 11 failing.
+- [x] `t6137-rev-parse-misc.sh` — 34/34 passing after making the synthetic
+  fixture request its expected `master` initial branch under the harness.
 - [ ] `t6016-rev-list-graph-simplify-history.sh` — 4/12 passing, 8 failing.
 - [ ] `t6136-rev-list-date-range.sh` — 24/31 passing, 7 failing.
 - [ ] `t6015-rev-list-show-all-parents.sh` — 32/38 passing, 6 failing.
