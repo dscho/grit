@@ -7276,6 +7276,13 @@ fn do_continue() -> Result<()> {
     let msg = format!("{ra} ({verb}): {subject}");
     let _ = append_reflog(git_dir, "HEAD", &head_oid, &new_oid, &ident, &msg, false);
 
+    if rb_dir.join("verbose").exists() {
+        let head_tree = commit_tree_oid_for_rebase(&repo, head_oid)?;
+        let new_tree = commit_tree_oid_for_rebase(&repo, new_oid)?;
+        let entries = diff::diff_trees(&repo.odb, Some(&head_tree), Some(&new_tree), "")?;
+        print_diffstat_from_entries(&repo, &entries);
+    }
+
     // The conflict stop paths (RebaseReplayStep::PickLike / Pick `Err`) rewrite the todo as
     // `todo[i..]`, leaving the *conflicting* commit as the first actionable line with msgnum=1.
     // We have now committed that resolved commit and advanced HEAD, so drop it from the todo
