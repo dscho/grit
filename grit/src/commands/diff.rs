@@ -1059,6 +1059,45 @@ impl WhitespaceMode {
     }
 }
 
+/// A [`Write`] wrapper that prepends a fixed prefix at the start of every output line
+/// (implements `git diff --line-prefix=<p>`: the prefix appears before each emitted line,
+/// including stat, raw, and patch bodies).
+struct LinePrefixWriter<W: Write> {
+    inner: W,
+    prefix: Vec<u8>,
+    at_line_start: bool,
+}
+
+impl<W: Write> LinePrefixWriter<W> {
+    fn new(inner: W, prefix: &str) -> Self {
+        Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            at_line_start: true,
+        }
+    }
+}
+
+impl<W: Write> Write for LinePrefixWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &b in buf {
+            if self.at_line_start {
+                self.inner.write_all(&self.prefix)?;
+                self.at_line_start = false;
+            }
+            self.inner.write_all(std::slice::from_ref(&b))?;
+            if b == b'\n' {
+                self.at_line_start = true;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// One logical line for `--no-index` diffing: compare key plus original bytes for output.
 struct NoIndexLineSlot {
     display: Vec<u8>,
@@ -3317,6 +3356,13 @@ pub fn run(mut args: Args) -> Result<()> {
     } else {
         Box::new(io::stdout())
     };
+    // `--line-prefix=<p>` prepends `<p>` to every emitted line; wrap the writer so all
+    // sections (stat, raw, patch) share the same prefix and the per-section emitters can
+    // stay prefix-agnostic.
+    let mut out: Box<dyn Write> = match args.line_prefix.as_deref() {
+        Some(p) if !p.is_empty() => Box::new(LinePrefixWriter::new(out, p)),
+        _ => out,
+    };
 
     let effective_word_diff_opt = effective_word_diff(&args, stdout_is_tty);
     let use_color_patch = use_color
@@ -3461,7 +3507,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     args.stat_name_width,
                     args.break_rewrites,
                     args.stat_graph_width,
-                    args.line_prefix.as_deref().unwrap_or(""),
+                    "",
                     &repo.git_dir,
                     line_ignore,
                     &ws_mode,
@@ -3519,7 +3565,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 args.stat_name_width,
                 args.break_rewrites,
                 args.stat_graph_width,
-                args.line_prefix.as_deref().unwrap_or(""),
+                "",
                 &repo.git_dir,
                 line_ignore,
                 &ws_mode,
