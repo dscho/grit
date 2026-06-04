@@ -1,4 +1,10 @@
 
+## 2026-06-04 — t5543-atomic-push
+
+- Focus harness: `./scripts/run-tests.sh t5543-atomic-push.sh --verbose` passes 13/13 after local `--receive-pack` failure emulation and literal `HEAD` success reporting.
+- Regression harness: `./scripts/run-tests.sh t5543-atomic-push.sh t5529-push-errors.sh t5519-push-alternates.sh t5533-push-cas.sh --verbose` passes all covered rows.
+
+
 ## 2026-06-04 — t5519-push-alternates
 
 - Focus harness: `./scripts/run-tests.sh t5519-push-alternates.sh --verbose` passes 8/8 after pruning newly copied loose objects that are already available via remote alternates.

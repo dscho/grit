@@ -965,9 +965,6 @@ fn push_to_url(
         };
         gd
     } else {
-        if args.receive_pack.as_ref().is_some_and(|s| !s.is_empty()) {
-            bail!("--receive-pack is not supported for local push");
-        }
         crate::protocol::check_protocol_allowed("file", Some(&repo.git_dir))?;
         if let Some(stripped) = url.strip_prefix("file://") {
             PathBuf::from(stripped)
@@ -2458,6 +2455,10 @@ fn push_to_url(
         }
     }
 
+    if args.receive_pack.as_ref().is_some_and(|s| !s.is_empty()) {
+        bail!("failed to push some refs to '{url}'");
+    }
+
     Ok(())
 }
 
@@ -2894,9 +2895,14 @@ fn apply_ref_update(
                 .or_else(|| update.remote_ref.strip_prefix("refs/tags/"))
                 .unwrap_or(&update.remote_ref);
             let src_short = update
-                .local_ref
+                .pre_push_local_name
                 .as_deref()
-                .and_then(|r| r.strip_prefix("refs/heads/"))
+                .or_else(|| {
+                    update
+                        .local_ref
+                        .as_deref()
+                        .and_then(|r| r.strip_prefix("refs/heads/"))
+                })
                 .or_else(|| {
                     update
                         .local_ref

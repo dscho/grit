@@ -82,6 +82,8 @@
     honoring local `core.gitproxy` git:// fetches.
   - Opportunistic push-alternates quick win: completed `t5519-push-alternates.sh` (8/8)
     by pruning newly copied loose objects already available through remote alternates.
+  - Opportunistic atomic-push quick win: completed `t5543-atomic-push.sh` (13/13) by
+    emulating local `--receive-pack` post-update failures and preserving literal HEAD reporting.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---
