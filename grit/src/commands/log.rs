@@ -1159,7 +1159,7 @@ fn run_line_log(
     let decorations = if !show_decorations {
         None
     } else {
-        Some(collect_decorations(repo, decorate_full)?)
+        Some(collect_decorations_inner(repo, decorate_full, args.clear_decorations)?)
     };
 
     let show_patch = !args.suppress_diff && !args.no_patch;
@@ -2423,7 +2423,7 @@ fn run_rev_list_log(
     let (show_decorations, decorate_full) =
         resolve_decoration_display(args, &repo.git_dir, format_requires_decorations);
     let decoration_map_for_display = if show_decorations {
-        Some(collect_decorations(repo, decorate_full)?)
+        Some(collect_decorations_inner(repo, decorate_full, args.clear_decorations)?)
     } else {
         None
     };
@@ -2860,7 +2860,7 @@ fn run_graph_log(
     let (show_decorations_graph, decorate_full_graph) =
         resolve_decoration_display(args, &repo.git_dir, format_requires_decorations_graph);
     let decorations = if args.simplify_by_decoration || show_decorations_graph {
-        Some(collect_decorations(repo, decorate_full_graph)?)
+        Some(collect_decorations_inner(repo, decorate_full_graph, args.clear_decorations)?)
     } else {
         None
     };
@@ -4833,12 +4833,12 @@ pub fn run(mut args: Args) -> Result<()> {
     // (`--oneline` does not imply `--decorate`). Use a separate map for display so we do not
     // print `(refs)` unless `--decorate` / `%d` requests it; OID keys match for full vs short maps.
     let decoration_map_for_display = if show_decorations {
-        Some(collect_decorations(&repo, decorate_full)?)
+        Some(collect_decorations_inner(&repo, decorate_full, args.clear_decorations)?)
     } else {
         None
     };
     let decoration_map_for_simplify_only = if args.simplify_by_decoration && !show_decorations {
-        Some(collect_decorations(&repo, false)?)
+        Some(collect_decorations_inner(&repo, false, args.clear_decorations)?)
     } else {
         None
     };
@@ -5487,7 +5487,7 @@ pub fn run_no_walk(
         None
     } else if args.decorate.is_some() {
         // Explicitly requested decorations
-        Some(collect_decorations(repo, decorate_full)?)
+        Some(collect_decorations_inner(repo, decorate_full, args.clear_decorations)?)
     } else {
         // Default: no decorations in no-walk mode (matches git behavior)
         None
@@ -10339,6 +10339,17 @@ fn prepend_decoration(items: &mut Vec<DecorationItem>, item: DecorationItem) {
 /// order, so the final per-commit list matches upstream (e.g. `tag: A1` before `other/main` before
 /// `other/HEAD`).
 fn collect_decorations(repo: &Repository, full: bool) -> Result<DecorationMap> {
+    collect_decorations_inner(repo, full, false)
+}
+
+/// Like [`collect_decorations`], but `clear_decorations` removes the default ref
+/// filter so refs that are normally hidden (e.g. `refs/notes/*`) also get
+/// decorated (matches `git log --clear-decorations`).
+fn collect_decorations_inner(
+    repo: &Repository,
+    full: bool,
+    clear_decorations: bool,
+) -> Result<DecorationMap> {
     let mut map: DecorationMap = HashMap::new();
     let git_dir = &repo.git_dir;
     let odb = &repo.odb;
@@ -10437,6 +10448,22 @@ fn collect_decorations(repo: &Repository, full: bool) -> Result<DecorationMap> {
                     refname: Some(refname.clone()),
                     display,
                     kind: DecorationKind::RemoteBranch,
+                },
+            );
+            continue;
+        }
+
+        // With `--clear-decorations`, the default ref filter is removed, so any
+        // remaining ref (e.g. `refs/notes/commits`) is also decorated. Such refs
+        // are always shown with their full name.
+        if clear_decorations {
+            let peeled = peel_to_commit_hex(odb, &oid.to_hex()).unwrap_or_else(|| oid.to_hex());
+            prepend_decoration(
+                map.entry(peeled).or_default(),
+                DecorationItem {
+                    refname: Some(refname.clone()),
+                    display: refname.clone(),
+                    kind: DecorationKind::Branch,
                 },
             );
         }
