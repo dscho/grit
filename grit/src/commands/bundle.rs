@@ -123,7 +123,7 @@ fn run_create(args: CreateArgs) -> Result<()> {
     }
     let rev_args = collect_create_rev_args(&args)?;
 
-    let refs = collect_refs_for_bundle(&repo, &rev_args, args.ignore_missing)?;
+    let mut refs = collect_refs_for_bundle(&repo, &rev_args, args.ignore_missing)?;
     if refs.is_empty() {
         bail!("refusing to create empty bundle");
     }
@@ -179,6 +179,12 @@ fn run_create(args: CreateArgs) -> Result<()> {
                 }
             }
         }
+        for oid in refs.values() {
+            if read_object(&repo, oid).is_ok_and(|obj| obj.kind == ObjectKind::Tag) {
+                oids.insert(*oid);
+            }
+        }
+        refs.retain(|_, oid| oids.contains(oid));
     } else {
         for (oid, _) in &listed.objects {
             if let Ok(obj) = read_object(&repo, oid) {

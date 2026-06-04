@@ -2809,3 +2809,9 @@ Updated: 2026-06-01
   `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
   backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
   `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, and `git diff --check`.
+- t6020 max-count ref focus: `bundle create --max-count` now advertises only refs whose objects are
+  present in the limited bundle while still carrying explicit annotated tag objects. Focused
+  `./scripts/run-tests.sh t6020-bundle-misc.sh --quiet` improves from 20/37 to 21/37. Ran
+  `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty` (existing warning
+  backlog and failed auto-fix attempts remain; unrelated `filter_process.rs` auto-fix restored),
+  `cargo test -p grit-lib --lib`, and `git diff --check`.
