@@ -197,6 +197,10 @@
   - Refreshed adjacent clone-local row: `t5605-clone-local.sh` is back to 23/23 after rejecting
     explicit nonexistent `.git` clone sources and routing custom `git-upload-pack` templates
     through grit without the test-only dubious-owner override.
+  - Audited zero-count t5 rows and marked skipped: `t5570-git-daemon`, `t5608-clone-2gb`,
+    `t5700-protocol-v1`, `t5702-protocol-v2`, `t5731-protocol-v2-bundle-uri-git`, and
+    `t5811-proto-disable-git`. These rows are environment-gated or contain no runnable harness
+    assertions in this setup.
   - Completed `t5351-unpack-large-objects.sh` (7/7) after honoring large-object allocation
     limits, preserving existing packs during unpack, and emitting batch fsync counters.
   - Pack/index correctness subgroup complete: `t5300-pack-object`, `t5300-unpack-objects`,

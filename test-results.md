@@ -2284,3 +2284,8 @@ Updated: 2026-06-01
 - Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` passes 25/25 after `repack --local` forwarding and stale cruft pack cleanup were fixed.
 - Related verification: `./scripts/run-tests.sh t5304-prune.sh t5331-pack-objects-stdin.sh t5605-clone-local.sh t5304-prune-packed.sh t5312-prune-corruption.sh --verbose` passes 32/32, 16/16, 23/23, 20/20, and 11/11.
 - Quality gates: `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and `cargo test -p grit-lib --lib` completed; pre-existing unrelated warnings remain.
+
+## 2026-06-04 — t5 zero-count row audit
+
+- Marked six zero-count t5 rows as skipped after audit: `t5570-git-daemon`, `t5608-clone-2gb`, `t5700-protocol-v1`, `t5702-protocol-v2`, `t5731-protocol-v2-bundle-uri-git`, and `t5811-proto-disable-git`.
+- Regenerated dashboards with `python3 scripts/generate-dashboard-from-test-files.py`; no Rust code changed.
