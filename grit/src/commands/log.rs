@@ -437,6 +437,17 @@ pub struct Args {
     #[arg(long = "abbrev-commit")]
     pub abbrev_commit: bool,
 
+    /// Disable commit-hash abbreviation (overrides `--abbrev-commit` and the
+    /// `log.abbrevCommit` config).
+    #[arg(long = "no-abbrev-commit")]
+    pub no_abbrev_commit: bool,
+
+    /// True when `--abbrev-commit` was given explicitly on the command line (as
+    /// opposed to being enabled by `log.abbrevCommit`). `--pretty=raw` honors
+    /// only the explicit flag. Set during `run()`; not a CLI argument itself.
+    #[arg(skip)]
+    pub abbrev_commit_explicit: bool,
+
     /// Color output.
     #[arg(long = "color", default_missing_value = "always", num_args = 0..=1, require_equals = true)]
     pub color: Option<String>,
@@ -4564,6 +4575,24 @@ pub fn run(mut args: Args) -> Result<()> {
         let resolved = resolve_abbrev_len(&None, &repo.git_dir);
         if resolved != 7 {
             args.abbrev = Some(resolved.to_string());
+        }
+    }
+    // `log.abbrevCommit` enables `--abbrev-commit` for the multi-line pretty
+    // formats. Record whether the flag was given explicitly first, since
+    // `--pretty=raw` honors only the explicit flag, not the config.
+    args.abbrev_commit_explicit = args.abbrev_commit && !args.no_abbrev_commit;
+    if args.no_abbrev_commit {
+        // `--no-abbrev-commit` overrides both `--abbrev-commit` and the config.
+        args.abbrev_commit = false;
+    } else if !args.abbrev_commit && !args.no_abbrev {
+        if let Ok(cfg) = ConfigSet::load(Some(&repo.git_dir), true) {
+            if cfg
+                .get_bool("log.abbrevCommit")
+                .and_then(|r| r.ok())
+                .unwrap_or(false)
+            {
+                args.abbrev_commit = true;
+            }
         }
     }
     if args.format.is_none() {
@@ -8711,6 +8740,15 @@ fn format_commit(
     } else {
         parse_abbrev(&args.abbrev)
     };
+    // The `commit <hash>` header (and `tree`/`parent` in raw) is abbreviated under
+    // `--abbrev-commit` (or the builtin `--oneline`), otherwise it is the full hash.
+    let commit_hex: String = if (args.abbrev_commit || log_uses_builtin_oneline(args))
+        && !args.no_abbrev
+    {
+        hex[..abbrev_len.min(hex.len())].to_string()
+    } else {
+        hex.clone()
+    };
     let display_parents = parent_line_override.unwrap_or(info.parents.as_slice());
     // The `(from <parent>)` marker uses the same abbreviation as the commit hash itself:
     // full hex for the multi-line formats (which print the full `commit <hex>`), abbreviated
@@ -8834,7 +8872,14 @@ fn format_commit(
             }
         }
         Some("raw") => {
-            writeln!(out, "commit {hex}")?;
+            // `--pretty=raw` only abbreviates `commit` for an explicit
+            // `--abbrev-commit` flag, not for the `log.abbrevCommit` config.
+            let raw_commit_hex = if args.abbrev_commit_explicit && !args.no_abbrev {
+                &hex[..abbrev_len.min(hex.len())]
+            } else {
+                hex.as_str()
+            };
+            writeln!(out, "commit {raw_commit_hex}")?;
             writeln!(out, "tree {}", info.tree.to_hex())?;
             for parent in display_parents {
                 writeln!(out, "parent {}", parent.to_hex())?;
@@ -8865,7 +8910,7 @@ fn format_commit(
                 decoration_paint,
                 head_for_decor,
             );
-            writeln!(out, "commit {hex}{merge_suffix}{dec}")?;
+            writeln!(out, "commit {commit_hex}{merge_suffix}{dec}")?;
             if display_parents.len() > 1 {
                 let parent_abbrevs: Vec<String> = display_parents
                     .iter()
@@ -8903,9 +8948,9 @@ fn format_commit(
                 let r = decoration_paint
                     .map(|p| p.reset.as_str())
                     .unwrap_or("\x1b[m");
-                writeln!(out, "{c}commit {hex}{merge_suffix}{r}{dec}")?;
+                writeln!(out, "{c}commit {commit_hex}{merge_suffix}{r}{dec}")?;
             } else {
-                writeln!(out, "commit {hex}{merge_suffix}{dec}")?;
+                writeln!(out, "commit {commit_hex}{merge_suffix}{dec}")?;
             }
             if display_parents.len() > 1 {
                 let parent_abbrevs: Vec<String> = display_parents
@@ -8945,7 +8990,7 @@ fn format_commit(
                 decoration_paint,
                 head_for_decor,
             );
-            writeln!(out, "commit {hex}{merge_suffix}{dec}")?;
+            writeln!(out, "commit {commit_hex}{merge_suffix}{dec}")?;
             if display_parents.len() > 1 {
                 let parent_abbrevs: Vec<String> = display_parents
                     .iter()
@@ -8984,7 +9029,7 @@ fn format_commit(
                 decoration_paint,
                 head_for_decor,
             );
-            writeln!(out, "commit {hex}{merge_suffix}{dec}")?;
+            writeln!(out, "commit {commit_hex}{merge_suffix}{dec}")?;
             if display_parents.len() > 1 {
                 let parent_abbrevs: Vec<String> = display_parents
                     .iter()

@@ -353,6 +353,8 @@ fn run_show(args: ShowArgs) -> Result<()> {
         remerge_diff: false,
         color_moved: None,
         abbrev_commit: args.abbrev_commit,
+        no_abbrev_commit: args.no_abbrev_commit,
+        abbrev_commit_explicit: args.abbrev_commit,
         color: None,
         no_color: false,
         decorate_refs: Vec::new(),

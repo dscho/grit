@@ -115,6 +115,9 @@ struct Options {
     context_lines: usize,
     /// Abbreviate OIDs to this length (None = full).
     abbrev: Option<usize>,
+    /// Abbreviate the `commit <hash>` header line (`--abbrev-commit` /
+    /// `log.abbrevCommit`).
+    abbrev_commit: bool,
     /// Rename detection threshold (None = disabled).
     find_renames: Option<u32>,
     /// Copy detection threshold (None = disabled).
@@ -262,6 +265,7 @@ impl Default for Options {
             format: OutputFormat::Raw,
             context_lines: 3,
             abbrev: None,
+            abbrev_commit: false,
             find_renames: None,
             find_copies: None,
             break_rewrites: false,
@@ -415,6 +419,8 @@ fn parse_options(repo: &Repository, argv: &[String]) -> Result<Options> {
                 }
                 "--abbrev" => opts.abbrev = Some(7),
                 "--no-abbrev" => opts.abbrev = Some(40),
+                "--abbrev-commit" => opts.abbrev_commit = true,
+                "--no-abbrev-commit" => opts.abbrev_commit = false,
                 _ if arg.starts_with("--abbrev=") => {
                     let val = &arg["--abbrev=".len()..];
                     opts.abbrev = Some(
@@ -679,6 +685,21 @@ pub fn run_whatchanged(argv: &[String]) -> Result<()> {
     }
     if opts.abbrev.is_none() && !opts.full_index {
         opts.abbrev = Some(7);
+    }
+    // `log.abbrevCommit` enables `--abbrev-commit` unless `--no-abbrev-commit`
+    // was given explicitly on the command line.
+    if !opts.abbrev_commit
+        && !argv.iter().any(|a| a == "--no-abbrev-commit")
+        && !argv.iter().any(|a| a == "--abbrev-commit")
+    {
+        let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        if cfg
+            .get_bool("log.abbrevCommit")
+            .and_then(|r| r.ok())
+            .unwrap_or(false)
+        {
+            opts.abbrev_commit = true;
+        }
     }
     if matches!(
         opts.format,
@@ -3289,10 +3310,16 @@ fn write_commit_header(
             }
             return Ok(false);
         }
-        if let Some(p) = from_parent {
-            writeln!(out, "commit {} (from {})", oid.to_hex(), p.to_hex())?;
+        let commit_hex = if opts.abbrev_commit {
+            let full = oid.to_hex();
+            full[..opts.abbrev.unwrap_or(7).min(full.len())].to_string()
         } else {
-            writeln!(out, "commit {oid}")?;
+            oid.to_hex()
+        };
+        if let Some(p) = from_parent {
+            writeln!(out, "commit {} (from {})", commit_hex, p.to_hex())?;
+        } else {
+            writeln!(out, "commit {commit_hex}")?;
         }
         if commit.parents.len() > 1 {
             // Git abbreviates the `Merge:` parent OIDs to the default short length
