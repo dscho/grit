@@ -111,6 +111,10 @@
     glued `-C<n>` preprocessing to advance the parser, and making apply-backend options respect
     `--no-rebase-merges`/`--no-update-refs` overrides while still reporting config-specific
     incompatibility advice.
+  - Current focus: `t3418-rebase-continue.sh`; initial parsing partial accepts attached
+    `-X<option>`, `-o`, rerere autoupdate, and reschedule-failed-exec flags so direct runs reach
+    behavior assertions instead of option parsing failures, but continuation behavior still needs
+    fixes.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass

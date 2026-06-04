@@ -1465,3 +1465,13 @@ Updated: 2026-06-01
   t3650-replay-basics.sh` passed both files.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-04 — t3418-rebase-continue parsing partial
+
+- Direct `t3418-rebase-continue.sh --verbose` now reaches TAP output after rebase accepts
+  attached `-X<option>`, `-o`, rerere autoupdate, and reschedule-failed-exec flags.
+- Remaining direct failures are behavior-level rebase continuation cases (merge strategy option
+  replay, rerere autoupdate persistence, break/patch cleanup, rescheduled exec), so the harness row
+  is not green yet.
+- Regression verification: `./scripts/run-tests.sh t3422-rebase-incompatible-options.sh
+  t3650-replay-basics.sh` passed both files.

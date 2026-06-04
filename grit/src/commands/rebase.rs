@@ -227,7 +227,12 @@ pub struct Args {
     pub strategy: Option<String>,
 
     /// Options for the merge strategy (merge backend; accepted for compatibility).
-    #[arg(short = 'X', long = "strategy-option", value_name = "option")]
+    #[arg(
+        short = 'X',
+        short_alias = 'o',
+        long = "strategy-option",
+        value_name = "option"
+    )]
     pub strategy_option: Vec<String>,
 
     /// Branch to rebase (checkout first, then rebase onto upstream).
@@ -278,6 +283,28 @@ pub struct Args {
     #[arg(long = "ignore-whitespace")]
     pub ignore_whitespace: bool,
 
+    /// Update the index with reused recorded conflict resolutions.
+    #[arg(long = "rerere-autoupdate", conflicts_with = "no_rerere_autoupdate")]
+    pub rerere_autoupdate: bool,
+
+    /// Do not update the index with reused recorded conflict resolutions.
+    #[arg(long = "no-rerere-autoupdate", conflicts_with = "rerere_autoupdate")]
+    pub no_rerere_autoupdate: bool,
+
+    /// Reschedule failed exec commands in interactive rebase.
+    #[arg(
+        long = "reschedule-failed-exec",
+        conflicts_with = "no_reschedule_failed_exec"
+    )]
+    pub reschedule_failed_exec: bool,
+
+    /// Do not reschedule failed exec commands in interactive rebase.
+    #[arg(
+        long = "no-reschedule-failed-exec",
+        conflicts_with = "reschedule_failed_exec"
+    )]
+    pub no_reschedule_failed_exec: bool,
+
     /// Set committer date to the author date of the replayed commit.
     #[arg(long = "committer-date-is-author-date")]
     pub committer_date_is_author_date: bool,
@@ -321,6 +348,12 @@ pub fn preprocess_rebase_argv(rest: &[String]) -> Vec<String> {
                 i += 1;
                 continue;
             }
+        }
+        if arg.len() > 2 && arg.starts_with("-X") && !arg.starts_with("--") {
+            out.push("-X".to_string());
+            out.push(arg[2..].to_string());
+            i += 1;
+            continue;
         }
         if arg == "-r" {
             if i + 1 < rest.len() {
