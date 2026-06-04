@@ -71,11 +71,12 @@ Completed rev-list/revision files: `t6004`, `t6005`, `t6007-rev-list-cherry-pick
 - [x] `t6423-merge-rename-directories.sh` — 80/82 passing, 0 failing, with 2 expected
   failures.
 - [x] `t6438-submodule-directory-file-conflicts.sh` — 56/56 passing.
-- [~] `t6430-merge-recursive.sh` — 35/36 passing, 1 failing after
+- [x] `t6430-merge-recursive.sh` — 36/36 passing after
   normal checkout stopped applying the rebase-only submodule replacement refusal and
   clean `merge-recursive` D/F auto-resolution kept the merged index while true
   D/F conflicts still exit non-zero and use commit OID suffixes for relocated
-  conflicted files, including alternate `GIT_INDEX_FILE` merge-recursive writes.
+  conflicted files, alternate `GIT_INDEX_FILE` writes land in the selected index,
+  and unchanged-base file sides do not create D/F conflicts.
 - [ ] `t6402-merge-rename.sh` — 24/46 passing, 22 failing.
 - [ ] `t6416-recursive-corner-cases.sh` — 24/37 passing, 13 failing, with 3 expected failures.
 - [ ] `t6415-merge-dir-to-symlink.sh` — 13/24 passing, 11 failing.
