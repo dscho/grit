@@ -221,7 +221,7 @@ fn normalize_leading_and(tokens: &[PatternToken]) -> Vec<PatternToken> {
                 atoms.push(s.clone());
                 i += 1;
             }
-            other => {
+            _other => {
                 rest = tokens[i..].to_vec();
                 break;
             }

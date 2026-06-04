@@ -7,7 +7,6 @@ use anyhow::Result;
 use grit_lib::git_date::show::{parse_date_format, show_date, DateMode, DateModeType};
 use grit_lib::mailmap::{load_mailmap_table, read_mailmap_string, MailmapTable};
 use grit_lib::objects::{parse_commit, CommitData, ObjectId};
-use grit_lib::odb::Odb;
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::{rev_list, RevListOptions};
 use std::collections::HashMap;

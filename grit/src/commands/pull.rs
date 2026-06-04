@@ -4,7 +4,6 @@
 //! `grit rebase` with `--rebase`).  Only local transports are supported.
 
 use crate::explicit_exit::ExplicitExit;
-use crate::protocol_wire;
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
@@ -262,8 +261,6 @@ pub fn run(args: Args) -> Result<()> {
         &config,
         local_remote_path.as_deref(),
     )?;
-
-    let client_proto = protocol_wire::effective_client_protocol_version();
 
     let fetch_recurse = if args.no_recurse_submodules {
         None

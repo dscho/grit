@@ -3391,7 +3391,7 @@ pub fn run(mut args: Args) -> Result<()> {
         args.output_path.as_deref(),
     );
 
-    let mut out: Box<dyn Write> = if let Some(ref p) = args.output_path {
+    let out: Box<dyn Write> = if let Some(ref p) = args.output_path {
         let resolved = if p.is_absolute() {
             p.clone()
         } else {
@@ -7521,7 +7521,7 @@ fn write_patch_with_prefix(
             continue;
         }
 
-        let mut old_content = if entry.old_oid == zero_oid() {
+        let old_content = if entry.old_oid == zero_oid() {
             String::new()
         } else if use_textconv {
             blob_text_for_diff_with_oid(
@@ -7536,7 +7536,7 @@ fn write_patch_with_prefix(
         } else {
             String::from_utf8_lossy(&old_content_raw).into_owned()
         };
-        let mut new_content = if entry.new_oid == zero_oid() {
+        let new_content = if entry.new_oid == zero_oid() {
             String::new()
         } else if use_textconv {
             blob_text_for_diff_with_oid(

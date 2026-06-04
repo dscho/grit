@@ -11,7 +11,6 @@ use crate::commands::grep_expr::{
     collect_atom_indices, line_matches_expr, match_expr_eval, CompiledGrep, GrepExpr,
 };
 use crate::commands::grep_pattern::PatternToken;
-use crate::explicit_exit::ExplicitExit;
 use grit_lib::attributes::quote_path_for_check_attr;
 use grit_lib::config::ConfigSet;
 use grit_lib::index::{MODE_GITLINK, MODE_TREE};

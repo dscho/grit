@@ -115,11 +115,6 @@ pub fn ensure_body_trailing_newline(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-/// Resolve an encoding label the way Git uses it in config and commit objects.
-///
-/// Git accepts names like `eucJP` that [`Encoding::for_label`] does not recognize.
-/// ISO-8859-1 is handled separately (strict Latin-1).
-#[must_use]
 /// Whether `label` names an encoding Git can decode (ISO-8859-1 or any encoding
 /// resolvable via [`resolve`]). Unknown names (e.g. the test's `non-utf-8`) return
 /// false, matching Git's `logmsg_reencode` no-op fallback.
@@ -128,6 +123,11 @@ pub fn is_known_encoding(label: &str) -> bool {
     is_iso_8859_1(label) || resolve(label).is_some()
 }
 
+/// Resolve an encoding label the way Git uses it in config and commit objects.
+///
+/// Git accepts names like `eucJP` that [`Encoding::for_label`] does not recognize.
+/// ISO-8859-1 is handled separately as strict Latin-1 and returns `None`.
+#[must_use]
 pub fn resolve(label: &str) -> Option<&'static Encoding> {
     let t = label.trim();
     if t.is_empty() || is_iso_8859_1(t) {

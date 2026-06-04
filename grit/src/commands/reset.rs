@@ -1813,10 +1813,9 @@ fn check_merge_reset_worktree(
     head: &HeadState,
     target_oid: &ObjectId,
 ) -> Result<()> {
-    let head_oid = match head.oid() {
-        Some(oid) => *oid,
-        None => return Ok(()),
-    };
+    if head.oid().is_none() {
+        return Ok(());
+    }
 
     let target_tree_oid = commit_to_tree(repo, target_oid)?;
     let target_entries = tree_to_flat_entries(repo, &target_tree_oid, "")?;

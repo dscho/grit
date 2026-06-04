@@ -23,7 +23,11 @@ fn main() -> grit_lib::error::Result<()> {
         println!("pack: {}", idx.pack_path.display());
         println!("  index entries: {}", idx.entries.len());
         if let Some(e) = idx.entries.first() {
-            println!("  first oid: {} @ offset {}", e.oid, e.offset);
+            println!(
+                "  first oid: {} @ offset {}",
+                pack::oid_bytes_to_hex(&e.oid),
+                e.offset
+            );
         }
     }
 

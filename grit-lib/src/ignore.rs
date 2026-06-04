@@ -837,8 +837,6 @@ fn gitignore_prefix_is_literal(prefix: &str) -> bool {
 struct SparsePattern {
     negative: bool,
     directory_only: bool,
-    /// Git `PATTERN_FLAG_NODIR`: pattern has no `/` (e.g. `/*`) — matches files only.
-    nodir: bool,
     anchored: bool,
     has_slash: bool,
     body: String,
@@ -889,11 +887,9 @@ impl SparsePattern {
         }
 
         let has_slash = raw.contains('/');
-        let nodir = !has_slash && !directory_only;
         Some(Self {
             negative,
             directory_only,
-            nodir,
             anchored,
             has_slash,
             body: raw,

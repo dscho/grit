@@ -19,7 +19,7 @@ use grit_lib::state::resolve_head;
 use grit_lib::userdiff;
 use grit_lib::wildmatch::wildmatch;
 use regex::Regex;
-use similar::{Algorithm as SimilarAlgorithm, ChangeTag, TextDiff};
+use similar::Algorithm as SimilarAlgorithm;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

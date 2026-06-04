@@ -120,10 +120,6 @@ pub fn common_dir(git_dir: &Path) -> Option<PathBuf> {
     path.canonicalize().ok()
 }
 
-fn notes_merge_state_ref(refname: &str) -> bool {
-    matches!(refname, "NOTES_MERGE_REF" | "NOTES_MERGE_PARTIAL")
-}
-
 /// Internal recursive resolver with cycle detection.
 ///
 /// When operating inside a worktree, `common` points to the shared git

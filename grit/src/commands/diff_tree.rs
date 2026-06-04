@@ -784,7 +784,7 @@ fn render_whatchanged_commit(
     opts: &Options,
     out: &mut impl Write,
     oid: &ObjectId,
-    pickaxe_active: bool,
+    _pickaxe_active: bool,
     leading_blank: bool,
 ) -> Result<bool> {
     let obj = repo.odb.read(oid).context("reading commit")?;

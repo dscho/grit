@@ -46,16 +46,6 @@ fn imara_unified_hunk_slices(body: &str) -> Vec<&str> {
     starts.windows(2).map(|w| &body[w[0]..w[1]]).collect()
 }
 
-/// Effective context length for imara's hunk merger so it approximates Git's
-/// `2 * U + inter_hunk_context` unchanged-line merge threshold.
-fn imara_context_len_for_git(context_lines: usize, inter_hunk_context: usize) -> u32 {
-    (2usize
-        .saturating_mul(context_lines)
-        .saturating_add(inter_hunk_context))
-    .div_ceil(2)
-    .min(u32::MAX as usize) as u32
-}
-
 fn histogram_unified_body_raw(
     old_content: &str,
     new_content: &str,
@@ -315,8 +305,6 @@ pub fn word_diff_ops_imara(old_words: &[&str], new_words: &[&str]) -> Vec<simila
                 new_index: new_pos,
                 len,
             });
-            old_pos += len;
-            new_pos += len;
         }
         let del = b_end - b_start;
         let ins = a_end - a_start;

@@ -1,3 +1,12 @@
+## 2026-06-04 — Cargo warnings cleanup
+
+- Quality gates: `cargo fmt`, `cargo check --workspace`, `cargo check --workspace --all-targets`,
+  and `cargo test -p grit-lib --lib` passed. The library test run passed 238/238.
+- Harness: skipped because this was a warnings-only cleanup with no upstream test fixture focus.
+- Note: `cargo clippy --workspace --all-targets` was probed but remains blocked by a broad
+  pre-existing Clippy backlog, including denied unwrap/expect use in test targets and hundreds of
+  style warnings.
+
 ## 2026-06-03 — t3301-notes partial
 
 - Focus harness improved to 113/153 after `log --pretty=raw` stopped printing an extra trailing
