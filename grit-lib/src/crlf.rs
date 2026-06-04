@@ -98,6 +98,8 @@ pub enum DiffAttr {
     Unspecified,
     /// `-diff` / `diff=unset` / `binary` — treat as binary for diff purposes.
     Unset,
+    /// Bare `diff` (set) — force textual diff even when the blob contains NUL.
+    Set,
     /// `diff=<driver>` — use named driver (e.g. for textconv).
     Driver(String),
 }
@@ -466,7 +468,9 @@ pub fn get_file_attrs(
                     "diff" => {
                         if value == "unset" {
                             fa.diff_attr = DiffAttr::Unset;
-                        } else if !value.is_empty() && value != "set" {
+                        } else if value == "set" {
+                            fa.diff_attr = DiffAttr::Set;
+                        } else if !value.is_empty() {
                             fa.diff_attr = DiffAttr::Driver(value.clone());
                         }
                     }
