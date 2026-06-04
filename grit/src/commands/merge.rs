@@ -854,6 +854,25 @@ pub fn run(mut args: Args) -> Result<()> {
     // CLI flags (--ff, --no-ff, --ff-only) take precedence over config.
     let repo = Repository::discover(None).context("not a git repository")?;
     if args.commits.len() == 1 && args.commits[0] == "FETCH_HEAD" {
+        // Derive the default merge message from the FETCH_HEAD branch/tag descriptions
+        // (git's fmt-merge-msg) before the spec is resolved to a bare OID, which would
+        // otherwise yield "Merge commit '<oid>'" instead of "Merge branch 'side'".
+        if args.message.is_none() {
+            if let Ok(content) = std::fs::read_to_string(repo.git_dir.join("FETCH_HEAD")) {
+                let into_name = resolve_head(&repo.git_dir)
+                    .ok()
+                    .and_then(|h| h.branch_name().map(str::to_owned));
+                let opts = grit_lib::fmt_merge_msg::FmtMergeMsgOptions {
+                    message: None,
+                    into_name,
+                };
+                let derived = grit_lib::fmt_merge_msg::fmt_merge_msg(&content, &opts);
+                let derived = derived.trim_end_matches('\n');
+                if !derived.is_empty() {
+                    args.message = Some(derived.to_owned());
+                }
+            }
+        }
         args.commits = read_fetch_head_merge_oids(&repo)?;
     }
     let mut merge_renormalize = false;
@@ -10158,6 +10177,7 @@ fn print_diffstat(repo: &Repository, entries: &[DiffEntry], compact: bool) {
             insertions: s.insertions,
             deletions: s.deletions,
             is_binary: s.is_binary,
+            is_unmerged: false,
         })
         .collect();
 

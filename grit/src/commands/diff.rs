@@ -32,7 +32,8 @@ use grit_lib::diff::{
     empty_blob_oid, format_stat_line, resolve_indent_heuristic,
     rewrite_dissimilarity_index_percent, should_break_rewrite_for_stat,
     unified_diff_histogram_hunks_only, unified_diff_with_prefix,
-    unified_diff_with_prefix_and_funcname_and_algorithm, zero_oid, DiffEntry, DiffStatus,
+    unified_diff_with_prefix_and_funcname_and_algorithm, word_diff_ops_imara, zero_oid, DiffEntry,
+    DiffStatus,
 };
 use grit_lib::diffstat::{terminal_columns, write_diffstat_block, DiffstatOptions, FileStatInput};
 use grit_lib::error::Error;
@@ -888,11 +889,17 @@ fn emit_ws_markup_line(
     };
     match ws_color {
         None => {
-            // No highlighting: `{set}{sign}{body}{reset}`.
+            // No highlighting (Git `emit_line_0`): a trailing carriage return is
+            // emitted *after* the reset, so it never lands inside the line color.
+            let (body_core, cr) = match body_no_nl.strip_suffix('\r') {
+                Some(b) => (b, "\r"),
+                None => (body_no_nl, ""),
+            };
             out.push_str(set);
             out.push(sign);
-            out.push_str(body_no_nl);
+            out.push_str(body_core);
             out.push_str(reset);
+            out.push_str(cr);
             out.push_str(nl);
         }
         Some(ws) if blank_at_eof => {
@@ -960,6 +967,16 @@ impl WhitespaceMode {
             lines.retain(|l| !l.trim().is_empty());
         }
         lines.join("\n")
+    }
+
+    /// True when only `--ignore-blank-lines` is active among the whitespace modes (so blank-line
+    /// ignoring can be handled by xdiff-style hunk suppression rather than line deletion).
+    fn only_blank_lines(&self) -> bool {
+        self.ignore_blank_lines
+            && !self.ignore_all_space
+            && !self.ignore_space_change
+            && !self.ignore_space_at_eol
+            && !self.ignore_cr_at_eol
     }
 
     /// Normalize a single line according to the active whitespace modes.
@@ -1056,6 +1073,45 @@ impl WhitespaceMode {
         }
 
         bytes
+    }
+}
+
+/// A [`Write`] wrapper that prepends a fixed prefix at the start of every output line
+/// (implements `git diff --line-prefix=<p>`: the prefix appears before each emitted line,
+/// including stat, raw, and patch bodies).
+struct LinePrefixWriter<W: Write> {
+    inner: W,
+    prefix: Vec<u8>,
+    at_line_start: bool,
+}
+
+impl<W: Write> LinePrefixWriter<W> {
+    fn new(inner: W, prefix: &str) -> Self {
+        Self {
+            inner,
+            prefix: prefix.as_bytes().to_vec(),
+            at_line_start: true,
+        }
+    }
+}
+
+impl<W: Write> Write for LinePrefixWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        for &b in buf {
+            if self.at_line_start {
+                self.inner.write_all(&self.prefix)?;
+                self.at_line_start = false;
+            }
+            self.inner.write_all(std::slice::from_ref(&b))?;
+            if b == b'\n' {
+                self.at_line_start = true;
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1908,6 +1964,7 @@ pub(crate) fn unstaged_patch_for_add_edit(
         &empty_sm,
         &empty_gm,
         None,
+        &WhitespaceMode::default(),
         &diff_algo_ctx,
         diff_algo_cli,
         false,
@@ -2325,6 +2382,14 @@ pub fn run(mut args: Args) -> Result<()> {
                 s if s.starts_with("--color-moved") => {
                     args.color_moved = Some("default".to_owned());
                 }
+                // `--ws-error-highlight=<kinds>` / `--ws-error-highlight <kinds>` is consumed
+                // separately from raw argv by `ws_error_highlight_from_argv`; just accept it here
+                // (and skip its detached value, which lands in the rev bucket) so it is not
+                // rejected as an unknown option.
+                s if s.starts_with("--ws-error-highlight=") => {}
+                "--ws-error-highlight" => {
+                    rev_idx += 1;
+                }
                 s if s.starts_with("-O") && s.len() > 2 => {
                     let path = s[2..].to_string();
                     if path == "/dev/null" {
@@ -2459,6 +2524,9 @@ pub fn run(mut args: Args) -> Result<()> {
                 "-W" | "--function-context" => {
                     args.function_context = true;
                 }
+                // `git diff` is always recursive; `-r` / `-t` are accepted as no-ops for
+                // compatibility with diff-tree-style invocations.
+                "-r" | "-t" => {}
                 s if s.starts_with("--") => {
                     return Err(anyhow::Error::new(ExplicitExit {
                         code: 129,
@@ -2480,8 +2548,15 @@ pub fn run(mut args: Args) -> Result<()> {
         rev_idx += 1;
     }
     revs = extra_revs;
-    if revs.len() == 3 && args.name_only && !args.cached {
+    // `git diff <commit> <commit>...<commit>` (3+ commits) produces an N-way combined diff:
+    // the FIRST commit is the merge result, the rest are parents (builtin/diff.c
+    // `builtin_diff_combined`), and it defaults to the dense combined (`--cc`) format.
+    let auto_combined = revs.len() >= 3 && !args.cached && !want_combined_diff;
+    if revs.len() >= 3 && !args.cached {
         want_combined_diff = true;
+        if auto_combined {
+            combined_diff_dense = true;
+        }
     }
 
     let symmetric_tokens = revs.iter().filter(|r| is_symmetric_diff(r)).count();
@@ -2495,10 +2570,7 @@ pub fn run(mut args: Args) -> Result<()> {
     {
         bail!("usage: grit diff [<options>] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]");
     }
-    if revs.len() > 3
-        || (revs.len() > 2 && !want_combined_diff)
-        || (revs.len() == 3 && want_combined_diff && (args.cached || !args.name_only))
-    {
+    if revs.len() > 2 && !want_combined_diff {
         bail!("usage: grit diff [<options>] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]");
     }
 
@@ -2590,7 +2662,25 @@ pub fn run(mut args: Args) -> Result<()> {
     if revs.len() == 1 {
         if revs[0].ends_with("^!") {
             let expanded = expand_rev_token_circ_bang(&repo, &revs[0])?;
-            if expanded.len() >= 2 {
+            if expanded.len() > 2 {
+                // Merge commit: `rev^!` excludes all parents, which produces a
+                // combined diff (merge result against every parent), defaulting
+                // to the dense `--cc` format like git.
+                let commit_oid = resolve_revision(&repo, &expanded[0])
+                    .with_context(|| format!("unknown revision: '{}'", expanded[0]))?;
+                let mut new_revs = vec![commit_oid.to_hex()];
+                for p in &expanded[1..] {
+                    let parent_spec = p.strip_prefix('^').unwrap_or(p.as_str());
+                    let parent_oid = resolve_revision(&repo, parent_spec)
+                        .with_context(|| format!("unknown revision: '{parent_spec}'"))?;
+                    new_revs.push(parent_oid.to_hex());
+                }
+                revs = new_revs;
+                if !want_combined_diff {
+                    want_combined_diff = true;
+                    combined_diff_dense = true;
+                }
+            } else if expanded.len() == 2 {
                 let parent_spec = expanded[1]
                     .strip_prefix('^')
                     .unwrap_or(expanded[1].as_str());
@@ -2638,12 +2728,14 @@ pub fn run(mut args: Args) -> Result<()> {
         fn tree_oid_for_diff_spec(repo: &Repository, spec: &str) -> Result<ObjectId> {
             commit_or_tree_oid(repo, spec)
         }
-        let last_rev = revs
-            .last()
+        // The first revision is the merge result; the remaining ones are its parents
+        // (git's `first_non_parent` for `diff A B C...`).
+        let merge_rev = revs
+            .first()
             .ok_or_else(|| anyhow!("combined diff requires at least one revision"))?;
-        let merge_tree = tree_oid_for_diff_spec(&repo, last_rev)?;
+        let merge_tree = tree_oid_for_diff_spec(&repo, merge_rev)?;
         let mut parent_trees = Vec::with_capacity(revs.len() - 1);
-        for s in &revs[..revs.len() - 1] {
+        for s in &revs[1..] {
             parent_trees.push(tree_oid_for_diff_spec(&repo, s)?);
         }
         let walk = CombinedTreeDiffOptions {
@@ -2654,6 +2746,16 @@ pub fn run(mut args: Args) -> Result<()> {
         let mut cpaths =
             combined_diff_paths_trees(&repo.odb, &merge_tree, &parent_opts, &walk, None)?;
         cpaths = filter_combined_paths(cpaths, &paths);
+        // `-O<orderfile>` applies to combined diffs too (t4056).
+        if let Some(ref order_path) = args.order_file {
+            let patterns = read_orderfile_patterns(order_path, &cwd)?;
+            cpaths.sort_by_key(|p| {
+                patterns
+                    .iter()
+                    .position(|pat| orderfile_pattern_matches(pat, &p.path))
+                    .unwrap_or(patterns.len())
+            });
+        }
         let has_diff = !cpaths.is_empty();
         let abbrev_opt = if args.full_index || args.no_abbrev {
             None
@@ -2661,7 +2763,15 @@ pub fn run(mut args: Args) -> Result<()> {
             Some(args.abbrev.map(|n| n.max(4).min(40)).unwrap_or(7))
         };
         let mut stdout = io::stdout().lock();
-        if args.raw {
+        if args.name_only {
+            for p in &cpaths {
+                writeln!(
+                    stdout,
+                    "{}",
+                    grit_lib::quote_path::quote_c_style(&p.path, quote_path_fully)
+                )?;
+            }
+        } else if args.raw {
             for p in &cpaths {
                 writeln!(stdout, "{}", format_combined_raw_line(p, abbrev_opt))?;
             }
@@ -2684,6 +2794,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         &repo.odb,
                         &p.path,
                         &parent_trees,
+                        &merge_tree,
                         rename_thresh,
                     )
                 } else {
@@ -2706,7 +2817,14 @@ pub fn run(mut args: Args) -> Result<()> {
                     &p.parents,
                     quote_path_fully,
                 ) {
-                    write!(stdout, "{patch}")?;
+                    match args.line_prefix.as_deref() {
+                        Some(prefix) if !prefix.is_empty() => {
+                            for line in patch.split_inclusive('\n') {
+                                write!(stdout, "{prefix}{line}")?;
+                            }
+                        }
+                        _ => write!(stdout, "{patch}")?,
+                    }
                 }
             }
         }
@@ -2871,7 +2989,10 @@ pub fn run(mut args: Args) -> Result<()> {
     // When a whitespace-ignore mode is active, filter out entries whose
     // normalised content is identical. Deletions, additions, and mode
     // changes are always reported regardless of whitespace.
-    let entries = if ws_mode.any() {
+    //
+    // `--ignore-blank-lines` (alone) is handled by xdiff-style hunk suppression below so that
+    // line numbers stay intact, so it is excluded from this normalization-equality filter.
+    let entries = if ws_mode.any() && !ws_mode.only_blank_lines() {
         entries
             .into_iter()
             .filter(|e| {
@@ -2891,7 +3012,9 @@ pub fn run(mut args: Args) -> Result<()> {
         entries
     };
 
-    let entries = if let Some(ign) = line_ignore {
+    let entries = if line_ignore.is_some() || ws_mode.ignore_blank_lines {
+        let empty: &[Regex] = &[];
+        let ign = line_ignore.unwrap_or(empty);
         entries
             .into_iter()
             .filter(|e| !entry_hidden_by_line_ignore(e, &repo.odb, wt_for_content, &ws_mode, ign))
@@ -3283,6 +3406,13 @@ pub fn run(mut args: Args) -> Result<()> {
     } else {
         Box::new(io::stdout())
     };
+    // `--line-prefix=<p>` prepends `<p>` to every emitted line; wrap the writer so all
+    // sections (stat, raw, patch) share the same prefix and the per-section emitters can
+    // stay prefix-agnostic.
+    let mut out: Box<dyn Write> = match args.line_prefix.as_deref() {
+        Some(p) if !p.is_empty() => Box::new(LinePrefixWriter::new(out, p)),
+        _ => out,
+    };
 
     let effective_word_diff_opt = effective_word_diff(&args, stdout_is_tty);
     let use_color_patch = use_color
@@ -3427,7 +3557,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     args.stat_name_width,
                     args.break_rewrites,
                     args.stat_graph_width,
-                    args.line_prefix.as_deref().unwrap_or(""),
+                    "",
                     &repo.git_dir,
                     line_ignore,
                     &ws_mode,
@@ -3472,6 +3602,7 @@ pub fn run(mut args: Args) -> Result<()> {
         if args.patch_with_raw && show_unified_patch && !args.raw {
             write_raw(&mut out, &entries, oid_len, !args.cached && revs.len() <= 1)?;
             need_blank_before_patch = true;
+            wrote_output = true;
         }
         if args.patch_with_stat && show_unified_patch && !stat_block_active {
             write_stat(
@@ -3484,7 +3615,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 args.stat_name_width,
                 args.break_rewrites,
                 args.stat_graph_width,
-                args.line_prefix.as_deref().unwrap_or(""),
+                "",
                 &repo.git_dir,
                 line_ignore,
                 &ws_mode,
@@ -3493,6 +3624,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 diff_algo_cli,
             )?;
             need_blank_before_patch = true;
+            wrote_output = true;
         }
         if show_unified_patch {
             if need_blank_before_patch && wrote_output {
@@ -3551,6 +3683,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &path_to_sm_name,
                     &gm_sub_ignore,
                     line_ignore,
+                    &ws_mode,
                     &diff_algo_ctx,
                     diff_algo_cli,
                     args.cached,
@@ -3779,6 +3912,7 @@ fn run_diff_blob_vs_file(
             &empty_sm,
             &empty_gm,
             None,
+            &WhitespaceMode::default(),
             &diff_algo_ctx,
             diff_algo_cli,
             false,
@@ -3970,12 +4104,20 @@ fn no_index_apply_textconv(
 ///
 /// Run `diff --no-index <path_a> <path_b>` — compare two files outside a repo.
 fn run_no_index(args: Args) -> Result<()> {
-    // Collect paths (skip "--" separators and unrecognized flags)
-    let paths: Vec<&String> = args
-        .args
-        .iter()
-        .filter(|a| a.as_str() != "--" && !a.starts_with('-'))
-        .collect();
+    // Collect paths (skip "--" separators and unrecognized flags). Everything
+    // after a literal "--" is a pathspec, including a bare "-" which means
+    // standard input. A bare "-" outside of "--" is also treated as a path.
+    let mut paths: Vec<&String> = Vec::new();
+    let mut after_dd = false;
+    for a in args.args.iter() {
+        if a.as_str() == "--" {
+            after_dd = true;
+            continue;
+        }
+        if after_dd || a.as_str() == "-" || !a.starts_with('-') {
+            paths.push(a);
+        }
+    }
     if paths.len() != 2 {
         bail!("diff --no-index requires exactly two paths");
     }
@@ -4043,8 +4185,15 @@ fn run_no_index(args: Args) -> Result<()> {
         }
     }
 
-    // Read file or symlink target (for symlinks, read the target path as content)
+    // Read file or symlink target (for symlinks, read the target path as content).
+    // A bare "-" means read from standard input.
     let read_path_or_symlink = |p: &Path, name: &str| -> Result<Vec<u8>> {
+        if name == "-" {
+            let mut buf = Vec::new();
+            io::Read::read_to_end(&mut io::stdin().lock(), &mut buf)
+                .context("could not read from standard input")?;
+            return Ok(buf);
+        }
         if let Ok(meta) = std::fs::symlink_metadata(p) {
             if meta.file_type().is_symlink() {
                 return std::fs::read_link(p)
@@ -4471,7 +4620,7 @@ fn run_no_index_dirs(args: Args, dir_a: &Path, dir_b: &Path) -> Result<()> {
         }
 
         has_diff = true;
-        let _label_a = format!("{}/{}", dir_a.display(), rel);
+        let label_a = format!("{}/{}", dir_a.display(), rel);
         let label_b = format!("{}/{}", dir_b.display(), rel);
 
         if args.name_only {
@@ -4485,6 +4634,43 @@ fn run_no_index_dirs(args: Args, dir_a: &Path, dir_b: &Path) -> Result<()> {
                 _ => "M",
             };
             writeln!(out, "{}\t{}", status, label_b)?;
+            continue;
+        }
+        if args.raw {
+            // `git diff --no-index --raw`: emit the raw plumbing line with all-zero OIDs (there
+            // are no objects in --no-index mode). Path shown is the second argument's side.
+            let mode_a = fa
+                .symlink_metadata()
+                .ok()
+                .and_then(|m| m.file_type().is_symlink().then_some("120000"))
+                .unwrap_or("100644");
+            let mode_b = fb
+                .symlink_metadata()
+                .ok()
+                .and_then(|m| m.file_type().is_symlink().then_some("120000"))
+                .unwrap_or("100644");
+            let (status, om, nm, path) = match (&data_a, &data_b) {
+                (None, Some(_)) => ("A", "000000", mode_b, label_b.as_str()),
+                (Some(_), None) => ("D", mode_a, "000000", label_a.as_str()),
+                _ => ("M", mode_a, mode_b, label_b.as_str()),
+            };
+            let raw_abbrev = if args.abbrev == Some(0) || args.no_abbrev {
+                40usize
+            } else if let Some(n) = args.abbrev {
+                n.clamp(4, 40)
+            } else {
+                7
+            };
+            let ell = if raw_abbrev < 40
+                && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").ok().as_deref() == Some("yes")
+            {
+                "..."
+            } else {
+                ""
+            };
+            let zeros = format!("{}{ell}", "0".repeat(raw_abbrev));
+            writeln!(out, ":{om} {nm} {zeros} {zeros} {status}\t{path}")?;
+            has_diff = true;
             continue;
         }
 
@@ -4861,6 +5047,12 @@ fn diff_cli_requests_unified_patch_alongside_stat(argv: &[String]) -> bool {
             continue;
         }
         if arg == "-p" || arg == "--patch" || arg == "-u" {
+            emit = true;
+            continue;
+        }
+        // `--patch-with-raw` / `--patch-with-stat` request the unified patch alongside the
+        // raw/stat output (git's `--patch-with-*`).
+        if arg == "--patch-with-raw" || arg == "--patch-with-stat" {
             emit = true;
             continue;
         }
@@ -5395,7 +5587,9 @@ fn gather_dirstat_recursive(
         if permille_val >= permille {
             let int_part = permille_val / 10;
             let frac = permille_val % 10;
-            writeln!(out, " {:>4}.{}% {}", int_part, frac, &base[..base_len])?;
+            // Git formats dirstat lines as `%4d.%01d%% %s` (no leading space; the
+            // width-4 field provides the alignment).
+            writeln!(out, "{:>4}.{}% {}", int_part, frac, &base[..base_len])?;
             if !cumulative {
                 return Ok(sum);
             }
@@ -5899,15 +6093,23 @@ fn filter_by_paths(entries: Vec<DiffEntry>, paths: &[String]) -> Vec<DiffEntry> 
         .into_iter()
         .filter(|e| {
             let path = e.path();
+            // Classify the entry from its modes so `dir/` style pathspecs match
+            // gitlinks (t4010: `submod/` must match submodule entry `submod`).
+            let old_ctx = grit_lib::pathspec::context_from_mode_octal(&e.old_mode);
+            let new_ctx = grit_lib::pathspec::context_from_mode_octal(&e.new_mode);
+            let ctx = grit_lib::pathspec::PathspecMatchContext {
+                is_directory: old_ctx.is_directory || new_ctx.is_directory,
+                is_git_submodule: old_ctx.is_git_submodule || new_ctx.is_git_submodule,
+            };
             let included = include_specs.iter().any(|spec| {
                 if spec == &"." || spec.is_empty() {
                     return true;
                 }
-                grit_lib::pathspec::pathspec_matches(spec, path)
+                grit_lib::pathspec::matches_pathspec_with_context(spec, path, ctx)
             });
             let excluded = exclude_inners
                 .iter()
-                .any(|inner| grit_lib::pathspec::pathspec_matches(inner, path));
+                .any(|inner| grit_lib::pathspec::matches_pathspec_with_context(inner, path, ctx));
             included && !excluded
         })
         .collect()
@@ -5937,7 +6139,93 @@ fn apply_ignore_matching_lines_to_text(text: &str, ignore: &[Regex]) -> String {
     out
 }
 
-/// True when `-I` / `--ignore-matching-lines` removes all substantive differences (entry hidden like Git).
+/// True when a changed line (the text after the leading `+`/`-`) is "ignorable":
+/// it matches one of the `-I` regexes, or (with `--ignore-blank-lines`) is blank.
+fn changed_line_is_ignorable(body: &str, ignore: &[Regex], ignore_blank: bool) -> bool {
+    if ignore_blank && body.trim().is_empty() {
+        return true;
+    }
+    ignore.iter().any(|re| re.is_match(body))
+}
+
+/// Suppress hunks whose changed lines are *all* ignorable (xdiff `-I` / `--ignore-blank-lines`
+/// semantics: the diff is computed normally, then hunks made up entirely of ignorable changes
+/// are dropped at emission, preserving line numbers in the remaining hunks).
+///
+/// Operates on a single-file patch body (optional leading `diff --git`/`index`/`mode` lines, the
+/// `---`/`+++` header pair, then `@@` hunks). Returns the filtered patch; when no hunk survives the
+/// result is empty (the caller suppresses the whole file entry).
+pub(crate) fn suppress_ignored_hunks_in_patch(
+    patch: &str,
+    ignore: &[Regex],
+    ignore_blank: bool,
+) -> String {
+    if ignore.is_empty() && !ignore_blank {
+        return patch.to_owned();
+    }
+    let lines: Vec<&str> = patch.split_inclusive('\n').collect();
+    // Find where the first hunk header starts; everything before it is file header.
+    let first_hunk = lines.iter().position(|l| l.starts_with("@@ "));
+    let Some(first_hunk) = first_hunk else {
+        // No hunks (e.g. pure mode change / binary); leave untouched.
+        return patch.to_owned();
+    };
+    let header: String = lines[..first_hunk].concat();
+
+    let mut kept_hunks = String::new();
+    let mut any_kept = false;
+    let mut i = first_hunk;
+    while i < lines.len() {
+        // Collect this hunk: the @@ line plus following body lines until the next @@.
+        let hunk_start = i;
+        i += 1;
+        while i < lines.len() && !lines[i].starts_with("@@ ") {
+            i += 1;
+        }
+        let hunk_lines = &lines[hunk_start..i];
+
+        let mut has_change = false;
+        let mut all_ignorable = true;
+        for &l in &hunk_lines[1..] {
+            // Trim a single trailing newline for matching.
+            let l_trim = l.strip_suffix('\n').unwrap_or(l);
+            if let Some(body) = l_trim.strip_prefix('+') {
+                has_change = true;
+                if !changed_line_is_ignorable(body, ignore, ignore_blank) {
+                    all_ignorable = false;
+                }
+            } else if let Some(body) = l_trim.strip_prefix('-') {
+                has_change = true;
+                if !changed_line_is_ignorable(body, ignore, ignore_blank) {
+                    all_ignorable = false;
+                }
+            }
+            // Context lines (' ') and `\ No newline` markers don't affect ignorability.
+        }
+
+        if has_change && all_ignorable {
+            // Drop this hunk entirely.
+            continue;
+        }
+        any_kept = true;
+        for &l in hunk_lines {
+            kept_hunks.push_str(l);
+        }
+    }
+
+    if !any_kept {
+        return String::new();
+    }
+    let mut out = header;
+    out.push_str(&kept_hunks);
+    out
+}
+
+/// True when `-I` / `--ignore-matching-lines` (and `--ignore-blank-lines`) removes all substantive
+/// differences, so Git hides the file entirely (no `diff --git`, no `--raw`/`--name-only` line).
+///
+/// Mirrors xdiff: the diff is computed normally, then a file whose every hunk consists solely of
+/// ignorable changes (regex match or, with `--ignore-blank-lines`, blank lines) emits no patch.
 fn entry_hidden_by_line_ignore(
     entry: &DiffEntry,
     odb: &Odb,
@@ -5945,7 +6233,8 @@ fn entry_hidden_by_line_ignore(
     ws_mode: &WhitespaceMode,
     ignore: &[Regex],
 ) -> bool {
-    if ignore.is_empty() {
+    let ignore_blank = ws_mode.ignore_blank_lines;
+    if ignore.is_empty() && !ignore_blank {
         return false;
     }
     if matches!(
@@ -5973,13 +6262,23 @@ fn entry_hidden_by_line_ignore(
             read_content(odb, &entry.new_oid, work_tree, new_path),
         ),
     };
-    let mut old_f = apply_ignore_matching_lines_to_text(&old, ignore);
-    let mut new_f = apply_ignore_matching_lines_to_text(&new, ignore);
-    if ws_mode.any() {
-        old_f = ws_mode.normalize(&old_f);
-        new_f = ws_mode.normalize(&new_f);
+    // Apply non-blank whitespace normalization (blank-line ignoring is handled by hunk
+    // suppression so line numbers stay intact). When other ws flags are present the file would
+    // already have been dropped by the ws-equality filter, so this only refines the `-I` case.
+    let (old_f, new_f) = if ws_mode.any() && !ws_mode.only_blank_lines() {
+        (ws_mode.normalize(&old), ws_mode.normalize(&new))
+    } else {
+        (old, new)
+    };
+    if old_f == new_f {
+        return true;
     }
-    old_f == new_f
+    // Compute a plain unified body and check whether every hunk is ignorable.
+    let body = unified_diff_histogram_hunks_only(&old_f, &new_f, 3, 0);
+    if body.is_empty() {
+        return true;
+    }
+    suppress_ignored_hunks_in_patch(&body, ignore, ignore_blank).is_empty()
 }
 
 /// Read raw bytes for a diff entry side from the ODB.
@@ -6820,6 +7119,50 @@ fn check_blank_at_eof(pre: &[u8], post: &[u8]) -> (usize, usize) {
     )
 }
 
+/// Rewrite the `--- a/<path>` / `+++ b/<path>` labels produced by
+/// [`no_index_unified_patch_body`] (which always uses the `a/`,`b/` prefixes) so they use the
+/// caller's `src_prefix`/`dst_prefix`. The body (hunks) is left untouched.
+fn rewrite_patch_label_prefixes(
+    body: &str,
+    src_prefix: &str,
+    dst_prefix: &str,
+    old_path: &str,
+    new_path: &str,
+    quote_path_fully: bool,
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    let old_label = if old_path == "/dev/null" {
+        "--- /dev/null".to_string()
+    } else {
+        format!(
+            "--- {}",
+            format_diff_path_with_prefix(src_prefix, old_path, quote_path_fully)
+        )
+    };
+    let new_label = if new_path == "/dev/null" {
+        "+++ /dev/null".to_string()
+    } else {
+        format!(
+            "+++ {}",
+            format_diff_path_with_prefix(dst_prefix, new_path, quote_path_fully)
+        )
+    };
+    for (i, line) in body.split_inclusive('\n').enumerate() {
+        match i {
+            0 if line.starts_with("--- ") => {
+                out.push_str(&old_label);
+                out.push('\n');
+            }
+            1 if line.starts_with("+++ ") => {
+                out.push_str(&new_label);
+                out.push('\n');
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
+}
+
 fn write_patch_with_prefix(
     out: &mut impl Write,
     repo: &Repository,
@@ -6848,6 +7191,7 @@ fn write_patch_with_prefix(
     path_to_sm_name: &HashMap<String, String>,
     gm_sub_ignore: &HashMap<String, String>,
     line_ignore: Option<&[Regex]>,
+    ws_mode: &WhitespaceMode,
     algo_ctx: &DiffAlgoContext,
     algo_cli: Option<CliDiffAlgo>,
     cached: bool,
@@ -6857,6 +7201,7 @@ fn write_patch_with_prefix(
     relative_prefix: Option<&str>,
     indent_heuristic: bool,
 ) -> Result<()> {
+    let ignore_blank = ws_mode.ignore_blank_lines;
     for entry in entries {
         let old_path = entry.old_path.as_deref().unwrap_or("/dev/null");
         let new_path = entry.new_path.as_deref().unwrap_or("/dev/null");
@@ -7204,12 +7549,9 @@ fn write_patch_with_prefix(
         } else {
             String::from_utf8_lossy(&new_content_raw).into_owned()
         };
-        if let Some(ign) = line_ignore {
-            if !ign.is_empty() {
-                old_content = apply_ignore_matching_lines_to_text(&old_content, ign);
-                new_content = apply_ignore_matching_lines_to_text(&new_content, ign);
-            }
-        }
+        // `-I` / `--ignore-blank-lines`: the diff is computed on the *full* content (so line
+        // numbers are preserved) and then ignorable hunks are dropped from the rendered patch
+        // below — never by pre-deleting lines here.
 
         // Intent-to-add empty file: header + `index 0000000..e69de29` only (t2203).
         if !cached
@@ -7319,22 +7661,65 @@ fn write_patch_with_prefix(
                 algo_ctx.ignore_case_attrs,
             )
             .unwrap_or(None);
-            let patch = unified_diff_with_prefix_and_funcname_and_algorithm(
-                &old_content,
-                &new_content,
-                display_old,
-                display_new,
-                context_lines,
-                inter_hunk_context,
-                src_prefix,
-                dst_prefix,
-                func_matcher.as_ref(),
-                algo,
-                function_context,
-                use_git_histogram,
-                indent_heuristic,
-                quote_path_fully,
-            );
+            // When a whitespace-ignore mode other than (or in addition to) blank-line
+            // ignoring is active, diff normalised line keys but emit the original lines
+            // (Git's xdiff whitespace flags). `no_index_unified_patch_body` already does
+            // exactly this; reuse it so `-b`, `--ignore-space-at-eol`, and
+            // `--ignore-cr-at-eol` collapse whitespace-only hunks here too.
+            let ws_aware = ws_mode.any()
+                && (ws_mode.ignore_space_change
+                    || ws_mode.ignore_all_space
+                    || ws_mode.ignore_space_at_eol
+                    || ws_mode.ignore_cr_at_eol);
+            let patch = if ws_aware {
+                let body = no_index_unified_patch_body(
+                    old_content.as_bytes(),
+                    new_content.as_bytes(),
+                    display_old,
+                    display_new,
+                    context_lines,
+                    inter_hunk_context,
+                    ws_mode,
+                    algo,
+                    false,
+                    indent_heuristic,
+                    quote_path_fully,
+                );
+                // `no_index_unified_patch_body` emits `--- a/<old>` / `+++ b/<new>` labels using a
+                // fixed `a/`,`b/` prefix; rewrite them to the caller's prefixes.
+                rewrite_patch_label_prefixes(
+                    &body,
+                    src_prefix,
+                    dst_prefix,
+                    display_old,
+                    display_new,
+                    quote_path_fully,
+                )
+            } else {
+                unified_diff_with_prefix_and_funcname_and_algorithm(
+                    &old_content,
+                    &new_content,
+                    display_old,
+                    display_new,
+                    context_lines,
+                    inter_hunk_context,
+                    src_prefix,
+                    dst_prefix,
+                    func_matcher.as_ref(),
+                    algo,
+                    function_context,
+                    use_git_histogram,
+                    indent_heuristic,
+                    quote_path_fully,
+                )
+            };
+            let patch = match line_ignore {
+                Some(ign) if !ign.is_empty() || ignore_blank => {
+                    suppress_ignored_hunks_in_patch(&patch, ign, ignore_blank)
+                }
+                _ if ignore_blank => suppress_ignored_hunks_in_patch(&patch, &[], ignore_blank),
+                _ => patch,
+            };
             let patch = if suppress_blank_empty {
                 strip_blank_context_trailing_space(&patch)
             } else {
@@ -7547,6 +7932,80 @@ pub struct WordRe {
     longest: regex_automata::dfa::regex::Regex,
 }
 
+/// Translate a POSIX ERE (as used by Git's `wordRegex`) into a pattern the `regex` crate accepts.
+///
+/// POSIX bracket expressions allow `]` as the first member of a class (e.g. `[][)(]` or the
+/// scheme driver's `[^][)(}{[ \t]`), but the `regex` crate requires it to be escaped. We rewrite
+/// a `]` that immediately follows `[` or `[^` into `\]`. Backslash escapes are passed through so
+/// existing `\]`, `\[`, etc. are untouched.
+fn posix_ere_to_rust_regex(pattern: &str) -> String {
+    let bytes = pattern.as_bytes();
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut i = 0usize;
+    let mut in_class = false;
+    // Position (in `out`-equivalent terms) tracking where the current class body began, so we can
+    // detect the "first member" slot (just after `[` or `[^`).
+    let mut class_just_opened = false;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' && i + 1 < bytes.len() {
+            // Pass through an escape pair verbatim.
+            out.push('\\');
+            out.push(bytes[i + 1] as char);
+            i += 2;
+            class_just_opened = false;
+            continue;
+        }
+        if !in_class {
+            if c == b'[' {
+                in_class = true;
+                class_just_opened = true;
+                out.push('[');
+                i += 1;
+                // Handle a leading negation.
+                if i < bytes.len() && bytes[i] == b'^' {
+                    out.push('^');
+                    i += 1;
+                }
+                continue;
+            }
+            out.push(c as char);
+            i += 1;
+            continue;
+        }
+        // Inside a character class.
+        if class_just_opened && c == b']' {
+            // `]` as the first member is a literal in POSIX; escape it for the regex crate.
+            out.push_str("\\]");
+            i += 1;
+            class_just_opened = false;
+            continue;
+        }
+        class_just_opened = false;
+        if c == b']' {
+            in_class = false;
+            out.push(']');
+            i += 1;
+            continue;
+        }
+        if c == b'[' {
+            // A POSIX bracket expression (`[:alpha:]`, `[.ch.]`, `[=a=]`) is passed through;
+            // any other `[` is a literal member, which the `regex` crate would otherwise treat
+            // as the start of a nested class, so escape it.
+            if i + 1 < bytes.len() && matches!(bytes[i + 1], b':' | b'.' | b'=') {
+                out.push('[');
+            } else {
+                out.push_str("\\[");
+            }
+            i += 1;
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
 impl WordRe {
     fn build(pattern: &str, case_insensitive: bool) -> Option<Self> {
         use regex_automata::{
@@ -7554,6 +8013,7 @@ impl WordRe {
             util::syntax,
             MatchKind,
         };
+        let pattern = &posix_ere_to_rust_regex(pattern);
         let start = RegexBuilder::new(pattern)
             .multi_line(true)
             .case_insensitive(case_insensitive)
@@ -7758,13 +8218,9 @@ fn git_word_diff_show(
         .map(|(a, b)| plus.get(*a..*b).unwrap_or(""))
         .collect();
 
-    // Diff the word streams with raw Myers (no Git-style hunk sliding). Git's
-    // word diff keeps each changed run bounded by the surrounding equal words;
-    // applying `xdl_change_compact`-style sliding here can over-merge a changed
-    // word with an adjacent equal one across line boundaries (e.g. gluing the
-    // closing `'` of `'x'`/`'y'` to the changed letter), so we deliberately use
-    // `capture_diff_slices` rather than `diff_slice_ops_compacted`.
-    let ops = similar::capture_diff_slices(similar::Algorithm::Myers, &mw, &pw);
+    // Diff the word streams with imara's Myers (Git's default xdiff engine) followed by
+    // `xdl_change_compact`, matching Git's word-level alignment and tie-breaking.
+    let ops = word_diff_ops_imara(&mw, &pw);
 
     // current_plus tracks the byte offset into `plus` already emitted.
     let mut current_plus: usize = 0;
@@ -8717,7 +9173,10 @@ fn color_hunk_header_word_diff(header: &str, cb: &str, cr: &str, fb: &str, fr: &
     if func_part.is_empty() {
         format!("{cb}{frag}{cr}{rest}")
     } else {
-        format!("{cb}{frag}{cr}{space_part}{fb}{func_part}{fr}")
+        // Git `emit_hunk_header`: the blank before the func header is emitted in
+        // the (empty) context color and closed with a reset, then the func part.
+        let space_reset = if space_part.is_empty() { "" } else { cr };
+        format!("{cb}{frag}{cr}{space_part}{space_reset}{fb}{func_part}{fr}")
     }
 }
 
@@ -8866,6 +9325,14 @@ fn write_compact_summary(
     let mut total_del = 0usize;
     for entry in entries {
         if entry.status == DiffStatus::Unmerged {
+            // git lists unmerged paths as ` <name> | Unmerged` (not counted as changed).
+            files.push(FileStatInput {
+                path_display: compact_summary_display_path(entry, quote_path_fully),
+                insertions: 0,
+                deletions: 0,
+                is_binary: false,
+                is_unmerged: true,
+            });
             continue;
         }
         let old_raw = read_content_raw(odb, &entry.old_oid);
@@ -8909,6 +9376,7 @@ fn write_compact_summary(
             insertions: ins,
             deletions: del,
             is_binary: binary,
+            is_unmerged: false,
         });
     }
 
@@ -8963,6 +9431,14 @@ fn write_shortstat(
     let mut files_changed = 0usize;
 
     for entry in entries {
+        // Binary files count as a changed file but contribute no line counts
+        // (t4012: `diff --shortstat` on binary change is "0 insertions, 0 deletions").
+        let old_raw = read_content_raw(odb, &entry.old_oid);
+        let new_raw = read_content_raw_or_worktree(odb, &entry.new_oid, work_tree, entry.path());
+        if is_binary(&old_raw) || is_binary(&new_raw) {
+            files_changed += 1;
+            continue;
+        }
         let (ins, del) = stat_ins_del_for_entry(
             odb,
             entry,
@@ -9054,6 +9530,14 @@ fn write_stat(
     let mut files: Vec<FileStatInput> = Vec::with_capacity(entries.len());
     for (i, entry) in entries.iter().enumerate() {
         if entry.status == DiffStatus::Unmerged {
+            // git lists unmerged paths as ` <name> | Unmerged` (not counted).
+            files.push(FileStatInput {
+                path_display: display_paths[i].clone(),
+                insertions: 0,
+                deletions: 0,
+                is_binary: false,
+                is_unmerged: true,
+            });
             continue;
         }
         let old_raw = read_content_raw(odb, &entry.old_oid);
@@ -9078,6 +9562,7 @@ fn write_stat(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let (ins, del) = if mode_only {
@@ -9099,6 +9584,7 @@ fn write_stat(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }
@@ -9135,9 +9621,16 @@ fn write_stat(
 /// Format a rename/copy path for numstat: `{old_quoted}\t{new_quoted}` or
 /// `{old_quoted} => {new_quoted}` depending on format.
 fn format_rename_display(old: &str, new: &str, quote_path_fully: bool) -> String {
+    // Git pprint_rename: when either side needs C-style quoting there is no
+    // `{a => b}` common-prefix compaction; each side is quoted independently
+    // (t4016: `"with\tHT" => Rpathname with SP.1`).
+    let old_q = grit_lib::quote_path::quote_c_style(old, quote_path_fully);
+    let new_q = grit_lib::quote_path::quote_c_style(new, quote_path_fully);
+    if old_q != old || new_q != new {
+        return format!("{old_q} => {new_q}");
+    }
     // Use the pretty-print format with common prefix/suffix like c/{b/a => d/e}
-    let pretty = grit_lib::diff::format_rename_path(old, new);
-    grit_lib::quote_path::quote_c_style(&pretty, quote_path_fully)
+    grit_lib::diff::format_rename_path(old, new)
 }
 
 /// Write machine-readable numstat output: `{insertions}\t{deletions}\t{path}`.
@@ -9199,7 +9692,7 @@ fn write_numstat(
 
 /// Write only the names of changed files.
 /// Write `--summary` output for rename/copy/mode-change entries.
-fn write_diff_summary(
+pub(crate) fn write_diff_summary(
     out: &mut impl Write,
     entries: &[DiffEntry],
     break_rewrites: bool,
@@ -9278,6 +9771,15 @@ fn write_raw(
     abbrev_len: usize,
     worktree_new_side: bool,
 ) -> Result<()> {
+    // When OIDs are abbreviated (abbrev_len < 40), git appends `...` if
+    // GIT_PRINT_SHA1_ELLIPSIS=yes (the default ellipsis behaviour for `--raw`).
+    let ell = if abbrev_len < 40
+        && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").ok().as_deref() == Some("yes")
+    {
+        "..."
+    } else {
+        ""
+    };
     for entry in entries {
         let old_mode = &entry.old_mode;
         let new_mode = &entry.new_mode;
@@ -9285,16 +9787,16 @@ fn write_raw(
         let new_oid_hex = entry.new_oid.to_hex();
         let olen = abbrev_len.min(old_oid_hex.len());
         let nlen = abbrev_len.min(new_oid_hex.len());
-        let old_oid = &old_oid_hex[..olen];
+        let old_oid = format!("{}{ell}", &old_oid_hex[..olen]);
         // A gitlink whose new side is the work tree (e.g. a blob→gitlink typechange or a
         // worktree-side submodule bump) prints the all-zero OID in raw plumbing, even though the
         // `--submodule` patch shows the real HEAD. See t4041/t4060.
         let zero_wt_gitlink = worktree_new_side && new_mode == "160000";
-        let zeroed = "0".repeat(nlen);
+        let zeroed = format!("{}{ell}", "0".repeat(nlen));
         let new_oid = if zero_wt_gitlink {
-            zeroed.as_str()
+            zeroed.clone()
         } else {
-            &new_oid_hex[..nlen]
+            format!("{}{ell}", &new_oid_hex[..nlen])
         };
         let status = entry.status.letter();
         match entry.status {
@@ -9308,8 +9810,8 @@ fn write_raw(
                 let zero_new = (old_mode == "160000"
                     && new_mode == "160000"
                     && entry.old_oid == entry.new_oid)
-                    .then(|| "0".repeat(abbrev_len));
-                let rn = zero_new.as_deref().unwrap_or(new_oid);
+                    .then(|| format!("{}{ell}", "0".repeat(abbrev_len)));
+                let rn = zero_new.as_deref().unwrap_or(new_oid.as_str());
                 if let Some(pct) = entry.score {
                     writeln!(
                         out,
@@ -9794,10 +10296,31 @@ fn resolve_diff_prefixes(args: &Args, repo: &Repository, cached: bool) -> (Strin
 
 /// Write unified diff output for a list of DiffEntry pairs.
 pub fn write_patch_from_pairs(
-    _out: &mut dyn std::io::Write,
-    _entries: &[DiffEntry],
-    _repo: &Repository,
+    out: &mut dyn std::io::Write,
+    entries: &[DiffEntry],
+    repo: &Repository,
 ) -> anyhow::Result<()> {
-    // Stub: full implementation pending
+    // Match `git diff-tree -p` defaults: 3 context lines, 7-char abbrev,
+    // config-driven path quoting, indent heuristic on (t4070 diff-pairs).
+    let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
+        .unwrap_or_else(|_| grit_lib::config::ConfigSet::new());
+    let quote_fully = config.quote_path_fully();
+    let indent_heuristic = grit_lib::diff::resolve_indent_heuristic(&config, false, false);
+    let mut out = out;
+    for entry in entries {
+        crate::commands::diff_tree::write_patch_entry(
+            &mut out,
+            &repo.odb,
+            entry,
+            3,
+            Some(7),
+            false,
+            false,
+            false,
+            &repo.git_dir,
+            quote_fully,
+            indent_heuristic,
+        )?;
+    }
     Ok(())
 }

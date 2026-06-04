@@ -268,6 +268,10 @@ pub struct Args {
     #[arg(long = "numbered-files")]
     pub numbered_files: bool,
 
+    /// Filename suffix for generated patches (default `.patch`).
+    #[arg(long = "suffix")]
+    pub suffix: Option<String>,
+
     /// Include diffstat in patch body (`--stat[=width[,name-width[,count]]]`).
     #[arg(long = "stat", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub stat: Option<String>,
@@ -981,6 +985,9 @@ pub fn run(mut args: Args) -> Result<()> {
         .map(|v| format!("v{}-", sanitize_reroll(v)))
         .unwrap_or_default();
 
+    // Patch filename suffix (default `.patch`; `--suffix=` overrides, e.g. `.diff`).
+    let patch_suffix: &str = args.suffix.as_deref().unwrap_or(".patch");
+
     // Message-Id chain state for threading.
     let mut thread = ThreadState::new(thread_mode, opts.in_reply_to.clone(), want_cover);
 
@@ -1026,7 +1033,7 @@ pub fn run(mut args: Args) -> Result<()> {
             &mut single_buf,
             to_single,
             &out_dir,
-            &format!("{file_prefix}0000-cover-letter.patch"),
+            &format!("{file_prefix}0000-cover-letter{patch_suffix}"),
             &cover,
             args.quiet,
         )?;
@@ -1071,6 +1078,23 @@ pub fn run(mut args: Args) -> Result<()> {
         } else {
             None
         };
+        // Git derives the patch filename from only the FIRST line of the subject (it stops at the
+        // first newline), even though the Subject header flattens a multi-line subject onto one line.
+        let filename_subject = first_subject_line(&display_msg);
+        // `--numbered-files`: the patch file (and its MIME attachment name) is just the
+        // sequence number, with no prefix, subject, or suffix (matches Git).
+        let filename = if args.numbered_files {
+            patch_num.to_string()
+        } else {
+            build_patch_filename(
+                &file_prefix,
+                patch_num,
+                filename_subject,
+                filename_max_length,
+                patch_suffix,
+            )
+        };
+
         let patch = format_single_patch(
             &repo,
             &repo.odb,
@@ -1087,17 +1111,8 @@ pub fn run(mut args: Args) -> Result<()> {
             &thread.references_for(seq),
             encode_email_headers,
             solo_extra.as_deref(),
+            &filename,
         )?;
-
-        // Git derives the patch filename from only the FIRST line of the subject (it stops at the
-        // first newline), even though the Subject header flattens a multi-line subject onto one line.
-        let filename_subject = first_subject_line(&display_msg);
-        let filename = build_patch_filename(
-            &file_prefix,
-            patch_num,
-            filename_subject,
-            filename_max_length,
-        );
         emit_output(
             &mut single_buf,
             to_single,
@@ -1445,6 +1460,7 @@ fn diffstat_for_patch_entries(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let old_content = String::from_utf8_lossy(&old_raw).into_owned();
@@ -1455,6 +1471,7 @@ fn diffstat_for_patch_entries(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }
@@ -1538,9 +1555,64 @@ fn diffstat_for_patch_entries(
         let mut buf = Vec::new();
         write_diffstat_block(&mut buf, &files, &dstat_opts)?;
         out.push_str(&String::from_utf8_lossy(&buf));
+
+        // git format-patch emits `--summary` lines (create/delete mode, mode change,
+        // rename/copy) right after the diffstat.
+        out.push_str(&format_summary_lines(entries));
     }
 
     Ok(out)
+}
+
+/// `--summary` lines for the diffstat (git's `show_stats`/`show_rename_copy`): file
+/// creations, deletions, mode changes, and renames/copies.
+fn format_summary_lines(entries: &[grit_lib::diff::DiffEntry]) -> String {
+    use grit_lib::diff::DiffStatus;
+    let mut out = String::new();
+    for entry in entries {
+        match entry.status {
+            DiffStatus::Added => {
+                out.push_str(&format!(
+                    " create mode {} {}\n",
+                    entry.new_mode,
+                    entry.path()
+                ));
+            }
+            DiffStatus::Deleted => {
+                out.push_str(&format!(
+                    " delete mode {} {}\n",
+                    entry.old_mode,
+                    entry.path()
+                ));
+            }
+            DiffStatus::Modified | DiffStatus::TypeChanged if entry.old_mode != entry.new_mode => {
+                out.push_str(&format!(
+                    " mode change {} => {} {}\n",
+                    entry.old_mode,
+                    entry.new_mode,
+                    entry.path()
+                ));
+            }
+            DiffStatus::Renamed => {
+                let sim = entry.score.unwrap_or(100);
+                out.push_str(&format!(
+                    " rename {} => {} ({sim}%)\n",
+                    entry.old_path.as_deref().unwrap_or(""),
+                    entry.new_path.as_deref().unwrap_or("")
+                ));
+            }
+            DiffStatus::Copied => {
+                let sim = entry.score.unwrap_or(100);
+                out.push_str(&format!(
+                    " copy {} => {} ({sim}%)\n",
+                    entry.old_path.as_deref().unwrap_or(""),
+                    entry.new_path.as_deref().unwrap_or("")
+                ));
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 fn read_blob_raw(odb: &Odb, oid: &ObjectId) -> Vec<u8> {
@@ -1589,10 +1661,21 @@ fn format_cover_letter(
     };
     out.push_str(&format!("From {cover_from_oid} Mon Sep 17 00:00:00 2001\n"));
 
+    // Git's cover letter uses the committer identity (`git_committer_info(0)`) for the
+    // `From`/`Date` headers, not the last commit's author. A `--from=<custom>` overrides
+    // only the address, keeping the committer date.
+    let committer_ident = current_committer_ident_line(repo);
     let charset_label = rfc2047_charset_label(log_output_encoding);
     let use_utf8_log = charset_label.eq_ignore_ascii_case("UTF-8");
     if !matches!(patch_opts.from_header, FromHeaderMode::Omit) {
-        let mailbox = mailbox_for_from_header(last_commit, &patch_opts.from_header);
+        let mailbox = match &patch_opts.from_header {
+            FromHeaderMode::Custom(s) => {
+                format_ident(&grit_lib::commit_encoding::decode_rfc2047_mailbox_from_line(s))
+            }
+            _ => format_ident(
+                &grit_lib::commit_encoding::decode_rfc2047_mailbox_from_line(&committer_ident),
+            ),
+        };
         write_addr_header(
             &mut out,
             "From",
@@ -1602,7 +1685,7 @@ fn format_cover_letter(
         );
     }
 
-    let date = format_date_rfc2822(&last_commit.author);
+    let date = format_date_rfc2822(&committer_ident);
     out.push_str(&format!("Date: {date}\n"));
 
     // Subject is pre-built; encode/fold it.
@@ -1779,6 +1862,44 @@ fn wrap_oneline(text: &str) -> String {
     out
 }
 
+/// Build the current committer ident line (`Name <email> <epoch> <tz>`) from the
+/// `GIT_COMMITTER_*` environment and config, matching Git's `git_committer_info(0)`.
+/// Used for the cover letter's `From`/`Date` headers (Git uses the committer, not the
+/// last commit's author).
+fn current_committer_ident_line(repo: &Repository) -> String {
+    let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+
+    let name = match read_git_identity_name_env("GIT_COMMITTER_NAME") {
+        GitIdentityNameEnv::Set(s) if !s.trim().is_empty() => s,
+        _ => config
+            .get("user.name")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Unknown".to_owned()),
+    };
+    let email = std::env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config.get("user.email").filter(|s| !s.trim().is_empty()))
+        .unwrap_or_default();
+
+    let date = std::env::var("GIT_COMMITTER_DATE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|d| crate::commands::commit::parse_date_to_git_timestamp(&d).or(Some(d)))
+        .unwrap_or_else(|| {
+            let now = time::OffsetDateTime::now_utc();
+            let off = now.offset();
+            format!(
+                "{} {:+03}{:02}",
+                now.unix_timestamp(),
+                off.whole_hours(),
+                off.minutes_past_hour().unsigned_abs()
+            )
+        });
+
+    format!("{name} <{email}> {date}")
+}
+
 /// Get the signoff identity, preferring GIT_COMMITTER_NAME/EMAIL env vars.
 fn get_signoff_identity(committer_ident: &str) -> (String, String) {
     let env_email = std::env::var("GIT_COMMITTER_EMAIL").ok();
@@ -1827,6 +1948,7 @@ fn format_single_patch(
     references: &[String],
     encode_email_headers: bool,
     solo_extra: Option<&str>,
+    attachment_filename: &str,
 ) -> Result<String> {
     let mut out = String::new();
     let charset_label = rfc2047_charset_label(log_output_encoding);
@@ -1963,7 +2085,9 @@ fn format_single_patch(
         .filter(|b| !b.is_empty())
         .map(|b| format!("------------{b}"));
     let use_mime = opts.attach.is_some() || opts.inline.is_some();
-    let boundary = mime_boundary.unwrap_or_else(|| "------------grit-patch-boundary".to_owned());
+    // Default MIME boundary is git's version string with the fixed `------------` prefix
+    // (builtin/log.c make_cover_letter / mime boundary uses `git_version_string`).
+    let boundary = mime_boundary.unwrap_or_else(|| format!("------------{}", git_version_string()));
 
     // From line
     let from_oid = if opts.zero_commit {
@@ -2062,10 +2186,11 @@ fn format_single_patch(
     out.push('\n');
 
     if use_mime {
-        // MIME multipart: description part, then patch as attachment
+        // MIME multipart: preamble, description part, then patch as attachment.
+        out.push_str("This is a multi-part message in MIME format.\n");
         out.push_str(&format!("--{boundary}\n"));
         out.push_str(&format!(
-            "Content-Type: text/plain; charset={charset_label}\n"
+            "Content-Type: text/plain; charset={charset_label}; format=fixed\n"
         ));
         out.push_str("Content-Transfer-Encoding: 8bit\n");
         out.push('\n');
@@ -2073,6 +2198,9 @@ fn format_single_patch(
             out.push_str(&format!("From: {ibf}\n\n"));
         }
         if !body_with_signoff.is_empty() {
+            // git's MIME text/plain part keeps the blank line that separates the (omitted)
+            // subject from the body, so a non-empty body is preceded by a blank line.
+            out.push('\n');
             out.push_str(&mboxrd_escape(&body_with_signoff, opts.mboxrd));
             out.push('\n');
         }
@@ -2085,17 +2213,17 @@ fn format_single_patch(
         out.push_str(&stat_block);
         out.push('\n');
 
-        // Patch attachment part
+        // Patch attachment part. Git names the part after the patch's filename
+        // (`0001-<subject>.patch`).
         out.push_str(&format!("--{boundary}\n"));
         let disposition = if opts.inline.is_some() {
             "inline"
         } else {
             "attachment"
         };
-        let subject_line = flatten_subject(&commit_msg_unicode);
-        let filename = format!("{}.patch", sanitize_subject(&subject_line));
+        let filename = attachment_filename;
         out.push_str(&format!(
-            "Content-Type: text/x-patch; charset={charset_label}\n"
+            "Content-Type: text/x-patch; name=\"{filename}\"\n"
         ));
         out.push_str("Content-Transfer-Encoding: 8bit\n");
         out.push_str(&format!(
@@ -2114,7 +2242,11 @@ fn format_single_patch(
                 }
             }
         }
+        // A blank line separates the patch body from the closing boundary, and git emits
+        // two trailing blank lines after it.
+        out.push('\n');
         out.push_str(&format!("--{boundary}--\n"));
+        out.push('\n');
         out.push('\n');
     } else {
         // Standard (non-MIME) patch format
@@ -2159,7 +2291,11 @@ fn format_single_patch(
         out.push_str(extra);
     }
 
-    write_signature(&mut out, opts.signature.as_deref());
+    // MIME (--attach / --inline) patches carry no `-- \n<signature>` trailer; the closing
+    // boundary terminates the message instead.
+    if !use_mime {
+        write_signature(&mut out, opts.signature.as_deref());
+    }
 
     Ok(out)
 }
@@ -2518,9 +2654,9 @@ fn build_patch_filename(
     patch_num: usize,
     subject: &str,
     max_len: Option<usize>,
+    suffix: &str,
 ) -> String {
     let max = max_len.unwrap_or(64);
-    let suffix = ".patch";
     let head = format!("{file_prefix}{patch_num:04}-");
     let sanitized = sanitize_subject(subject);
     // Cap so that head + sanitized + suffix has length <= max - 1.

@@ -16,12 +16,46 @@ pub fn combined_parent_status_char(s: CombinedParentStatus) -> char {
         CombinedParentStatus::Added => 'A',
         CombinedParentStatus::Modified => 'M',
         CombinedParentStatus::Deleted => 'D',
+        CombinedParentStatus::Renamed => 'R',
     }
+}
+
+/// Git raw combined line (`::::modes... oids... MM\tpath`).
+///
+/// When `combined_all_paths` is set and a parent side is a rename, the source name for every
+/// parent is emitted (tab-separated) before the merge-result path, each C-quoted with `quote_fully`.
+#[must_use]
+pub fn format_combined_raw_line_all_paths(
+    p: &CombinedDiffPath,
+    abbrev_len: Option<usize>,
+    combined_all_paths: bool,
+    quote_fully: bool,
+) -> String {
+    if !combined_all_paths {
+        return format_combined_raw_line(p, abbrev_len);
+    }
+    // Emit metadata (modes/oids/status) followed by one source name per parent and the merge path.
+    // We can't string-split the single-path line on `\t` because funny names contain tabs.
+    let mut line = combined_raw_meta(p, abbrev_len);
+    for side in &p.parents {
+        let name = side.rename_from.as_deref().unwrap_or(&p.path);
+        line.push('\t');
+        line.push_str(&crate::quote_path::quote_c_style(name, quote_fully));
+    }
+    line.push('\t');
+    line.push_str(&crate::quote_path::quote_c_style(&p.path, quote_fully));
+    line
 }
 
 /// Git raw combined line (`::::modes... oids... MM\tpath`).
 #[must_use]
 pub fn format_combined_raw_line(p: &CombinedDiffPath, abbrev_len: Option<usize>) -> String {
+    format!("{}\t{}", combined_raw_meta(p, abbrev_len), p.path)
+}
+
+/// Metadata portion of a combined raw line: `::::modes... oids... <status>` (no trailing tab/path).
+#[must_use]
+pub fn combined_raw_meta(p: &CombinedDiffPath, abbrev_len: Option<usize>) -> String {
     let n = p.parents.len();
     let mut colons = String::with_capacity(n);
     for _ in 0..n {
@@ -68,7 +102,7 @@ pub fn format_combined_raw_line(p: &CombinedDiffPath, abbrev_len: Option<usize>)
         .iter()
         .map(|s| combined_parent_status_char(s.status))
         .collect();
-    format!("{colons}{modes}{oids}{status}\t{}", p.path)
+    format!("{colons}{modes}{oids}{status}")
 }
 
 /// Per-parent coarse status in a combined diff (`A` / `M` / `D`).
@@ -80,6 +114,9 @@ pub enum CombinedParentStatus {
     Modified,
     /// Path removed from merge (only in parents that had it at the min name).
     Deleted,
+    /// Path renamed relative to this parent (`-M`/`--combined-all-paths`); the source name is
+    /// carried on [`CombinedParentSide::rename_from`].
+    Renamed,
 }
 
 /// One path in a combined diff: merge result tree vs each parent tree.
@@ -100,6 +137,8 @@ pub struct CombinedParentSide {
     pub mode: u32,
     pub oid: ObjectId,
     pub status: CombinedParentStatus,
+    /// Source path when this parent saw the result as a rename (`-M`); `None` otherwise.
+    pub rename_from: Option<String>,
 }
 
 /// Options for the multitree walk.
@@ -175,6 +214,7 @@ fn emit_combined_path(
                 mode: mode_i,
                 oid: oid_i,
                 status,
+                rename_from: None,
             });
         }
         let p = CombinedDiffPath {
@@ -199,6 +239,7 @@ fn emit_combined_path(
                 mode: mode_i,
                 oid: oid_i,
                 status,
+                rename_from: None,
             });
         }
         let p = CombinedDiffPath {
@@ -272,18 +313,23 @@ fn ll_diff_tree_paths(
 
         if cmp == std::cmp::Ordering::Equal {
             if let Some(te) = t_cur {
-                let mut skip_emit = true;
+                // Combined-diff intersection rule (git tree-diff.c ll_diff_tree_paths,
+                // cmp == 0 branch): skip the path when it is identical to *some* parent
+                // that has it at p[imin]. A path is only interesting for a combined diff
+                // if it differs from every parent. (find_copies_harder is not modelled
+                // here, matching the fast multitree path.)
+                let mut skip_emit = false;
                 for i in 0..nparent {
+                    // p[i] > p[imin]: path absent in this parent -> "+t" in D(T,Pi).
                     if parent_neq[i] {
                         continue;
                     }
-                    let Some(pe) = tp_entries[i].get(tp_idx[i]) else {
-                        skip_emit = false;
-                        break;
-                    };
-                    if pe.oid != te.oid || pe.mode != te.mode {
-                        skip_emit = false;
-                        break;
+                    if let Some(pe) = tp_entries[i].get(tp_idx[i]) {
+                        if pe.oid == te.oid && pe.mode == te.mode {
+                            // diff(t, pi) == empty: result matches this parent -> skip.
+                            skip_emit = true;
+                            break;
+                        }
                     }
                 }
 
@@ -394,7 +440,10 @@ fn ll_diff_tree_paths(
             }
             ti += 1;
         } else {
-            let skip_emit_tp = (0..nparent).all(|i| parent_neq[i]);
+            // git tree-diff.c (t > p[imin] branch): "-p[imin]" is only in D(T,Pi)
+            // when *every* parent has the path at p[imin] (deleted from all of them).
+            // Skip when any parent lacks it (parent_neq[i] set).
+            let skip_emit_tp = (0..nparent).any(|i| parent_neq[i]);
             if !skip_emit_tp {
                 if let Some(pe) = p_min {
                     let name = std::str::from_utf8(&pe.name).unwrap_or("");

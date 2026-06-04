@@ -286,6 +286,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         &options,
                         options.abbrev,
                         options.indent_heuristic,
+                        options.no_prefix,
                     )?;
                 }
             }
@@ -385,6 +386,7 @@ pub fn run(mut args: Args) -> Result<()> {
                                 &options,
                                 options.abbrev,
                                 options.indent_heuristic,
+                                options.no_prefix,
                             )?;
                         }
                     }
@@ -583,6 +585,8 @@ struct Options {
     /// Detect complete rewrites (`-B` / `--break-rewrites`) for summary/raw dissimilarity.
     break_rewrites: bool,
     indent_heuristic: bool,
+    /// `--no-prefix`: omit the `a/`/`b/` path prefixes in patch output.
+    no_prefix: bool,
     ignore_all_space: bool,
     ignore_space_change: bool,
     ignore_space_at_eol: bool,
@@ -613,7 +617,8 @@ struct Change {
 fn parse_options(argv: &[String]) -> Result<Options> {
     let fmt = parse_diff_files_format_argv(&env::args().collect::<Vec<_>>());
     let mut pathspecs = Vec::new();
-    let mut stage: u8 = 0;
+    // 255 = "no -N flag given" (git default: unmerged stage 2, normal merged diff).
+    let mut stage: u8 = 255;
     let mut quiet = false;
     let mut exit_code = false;
     let mut abbrev: Option<usize> = None;
@@ -644,6 +649,7 @@ fn parse_options(argv: &[String]) -> Result<Options> {
     let mut ignore_space_change = false;
     let mut ignore_space_at_eol = false;
     let mut ignore_blank_lines = false;
+    let mut no_prefix = false;
     let mut end_of_options = false;
 
     let mut idx = 0usize;
@@ -689,7 +695,8 @@ fn parse_options(argv: &[String]) -> Result<Options> {
                 "--ignore-space-at-eol" => ignore_space_at_eol = true,
                 "--ignore-blank-lines" => ignore_blank_lines = true,
                 // Silently accept diff options we don't fully implement yet
-                "--full-index" | "--no-ext-diff" | "--no-prefix" | "--no-abbrev" => {}
+                "--no-prefix" => no_prefix = true,
+                "--full-index" | "--no-ext-diff" | "--no-abbrev" => {}
                 "--indent-heuristic" | "--no-indent-heuristic" => {}
                 "-s" | "--no-patch" | "-p" | "--patch" | "-u" | "--raw" | "--stat"
                 | "--compact-summary" | "--numstat" | "--shortstat" | "--name-only"
@@ -821,6 +828,7 @@ fn parse_options(argv: &[String]) -> Result<Options> {
         reverse,
         break_rewrites,
         indent_heuristic: false,
+        no_prefix,
         ignore_all_space,
         ignore_space_change,
         ignore_space_at_eol,
@@ -947,6 +955,17 @@ fn collect_changes(
     let mut unmerged_paths: BTreeSet<String> = BTreeSet::new();
     let mut staged: BTreeMap<String, (u32, ObjectId, bool)> = BTreeMap::new();
 
+    // git's `diff_unmerged_stage` defaults to 2 (theirs/ours = stage 2). Plain
+    // `diff-files` therefore behaves like `diff-files -2` for unmerged paths:
+    // it emits a U line plus an M/D line against stage 2. `-1/-2/-3` override it.
+    // git's `diff_unmerged_stage` defaults to 2; `-0` selects "U only" (no M/D),
+    // `-1/-2/-3` select that stage. 255 is our sentinel for "no -N given".
+    let unmerged_compare_stage: u8 = if options.stage == 255 {
+        2
+    } else {
+        options.stage
+    };
+
     for entry in &index.entries {
         let Ok(path) = String::from_utf8(entry.path.clone()) else {
             continue;
@@ -962,7 +981,7 @@ fn collect_changes(
             stage0.insert(path, (entry.mode, entry.oid, entry));
         } else {
             unmerged_paths.insert(path.clone());
-            if s == options.stage {
+            if s == unmerged_compare_stage {
                 let skip_wt_examine = entry.assume_unchanged() || entry.skip_worktree();
                 staged.insert(path, (entry.mode, entry.oid, skip_wt_examine));
             }
@@ -971,7 +990,7 @@ fn collect_changes(
 
     let mut changes: BTreeMap<String, Change> = BTreeMap::new();
 
-    if options.stage == 0 {
+    if options.stage == 0 || options.stage == 255 {
         // Normal mode: compare stage-0 entries against worktree.
         // Use stat info to skip unchanged files (avoid hashing).
         for (path, (idx_mode, idx_oid, idx_entry)) in &stage0 {
@@ -1083,7 +1102,10 @@ fn collect_changes(
             }
         }
 
-        // Unmerged paths (no stage-0 entry).
+        // Unmerged paths (no stage-0 entry): emit U + (M/D against the default
+        // unmerged stage 2), like git's plain `diff-files`. These go into an
+        // ordered Vec (two lines can share a path) and are merged below.
+        let mut unmerged_out: Vec<Change> = Vec::new();
         for path in &unmerged_paths {
             if stage0.contains_key(path) {
                 continue;
@@ -1091,35 +1113,29 @@ fn collect_changes(
             if !matches_pathspec(path, &options.pathspecs) {
                 continue;
             }
-            changes.insert(
-                path.clone(),
-                Change {
-                    path: path.clone(),
-                    status: 'U',
-                    old_mode: 0,
-                    new_mode: 0,
-                    old_oid: zero_oid(),
-                    new_oid: zero_oid(),
-                    intent_to_add: false,
-                },
-            );
-        }
-    } else {
-        // Stage-specific mode: compare requested stage entries against worktree.
-        for (path, (idx_mode, idx_oid, skip_wt_examine)) in &staged {
-            if *skip_wt_examine {
-                continue;
-            }
             let abs = work_tree.join(path);
-            match read_worktree_info(repo, &abs)? {
-                Some((wt_mode, wt_oid)) => {
-                    let idx_mode = canonicalize_mode(*idx_mode);
-                    if idx_mode == wt_mode && *idx_oid == wt_oid {
-                        continue;
-                    }
-                    changes.insert(
-                        path.clone(),
-                        Change {
+            let wt_info = read_worktree_info(repo, &abs)?;
+            let wt_mode_for_u = wt_info.as_ref().map_or(0, |(m, _)| *m);
+            unmerged_out.push(Change {
+                path: path.clone(),
+                status: 'U',
+                old_mode: 0,
+                new_mode: wt_mode_for_u,
+                old_oid: zero_oid(),
+                new_oid: zero_oid(),
+                intent_to_add: false,
+            });
+            if let Some((idx_mode, idx_oid, skip_wt_examine)) = staged.get(path) {
+                if *skip_wt_examine {
+                    continue;
+                }
+                match wt_info {
+                    Some((wt_mode, wt_oid)) => {
+                        let idx_mode = canonicalize_mode(*idx_mode);
+                        if idx_mode == wt_mode && *idx_oid == wt_oid {
+                            continue;
+                        }
+                        unmerged_out.push(Change {
                             path: path.clone(),
                             status: 'M',
                             old_mode: idx_mode,
@@ -1127,13 +1143,10 @@ fn collect_changes(
                             old_oid: *idx_oid,
                             new_oid: wt_oid,
                             intent_to_add: false,
-                        },
-                    );
-                }
-                None => {
-                    changes.insert(
-                        path.clone(),
-                        Change {
+                        });
+                    }
+                    None => {
+                        unmerged_out.push(Change {
                             path: path.clone(),
                             status: 'D',
                             old_mode: canonicalize_mode(*idx_mode),
@@ -1141,18 +1154,102 @@ fn collect_changes(
                             old_oid: *idx_oid,
                             new_oid: zero_oid(),
                             intent_to_add: false,
-                        },
-                    );
+                        });
+                    }
                 }
             }
         }
+        // Merge merged-path changes (from `changes`) with unmerged U/M/D lines,
+        // keeping overall path order and U-before-M/D per path.
+        let mut combined: Vec<Change> = changes.into_values().collect();
+        combined.extend(unmerged_out);
+        combined.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then_with(|| status_rank(a.status).cmp(&status_rank(b.status)))
+        });
+        let mut out = combined;
+        if let Some(spec) = options.diff_filter.as_deref() {
+            out.retain(|change| matches_diff_filter(change.status, spec));
+        }
+        return Ok(out);
+    } else {
+        // Stage-specific mode (`diff-files -1/-2/-3`). git emits, for *every*
+        // unmerged path, a ":000000 <wt-mode> 0 0 U" line (diff_unmerge), and
+        // *additionally* an M/D line when that path has an entry at the requested
+        // stage. The two lines share a path, so we build an ordered Vec here
+        // instead of the per-path map; U precedes M/D for the same path.
+        let mut staged_out: Vec<Change> = Vec::new();
+        for path in &unmerged_paths {
+            if stage0.contains_key(path) {
+                continue;
+            }
+            if !matches_pathspec(path, &options.pathspecs) {
+                continue;
+            }
+            let abs = work_tree.join(path);
+            let wt_info = read_worktree_info(repo, &abs)?;
+            let wt_mode_for_u = wt_info.as_ref().map_or(0, |(m, _)| *m);
+            // U line for the unmerged path.
+            staged_out.push(Change {
+                path: path.clone(),
+                status: 'U',
+                old_mode: 0,
+                new_mode: wt_mode_for_u,
+                old_oid: zero_oid(),
+                new_oid: zero_oid(),
+                intent_to_add: false,
+            });
+            // M/D line against the requested stage, if present.
+            if let Some((idx_mode, idx_oid, skip_wt_examine)) = staged.get(path) {
+                if *skip_wt_examine {
+                    continue;
+                }
+                match wt_info {
+                    Some((wt_mode, wt_oid)) => {
+                        let idx_mode = canonicalize_mode(*idx_mode);
+                        if idx_mode == wt_mode && *idx_oid == wt_oid {
+                            continue;
+                        }
+                        staged_out.push(Change {
+                            path: path.clone(),
+                            status: 'M',
+                            old_mode: idx_mode,
+                            new_mode: wt_mode,
+                            old_oid: *idx_oid,
+                            new_oid: wt_oid,
+                            intent_to_add: false,
+                        });
+                    }
+                    None => {
+                        staged_out.push(Change {
+                            path: path.clone(),
+                            status: 'D',
+                            old_mode: canonicalize_mode(*idx_mode),
+                            new_mode: 0,
+                            old_oid: *idx_oid,
+                            new_oid: zero_oid(),
+                            intent_to_add: false,
+                        });
+                    }
+                }
+            }
+        }
+        let mut out: Vec<Change> = staged_out;
+        if let Some(spec) = options.diff_filter.as_deref() {
+            out.retain(|change| matches_diff_filter(change.status, spec));
+        }
+        Ok(out)
     }
+}
 
-    let mut out: Vec<Change> = changes.into_values().collect();
-    if let Some(spec) = options.diff_filter.as_deref() {
-        out.retain(|change| matches_diff_filter(change.status, spec));
+/// Ordering rank for combined raw output of an unmerged path: the `U` line is
+/// emitted before the per-stage `M`/`D` line (git diff_unmerge then diff_change).
+fn status_rank(status: char) -> u8 {
+    match status {
+        'U' => 0,
+        _ => 1,
     }
-    Ok(out)
 }
 
 fn change_to_diff_entry(c: &Change) -> DiffEntry {
@@ -1309,6 +1406,7 @@ fn print_patch_from_diff_entry(
     ws_opts: &Options,
     abbrev: Option<usize>,
     indent_heuristic: bool,
+    no_prefix: bool,
 ) -> Result<()> {
     let quote_path_fully = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
         .unwrap_or_default()
@@ -1323,17 +1421,18 @@ fn print_patch_from_diff_entry(
         .as_deref()
         .unwrap_or(entry.old_path.as_deref().unwrap_or(""));
 
+    let (src_prefix, dst_prefix) = if no_prefix { ("", "") } else { ("a/", "b/") };
     let old_label = match entry.status {
         DiffStatus::Added => "/dev/null".to_owned(),
-        _ => format!("a/{old_path}"),
+        _ => format!("{src_prefix}{old_path}"),
     };
     let new_label = match entry.status {
         DiffStatus::Deleted => "/dev/null".to_owned(),
-        _ => format!("b/{new_path}"),
+        _ => format!("{dst_prefix}{new_path}"),
     };
 
     let display_path = entry.path();
-    let mut header = format!("diff --git a/{old_path} b/{new_path}");
+    let mut header = format!("diff --git {src_prefix}{old_path} {dst_prefix}{new_path}");
     match entry.status {
         DiffStatus::Deleted => {
             header.push_str(&format!("\ndeleted file mode {}", entry.old_mode));
@@ -1638,6 +1737,7 @@ fn print_compact_summary_from_diff_entries(
             insertions: ins,
             deletions: del,
             is_binary: binary,
+            is_unmerged: false,
         });
     }
     let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), false)

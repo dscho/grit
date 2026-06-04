@@ -66,6 +66,9 @@ pub struct FileStatInput {
     pub insertions: usize,
     pub deletions: usize,
     pub is_binary: bool,
+    /// Unmerged (conflicted) path: rendered as ` name | Unmerged` and excluded
+    /// from the "N files changed" count (git `diffstat_file.is_unmerged`).
+    pub is_unmerged: bool,
 }
 
 /// Options for laying out diffstat lines (Git `diff_options` stat fields).
@@ -181,6 +184,13 @@ pub fn write_diffstat_block(
         if max_len < w {
             max_len = w;
         }
+        if f.is_unmerged {
+            // "Unmerged" is 8 characters (git show_stats()).
+            if bin_width < 8 {
+                bin_width = 8;
+            }
+            continue;
+        }
         if f.is_binary {
             let w = if f.insertions == 0 && f.deletions == 0 {
                 3
@@ -269,6 +279,30 @@ pub fn write_diffstat_block(
 
     for f in shown {
         let prefix = opts.line_prefix;
+        if f.is_unmerged {
+            let (display_name, _) = truncate_path_for_name_area(&f.path_display, name_width);
+            let name_col = pad_name_to_display_width(&display_name, name_width);
+            // git: ` %s%s%*s | %*sUnmerged` — number_width is usually < len("Unmerged"),
+            // so the word is printed verbatim with no extra left padding.
+            if prefix.is_empty() {
+                writeln!(
+                    out,
+                    " {} | {:>nw$}",
+                    name_col,
+                    "Unmerged",
+                    nw = number_width
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "{prefix}{} | {:>nw$}",
+                    name_col,
+                    "Unmerged",
+                    nw = number_width
+                )?;
+            }
+            continue;
+        }
         if f.is_binary {
             let (display_name, _) = truncate_path_for_name_area(&f.path_display, name_width);
             let name_col = pad_name_to_display_width(&display_name, name_width);
@@ -377,7 +411,18 @@ pub fn write_diffstat_block(
         }
     }
 
-    let files_changed = files.len();
+    // `--stat-count` only truncates the per-file lines; the summary still
+    // covers every entry (t4049).
+    for f in &files[limit..] {
+        if f.is_binary {
+            continue;
+        }
+        total_ins = total_ins.saturating_add(f.insertions);
+        total_del = total_del.saturating_add(f.deletions);
+    }
+
+    // Unmerged paths are listed but not counted as "changed" (git show_stats()).
+    let files_changed = files.iter().filter(|f| !f.is_unmerged).count();
     let mut summary = if opts.line_prefix.is_empty() {
         format!(
             " {} file{} changed",
@@ -392,22 +437,26 @@ pub fn write_diffstat_block(
             if files_changed == 1 { "" } else { "s" }
         )
     };
-    if total_ins > 0 {
-        summary.push_str(&format!(
-            ", {} insertion{}(+)",
-            total_ins,
-            if total_ins == 1 { "" } else { "s" }
-        ));
-    }
-    if total_del > 0 {
-        summary.push_str(&format!(
-            ", {} deletion{}(-)",
-            total_del,
-            if total_del == 1 { "" } else { "s" }
-        ));
-    }
-    if total_ins == 0 && total_del == 0 {
-        summary.push_str(", 0 insertions(+), 0 deletions(-)");
+    // git: when no files changed (e.g. only unmerged paths), the summary is just
+    // " 0 files changed" with no insertions/deletions suffix.
+    if files_changed > 0 {
+        if total_ins > 0 {
+            summary.push_str(&format!(
+                ", {} insertion{}(+)",
+                total_ins,
+                if total_ins == 1 { "" } else { "s" }
+            ));
+        }
+        if total_del > 0 {
+            summary.push_str(&format!(
+                ", {} deletion{}(-)",
+                total_del,
+                if total_del == 1 { "" } else { "s" }
+            ));
+        }
+        if total_ins == 0 && total_del == 0 {
+            summary.push_str(", 0 insertions(+), 0 deletions(-)");
+        }
     }
     writeln!(out, "{summary}")?;
 
@@ -435,6 +484,7 @@ mod tests {
             insertions: 0,
             deletions: 0,
             is_binary: false,
+            is_unmerged: false,
         }];
         let opts = DiffstatOptions {
             total_width: 80,

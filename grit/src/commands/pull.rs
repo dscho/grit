@@ -504,7 +504,10 @@ fn pull_fetch_head_line(remote: &Repository, spec: &str) -> Result<(ObjectId, St
         }
     }
     let oid = resolve_revision(remote, spec).with_context(|| format!("bad revision '{spec}'"))?;
-    Ok((oid, format!("branch 'refs/heads/{spec}' of .")))
+    // Match git's FETCH_HEAD format: the short branch name (e.g. `branch 'side' of .`),
+    // not the full `refs/heads/...` ref. fmt-merge-msg reads this verbatim.
+    let short = spec.strip_prefix("refs/heads/").unwrap_or(spec);
+    Ok((oid, format!("branch '{short}' of .")))
 }
 
 fn config_pull_rebase(

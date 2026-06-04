@@ -6,6 +6,7 @@
 use crate::explicit_exit::ExplicitExit;
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
+use grit_lib::combined_diff_patch::CombinedDiffWsOptions;
 use grit_lib::combined_tree_diff::{combined_diff_paths_filtered, CombinedTreeDiffOptions};
 use grit_lib::commit_graph_file::{
     BloomPrecheck, BloomWalkStats, BloomWalkStatsHandle, CommitGraphChain,
@@ -13,8 +14,9 @@ use grit_lib::commit_graph_file::{
 use grit_lib::config::{parse_bool, parse_color, ConfigSet};
 use grit_lib::crlf::{get_file_attrs, load_gitattributes, DiffAttr};
 use grit_lib::diff::{
-    count_changes, diff_trees, diff_trees_show_tree_entries, format_raw,
-    indent_heuristic_from_config, unified_diff, zero_oid, DiffEntry, DiffStatus,
+    count_changes, diff_trees, diff_trees_show_tree_entries, format_raw, format_raw_abbrev,
+    indent_heuristic_from_config, unified_diff, unified_diff_histogram_hunks_only, zero_oid,
+    DiffEntry, DiffStatus,
 };
 use grit_lib::diffstat::{terminal_columns, write_diffstat_block, DiffstatOptions, FileStatInput};
 use grit_lib::git_date::parse::parse_date_basic;
@@ -28,7 +30,8 @@ use grit_lib::line_log::{
 use grit_lib::mailmap::{load_mailmap_table, MailmapTable};
 use grit_lib::merge_base::is_ancestor;
 use grit_lib::merge_diff::{
-    blob_text_for_diff, blob_text_for_diff_with_oid, diff_textconv_active, is_binary_for_diff,
+    blob_text_for_diff, blob_text_for_diff_with_oid, diff_textconv_active,
+    format_combined_textconv_patch, is_binary_for_diff,
 };
 use grit_lib::objects::{parse_commit, parse_tag, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
@@ -321,6 +324,16 @@ pub struct Args {
     #[arg(long = "pickaxe-string", value_name = "STRING", hide = true)]
     pub pickaxe_string: Option<String>,
 
+    /// Ignore changed lines matching these regexes (`-I` / `--ignore-matching-lines`; `-I` is
+    /// canonicalized to `--ignore-matching-lines=<regex>` during argv preprocessing). A hunk whose
+    /// changed lines are all ignorable is dropped; a file with no surviving hunk emits no patch.
+    #[arg(long = "ignore-matching-lines", value_name = "REGEX")]
+    pub ignore_matching_lines: Vec<String>,
+
+    /// Ignore changes whose lines are all blank (`--ignore-blank-lines`).
+    #[arg(long = "ignore-blank-lines")]
+    pub ignore_blank_lines: bool,
+
     /// Treat `-S` needle as an extended regex (`--pickaxe-regex`).
     #[arg(long = "pickaxe-regex", hide = true)]
     pub pickaxe_regex: bool,
@@ -543,6 +556,10 @@ pub struct Args {
     #[arg(long = "shortstat")]
     pub shortstat: bool,
 
+    /// Show a condensed summary of extended header info (created/deleted/renamed files).
+    #[arg(long = "summary")]
+    pub summary: bool,
+
     /// Bisect mode (accepted for compatibility).
     #[arg(long = "bisect")]
     pub bisect: bool,
@@ -744,8 +761,24 @@ fn effective_merge_diff_format(
     if !is_merge {
         return Ok(MergeDiffFormat::FirstParent);
     }
+    let base = effective_merge_diff_format_base(args, git_dir)?;
+    // git diff-merges.c `diff_merges_default_to_first_parent`: when `--first-parent` is given
+    // together with a separate (`-m`) merge format, `first_parent_merges` is set, so the merge
+    // is shown like first-parent (single diff, no `(from <parent>)` header).
+    if args.first_parent && base == MergeDiffFormat::Separate {
+        return Ok(MergeDiffFormat::FirstParent);
+    }
+    Ok(base)
+}
+
+fn effective_merge_diff_format_base(args: &Args, git_dir: &Path) -> Result<MergeDiffFormat> {
     if args.remerge_diff {
         return Ok(MergeDiffFormat::Remerge);
+    }
+    // `-m` resets any combine flag (git's `common_setup` -> `suppress`), so when `-m` is given
+    // alongside `-c`/`--cc` (as in `--cc -m -p` / `-c -m -p`) the separate format wins.
+    if args.merge_diff_m {
+        return log_diff_merges_default_format(git_dir);
     }
     if args.merge_diff_c {
         return Ok(MergeDiffFormat::Combined);
@@ -766,9 +799,6 @@ fn effective_merge_diff_format(
         }
         anyhow::bail!("invalid value for '--diff-merges': '{s}'");
     }
-    if args.merge_diff_m {
-        return log_diff_merges_default_format(git_dir);
-    }
     if args.first_parent {
         return Ok(MergeDiffFormat::FirstParent);
     }
@@ -780,7 +810,36 @@ fn merge_commit_wants_diff(args: &Args, git_dir: &Path) -> Result<bool> {
     Ok(effective_merge_diff_format(args, true, git_dir)? != MergeDiffFormat::Off)
 }
 
+/// Whether merges force a diff even without `-p` (git's `merges_need_diff` / `merges_imply_patch`).
+///
+/// In git (diff-merges.c): any non-`off` `--diff-merges=<x>` value sets `merges_need_diff = 1`
+/// (via `common_setup`), and `-c`/`--cc`/`--dd`/`--remerge-diff` set `merges_imply_patch = 1`.
+/// Both cause `output_format` to default to PATCH so a merge shows its diff with no `-p`.
+/// The literal `-m` flag is special-cased to reset `merges_need_diff = 0`, so plain `-m` does
+/// NOT force a diff. `--first-parent` alone (no `--diff-merges`) also does not force one.
+fn merges_force_diff(args: &Args) -> bool {
+    if args.merge_diff_c || args.cc || args.merge_diff_dd || args.remerge_diff {
+        return true;
+    }
+    if args.no_diff_merges {
+        return false;
+    }
+    if let Some(ref s) = args.diff_merges {
+        return !matches!(s.trim(), "off" | "none");
+    }
+    false
+}
+
 /// Whether `git log` should run diff machinery for a commit (false for merge + `off` unless only `-m` without patch — then still false).
+/// `log.showroot` config (git default: true). When false, a root commit's diff against the
+/// empty tree is suppressed unless `--root` is given.
+fn log_show_root_default(git_dir: &Path) -> bool {
+    ConfigSet::load(Some(git_dir), true)
+        .ok()
+        .and_then(|c| c.get_bool("log.showroot").and_then(|r| r.ok()))
+        .unwrap_or(true)
+}
+
 fn log_commit_needs_diff_output(args: &Args, info: &CommitInfo, git_dir: &Path) -> Result<bool> {
     let wants_diff = args.patch
         || args.patch_u
@@ -791,8 +850,17 @@ fn log_commit_needs_diff_output(args: &Args, info: &CommitInfo, git_dir: &Path) 
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces a merge to show its diff (git's
+        // `merges_need_diff`) even with no `-p`/`--stat`/etc.
+        || (info.parents.len() > 1 && merges_force_diff(args));
     if !wants_diff {
+        return Ok(false);
+    }
+    // A root commit (no parents) produces a diff against the empty tree only when
+    // `show_root_diff` is set: that is `--root`, or the default `log.showroot=true`
+    // (log-tree.c). When `log.showroot=false` and `--root` is absent, suppress it.
+    if info.parents.is_empty() && !args.root && !log_show_root_default(git_dir) {
         return Ok(false);
     }
     let is_merge = info.parents.len() > 1;
@@ -808,7 +876,19 @@ fn log_wants_patch_hunks(args: &Args, info: &CommitInfo, git_dir: &Path) -> Resu
         return Ok(false);
     }
     let is_merge = info.parents.len() > 1;
-    let patch = args.patch || args.patch_u;
+    let mut patch = args.patch || args.patch_u || args.patch_with_stat;
+    // git: `merges_need_diff` / `merges_imply_patch` default `output_format` to PATCH, so a
+    // merge shows its diff even without `-p` — but only when no other output format is selected.
+    if is_merge && !patch && merges_force_diff(args) {
+        let other_format = !args.stat.is_empty()
+            || args.name_only
+            || args.name_status
+            || args.raw
+            || args.shortstat;
+        if !other_format {
+            patch = true;
+        }
+    }
     if !patch {
         return Ok(false);
     }
@@ -839,6 +919,23 @@ fn merge_diff_is_dense_combined(args: &Args, is_merge: bool, git_dir: &Path) -> 
 }
 
 /// Whether log should emit one diff per parent (`separate` / `-m` default).
+/// Whether the per-commit header is emitted by the diff machinery (once per parent, each
+/// `(from <parent>)`) rather than once by the caller. True only for separate (`-m`) merges
+/// that actually produce diff output.
+fn log_commit_uses_per_parent_header(
+    args: &Args,
+    info: &CommitInfo,
+    git_dir: &Path,
+) -> Result<bool> {
+    if info.parents.len() <= 1 {
+        return Ok(false);
+    }
+    if !log_commit_needs_diff_output(args, info, git_dir)? {
+        return Ok(false);
+    }
+    merge_diff_is_separate(args, true, git_dir)
+}
+
 fn merge_diff_is_separate(args: &Args, is_merge: bool, git_dir: &Path) -> Result<bool> {
     if !is_merge {
         return Ok(false);
@@ -1127,7 +1224,11 @@ fn run_line_log(
     let decorations = if !show_decorations {
         None
     } else {
-        Some(collect_decorations(repo, decorate_full)?)
+        Some(collect_decorations_inner(
+            repo,
+            decorate_full,
+            args.clear_decorations,
+        )?)
     };
 
     let show_patch = !args.suppress_diff && !args.no_patch;
@@ -1558,6 +1659,24 @@ fn parse_date_to_epoch(s: &str) -> Option<i64> {
 fn log_uses_builtin_oneline(args: &Args) -> bool {
     (args.oneline && args.format.as_deref().map_or(true, |f| f == "oneline"))
         || (!args.oneline && args.format.as_deref() == Some("oneline"))
+}
+
+/// Whether a blank line separates consecutive log entries (git log-tree.c `shown_one`
+/// behaviour). All builtin pretty formats (medium/short/full/fuller/raw) print a blank
+/// line between commits; `oneline` and user `format:`/`tformat:` strings do not (those are
+/// handled separately by the `is_format_separator` logic).
+fn log_uses_blank_separator(args: &Args) -> bool {
+    if log_uses_builtin_oneline(args) {
+        return false;
+    }
+    // Only the builtin multi-line pretty formats (and the default) print the blank
+    // separator. `oneline`, `reference`, `email`, and any user `format:`/`tformat:`/`%`
+    // string carry their own terminator.
+    match args.format.as_deref() {
+        None => true,
+        Some("medium") | Some("short") | Some("full") | Some("fuller") | Some("raw") => true,
+        _ => false,
+    }
 }
 
 /// Whether to load ref decorations and whether to use full ref names (`refs/heads/...`).
@@ -2370,7 +2489,11 @@ fn run_rev_list_log(
     let (show_decorations, decorate_full) =
         resolve_decoration_display(args, &repo.git_dir, format_requires_decorations);
     let decoration_map_for_display = if show_decorations {
-        Some(collect_decorations(repo, decorate_full)?)
+        Some(collect_decorations_inner(
+            repo,
+            decorate_full,
+            args.clear_decorations,
+        )?)
     } else {
         None
     };
@@ -2398,7 +2521,10 @@ fn run_rev_list_log(
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+        // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+        || merges_force_diff(args);
 
     let mut shown = 0usize;
     let parent_format_requested = log_parent_format_requested(args);
@@ -2488,26 +2614,33 @@ fn run_rev_list_log(
                 writeln!(out)?;
             }
         }
+        let blank_separator = log_uses_blank_separator(args);
+        if blank_separator && shown > 0 {
+            writeln!(out)?;
+        }
 
-        format_commit(
-            &mut out,
-            &oid,
-            &info,
-            args,
-            use_mailmap,
-            mailmap,
-            decoration_map_for_display.as_ref(),
-            use_color,
-            decoration_paint.as_ref(),
-            &head_state,
-            &mut notes_cache,
-            &repo.odb,
-            parent_override.as_deref(),
-            false,
-            None,
-            None,
-            None,
-        )?;
+        let per_parent_header = log_commit_uses_per_parent_header(args, &info, &repo.git_dir)?;
+        if !per_parent_header {
+            format_commit(
+                &mut out,
+                &oid,
+                &info,
+                args,
+                use_mailmap,
+                mailmap,
+                decoration_map_for_display.as_ref(),
+                use_color,
+                decoration_paint.as_ref(),
+                &head_state,
+                &mut notes_cache,
+                &repo.odb,
+                parent_override.as_deref(),
+                false,
+                None,
+                None,
+                None,
+            )?;
+        }
 
         if show_diff {
             write_commit_diff(
@@ -2526,6 +2659,7 @@ fn run_rev_list_log(
                 &head_state,
                 &mut notes_cache,
                 patch_context,
+                blank_separator,
             )?;
         }
         shown += 1;
@@ -2799,7 +2933,11 @@ fn run_graph_log(
     let (show_decorations_graph, decorate_full_graph) =
         resolve_decoration_display(args, &repo.git_dir, format_requires_decorations_graph);
     let decorations = if args.simplify_by_decoration || show_decorations_graph {
-        Some(collect_decorations(repo, decorate_full_graph)?)
+        Some(collect_decorations_inner(
+            repo,
+            decorate_full_graph,
+            args.clear_decorations,
+        )?)
     } else {
         None
     };
@@ -2929,6 +3067,7 @@ fn run_graph_log(
                 &head_state,
                 &mut notes_cache,
                 patch_context,
+                false,
             )?;
         }
     }
@@ -4772,12 +4911,20 @@ pub fn run(mut args: Args) -> Result<()> {
     // (`--oneline` does not imply `--decorate`). Use a separate map for display so we do not
     // print `(refs)` unless `--decorate` / `%d` requests it; OID keys match for full vs short maps.
     let decoration_map_for_display = if show_decorations {
-        Some(collect_decorations(&repo, decorate_full)?)
+        Some(collect_decorations_inner(
+            &repo,
+            decorate_full,
+            args.clear_decorations,
+        )?)
     } else {
         None
     };
     let decoration_map_for_simplify_only = if args.simplify_by_decoration && !show_decorations {
-        Some(collect_decorations(&repo, false)?)
+        Some(collect_decorations_inner(
+            &repo,
+            false,
+            args.clear_decorations,
+        )?)
     } else {
         None
     };
@@ -4872,7 +5019,10 @@ pub fn run(mut args: Args) -> Result<()> {
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+        // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+        || merges_force_diff(&args);
 
     let mut notes_cache = NotesMapCache::new(&repo);
     let flush_each = out.is_terminal();
@@ -4930,7 +5080,8 @@ pub fn run(mut args: Args) -> Result<()> {
                     writeln!(out)?;
                 }
             }
-            if !is_format_separator && shown > 0 && log_wants_blank_line_between_commits(&args) {
+            let blank_separator = log_uses_blank_separator(&args);
+            if blank_separator && shown > 0 {
                 writeln!(out)?;
             }
             let oneline_fmt = args.oneline || args.format.as_deref() == Some("oneline");
@@ -4946,25 +5097,29 @@ pub fn run(mut args: Args) -> Result<()> {
             } else {
                 None
             };
-            format_commit(
-                &mut out,
-                &oid,
-                &commit_data,
-                &args,
-                use_mailmap,
-                &mailmap,
-                decoration_map_for_display.as_ref(),
-                use_color,
-                decoration_paint.as_ref(),
-                &head_state,
-                &mut notes_cache,
-                &repo.odb,
-                None,
-                false,
-                None,
-                None,
-                source_for_oneline,
-            )?;
+            let per_parent_header =
+                log_commit_uses_per_parent_header(&args, &commit_data, &repo.git_dir)?;
+            if !per_parent_header {
+                format_commit(
+                    &mut out,
+                    &oid,
+                    &commit_data,
+                    &args,
+                    use_mailmap,
+                    &mailmap,
+                    decoration_map_for_display.as_ref(),
+                    use_color,
+                    decoration_paint.as_ref(),
+                    &head_state,
+                    &mut notes_cache,
+                    &repo.odb,
+                    None,
+                    false,
+                    None,
+                    None,
+                    source_for_oneline,
+                )?;
+            }
 
             if show_diff {
                 write_commit_diff(
@@ -4983,6 +5138,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &head_state,
                     &mut notes_cache,
                     patch_context,
+                    blank_separator,
                 )?;
             }
             if flush_each {
@@ -5124,6 +5280,7 @@ pub fn run(mut args: Args) -> Result<()> {
             commits
         };
 
+        let blank_separator = log_uses_blank_separator(&args);
         for (i, (oid, commit_data)) in commits.iter().enumerate() {
             if is_format_separator && i > 0 {
                 if args.null_terminator {
@@ -5132,7 +5289,9 @@ pub fn run(mut args: Args) -> Result<()> {
                     writeln!(out)?;
                 }
             }
-            if !is_format_separator && i > 0 && log_wants_blank_line_between_commits(&args) {
+            // Builtin pretty formats print a blank line between consecutive entries
+            // (git log-tree.c `shown_one`).
+            if blank_separator && i > 0 {
                 writeln!(out)?;
             }
             let oneline_fmt = args.oneline || args.format.as_deref() == Some("oneline");
@@ -5148,25 +5307,29 @@ pub fn run(mut args: Args) -> Result<()> {
             } else {
                 None
             };
-            format_commit(
-                &mut out,
-                oid,
-                commit_data,
-                &args,
-                use_mailmap,
-                &mailmap,
-                decoration_map_for_display.as_ref(),
-                use_color,
-                decoration_paint.as_ref(),
-                &head_state,
-                &mut notes_cache,
-                &repo.odb,
-                None,
-                false,
-                None,
-                None,
-                source_for_oneline,
-            )?;
+            let per_parent_header =
+                log_commit_uses_per_parent_header(&args, commit_data, &repo.git_dir)?;
+            if !per_parent_header {
+                format_commit(
+                    &mut out,
+                    oid,
+                    commit_data,
+                    &args,
+                    use_mailmap,
+                    &mailmap,
+                    decoration_map_for_display.as_ref(),
+                    use_color,
+                    decoration_paint.as_ref(),
+                    &head_state,
+                    &mut notes_cache,
+                    &repo.odb,
+                    None,
+                    false,
+                    None,
+                    None,
+                    source_for_oneline,
+                )?;
+            }
 
             if show_diff {
                 write_commit_diff(
@@ -5185,6 +5348,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &head_state,
                     &mut notes_cache,
                     patch_context,
+                    blank_separator,
                 )?;
             }
         }
@@ -5412,7 +5576,11 @@ pub fn run_no_walk(
         None
     } else if args.decorate.is_some() {
         // Explicitly requested decorations
-        Some(collect_decorations(repo, decorate_full)?)
+        Some(collect_decorations_inner(
+            repo,
+            decorate_full,
+            args.clear_decorations,
+        )?)
     } else {
         // Default: no decorations in no-walk mode (matches git behavior)
         None
@@ -5461,7 +5629,10 @@ pub fn run_no_walk(
         || args.cc
         || args.merge_diff_c
         || args.remerge_diff
-        || args.patch_with_stat;
+        || args.patch_with_stat
+        // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+        // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+        || merges_force_diff(&args);
 
     let mut notes_cache = NotesMapCache::new(repo);
     let use_color = log_resolve_stdout_color(args, &repo.git_dir);
@@ -5472,32 +5643,37 @@ pub fn run_no_walk(
         None
     };
 
+    let blank_separator = log_uses_blank_separator(args);
     for (i, (oid, commit_data)) in commits.iter().enumerate() {
         if is_format_separator && i > 0 {
             writeln!(out)?;
         }
-        if !is_format_separator && i > 0 && log_wants_blank_line_between_commits(args) {
+        if blank_separator && i > 0 {
             writeln!(out)?;
         }
-        format_commit(
-            &mut out,
-            oid,
-            commit_data,
-            args,
-            use_mailmap,
-            mailmap,
-            decorations.as_ref(),
-            use_color,
-            decoration_paint.as_ref(),
-            &head_state,
-            &mut notes_cache,
-            &repo.odb,
-            None,
-            false,
-            None,
-            None,
-            None,
-        )?;
+        let per_parent_header =
+            log_commit_uses_per_parent_header(args, commit_data, &repo.git_dir)?;
+        if !per_parent_header {
+            format_commit(
+                &mut out,
+                oid,
+                commit_data,
+                args,
+                use_mailmap,
+                mailmap,
+                decorations.as_ref(),
+                use_color,
+                decoration_paint.as_ref(),
+                &head_state,
+                &mut notes_cache,
+                &repo.odb,
+                None,
+                false,
+                None,
+                None,
+                None,
+            )?;
+        }
         if show_diff {
             write_commit_diff(
                 &mut out,
@@ -5515,6 +5691,7 @@ pub fn run_no_walk(
                 &head_state,
                 &mut notes_cache,
                 patch_context,
+                blank_separator,
             )?;
         }
     }
@@ -6396,7 +6573,10 @@ fn run_reflog_walk(
             || args.cc
             || args.merge_diff_c
             || args.remerge_diff
-            || args.patch_with_stat;
+            || args.patch_with_stat
+            // An explicit `--diff-merges=<non-off>` forces merges to show a diff with no `-p`;
+            // `write_commit_diff` re-checks per-commit, so non-merges still print nothing.
+            || merges_force_diff(args);
         if show_diff {
             write_commit_diff(
                 &mut out,
@@ -6414,6 +6594,7 @@ fn run_reflog_walk(
                 &head_state,
                 &mut notes_cache,
                 patch_context,
+                false,
             )?;
             if j > 0 {
                 writeln!(out)?;
@@ -8044,6 +8225,101 @@ fn commit_pickaxe_matches(
     Ok(false)
 }
 
+/// Return the set of paths whose change matches the active pickaxe (`-S` / `-G`).
+///
+/// Mirrors [`commit_pickaxe_matches`] but collects every matching path instead of
+/// short-circuiting. Used to limit the `-p` patch to matching files unless
+/// `--pickaxe-all` is given (Git's `diffcore_pickaxe` behaviour).
+fn pickaxe_matching_paths(
+    git_dir: &Path,
+    odb: &Odb,
+    entries: &[DiffEntry],
+    args: &Args,
+) -> Result<std::collections::HashSet<String>> {
+    let mut matched = std::collections::HashSet::new();
+    let use_textconv = !args.no_textconv;
+    let config = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
+
+    let grep_re = if let Some(ref pat) = args.pickaxe_grep {
+        Some(
+            RegexBuilder::new(pat)
+                .case_insensitive(args.regexp_ignore_case)
+                .build()
+                .with_context(|| format!("invalid pickaxe regex: {pat}"))?,
+        )
+    } else {
+        None
+    };
+    let s_pickaxe_re = if args.pickaxe_regex {
+        let needle = args
+            .pickaxe_string
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("internal: --pickaxe-regex without -S"))?;
+        Some(
+            RegexBuilder::new(needle)
+                .case_insensitive(args.regexp_ignore_case)
+                .build()
+                .with_context(|| format!("invalid pickaxe regex: {needle}"))?,
+        )
+    } else {
+        None
+    };
+
+    for entry in entries {
+        let path = entry.path();
+        let old_raw = read_blob_bytes(odb, &entry.old_oid);
+        let new_raw = read_blob_bytes(odb, &entry.new_oid);
+
+        if grep_re.is_some() && !args.text {
+            let has_textconv_driver =
+                use_textconv && path_has_textconv_driver(git_dir, &config, path);
+            let old_bin = is_binary_for_diff(git_dir, path, &old_raw);
+            let new_bin = is_binary_for_diff(git_dir, path, &new_raw);
+            if (!has_textconv_driver && old_bin) || (!has_textconv_driver && new_bin) {
+                continue;
+            }
+        }
+
+        let old_text = blob_text_for_diff(git_dir, &config, path, &old_raw, use_textconv);
+        let new_text = blob_text_for_diff(git_dir, &config, path, &new_raw, use_textconv);
+
+        if let Some(ref re) = grep_re {
+            let patch = unified_diff(
+                old_text.as_str(),
+                new_text.as_str(),
+                entry.old_path.as_deref().unwrap_or(path),
+                entry.new_path.as_deref().unwrap_or(path),
+                3,
+                indent_heuristic_from_config(&config),
+                config.quote_path_fully(),
+            );
+            if pickaxe_g_matches_diff_lines(re, &patch) {
+                matched.insert(path.to_owned());
+            }
+            continue;
+        }
+
+        if let Some(ref needle) = args.pickaxe_string {
+            let differs = if args.pickaxe_regex {
+                let re = s_pickaxe_re.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("internal: --pickaxe-regex without compiled regex")
+                })?;
+                re.find_iter(old_text.as_str()).count() != re.find_iter(new_text.as_str()).count()
+            } else if args.regexp_ignore_case && needle.is_ascii() {
+                count_ascii_case_insensitive(&old_text, needle)
+                    != count_ascii_case_insensitive(&new_text, needle)
+            } else {
+                old_text.matches(needle.as_str()).count()
+                    != new_text.matches(needle.as_str()).count()
+            };
+            if differs {
+                matched.insert(path.to_owned());
+            }
+        }
+    }
+    Ok(matched)
+}
+
 fn read_blob_bytes(odb: &Odb, oid: &ObjectId) -> Vec<u8> {
     if oid.is_zero() {
         return Vec::new();
@@ -8332,10 +8608,18 @@ fn format_commit(
         parse_abbrev(&args.abbrev)
     };
     let display_parents = parent_line_override.unwrap_or(info.parents.as_slice());
+    // The `(from <parent>)` marker uses the same abbreviation as the commit hash itself:
+    // full hex for the multi-line formats (which print the full `commit <hex>`), abbreviated
+    // only under `--abbrev-commit`/`--oneline`.
+    let from_uses_abbrev = args.abbrev_commit || log_uses_builtin_oneline(args);
     let merge_suffix = merge_from_parent
         .map(|p| {
             let h = p.to_hex();
-            format!(" (from {})", &h[..abbrev_len.min(h.len())])
+            if from_uses_abbrev {
+                format!(" (from {})", &h[..abbrev_len.min(h.len())])
+            } else {
+                format!(" (from {h})")
+            }
         })
         .unwrap_or_default();
     let et = args.expand_tabs_in_log;
@@ -10246,6 +10530,17 @@ fn prepend_decoration(items: &mut Vec<DecorationItem>, item: DecorationItem) {
 /// order, so the final per-commit list matches upstream (e.g. `tag: A1` before `other/main` before
 /// `other/HEAD`).
 fn collect_decorations(repo: &Repository, full: bool) -> Result<DecorationMap> {
+    collect_decorations_inner(repo, full, false)
+}
+
+/// Like [`collect_decorations`], but `clear_decorations` removes the default ref
+/// filter so refs that are normally hidden (e.g. `refs/notes/*`) also get
+/// decorated (matches `git log --clear-decorations`).
+fn collect_decorations_inner(
+    repo: &Repository,
+    full: bool,
+    clear_decorations: bool,
+) -> Result<DecorationMap> {
     let mut map: DecorationMap = HashMap::new();
     let git_dir = &repo.git_dir;
     let odb = &repo.odb;
@@ -10344,6 +10639,22 @@ fn collect_decorations(repo: &Repository, full: bool) -> Result<DecorationMap> {
                     refname: Some(refname.clone()),
                     display,
                     kind: DecorationKind::RemoteBranch,
+                },
+            );
+            continue;
+        }
+
+        // With `--clear-decorations`, the default ref filter is removed, so any
+        // remaining ref (e.g. `refs/notes/commits`) is also decorated. Such refs
+        // are always shown with their full name.
+        if clear_decorations {
+            let peeled = peel_to_commit_hex(odb, &oid.to_hex()).unwrap_or_else(|| oid.to_hex());
+            prepend_decoration(
+                map.entry(peeled).or_default(),
+                DecorationItem {
+                    refname: Some(refname.clone()),
+                    display: refname.clone(),
+                    kind: DecorationKind::Branch,
                 },
             );
         }
@@ -10740,6 +11051,7 @@ fn write_commit_diff(
     head_for_decor: &HeadState,
     notes_cache: &mut NotesMapCache<'_>,
     patch_context: usize,
+    leading_blank: bool,
 ) -> Result<()> {
     let odb = &repo.odb;
     let git_dir = &repo.git_dir;
@@ -10768,6 +11080,9 @@ fn write_commit_diff(
             context_lines: patch_context,
             indent_heuristic,
         };
+        if leading_blank {
+            writeln!(out)?;
+        }
         return write_remerge_diff(out, repo, &info.tree, &info.parents, &opts);
     }
 
@@ -10777,6 +11092,7 @@ fn write_commit_diff(
     let log_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     if separate {
+        let mut shown_parent = 0usize;
         for (i, parent_oid) in info.parents.iter().enumerate() {
             let mut entries = compute_commit_diff_against_parent(odb, info, i)?;
             if entries.is_empty() {
@@ -10793,29 +11109,33 @@ fn write_commit_diff(
                 args.rotate_to.as_deref(),
                 args.skip_to.as_deref(),
             )?;
-            // First parent: the main `format_commit` was already printed; only extra headers
-            // repeat the commit with `(from <parent>)` for parents 2+ (matches Git).
-            if i > 0 {
-                format_commit(
-                    out,
-                    commit_oid,
-                    info,
-                    args,
-                    use_mailmap,
-                    mailmap,
-                    decorations,
-                    use_color,
-                    decoration_paint,
-                    head_for_decor,
-                    notes_cache,
-                    odb,
-                    None,
-                    false,
-                    None,
-                    Some(parent_oid),
-                    None,
-                )?;
+            // In separate (`-m`) mode git re-prints the commit header for EVERY parent,
+            // each tagged `(from <parent>)`. The caller suppresses its plain header in this
+            // mode (see `log_commit_uses_per_parent_header`), so we print all of them here,
+            // separated by a blank line (git's `shown_one`).
+            if shown_parent > 0 && leading_blank {
+                writeln!(out)?;
             }
+            shown_parent += 1;
+            format_commit(
+                out,
+                commit_oid,
+                info,
+                args,
+                use_mailmap,
+                mailmap,
+                decorations,
+                use_color,
+                decoration_paint,
+                head_for_decor,
+                notes_cache,
+                odb,
+                None,
+                false,
+                None,
+                Some(parent_oid),
+                None,
+            )?;
             write_commit_diff_body(
                 out,
                 odb,
@@ -10829,6 +11149,8 @@ fn write_commit_diff(
                 false,
                 patch_context,
                 indent_heuristic,
+                leading_blank,
+                None,
             )?;
         }
         return Ok(());
@@ -10845,6 +11167,19 @@ fn write_commit_diff(
     }
     if entries.is_empty() {
         return Ok(());
+    }
+
+    // Pickaxe (`-S` / `-G`) without `--pickaxe-all` limits the patch to the files whose
+    // change matches the needle (Git's `diffcore_pickaxe`).
+    if !args.pickaxe_all
+        && !is_merge
+        && (args.pickaxe_string.is_some() || args.pickaxe_grep.is_some())
+    {
+        let matched = pickaxe_matching_paths(git_dir, odb, &entries, args)?;
+        entries.retain(|e| matched.contains(e.path()));
+        if entries.is_empty() {
+            return Ok(());
+        }
     }
 
     if let Some(ref order_path) = args.order_file {
@@ -10877,6 +11212,16 @@ fn write_commit_diff(
         entries.clone()
     };
 
+    // For combined (`-c`/`--cc`) merge patches, log must render true combined
+    // (`@@@`) hunks rather than a first-parent unified diff. Pass the merge tree
+    // and parent commit OIDs so write_commit_diff_body can build them.
+    let combined_merge_ctx: Option<(ObjectId, Vec<ObjectId>)> =
+        if combined_style && info.parents.len() >= 2 {
+            Some((info.tree, info.parents.clone()))
+        } else {
+            None
+        };
+
     write_commit_diff_body(
         out,
         odb,
@@ -10890,6 +11235,8 @@ fn write_commit_diff(
         is_merge,
         patch_context,
         indent_heuristic,
+        leading_blank,
+        combined_merge_ctx.as_ref(),
     )?;
 
     Ok(())
@@ -10924,6 +11271,7 @@ fn filter_diff_entries_by_pathspecs(entries: Vec<DiffEntry>, specs: &[String]) -
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_commit_diff_body(
     out: &mut impl Write,
     odb: &Odb,
@@ -10937,12 +11285,29 @@ fn write_commit_diff_body(
     treat_as_merge_for_format: bool,
     patch_context: usize,
     indent_heuristic: bool,
+    leading_blank: bool,
+    combined_merge_ctx: Option<&(ObjectId, Vec<ObjectId>)>,
 ) -> Result<()> {
     let combined_style = merge_diff_is_combined_style(args, treat_as_merge_for_format, git_dir)?;
     let entries_owned: Vec<DiffEntry> = entries.to_vec();
     let combined_owned: Vec<DiffEntry> = combined_entries.to_vec();
     let entries_f = filter_diff_entries_by_pathspecs(entries_owned, pathspecs);
     let combined_f = filter_diff_entries_by_pathspecs(combined_owned, pathspecs);
+
+    // `-I` / `--ignore-blank-lines`: drop files whose changes are entirely ignorable so no patch,
+    // `--raw`, `--name-only`, `--name-status`, or `--stat` line is emitted for them (xdiff).
+    let line_ignore = compile_log_line_ignore(args);
+    let (entries_f, combined_f) = if !line_ignore.is_empty() || args.ignore_blank_lines {
+        let f = |e: &DiffEntry| {
+            !log_entry_hidden_by_line_ignore(odb, e, &line_ignore, args.ignore_blank_lines)
+        };
+        (
+            entries_f.into_iter().filter(&f).collect::<Vec<_>>(),
+            combined_f.into_iter().filter(&f).collect::<Vec<_>>(),
+        )
+    } else {
+        (entries_f, combined_f)
+    };
     let list_raw_name: &[DiffEntry] = if combined_style {
         &combined_f
     } else {
@@ -10953,28 +11318,62 @@ fn write_commit_diff_body(
     } else {
         &entries_f
     };
-    if list_raw_name.is_empty() && list_patch.is_empty() {
+    // `--cc -p --stat` on a merge: even when the dense combined diff is empty,
+    // Git still prints the first-parent diffstat (t4066).
+    let merge_stat_from_first_parent =
+        combined_style && (!args.stat.is_empty() || args.patch_with_stat) && !entries.is_empty();
+    if list_raw_name.is_empty() && list_patch.is_empty() && !merge_stat_from_first_parent {
         return Ok(());
     }
     let has_patch = show_patch && !list_patch.is_empty();
+    // `--patch-with-stat` shows a diffstat even though `--stat` was not given explicitly.
+    let wants_stat = !args.stat.is_empty() || args.patch_with_stat;
 
-    if args.raw {
-        for entry in list_raw_name {
-            writeln!(out, "{}", format_raw(entry))?;
-        }
+    // Builtin pretty formats (medium/short/full/fuller/raw) print a blank line between
+    // the commit message and the diff body (git log-tree.c). `--stat`/`--name-status`
+    // emit their own leading separator below, so only prefix it for the raw/patch cases.
+    if leading_blank && !wants_stat && !args.name_only && !args.name_status {
         writeln!(out)?;
     }
 
-    if !args.stat.is_empty() {
-        if has_patch {
+    if args.raw {
+        // git `log --raw` abbreviates OIDs (default 7) with a trailing `...` ellipsis,
+        // unless `--no-abbrev` was given (then full 40-hex, no ellipsis).
+        let raw_abbrev = if args.no_abbrev {
+            None
+        } else {
+            Some(parse_abbrev(&args.abbrev))
+        };
+        for entry in list_raw_name {
+            match raw_abbrev {
+                Some(len) => writeln!(out, "{}", format_raw_abbrev(entry, len))?,
+                None => writeln!(out, "{}", format_raw(entry))?,
+            }
+        }
+        // No trailing blank here: the blank line separating commits is emitted by the
+        // log walk's inter-commit separator (git's raw format prints no extra blank).
+    }
+
+    if wants_stat {
+        // Combined (`-c`/`--cc`) merge diffs compute the stat from the first parent
+        // and separate it from the message with a blank line, not the `---` marker
+        // that precedes a normal unified patch's diffstat (git diff_tree_combined).
+        let combined_merge_stat = combined_style && combined_merge_ctx.is_some();
+        if has_patch && !combined_merge_stat {
             writeln!(out, "---")?;
         } else {
             writeln!(out)?;
         }
+        // Limit the diffstat to the pathspec-matched entries (git stats only the shown files).
+        let stat_entries: &[DiffEntry] = if merge_stat_from_first_parent {
+            entries
+        } else {
+            &entries_f
+        };
         log_print_stat_summary(
             out,
             odb,
-            entries,
+            stat_entries,
             has_patch,
             args,
             graph_stat_prefix,
@@ -11000,21 +11399,157 @@ fn write_commit_diff_body(
 
     if show_patch {
         let config = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
-        for entry in list_patch {
-            log_write_patch_entry(
+        if let Some((merge_tree, parent_commits)) = combined_merge_ctx.filter(|_| combined_style) {
+            log_write_combined_patches(
                 out,
                 odb,
                 git_dir,
                 &config,
-                entry,
+                list_patch,
+                merge_tree,
+                parent_commits,
                 args,
                 patch_context,
-                indent_heuristic,
             )?;
+        } else {
+            for entry in list_patch {
+                log_write_patch_entry(
+                    out,
+                    odb,
+                    git_dir,
+                    &config,
+                    entry,
+                    args,
+                    patch_context,
+                    indent_heuristic,
+                )?;
+            }
         }
     }
 
     Ok(())
+}
+
+/// Render true combined (`@@@`) patches for a `-c`/`--cc` merge commit in `git log`,
+/// mirroring diff-tree's `print_combined_merge_output` patch path.
+#[allow(clippy::too_many_arguments)]
+fn log_write_combined_patches(
+    out: &mut impl Write,
+    odb: &Odb,
+    git_dir: &Path,
+    config: &ConfigSet,
+    list_patch: &[DiffEntry],
+    merge_tree: &ObjectId,
+    parent_commits: &[ObjectId],
+    args: &Args,
+    patch_context: usize,
+) -> Result<()> {
+    if parent_commits.len() < 2 {
+        return Ok(());
+    }
+    let dense = merge_diff_is_dense_combined(args, true, git_dir)?;
+    let abbrev = if args.no_abbrev {
+        40usize
+    } else {
+        parse_abbrev(&args.abbrev)
+    };
+    let quote_fully = config.quote_path_fully();
+    // `git log` does not currently plumb the diff whitespace flags into combined
+    // patches; default to no whitespace normalization (matches the non-combined path).
+    let ws = CombinedDiffWsOptions::default();
+    let mut parent_trees = Vec::with_capacity(parent_commits.len());
+    for p in parent_commits {
+        let obj = odb.read(p)?;
+        let commit = parse_commit(&obj.data)?;
+        parent_trees.push(commit.tree);
+    }
+    // Build the combined parent sides for each interesting path so the combined
+    // patch shows the correct per-parent index OIDs.
+    let walk = CombinedTreeDiffOptions {
+        recursive: true,
+        tree_in_recursive: false,
+    };
+    let cpaths = combined_diff_paths_filtered(odb, merge_tree, parent_commits, &walk, None)?;
+    for entry in list_patch {
+        let path = entry.path();
+        let parent_sides = cpaths
+            .iter()
+            .find(|p| p.path == path)
+            .map(|p| p.parents.clone())
+            .unwrap_or_default();
+        if let Some(patch) = format_combined_textconv_patch(
+            git_dir,
+            config,
+            odb,
+            path,
+            &parent_trees,
+            merge_tree,
+            abbrev,
+            patch_context,
+            dense,
+            false,
+            ws,
+            false,
+            None,
+            &parent_sides,
+            quote_fully,
+        ) {
+            write!(out, "{patch}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Compile the `-I` / `--ignore-matching-lines` regexes (invalid regex aborts with code 129,
+/// matching git's `invalid regex given to -I:` diagnostic).
+fn compile_log_line_ignore(args: &Args) -> Vec<Regex> {
+    let mut out = Vec::with_capacity(args.ignore_matching_lines.len());
+    for p in &args.ignore_matching_lines {
+        match Regex::new(p) {
+            Ok(re) => out.push(re),
+            Err(_) => {
+                eprintln!("error: invalid regex given to -I: {p}");
+                std::process::exit(129);
+            }
+        }
+    }
+    out
+}
+
+/// True when every hunk of this entry's diff is ignorable (so git emits no patch for the file).
+fn log_entry_hidden_by_line_ignore(
+    odb: &Odb,
+    entry: &DiffEntry,
+    ignore: &[Regex],
+    ignore_blank: bool,
+) -> bool {
+    if ignore.is_empty() && !ignore_blank {
+        return false;
+    }
+    if matches!(
+        entry.status,
+        DiffStatus::Renamed | DiffStatus::Copied | DiffStatus::TypeChanged | DiffStatus::Unmerged
+    ) {
+        return false;
+    }
+    if entry.old_mode != entry.new_mode {
+        return false;
+    }
+    let old = if entry.old_oid == zero_oid() {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&read_blob_bytes(odb, &entry.old_oid)).into_owned()
+    };
+    let new = if entry.new_oid == zero_oid() {
+        String::new()
+    } else {
+        String::from_utf8_lossy(&read_blob_bytes(odb, &entry.new_oid)).into_owned()
+    };
+    let body = unified_diff_histogram_hunks_only(&old, &new, 3, 0);
+    if body.is_empty() {
+        return true;
+    }
+    crate::commands::diff::suppress_ignored_hunks_in_patch(&body, ignore, ignore_blank).is_empty()
 }
 
 /// Write a unified-diff block for one entry.
@@ -11222,6 +11757,17 @@ fn log_write_patch_entry(
         indent_heuristic,
         config.quote_path_fully(),
     );
+    // Drop hunks made up solely of ignorable changes (`-I` / `--ignore-blank-lines`).
+    let patch = if !args.ignore_matching_lines.is_empty() || args.ignore_blank_lines {
+        let ign = compile_log_line_ignore(args);
+        crate::commands::diff::suppress_ignored_hunks_in_patch(
+            &patch,
+            &ign,
+            args.ignore_blank_lines,
+        )
+    } else {
+        patch
+    };
     let patch = apply_diff_output_indicators(&patch, args);
     write!(out, "{patch}")?;
 
@@ -11357,6 +11903,7 @@ fn log_print_stat_summary(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let (old_content, new_content) = log_read_blob_pair(odb, entry)?;
@@ -11366,6 +11913,7 @@ fn log_print_stat_summary(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }
@@ -11388,6 +11936,17 @@ fn log_print_stat_summary(
         },
     };
     write_diffstat_block(out, &files, &opts)?;
+    // `--summary`: condensed extended-header lines (create/delete/rename mode), emitted right
+    // after the diffstat totals and before the trailing blank that precedes the patch.
+    if args.summary {
+        let quote_fully = cfg.quote_path_fully();
+        crate::commands::diff::write_diff_summary(
+            out,
+            entries,
+            args.break_rewrites.is_some(),
+            quote_fully,
+        )?;
+    }
     if trailing_blank {
         writeln!(out)?;
     }

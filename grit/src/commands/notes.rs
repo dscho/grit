@@ -693,13 +693,14 @@ fn write_notes_commit(
     // Build committer/author ident
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
     let now = OffsetDateTime::now_utc();
-    let ident = build_ident(&config, now);
+    let author = build_ident_role(&config, now, "AUTHOR");
+    let committer = build_ident_role(&config, now, "COMMITTER");
 
     let commit = CommitData {
         tree: tree_oid,
         parents: parent.into_iter().collect(),
-        author: ident.clone(),
-        committer: ident.clone(),
+        author,
+        committer: committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -724,7 +725,7 @@ fn write_notes_commit(
             notes_ref,
             &old_oid,
             &commit_oid,
-            &ident,
+            &committer,
             &reflog_msg,
             false,
         );
@@ -733,23 +734,57 @@ fn write_notes_commit(
 }
 
 /// Build a Git ident string from config.
-fn build_ident(config: &ConfigSet, now: OffsetDateTime) -> String {
-    let name = std::env::var("GIT_COMMITTER_NAME")
+/// Build an identity line for the notes commit, honoring the
+/// `GIT_{AUTHOR,COMMITTER}_{NAME,EMAIL,DATE}` environment variables exactly like
+/// `git notes` (and `git commit-tree`). `prefix` is either "AUTHOR" or "COMMITTER".
+fn build_ident_role(config: &ConfigSet, now: OffsetDateTime, prefix: &str) -> String {
+    let name_key = format!("GIT_{prefix}_NAME");
+    let email_key = format!("GIT_{prefix}_EMAIL");
+    let date_key = format!("GIT_{prefix}_DATE");
+
+    let name = std::env::var(&name_key)
         .ok()
+        .filter(|n| !n.trim().is_empty())
+        .or_else(|| {
+            if prefix == "COMMITTER" {
+                std::env::var("GIT_AUTHOR_NAME")
+                    .ok()
+                    .filter(|n| !n.trim().is_empty())
+            } else {
+                None
+            }
+        })
         .or_else(|| config.get("user.name"))
         .unwrap_or_else(|| "Unknown".to_owned());
 
-    let email = std::env::var("GIT_COMMITTER_EMAIL")
+    let email = std::env::var(&email_key)
         .ok()
+        .filter(|e| !e.trim().is_empty())
+        .or_else(|| {
+            if prefix == "COMMITTER" {
+                std::env::var("GIT_AUTHOR_EMAIL")
+                    .ok()
+                    .filter(|e| !e.trim().is_empty())
+            } else {
+                None
+            }
+        })
         .or_else(|| config.get("user.email"))
         .unwrap_or_default();
 
-    let epoch = now.unix_timestamp();
-    let offset = now.offset();
-    let hours = offset.whole_hours();
-    let minutes = offset.minutes_past_hour().unsigned_abs();
+    let date = std::env::var(&date_key)
+        .ok()
+        .filter(|d| !d.trim().is_empty())
+        .and_then(|d| crate::commands::commit::parse_date_to_git_timestamp(&d).or(Some(d)))
+        .unwrap_or_else(|| {
+            let epoch = now.unix_timestamp();
+            let offset = now.offset();
+            let hours = offset.whole_hours();
+            let minutes = offset.minutes_past_hour().unsigned_abs();
+            format!("{epoch} {hours:+03}{minutes:02}")
+        });
 
-    format!("{name} <{email}> {epoch} {hours:+03}{minutes:02}")
+    format!("{name} <{email}> {date}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2343,12 +2378,13 @@ fn write_notes_commit_with_parents(
     let tree_oid = write_notes_subtree(repo, &rewritten_entries)?;
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
     let now = OffsetDateTime::now_utc();
-    let ident = build_ident(&config, now);
+    let author = build_ident_role(&config, now, "AUTHOR");
+    let committer = build_ident_role(&config, now, "COMMITTER");
     let commit = CommitData {
         tree: tree_oid,
         parents: parents.to_vec(),
-        author: ident.clone(),
-        committer: ident,
+        author,
+        committer,
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,

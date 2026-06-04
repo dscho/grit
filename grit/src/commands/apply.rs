@@ -358,6 +358,9 @@ struct FilePatch {
     new_oid: Option<String>,
     /// Parsed binary patch payload (`GIT binary patch`) if present.
     binary_patch: Option<BinaryPatchPayload>,
+    /// Whether this is a binary change (`GIT binary patch` payload or a
+    /// `Binary files ... differ` marker); stat/numstat show `Bin` / `-`.
+    is_binary: bool,
     /// Hunks to apply.
     hunks: Vec<Hunk>,
     /// Merged `core.whitespace` + `whitespace` attribute (Git `ws_rule`); `0` before assignment.
@@ -1236,6 +1239,7 @@ fn parse_traditional_patch_pair(
         old_oid: None,
         new_oid: None,
         binary_patch: None,
+        is_binary: false,
         hunks: Vec::new(),
         ws_rule: 0,
         is_toplevel_relative: false,
@@ -1447,7 +1451,7 @@ fn find_name_extended_header(rest: &str, p_extended: usize) -> Option<String> {
 /// Parse a unified diff into a list of `FilePatch` entries.
 ///
 /// `strip` is Git's `p_value` (`-p` count, default 1).
-fn parse_patch(input: &str, strip: usize) -> Result<Vec<FilePatch>> {
+fn parse_patch(input: &str, strip: usize, input_name: &str) -> Result<Vec<FilePatch>> {
     let lines: Vec<&str> = input.lines().collect();
     let mut patches = Vec::new();
     let mut i = 0;
@@ -1481,6 +1485,7 @@ fn parse_patch(input: &str, strip: usize) -> Result<Vec<FilePatch>> {
                 old_oid: None,
                 new_oid: None,
                 binary_patch: None,
+                is_binary: false,
                 hunks: Vec::new(),
                 ws_rule: 0,
                 is_toplevel_relative: true,
@@ -1583,8 +1588,13 @@ fn parse_patch(input: &str, strip: usize) -> Result<Vec<FilePatch>> {
                 } else if line == "GIT binary patch" {
                     let (binary_patch, next_i) = parse_binary_patch(&lines, i + 1)?;
                     fp.binary_patch = Some(binary_patch);
+                    fp.is_binary = true;
                     i = next_i;
                     break;
+                } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+                    // Plain (non --binary) diff of a binary change; no payload to
+                    // apply but stat/numstat must report it as binary.
+                    fp.is_binary = true;
                 }
                 // skip other extended headers
                 i += 1;
@@ -1625,7 +1635,7 @@ fn parse_patch(input: &str, strip: usize) -> Result<Vec<FilePatch>> {
 
             // Parse hunks
             while i < lines.len() && lines[i].starts_with("@@ ") {
-                let (hunk, next_i) = parse_hunk(&lines, i)?;
+                let (hunk, next_i) = parse_hunk(&lines, i, input_name)?;
                 fp.hunks.push(hunk);
                 i = next_i;
             }
@@ -1649,7 +1659,7 @@ fn parse_patch(input: &str, strip: usize) -> Result<Vec<FilePatch>> {
 
             // Parse hunks
             while i < lines.len() && lines[i].starts_with("@@ ") {
-                let (hunk, next_i) = parse_hunk(&lines, i)?;
+                let (hunk, next_i) = parse_hunk(&lines, i, input_name)?;
                 fp.hunks.push(hunk);
                 i = next_i;
             }
@@ -1921,7 +1931,7 @@ fn split_diff_git_paths(s: &str) -> Option<(String, String)> {
 }
 
 /// Parse a single hunk starting at line `i` (which should be an `@@` line).
-fn parse_hunk(lines: &[&str], start: usize) -> Result<(Hunk, usize)> {
+fn parse_hunk(lines: &[&str], start: usize, input_name: &str) -> Result<(Hunk, usize)> {
     let header = lines[start];
     let (old_start, old_count, new_start, new_count) =
         parse_hunk_header(header).with_context(|| format!("invalid hunk header: {header}"))?;
@@ -1935,6 +1945,11 @@ fn parse_hunk(lines: &[&str], start: usize) -> Result<(Hunk, usize)> {
         lines: Vec::new(),
     };
 
+    // Track how many old/new lines the body actually provides so a hunk that
+    // ends prematurely is diagnosed like Git: "corrupt patch at <file>:<line>"
+    // (t4012; Git parse_fragment returns -1 when oldlines/newlines remain).
+    let mut old_seen = 0usize;
+    let mut new_seen = 0usize;
     let mut i = start + 1;
     while i < lines.len() {
         let line = lines[i];
@@ -1952,13 +1967,19 @@ fn parse_hunk(lines: &[&str], start: usize) -> Result<(Hunk, usize)> {
         }
         if let Some(rest) = line.strip_prefix('+') {
             hunk.lines.push(HunkLine::Add(rest.to_string()));
+            new_seen += 1;
         } else if let Some(rest) = line.strip_prefix('-') {
             hunk.lines.push(HunkLine::Remove(rest.to_string()));
+            old_seen += 1;
         } else if line.is_empty() {
             hunk.lines.push(HunkLine::Context(String::new()));
+            old_seen += 1;
+            new_seen += 1;
         } else if let Some(rest) = line.strip_prefix(' ') {
             // context line
             hunk.lines.push(HunkLine::Context(rest.to_string()));
+            old_seen += 1;
+            new_seen += 1;
         } else if line.starts_with('\\') {
             hunk.lines.push(HunkLine::NoNewline);
         } else {
@@ -1966,6 +1987,10 @@ fn parse_hunk(lines: &[&str], start: usize) -> Result<(Hunk, usize)> {
             break;
         }
         i += 1;
+    }
+
+    if old_seen < old_count || new_seen < new_count {
+        bail!("corrupt patch at {input_name}:{}", i + 1);
     }
 
     Ok((hunk, i))
@@ -4010,7 +4035,7 @@ fn show_stat(patches: &[FilePatch], directory: Option<&str>, quote_fully: bool) 
     let mut total_add = 0usize;
     let mut total_del = 0usize;
     let mut max_path_len = 0usize;
-    let mut entries: Vec<(String, usize, usize)> = Vec::new();
+    let mut entries: Vec<(String, usize, usize, bool)> = Vec::new();
 
     for fp in patches {
         let path = fp
@@ -4018,16 +4043,26 @@ fn show_stat(patches: &[FilePatch], directory: Option<&str>, quote_fully: bool) 
             .map(|p| adjust_path(p, directory))
             .unwrap_or_else(|| "(unknown)".to_string());
         let display = quote_c_style(&path, quote_fully);
-        let (add, del) = count_hunk_changes(&fp.hunks);
+        let binary = fp.is_binary;
+        let (add, del) = if binary {
+            (0, 0)
+        } else {
+            count_hunk_changes(&fp.hunks)
+        };
         if display.len() > max_path_len {
             max_path_len = display.len();
         }
         total_add += add;
         total_del += del;
-        entries.push((display, add, del));
+        entries.push((display, add, del, binary));
     }
 
-    for (path, add, del) in &entries {
+    for (path, add, del, binary) in &entries {
+        if *binary {
+            // Git: binary changes show "Bin" instead of line counts.
+            let _ = writeln!(out, " {path:<width$} |  Bin", width = max_path_len);
+            continue;
+        }
         let total = add + del;
         let bar = make_stat_bar(*add, *del, 40);
         let _ = writeln!(
@@ -4056,6 +4091,11 @@ fn show_numstat(patches: &[FilePatch], directory: Option<&str>, quote_fully: boo
             .map(|p| adjust_path(p, directory))
             .unwrap_or_else(|| "(unknown)".to_string());
         let display = quote_c_style(&path, quote_fully);
+        if fp.is_binary {
+            // Git: binary changes show "-" for both counts.
+            let _ = writeln!(out, "-\t-\t{display}");
+            continue;
+        }
         let (add, del) = count_hunk_changes(&fp.hunks);
         let _ = writeln!(out, "{add}\t{del}\t{display}");
     }
@@ -4181,7 +4221,13 @@ pub fn run(mut args: Args) -> Result<()> {
         buf
     };
 
-    let mut patches = parse_patch(&input, args.strip)?;
+    let patch_input_display = if args.patches.len() == 1 && args.patches[0].as_os_str() != "-" {
+        args.patches[0].to_string_lossy().into_owned()
+    } else {
+        "<stdin>".to_string()
+    };
+
+    let mut patches = parse_patch(&input, args.strip, &patch_input_display)?;
     normalize_mismatched_diff_git_paths(&mut patches, args.strip);
     postprocess_gitlink_file_patches(&mut patches);
     merge_adjacent_blob_to_gitlink_patches(&mut patches);
@@ -4195,11 +4241,6 @@ pub fn run(mut args: Args) -> Result<()> {
         bail!("No valid patches in input");
     }
 
-    let patch_input_display = if args.patches.len() == 1 && args.patches[0].as_os_str() != "-" {
-        args.patches[0].to_string_lossy().into_owned()
-    } else {
-        "<stdin>".to_string()
-    };
     validate_and_canonicalize_patch_modes(&mut patches, &patch_input_display)?;
 
     // Info-only modes unless explicitly overridden by --apply.

@@ -158,58 +158,96 @@ fn combine_one_parent(
     let new_keys: Vec<String> = slines[..cnt].iter().map(|s| line_key(&s.bol, ws)).collect();
     let ops = capture_diff_slices(Algorithm::Myers, &old_keys, &new_keys);
 
-    for op in ops {
-        match op {
-            DiffOp::Equal { .. } => {}
-            DiffOp::Delete {
-                old_index,
-                old_len,
-                new_index,
-                ..
-            } => {
-                let mut b = new_index.min(cnt);
-                if old_len > 0 && b == 0 && cnt > 0 {
-                    b = 1;
-                }
-                let b = b.min(cnt.saturating_sub(1));
-                for k in 0..old_len {
-                    slines[b].plost.push(LostSeg {
-                        text: parent_lines[old_index + k].clone(),
-                        parent_map: nmask,
-                    });
-                }
-            }
-            DiffOp::Insert {
-                new_index, new_len, ..
-            } => {
-                for k in 0..new_len {
-                    slines[new_index + k].flag |= nmask;
-                }
-            }
-            DiffOp::Replace {
-                old_index,
-                old_len,
-                new_index,
-                new_len,
-            } => {
-                let b = if new_len == 0 {
-                    let mut b = new_index.min(cnt);
-                    if old_len > 0 && b == 0 && cnt > 0 {
-                        b = 1;
+    // Group consecutive non-Equal ops into hunks, mirroring xdiff's hunk emission.
+    // Within each hunk we replicate combine-diff.c's consume_hunk()/consume_line():
+    // the per-hunk "lost bucket" is chosen from the result-side hunk start, and all
+    // '-' lines of the hunk are appended to that one bucket in order.
+    let mut idx = 0usize;
+    while idx < ops.len() {
+        if matches!(ops[idx], DiffOp::Equal { .. }) {
+            idx += 1;
+            continue;
+        }
+        // Collect a maximal run of change ops as one hunk.
+        let start = idx;
+        let mut del_lines: Vec<usize> = Vec::new();
+        let mut ins_lines: Vec<usize> = Vec::new();
+        // new-begin (nb) and new-count (nn): result-side coordinates of the hunk.
+        let mut nb: Option<usize> = None;
+        let mut nn = 0usize;
+        while idx < ops.len() && !matches!(ops[idx], DiffOp::Equal { .. }) {
+            match ops[idx] {
+                DiffOp::Delete {
+                    old_index,
+                    old_len,
+                    new_index,
+                    ..
+                } => {
+                    if nb.is_none() {
+                        nb = Some(new_index);
                     }
-                    b.min(cnt.saturating_sub(1))
-                } else {
-                    new_index.saturating_sub(1).min(cnt.saturating_sub(1))
-                };
-                for k in 0..old_len {
-                    slines[b].plost.push(LostSeg {
-                        text: parent_lines[old_index + k].clone(),
-                        parent_map: nmask,
-                    });
+                    for k in 0..old_len {
+                        del_lines.push(old_index + k);
+                    }
                 }
-                for k in 0..new_len {
-                    slines[new_index + k].flag |= nmask;
+                DiffOp::Insert {
+                    old_index: _,
+                    new_index,
+                    new_len,
+                } => {
+                    if nb.is_none() {
+                        nb = Some(new_index);
+                    }
+                    for k in 0..new_len {
+                        ins_lines.push(new_index + k);
+                        nn += 1;
+                    }
                 }
+                DiffOp::Replace {
+                    old_index,
+                    old_len,
+                    new_index,
+                    new_len,
+                } => {
+                    if nb.is_none() {
+                        nb = Some(new_index);
+                    }
+                    for k in 0..old_len {
+                        del_lines.push(old_index + k);
+                    }
+                    for k in 0..new_len {
+                        ins_lines.push(new_index + k);
+                        nn += 1;
+                    }
+                }
+                DiffOp::Equal { .. } => unreachable!(),
+            }
+            idx += 1;
+        }
+        let _ = start;
+        // nb here is 0-based (result index where the hunk's first change sits).
+        // Git's consume_hunk uses 1-based nb: bucket = sline[nb-1] normally, or
+        // sline[nb] when the hunk adds nothing to the result (nn == 0). With our
+        // 0-based nb, that translates to: bucket = nb (nn == 0) or nb (since
+        // sline[(nb+1)-1] == sline[nb]). Concretely git's nb_1based = nb0 + 1.
+        let nb0 = nb.unwrap_or(0);
+        let bucket = if nn == 0 {
+            // Lost lines hang on the result line *after* the removed span.
+            (nb0).min(cnt)
+        } else {
+            // Lost lines hang on the first result line of the hunk.
+            nb0.min(cnt)
+        };
+        let bucket = bucket.min(cnt);
+        for &oi in &del_lines {
+            slines[bucket].plost.push(LostSeg {
+                text: parent_lines[oi].clone(),
+                parent_map: nmask,
+            });
+        }
+        for &ni in &ins_lines {
+            if ni < cnt {
+                slines[ni].flag |= nmask;
             }
         }
     }
@@ -527,7 +565,10 @@ pub fn format_combined_diff_body(
     }
 
     let (res_lines, cnt) = split_lines_with_incomplete(result_text);
-    if cnt == 0 && result_text.is_empty() {
+    // An empty result with non-empty parents still produces a combined diff that
+    // shows every parent line as a deletion (e.g. a merge that empties a file).
+    // Only bail out when there is genuinely nothing on either side.
+    if cnt == 0 && result_text.is_empty() && parent_texts.iter().all(String::is_empty) {
         return String::new();
     }
 

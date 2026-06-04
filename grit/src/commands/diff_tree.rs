@@ -11,8 +11,9 @@ use clap::Args as ClapArgs;
 use encoding_rs::Encoding;
 use grit_lib::combined_diff_patch::CombinedDiffWsOptions;
 use grit_lib::combined_tree_diff::{
-    combined_diff_paths_filtered, combined_diff_paths_trees, format_combined_raw_line,
-    CombinedDiffPath, CombinedParentStatus, CombinedTreeDiffOptions,
+    combined_diff_paths_filtered, combined_diff_paths_trees, combined_raw_meta,
+    format_combined_raw_line, format_combined_raw_line_all_paths, CombinedDiffPath,
+    CombinedParentStatus, CombinedTreeDiffOptions,
 };
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::delta_encode::{encode_lcp_delta, encode_prefix_extension_delta};
@@ -25,8 +26,8 @@ use grit_lib::merge_base::{
     merge_base_for_diff_two_commits, merge_bases_first_vs_rest, MergeBaseForDiffError,
 };
 use grit_lib::merge_diff::{
-    combined_diff_paths, combined_merge_parent_blob_paths, format_combined_textconv_patch,
-    is_binary_for_diff,
+    combined_diff_paths, combined_merge_parent_blob_paths, enrich_combined_path_renames,
+    format_combined_textconv_patch, is_binary_for_diff,
 };
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
@@ -98,6 +99,8 @@ struct Options {
     suppress_diff: bool,
     /// Show a `Notes:` block in the pretty header (`--notes`); map is keyed by commit OID.
     notes_blocks: Option<std::collections::HashMap<ObjectId, String>>,
+    /// Raw note bytes per commit, for the `%N` placeholder in a user `--format` string.
+    format_notes: Option<std::collections::HashMap<ObjectId, Vec<u8>>>,
     /// Output binary patches (--binary).
     binary: bool,
     /// Show diffs for merge commits in stdin mode (`-m`).
@@ -249,6 +252,7 @@ impl Default for Options {
             stdin_mode: false,
             no_commit_id: false,
             notes_blocks: None,
+            format_notes: None,
             verbose: false,
             suppress_diff: false,
             binary: false,
@@ -594,6 +598,19 @@ fn parse_options(repo: &Repository, argv: &[String]) -> Result<Options> {
         opts.recursive = true;
     }
 
+    // A user `--format`/`--pretty=format:` string with the `%N` placeholder needs the raw
+    // note bytes for each commit; load them once here (default notes ref).
+    if opts.format_notes.is_none() {
+        if let Some(p) = &opts.pretty {
+            let template = p
+                .strip_prefix("tformat:")
+                .or_else(|| p.strip_prefix("format:"));
+            if template.is_some_and(|t| t.contains("%N")) {
+                opts.format_notes = Some(crate::commands::show::load_notes_map(repo));
+            }
+        }
+    }
+
     Ok(opts)
 }
 
@@ -843,7 +860,7 @@ fn run_multi_tree_combined(
         tree_in_recursive: false,
     };
     let parent_opts: Vec<Option<ObjectId>> = parent_trees.iter().copied().map(Some).collect();
-    let paths = combined_diff_paths_trees(odb, merge_tree, &parent_opts, &walk, None)?;
+    let mut paths = combined_diff_paths_trees(odb, merge_tree, &parent_opts, &walk, None)?;
     let has_diff = !paths.is_empty();
     if opts.quiet || !has_diff {
         return Ok(has_diff);
@@ -864,13 +881,28 @@ fn run_multi_tree_combined(
     };
     let rename_thresh = opts.find_renames.unwrap_or(50);
 
+    if opts.combined_all_paths && opts.find_renames.is_some() {
+        for p in &mut paths {
+            enrich_combined_path_renames(odb, p, parent_trees, merge_tree, rename_thresh);
+        }
+    }
+
     for p in &paths {
         match opts.format {
             OutputFormat::Raw => {
                 if opts.nul_terminated {
-                    write_combined_raw_z(out, None, p, opts.abbrev)?;
+                    write_combined_raw_z(out, None, p, opts.abbrev, opts.combined_all_paths)?;
                 } else {
-                    writeln!(out, "{}", format_combined_raw_line(p, opts.abbrev))?;
+                    writeln!(
+                        out,
+                        "{}",
+                        format_combined_raw_line_all_paths(
+                            p,
+                            opts.abbrev,
+                            opts.combined_all_paths,
+                            quote_fully,
+                        )
+                    )?;
                 }
             }
             OutputFormat::NameOnly | OutputFormat::NameStatus => {
@@ -878,7 +910,13 @@ fn run_multi_tree_combined(
             }
             OutputFormat::Patch => {
                 let parent_blob_paths = if opts.combined_all_paths && opts.find_renames.is_some() {
-                    combined_merge_parent_blob_paths(odb, &p.path, parent_trees, rename_thresh)
+                    combined_merge_parent_blob_paths(
+                        odb,
+                        &p.path,
+                        parent_trees,
+                        merge_tree,
+                        rename_thresh,
+                    )
                 } else {
                     None
                 };
@@ -1003,6 +1041,16 @@ fn run_one_commit(repo: &Repository, opts: &Options, out: &mut impl Write) -> Re
                     let entries = diff_with_opts(&repo.odb, old_side, new_side, opts)?;
                     let filtered = filter_entries(&repo.odb, &repo, entries, opts)?;
                     has_diff = !filtered.is_empty();
+                    if opts.check {
+                        // `--check` runs the whitespace/conflict-marker check instead of
+                        // emitting raw/patch output: print the commit header, then the check.
+                        if !opts.quiet {
+                            write_commit_header(out, &oid, &obj.data, opts, None)?;
+                        }
+                        let prepared = prepare_diff_tree_entries(&repo.odb, filtered, opts, None);
+                        run_diff_tree_whitespace_check(repo, &prepared, opts)?;
+                        return Ok(has_diff);
+                    }
                     if !opts.quiet && (has_diff || opts.pretty.is_some()) {
                         // `git diff-tree --root <commit>` prints the bare commit OID header
                         // line first (gated only on --no-commit-id), exactly like the
@@ -1523,25 +1571,53 @@ fn diff_trees_toplevel(
                     std::cmp::Ordering::Equal => {
                         if o.oid != n.oid || o.mode != n.mode {
                             let path = o_name.into_owned();
-                            // A mode-only change (e.g. chmod) is Modified, not TypeChanged.
-                            // TypeChanged is only for actual type changes (blob ↔ symlink etc.)
                             let old_type = o.mode & 0o170000;
                             let new_type = n.mode & 0o170000;
-                            let status = if old_type != new_type {
-                                DiffStatus::TypeChanged
+                            let old_is_tree = old_type == 0o040000;
+                            let new_is_tree = new_type == 0o040000;
+                            if old_is_tree != new_is_tree {
+                                // A directory turning into a file (or vice versa) is not a
+                                // typechange in non-recursive diff-tree; git emits a separate
+                                // addition of the new entry followed by deletion of the old.
+                                result.push(DiffEntry {
+                                    status: DiffStatus::Added,
+                                    old_path: None,
+                                    new_path: Some(path.clone()),
+                                    old_mode: "000000".to_owned(),
+                                    new_mode: format!("{:06o}", n.mode),
+                                    old_oid: zero,
+                                    new_oid: n.oid,
+                                    score: None,
+                                });
+                                result.push(DiffEntry {
+                                    status: DiffStatus::Deleted,
+                                    old_path: Some(path),
+                                    new_path: None,
+                                    old_mode: format!("{:06o}", o.mode),
+                                    new_mode: "000000".to_owned(),
+                                    old_oid: o.oid,
+                                    new_oid: zero,
+                                    score: None,
+                                });
                             } else {
-                                DiffStatus::Modified
-                            };
-                            result.push(DiffEntry {
-                                status,
-                                old_path: Some(path.clone()),
-                                new_path: Some(path),
-                                old_mode: format!("{:06o}", o.mode),
-                                new_mode: format!("{:06o}", n.mode),
-                                old_oid: o.oid,
-                                new_oid: n.oid,
-                                score: None,
-                            });
+                                // A mode-only change (e.g. chmod) is Modified, not TypeChanged.
+                                // TypeChanged is only for actual type changes (blob ↔ symlink etc.)
+                                let status = if old_type != new_type {
+                                    DiffStatus::TypeChanged
+                                } else {
+                                    DiffStatus::Modified
+                                };
+                                result.push(DiffEntry {
+                                    status,
+                                    old_path: Some(path.clone()),
+                                    new_path: Some(path),
+                                    old_mode: format!("{:06o}", o.mode),
+                                    new_mode: format!("{:06o}", n.mode),
+                                    old_oid: o.oid,
+                                    new_oid: n.oid,
+                                    score: None,
+                                });
+                            }
                         }
                         oi += 1;
                         ni += 1;
@@ -1960,6 +2036,29 @@ fn print_combined_merge_output(
         .unwrap_or_default()
         .quote_path_fully();
 
+    // With `-M`/`--combined-all-paths`, reclassify per-parent `Added` sides as renames so the raw
+    // line shows `R` and all source names (git's `find_paths_generic`). Work on an owned copy.
+    let enriched_storage: Option<Vec<CombinedDiffPath>> =
+        if opts.combined_all_paths && opts.find_renames.is_some() {
+            let rename_thresh = opts.find_renames.unwrap_or(50);
+            let mut parent_trees = Vec::with_capacity(parent_commits.len());
+            for p in parent_commits {
+                parent_trees.push(commit_tree(odb, p)?);
+            }
+            if parent_trees.len() >= 2 {
+                let mut owned = paths.to_vec();
+                for p in &mut owned {
+                    enrich_combined_path_renames(odb, p, &parent_trees, merge_tree, rename_thresh);
+                }
+                Some(owned)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+    let paths: &[CombinedDiffPath] = enriched_storage.as_deref().unwrap_or(paths);
+
     // Git computes `--stat`/`--summary` for a combined diff as an ordinary diff
     // against the FIRST parent (combine-diff.c: `diff_tree_oid(&parents->oid[0],
     // oid, ...)` under STAT_FORMAT_MASK), not from the combined-interesting paths.
@@ -1995,13 +2094,23 @@ fn print_combined_merge_output(
     }
 
     if want_raw {
-        let hex_storage = commit_oid.map(|o| o.to_hex());
-        let commit_hex = hex_storage.as_deref();
+        // The commit-id header (NUL- or newline-terminated) is already emitted by the per-commit
+        // caller, so do not prepend it here.
+        let _ = commit_oid;
         for p in paths {
             if opts.nul_terminated {
-                write_combined_raw_z(out, commit_hex, p, abbrev_len)?;
+                write_combined_raw_z(out, None, p, abbrev_len, opts.combined_all_paths)?;
             } else {
-                writeln!(out, "{}", format_combined_raw_line(p, abbrev_len))?;
+                writeln!(
+                    out,
+                    "{}",
+                    format_combined_raw_line_all_paths(
+                        p,
+                        abbrev_len,
+                        opts.combined_all_paths,
+                        quote_fully,
+                    )
+                )?;
             }
         }
     }
@@ -2032,7 +2141,13 @@ fn print_combined_merge_output(
             }
             for p in paths {
                 let parent_blob_paths = if opts.combined_all_paths && opts.find_renames.is_some() {
-                    combined_merge_parent_blob_paths(odb, &p.path, &parent_trees, rename_thresh)
+                    combined_merge_parent_blob_paths(
+                        odb,
+                        &p.path,
+                        &parent_trees,
+                        merge_tree,
+                        rename_thresh,
+                    )
                 } else {
                     None
                 };
@@ -2068,14 +2183,29 @@ fn write_combined_raw_z(
     commit_hex: Option<&str>,
     p: &CombinedDiffPath,
     abbrev_len: Option<usize>,
+    combined_all_paths: bool,
 ) -> Result<()> {
     if let Some(h) = commit_hex {
         out.write_all(h.as_bytes())?;
         out.write_all(b"\0")?;
     }
-    let line = format_combined_raw_line(p, abbrev_len);
-    out.write_all(line.as_bytes())?;
-    out.write_all(b"\0")?;
+    if combined_all_paths {
+        // NUL-separated raw (unquoted) output: metadata, then one source name per parent, then the
+        // merge path. Build the metadata directly (names contain tabs, so we cannot split on `\t`).
+        out.write_all(combined_raw_meta(p, abbrev_len).as_bytes())?;
+        out.write_all(b"\0")?;
+        for side in &p.parents {
+            let name = side.rename_from.as_deref().unwrap_or(&p.path);
+            out.write_all(name.as_bytes())?;
+            out.write_all(b"\0")?;
+        }
+        out.write_all(p.path.as_bytes())?;
+        out.write_all(b"\0")?;
+    } else {
+        let line = format_combined_raw_line(p, abbrev_len);
+        out.write_all(line.as_bytes())?;
+        out.write_all(b"\0")?;
+    }
     Ok(())
 }
 
@@ -2098,6 +2228,7 @@ fn print_combined_paths(
                         CombinedParentStatus::Added => 'A',
                         CombinedParentStatus::Modified => 'M',
                         CombinedParentStatus::Deleted => 'D',
+                        CombinedParentStatus::Renamed => 'R',
                     })
                     .collect();
                 writeln!(out, "{letters}\t{}", p.path)?;
@@ -2750,7 +2881,7 @@ fn emit_git_binary_patch(out: &mut impl Write, old_raw: &[u8], new_raw: &[u8]) -
     Ok(())
 }
 
-fn write_patch_entry(
+pub(crate) fn write_patch_entry(
     out: &mut impl Write,
     odb: &Odb,
     entry: &DiffEntry,
@@ -3131,16 +3262,21 @@ fn write_commit_header(
             .strip_prefix("tformat:")
             .or_else(|| pretty_fmt.strip_prefix("format:"))
         {
-            if template == "%s" {
-                let first_line = commit.message.lines().next().unwrap_or("");
-                writeln!(out, "{first_line}")?;
-                // The trailing blank line separates the subject from the raw/patch
-                // diff; with `-s`/`--no-patch` there is no diff, so git omits it.
-                if !opts.suppress_diff {
-                    writeln!(out)?;
-                }
-                return Ok(false);
+            // General user-format expansion (`%s`, `%N`, `%H`, …). Mirrors `git log --format`.
+            let note_bytes = opts
+                .format_notes
+                .as_ref()
+                .and_then(|m| m.get(oid))
+                .map(|v| v.as_slice());
+            let formatted =
+                crate::commands::show::apply_format_string(template, oid, &commit, note_bytes, 0);
+            writeln!(out, "{formatted}")?;
+            // A blank line separates the format header from the raw/patch diff; with
+            // `-s`/`--no-patch` there is no diff, so git omits it.
+            if !opts.suppress_diff {
+                writeln!(out)?;
             }
+            return Ok(false);
         }
         if let Some(p) = from_parent {
             writeln!(out, "commit {} (from {})", oid.to_hex(), p.to_hex())?;
@@ -3202,7 +3338,12 @@ fn write_commit_header(
             writeln!(out)?;
         }
     } else if !opts.no_commit_id {
-        writeln!(out, "{oid}")?;
+        // In `-z` raw mode git NUL-terminates the bare commit-id header instead of using a newline.
+        if opts.nul_terminated && opts.format == OutputFormat::Raw {
+            write!(out, "{oid}\0")?;
+        } else {
+            writeln!(out, "{oid}")?;
+        }
     }
     Ok(false)
 }
@@ -3326,7 +3467,11 @@ fn commit_tree(odb: &Odb, commit_oid: &ObjectId) -> Result<ObjectId> {
 fn read_blob_pair(odb: &Odb, entry: &DiffEntry) -> Result<(String, String)> {
     let zero = grit_lib::diff::zero_oid();
 
-    let old_content = if entry.old_oid == zero {
+    let old_content = if entry.old_mode == "160000" {
+        // Gitlink: the submodule commit is not in this repository's ODB; Git
+        // synthesizes the textual `Subproject commit` content instead.
+        format!("Subproject commit {}\n", entry.old_oid.to_hex())
+    } else if entry.old_oid == zero {
         if entry.old_mode != "000000" {
             bail!("unable to read {}", zero.to_hex());
         }
@@ -3338,7 +3483,9 @@ fn read_blob_pair(odb: &Odb, entry: &DiffEntry) -> Result<(String, String)> {
         String::from_utf8_lossy(&obj.data).into_owned()
     };
 
-    let new_content = if entry.new_oid == zero {
+    let new_content = if entry.new_mode == "160000" {
+        format!("Subproject commit {}\n", entry.new_oid.to_hex())
+    } else if entry.new_oid == zero {
         if entry.new_mode != "000000" {
             bail!("unable to read {}", zero.to_hex());
         }
@@ -3507,7 +3654,16 @@ fn filter_combined_paths_intersection(
         .collect();
     paths
         .into_iter()
-        .filter(|p| allowed.contains(&p.path))
+        .filter(|p| {
+            // `allowed` is a blob-level path list; tree entries (from `-t` /
+            // `--find-object`) are already intersection-filtered by the walker
+            // and must pass through (t4038: `diff-tree -c -t` shows `MM dir`).
+            let is_tree = (p.merge_mode & 0o170000) == 0o040000
+                || p.parents
+                    .iter()
+                    .any(|side| (side.mode & 0o170000) == 0o040000);
+            is_tree || allowed.contains(&p.path)
+        })
         .collect()
 }
 

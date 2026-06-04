@@ -193,6 +193,10 @@ pub struct Args {
     #[arg(short = 'm')]
     pub diff_merges: bool,
 
+    /// For merge commits, diff against the first parent only (like `git log --first-parent`).
+    #[arg(long = "first-parent")]
+    pub first_parent: bool,
+
     /// Dense combined diff for merge commits (`diff --combined`).
     #[arg(short = 'c')]
     pub combined: bool,
@@ -331,7 +335,16 @@ pub fn run(mut args: Args) -> Result<()> {
         args.format = args.pretty.clone();
     }
 
-    let mut raw_objects = args.objects.clone();
+    // `--root` forces a root commit's diff against the empty tree even when
+    // `log.showroot=false`. It is not a real object, so strip it from the list.
+    let want_root = args.objects.iter().any(|s| s == "--root");
+    let mut raw_objects: Vec<String> = args
+        .objects
+        .iter()
+        .filter(|s| s.as_str() != "--root")
+        .cloned()
+        .collect();
+    args.objects = raw_objects.clone();
     while let Some(first) = raw_objects.first() {
         if first.len() > 1
             && first.starts_with('-')
@@ -392,8 +405,18 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let rev_strings: Vec<&str> = rev_strings_owned.iter().map(|s| s.as_str()).collect();
-    let compact_multi_subject =
-        (args.quiet || args.no_patch) && args.format.as_deref() == Some("%s");
+    // `--name-only` / `--name-status` with a user `--format` string terminate each entry
+    // themselves (tformat semantics), so git emits no blank line between successive commits.
+    let user_format_name_listing = (args.name_only || args.name_status)
+        && args.format.as_deref().is_some_and(|f| {
+            !matches!(
+                f,
+                "medium" | "short" | "full" | "fuller" | "reference" | "oneline" | "raw" | "email"
+            )
+        });
+    let compact_multi_subject = ((args.quiet || args.no_patch)
+        && args.format.as_deref() == Some("%s"))
+        || user_format_name_listing;
 
     let notes_map = load_notes_map(&repo);
 
@@ -492,6 +515,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 Some(&emit_opts),
                 None,
                 indent_heuristic,
+                want_root,
             )?;
             remerge_shown = true;
         }
@@ -547,6 +571,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     Some(parent_oid),
                     indent_heuristic,
+                    want_root,
                 )?;
                 shown = true;
             }
@@ -604,6 +629,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         None,
                         None,
                         indent_heuristic,
+                        want_root,
                     )?;
                     shown = true;
                 }
@@ -638,6 +664,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 None,
                 None,
                 indent_heuristic,
+                want_root,
             )?;
             shown = true;
         }
@@ -668,6 +695,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     None,
                     indent_heuristic,
+                    want_root,
                 )?;
             }
             ObjectKind::Tag => {
@@ -867,6 +895,90 @@ fn expand_typechange_entries_for_porcelain(entries: Vec<DiffEntry>) -> Vec<DiffE
     out
 }
 
+/// Emit `git show -m` for a merge commit: one full medium-format entry per parent, each header
+/// tagged `(from <parent>)` and followed by that parent's diff (matches `git log -m -p`).
+#[allow(clippy::too_many_arguments)]
+fn show_commit_separate_merge(
+    out: &mut impl Write,
+    repo: &Repository,
+    oid: &ObjectId,
+    commit: &grit_lib::objects::CommitData,
+    args: &Args,
+    config: &ConfigSet,
+    expand_tabs_in_log: usize,
+    _indent_heuristic: bool,
+    signature_lines: Option<&str>,
+) -> Result<()> {
+    let odb = &repo.odb;
+    let git_dir = &repo.git_dir;
+    let hex = oid.to_hex();
+    let abbrev_len = if args.no_abbrev {
+        40usize
+    } else {
+        args.abbrev
+            .as_deref()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(7)
+    };
+    let context = args.unified.unwrap_or(3);
+    let use_textconv = !args.no_textconv;
+    let merge_abbrevs: Vec<String> = commit
+        .parents
+        .iter()
+        .map(|p| p.to_hex()[..7].to_string())
+        .collect();
+
+    let mut shown = 0usize;
+    for parent_oid in &commit.parents {
+        let parent_obj = odb.read(parent_oid).context("reading merge parent")?;
+        let parent_commit = parse_commit(&parent_obj.data).context("parsing merge parent")?;
+        let entries = diff_trees(odb, Some(&parent_commit.tree), Some(&commit.tree), "")
+            .context("computing merge parent diff")?;
+        if entries.is_empty() {
+            continue;
+        }
+        if shown > 0 {
+            writeln!(out)?;
+        }
+        shown += 1;
+
+        // Medium header, repeated for each parent with the `(from <parent>)` annotation.
+        writeln!(out, "commit {hex} (from {})", parent_oid.to_hex())?;
+        writeln!(out, "Merge: {}", merge_abbrevs.join(" "))?;
+        if let Some(sig) = signature_lines {
+            out.write_all(sig.as_bytes())?;
+        }
+        writeln!(out, "Author: {}", format_ident_display(&commit.author))?;
+        writeln!(out, "Date:   {}", format_date(&commit.author))?;
+        writeln!(out)?;
+        for line in commit.message.lines() {
+            writeln!(
+                out,
+                "{}",
+                grit_lib::tab_expand::indent_and_expand_tabs(line, 4, expand_tabs_in_log)
+            )?;
+        }
+        writeln!(out)?;
+
+        for entry in &entries {
+            if let Some(patch) = format_parent_patch(
+                git_dir,
+                config,
+                odb,
+                entry.path(),
+                &parent_commit.tree,
+                &commit.tree,
+                abbrev_len,
+                context,
+                use_textconv,
+            ) {
+                write!(out, "{patch}")?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Show a commit object: header + diff.
 fn show_commit(
     out: &mut impl Write,
@@ -879,6 +991,7 @@ fn show_commit(
     remerge_emit_opts: Option<&crate::commands::remerge_diff::RemergeDiffOptions<'_>>,
     merge_from_parent: Option<ObjectId>,
     indent_heuristic: bool,
+    want_root: bool,
 ) -> Result<()> {
     let odb = &repo.odb;
     let commit = parse_commit(data).context("parsing commit")?;
@@ -979,7 +1092,82 @@ fn show_commit(
         return Ok(());
     }
 
+    // A root commit with no diff to show (no `--root` and `log.showroot=false`) prints only
+    // the header/message — without the trailing blank that normally separates message and diff.
+    let root_diff_shown = !commit.parents.is_empty()
+        || want_root
+        || config
+            .get_bool("log.showroot")
+            .and_then(|r| r.ok())
+            .unwrap_or(true);
+
+    // Git's `log-tree.c` rule: when a verbose header is followed by BOTH a diffstat
+    // and a patch (`--patch-with-stat`), it emits a `---` line (no extra blank)
+    // between the message and the stat, instead of the usual blank line.
+    let header_stat_patch_dashes = {
+        let will_show_raw = args.patch_with_raw || (args.raw && !args.numstat);
+        let will_show_stat =
+            args.patch_with_stat || (!args.stat.is_empty() && !args.numstat && !will_show_raw);
+        let will_show_patch = !args.quiet
+            && !args.no_patch
+            && (args.patch
+                || args.binary
+                || args.patch_with_raw
+                || args.patch_with_stat
+                || (!args.raw
+                    && args.stat.is_empty()
+                    && !args.shortstat
+                    && !args.summary
+                    && !args.numstat
+                    && !args.name_only
+                    && !args.name_status));
+        will_show_stat && will_show_patch && !will_show_raw && !args.numstat
+    };
+
+    // `git show -m` on a merge: emit one full entry per parent (medium header repeated with
+    // `(from <parent>)`, followed by that parent's diff), matching `git log -m -p`.
+    let medium_format = matches!(resolved_format.as_deref(), None | Some("medium"));
+    let separate_merge_patch = commit.parents.len() > 1
+        && args.diff_merges
+        && !args.combined
+        && !args.combined_cc
+        && !args.first_parent
+        && !args.remerge_diff
+        && medium_format
+        && !args.quiet
+        && !args.no_patch
+        && !args.name_only
+        && !args.name_status
+        && !args.raw
+        && !args.numstat
+        && args.stat.is_empty()
+        && !args.shortstat
+        && !args.summary
+        && !args.patch_with_stat
+        && !args.patch_with_raw;
+    if separate_merge_patch {
+        return show_commit_separate_merge(
+            out,
+            repo,
+            oid,
+            &commit,
+            args,
+            &config,
+            expand_tabs_in_log,
+            indent_heuristic,
+            signature_lines.as_deref(),
+        );
+    }
+
     let format = resolved_format.as_deref();
+    // User `--format=<string>` (incl. `format:` / `tformat:`) emits no built-in trailing blank;
+    // git inserts one blank line between that header and the following diff body.
+    let user_format_header = matches!(
+        format,
+        Some(f) if f.starts_with("format:")
+            || f.starts_with("tformat:")
+            || !matches!(f, "medium" | "short" | "full" | "fuller" | "reference" | "oneline" | "raw" | "email")
+    );
     match format {
         Some(fmt) if fmt.starts_with("format:") || fmt.starts_with("tformat:") => {
             let _template = fmt
@@ -1066,6 +1254,14 @@ fn show_commit(
         Some("medium") | None => {
             // Medium format (default)
             writeln!(out, "commit {hex}")?;
+            if commit.parents.len() > 1 {
+                let abbrevs: Vec<String> = commit
+                    .parents
+                    .iter()
+                    .map(|p| p.to_hex()[..7].to_string())
+                    .collect();
+                writeln!(out, "Merge: {}", abbrevs.join(" "))?;
+            }
             if let Some(sig) = &signature_lines {
                 out.write_all(sig.as_bytes())?;
             }
@@ -1087,11 +1283,19 @@ fn show_commit(
                     for line in note_text.lines() {
                         writeln!(out, "    {line}")?;
                     }
+                } else if root_diff_shown {
+                    if header_stat_patch_dashes {
+                        writeln!(out, "---")?;
+                    } else {
+                        writeln!(out)?;
+                    }
+                }
+            } else if root_diff_shown {
+                if header_stat_patch_dashes {
+                    writeln!(out, "---")?;
                 } else {
                     writeln!(out)?;
                 }
-            } else {
-                writeln!(out)?;
             }
         }
         Some("email") => {
@@ -1269,10 +1473,51 @@ fn show_commit(
         )
     };
 
+    // A root commit's diff against the empty tree is shown only when `--root` is given or
+    // `log.showroot` is true (git default). When `log.showroot=false` and `--root` is absent,
+    // `git show <root>` prints just the header/message.
+    let show_root = want_root
+        || config
+            .get_bool("log.showroot")
+            .and_then(|r| r.ok())
+            .unwrap_or(true);
+    let diff_entries = if commit.parents.is_empty() && !show_root {
+        Vec::new()
+    } else {
+        diff_entries
+    };
+
+    // Limit the displayed diff to the given pathspecs (`git show <rev> -- <path>...`).
+    let diff_entries = if pathspecs.is_empty() {
+        diff_entries
+    } else {
+        diff_entries
+            .into_iter()
+            .filter(|e| {
+                let new_p = e.new_path.as_deref().unwrap_or("");
+                let old_p = e.old_path.as_deref().unwrap_or("");
+                (!new_p.is_empty()
+                    && grit_lib::pathspec::path_allowed_by_pathspec_list(pathspecs, new_p))
+                    || (!old_p.is_empty()
+                        && grit_lib::pathspec::path_allowed_by_pathspec_list(pathspecs, old_p))
+            })
+            .collect()
+    };
+
     let is_merge = commit.parents.len() > 1;
-    let default_merge_patch = is_merge && !args.diff_merges && !args.combined && !args.combined_cc;
-    let use_combined_format = args.combined || args.combined_cc || default_merge_patch;
+    // `--first-parent` forces a first-parent (single) diff for merges, suppressing the
+    // default dense-combined merge diff (git's `diff_merges_default_to_first_parent`).
+    let default_merge_patch =
+        is_merge && !args.diff_merges && !args.combined && !args.combined_cc && !args.first_parent;
+    let use_combined_format =
+        (args.combined || args.combined_cc || default_merge_patch) && !args.first_parent;
     let combined_use_cc_word = args.combined_cc || default_merge_patch;
+
+    // Separate a user `--format` header from the following name-only / name-status list with a
+    // blank line (git's behavior). Patch/stat sections emit their own leading separator below.
+    if user_format_header && (args.name_only || args.name_status) && !diff_entries.is_empty() {
+        writeln!(out)?;
+    }
 
     // --name-only: just print file names
     if args.name_only {
@@ -1374,9 +1619,16 @@ fn show_commit(
                 }
                 _ => new_path.to_string(),
             };
+            // Abbreviated OIDs get a trailing `...` when GIT_PRINT_SHA1_ELLIPSIS=yes.
+            let ellipsis =
+                if std::env::var("GIT_PRINT_SHA1_ELLIPSIS").ok().as_deref() == Some("yes") {
+                    "..."
+                } else {
+                    ""
+                };
             writeln!(
                 out,
-                ":{} {} {} {} {status_str}\t{paths}",
+                ":{} {} {}{ellipsis} {}{ellipsis} {status_str}\t{paths}",
                 entry.old_mode,
                 entry.new_mode,
                 &entry.old_oid.to_hex()[..7],
@@ -1409,9 +1661,16 @@ fn show_commit(
             args.stat_count,
             &config,
         )?;
+        // `--summary` emits create/delete mode, mode-change, and rename/copy lines after the
+        // diffstat. `--patch-with-stat` alone does NOT imply `--summary`.
+        if args.summary {
+            write_show_summary_lines(out, &diff_entries)?;
+        }
         if !show_patch {
             return Ok(());
         }
+        // A blank line separates the stat/summary block from the following patch.
+        writeln!(out)?;
     }
 
     if !show_patch {
@@ -1652,6 +1911,54 @@ fn show_commit(
     Ok(())
 }
 
+/// Write git's `--summary` lines (create/delete mode, mode change, rename/copy) for the
+/// given diff entries.
+fn write_show_summary_lines(
+    out: &mut impl Write,
+    entries: &[grit_lib::diff::DiffEntry],
+) -> Result<()> {
+    use grit_lib::diff::DiffStatus;
+    for entry in entries {
+        match entry.status {
+            DiffStatus::Added => {
+                writeln!(out, " create mode {} {}", entry.new_mode, entry.path())?;
+            }
+            DiffStatus::Deleted => {
+                writeln!(out, " delete mode {} {}", entry.old_mode, entry.path())?;
+            }
+            DiffStatus::Modified | DiffStatus::TypeChanged if entry.old_mode != entry.new_mode => {
+                writeln!(
+                    out,
+                    " mode change {} => {} {}",
+                    entry.old_mode,
+                    entry.new_mode,
+                    entry.path()
+                )?;
+            }
+            DiffStatus::Renamed => {
+                let sim = entry.score.unwrap_or(100);
+                writeln!(
+                    out,
+                    " rename {} => {} ({sim}%)",
+                    entry.old_path.as_deref().unwrap_or(""),
+                    entry.new_path.as_deref().unwrap_or("")
+                )?;
+            }
+            DiffStatus::Copied => {
+                let sim = entry.score.unwrap_or(100);
+                writeln!(
+                    out,
+                    " copy {} => {} ({sim}%)",
+                    entry.old_path.as_deref().unwrap_or(""),
+                    entry.new_path.as_deref().unwrap_or("")
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Write a diffstat summary for the given diff entries.
 /// Write a single numstat line for an entry.
 fn write_numstat_line(
@@ -1754,6 +2061,7 @@ fn write_diffstat(
                 insertions: added,
                 deletions: deleted,
                 is_binary: true,
+                is_unmerged: false,
             });
         } else {
             let old_content = String::from_utf8_lossy(&old_raw).into_owned();
@@ -1764,6 +2072,7 @@ fn write_diffstat(
                 insertions: ins,
                 deletions: del,
                 is_binary: false,
+                is_unmerged: false,
             });
         }
     }
@@ -1912,6 +2221,7 @@ fn show_tag(
                 None,
                 None,
                 indent_heuristic,
+                false,
             )?;
         }
         ObjectKind::Tag => {
@@ -1957,7 +2267,7 @@ pub(crate) fn format_commit_placeholder(
     apply_format_string(template, oid, commit, None, 0)
 }
 
-fn apply_format_string(
+pub(crate) fn apply_format_string(
     template: &str,
     oid: &ObjectId,
     commit: &grit_lib::objects::CommitData,
@@ -2458,7 +2768,7 @@ fn collect_tree_entries_recursive(
 }
 
 /// Load notes from the configured notes ref (or `refs/notes/commits` default).
-fn load_notes_map(repo: &Repository) -> HashMap<ObjectId, Vec<u8>> {
+pub(crate) fn load_notes_map(repo: &Repository) -> HashMap<ObjectId, Vec<u8>> {
     use grit_lib::config::ConfigSet;
     use grit_lib::refs::resolve_ref;
 

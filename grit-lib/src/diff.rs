@@ -62,15 +62,95 @@ fn histogram_unified_body_raw(
     context_lines: usize,
     inter_hunk_context: usize,
 ) -> String {
-    use imara_diff::{Algorithm, BasicLineDiffPrinter, Diff, InternedInput, UnifiedDiffConfig};
+    use imara_diff::{Algorithm, Diff, Hunk, InternedInput};
+    use std::fmt::Write as _;
 
     let input = InternedInput::new(old_content, new_content);
     let mut diff = Diff::compute(Algorithm::Histogram, &input);
     diff.postprocess_lines(&input);
-    let mut config = UnifiedDiffConfig::default();
-    config.context_len(imara_context_len_for_git(context_lines, inter_hunk_context));
-    let printer = BasicLineDiffPrinter(&input.interner);
-    diff.unified_diff(&printer, config, &input).to_string()
+
+    // Assemble hunks ourselves: imara's `UnifiedDiff` printer starts the first
+    // hunk's context at line 0 whenever the first change is within
+    // `2 * context_len` of the file start, emitting more leading context than
+    // its own header claims (t4061), and its gap threshold cannot express
+    // Git's odd `2 * U + inter_hunk_context` fuse limits (t4032).
+    let hunks: Vec<Hunk> = diff.hunks().collect();
+    if hunks.is_empty() {
+        return String::new();
+    }
+
+    let ctx = context_lines.min(u32::MAX as usize) as u32;
+    let max_gap = (2usize.saturating_mul(context_lines))
+        .saturating_add(inter_hunk_context)
+        .min(u32::MAX as usize) as u32;
+    let before_len = input.before.len() as u32;
+    let after_len = input.after.len() as u32;
+
+    // Fuse hunks whose unchanged gap is at most `max_gap` (Git xdl_get_hunk).
+    let mut groups: Vec<&[Hunk]> = Vec::new();
+    let mut group_start = 0usize;
+    for i in 1..hunks.len() {
+        if hunks[i].before.start - hunks[i - 1].before.end > max_gap {
+            groups.push(&hunks[group_start..i]);
+            group_start = i;
+        }
+    }
+    groups.push(&hunks[group_start..]);
+
+    fn push_line(out: &mut String, prefix: char, text: &str) {
+        out.push(prefix);
+        out.push_str(text);
+        if !text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    // Git hunk header range: 1-based start (the preceding line when the range
+    // is empty) with the `,count` part omitted when the count is exactly 1.
+    fn fmt_side(start: u32, count: u32) -> String {
+        let shown_start = if count == 0 { start } else { start + 1 };
+        if count == 1 {
+            format!("{shown_start}")
+        } else {
+            format!("{shown_start},{count}")
+        }
+    }
+
+    let mut out = String::new();
+    for group in groups {
+        let first = &group[0];
+        let last = &group[group.len() - 1];
+        let b_start = first.before.start.saturating_sub(ctx);
+        let a_start = first.after.start.saturating_sub(ctx);
+        let b_end = (last.before.end.saturating_add(ctx)).min(before_len);
+        let a_end = (last.after.end.saturating_add(ctx)).min(after_len);
+
+        let _ = writeln!(
+            out,
+            "@@ -{} +{} @@",
+            fmt_side(b_start, b_end - b_start),
+            fmt_side(a_start, a_end - a_start)
+        );
+
+        let mut pos = b_start;
+        for hunk in group {
+            for &token in &input.before[pos as usize..hunk.before.start as usize] {
+                push_line(&mut out, ' ', input.interner[token]);
+            }
+            for &token in &input.before[hunk.before.start as usize..hunk.before.end as usize] {
+                push_line(&mut out, '-', input.interner[token]);
+            }
+            for &token in &input.after[hunk.after.start as usize..hunk.after.end as usize] {
+                push_line(&mut out, '+', input.interner[token]);
+            }
+            pos = hunk.before.end;
+        }
+        for &token in &input.before[pos as usize..b_end as usize] {
+            push_line(&mut out, ' ', input.interner[token]);
+        }
+    }
+
+    out
 }
 
 /// Unified diff hunks for Git's histogram algorithm (no `---` / `+++` lines).
@@ -203,6 +283,76 @@ pub fn parse_indent_heuristic_cli_flags(argv: &[String]) -> (bool, bool) {
         }
     }
     (indent_heuristic, no_indent_heuristic)
+}
+
+/// Diff two token streams with imara's Myers implementation (Git's default xdiff engine) and
+/// return the result as `similar::DiffOp`s. Used by the word-diff machinery, where matching
+/// Git's exact LCS tie-breaking matters (`similar`'s Myers picks different — but equally
+/// minimal — alignments, mismatching Git's reference output for e.g. the `ada` driver).
+#[must_use]
+pub fn word_diff_ops_imara(old_words: &[&str], new_words: &[&str]) -> Vec<similar::DiffOp> {
+    use imara_diff::{Algorithm, Diff, InternedInput};
+    use similar::DiffOp;
+
+    let mut input: InternedInput<&str> = InternedInput::default();
+    input.update_before(old_words.iter().copied());
+    input.update_after(new_words.iter().copied());
+    let mut diff = Diff::compute(Algorithm::Myers, &input);
+    diff.postprocess_lines(&input);
+
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut old_pos = 0usize;
+    let mut new_pos = 0usize;
+    for hunk in diff.hunks() {
+        let b_start = hunk.before.start as usize;
+        let b_end = hunk.before.end as usize;
+        let a_start = hunk.after.start as usize;
+        let a_end = hunk.after.end as usize;
+        if b_start > old_pos {
+            let len = b_start - old_pos;
+            ops.push(DiffOp::Equal {
+                old_index: old_pos,
+                new_index: new_pos,
+                len,
+            });
+            old_pos += len;
+            new_pos += len;
+        }
+        let del = b_end - b_start;
+        let ins = a_end - a_start;
+        if del > 0 && ins > 0 {
+            ops.push(DiffOp::Replace {
+                old_index: b_start,
+                old_len: del,
+                new_index: a_start,
+                new_len: ins,
+            });
+        } else if del > 0 {
+            ops.push(DiffOp::Delete {
+                old_index: b_start,
+                old_len: del,
+                new_index: a_start,
+            });
+        } else if ins > 0 {
+            ops.push(DiffOp::Insert {
+                old_index: b_start,
+                new_index: a_start,
+                new_len: ins,
+            });
+        }
+        old_pos = b_end;
+        new_pos = a_end;
+    }
+    if old_pos < old_words.len() {
+        ops.push(DiffOp::Equal {
+            old_index: old_pos,
+            new_index: new_pos,
+            len: old_words.len() - old_pos,
+        });
+    }
+    // Slide changed runs to Git's canonical position (`xdl_change_compact`); the word
+    // diff never enables the indent heuristic.
+    diff_indent_heuristic::apply_change_compact_to_ops(&ops, old_words, new_words, false)
 }
 
 /// Line-diff ops for string slices after Git `xdl_change_compact` (and optional indent heuristic).
@@ -1964,6 +2114,17 @@ pub fn detect_renames(
         let del = &deleted[*di];
         let add = &added[*ai];
 
+        // A "rename" whose source and destination are the same path with the
+        // same blob is not a change at all (this arises with pathological
+        // duplicate tree entries, t4058). Git pairs and then drops it, leaving
+        // no diff entry; mirror that by skipping emission.
+        if del.old_path == add.new_path
+            && del.old_oid == add.new_oid
+            && del.old_mode == add.new_mode
+        {
+            continue;
+        }
+
         renames.push(DiffEntry {
             status: DiffStatus::Renamed,
             old_path: del.old_path.clone(),
@@ -2470,7 +2631,20 @@ pub fn format_raw_abbrev(entry: &DiffEntry, abbrev_len: usize) -> String {
     let old_abbrev = &old_hex[..abbrev_len.min(old_hex.len())];
     let new_abbrev = &new_hex[..abbrev_len.min(new_hex.len())];
 
-    let path = entry.path();
+    // Renames/copies carry a similarity score and a `<old>\t<new>` path pair.
+    let path = match entry.status {
+        DiffStatus::Renamed | DiffStatus::Copied => format!(
+            "{}\t{}",
+            entry.old_path.as_deref().unwrap_or(""),
+            entry.new_path.as_deref().unwrap_or("")
+        ),
+        _ => entry.path().to_owned(),
+    };
+    let status_str = match (entry.status, entry.score) {
+        (DiffStatus::Renamed, Some(s)) => format!("R{s:03}"),
+        (DiffStatus::Copied, Some(s)) => format!("C{s:03}"),
+        _ => entry.status.letter().to_string(),
+    };
 
     format!(
         ":{} {} {}{} {}{} {}\t{}",
@@ -2480,7 +2654,7 @@ pub fn format_raw_abbrev(entry: &DiffEntry, abbrev_len: usize) -> String {
         ellipsis,
         new_abbrev,
         ellipsis,
-        entry.status.letter(),
+        status_str,
         path
     )
 }
@@ -2643,7 +2817,7 @@ pub fn unified_diff_with_prefix_and_funcname_and_algorithm(
     }
 
     use crate::quote_path::format_diff_path_with_prefix;
-    use similar::{group_diff_ops, udiff::UnifiedDiffHunk, TextDiff};
+    use similar::{udiff::UnifiedDiffHunk, TextDiff};
 
     let diff = TextDiff::configure()
         .algorithm(algorithm)
@@ -2687,15 +2861,15 @@ pub fn unified_diff_with_prefix_and_funcname_and_algorithm(
 
     let old_lines: Vec<&str> = old_content.lines().collect();
 
-    // `similar::group_diff_ops` ends a hunk when an unchanged run has length > `2 * n`.
     // Git's xdiff merges adjacent changes while the gap between them in the old file is at most
-    // `2 * context_lines + inter_hunk_context` (see `xdl_get_hunk` in xemit.c). Match that by
-    // choosing `n` so `2 * n` equals that maximum merged gap (rounded up when the sum is odd).
+    // `2 * context_lines + inter_hunk_context` (see `xdl_get_hunk` in xemit.c).
+    // `similar::group_diff_ops` couples the split threshold and the displayed edge context to a
+    // single radius (split at `> 2n`), which over-merges when the gap limit is odd
+    // (t4032: `-U0 --inter-hunk-context=1` with 2 common lines must stay 2 hunks).
     let max_common_gap = context_lines
         .saturating_mul(2)
         .saturating_add(inter_hunk_context);
-    let group_radius = max_common_gap.div_ceil(2);
-    let op_groups = group_diff_ops(compacted_ops, group_radius);
+    let op_groups = group_diff_ops_gap(compacted_ops, context_lines, max_common_gap);
 
     for ops in op_groups {
         if ops.is_empty() {
@@ -2727,6 +2901,76 @@ pub fn unified_diff_with_prefix_and_funcname_and_algorithm(
     }
 
     output
+}
+
+/// Group diff ops into hunks like Git's `xdl_get_hunk`: two changes merge into one hunk while
+/// the run of unchanged lines between them is at most `max_common_gap`
+/// (`2 * context + inter_hunk_context`), and each hunk keeps at most `context` unchanged lines
+/// at its edges. Unlike `similar::group_diff_ops`, the split threshold is decoupled from the
+/// edge context so odd gap limits group exactly like Git.
+fn group_diff_ops_gap(
+    mut ops: Vec<similar::DiffOp>,
+    context: usize,
+    max_common_gap: usize,
+) -> Vec<Vec<similar::DiffOp>> {
+    use similar::DiffOp;
+    if ops.is_empty() {
+        return vec![];
+    }
+
+    let mut pending_group = Vec::new();
+    let mut rv = Vec::new();
+
+    if let Some(DiffOp::Equal {
+        old_index,
+        new_index,
+        len,
+    }) = ops.first_mut()
+    {
+        let offset = (*len).saturating_sub(context);
+        *old_index += offset;
+        *new_index += offset;
+        *len -= offset;
+    }
+
+    if let Some(DiffOp::Equal { len, .. }) = ops.last_mut() {
+        *len -= (*len).saturating_sub(context);
+    }
+
+    for op in ops.into_iter() {
+        if let DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = op
+        {
+            // End the current group and start a new one whenever the unchanged
+            // run is too long to fuse the surrounding changes.
+            if len > max_common_gap {
+                pending_group.push(DiffOp::Equal {
+                    old_index,
+                    new_index,
+                    len: context,
+                });
+                rv.push(pending_group);
+                let offset = len.saturating_sub(context);
+                pending_group = vec![DiffOp::Equal {
+                    old_index: old_index + offset,
+                    new_index: new_index + offset,
+                    len: len - offset,
+                }];
+                continue;
+            }
+        }
+        pending_group.push(op);
+    }
+
+    match &pending_group[..] {
+        &[] | &[similar::DiffOp::Equal { .. }] => {}
+        _ => rv.push(pending_group),
+    }
+
+    rv
 }
 
 /// `git diff -W`: expand each hunk to include full function bodies (see Git `xemit.c`).
@@ -3700,10 +3944,12 @@ fn extract_function_context(
     let start_line: usize = start_str.parse().ok()?;
 
     // Parse the old line count; "@@ -<start>,<count> ..." (no comma means count 1).
-    let old_count: usize = if let Some(comma) = rest.find(',') {
-        let after = &rest[comma + 1..];
-        let end = after.find([' ', '\t']).unwrap_or(after.len());
-        after[..end].parse().unwrap_or(1)
+    // Only look for the comma inside the old-range token itself — searching the
+    // whole remainder would pick up the comma from the new side (e.g. "+0,0").
+    let old_token_end = rest.find([' ', '\t']).unwrap_or(rest.len());
+    let old_token = &rest[..old_token_end];
+    let old_count: usize = if let Some(comma) = old_token.find(',') {
+        old_token[comma + 1..].parse().unwrap_or(1)
     } else {
         1
     };
