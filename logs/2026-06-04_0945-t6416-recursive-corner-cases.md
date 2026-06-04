@@ -26,3 +26,9 @@ Progress:
 - Ran `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose`; improved to
   31/40 passing, 6 failing, with 3 expected failures. Newly passing: D1/E4. Remaining
   ordinary failures: 28, 30, 32, 34, 38, and 40.
+- Fixed symlink add/add virtual-base materialization so unresolved symlink pairs are omitted from
+  the synthetic ancestor instead of creating a stage-1 symlink entry in the final criss-cross
+  conflict.
+- Ran `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose`; improved to
+  32/40 passing, 5 failing, with 3 expected failures. Newly passing: symlink add/add. Remaining
+  ordinary failures: 30, 32, 34, 38, and 40.

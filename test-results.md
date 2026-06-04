@@ -1,3 +1,15 @@
+## 2026-06-04 — t6416 symlink add/add virtual base
+
+- Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from
+  31/40 to 32/40 after symlink add/add conflicts stopped materializing a synthetic stage-1 entry
+  in recursive virtual merge bases.
+- `cargo build --release -p grit-cli` completed with the existing warning backlog.
+- `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`, and
+  `cargo test -p grit-lib --lib` completed with the existing warning backlog; unrelated
+  clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
 ## 2026-06-04 — t6416 rename/rename(1to2) content
 
 - Focus harness: `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose` improved from

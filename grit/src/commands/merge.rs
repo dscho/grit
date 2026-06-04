@@ -1653,6 +1653,17 @@ pub(crate) fn create_virtual_merge_base(
                 let Some(e2) = entries_at.iter().find(|e| e.stage() == 2).copied() else {
                     continue;
                 };
+                // Symlink add/add conflicts have no stable virtual-base winner; omitting
+                // the path lets the outer criss-cross merge surface stage 2/3 only.
+                if add_add
+                    && e2.mode == MODE_SYMLINK
+                    && entries_at
+                        .iter()
+                        .find(|e| e.stage() == 3)
+                        .is_some_and(|e| e.mode == MODE_SYMLINK)
+                {
+                    continue;
+                }
                 let mut e = e2.clone();
                 if let Some(content) = conflict_content_map.get(&path) {
                     e.oid = repo.odb.write(ObjectKind::Blob, content)?;
