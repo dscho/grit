@@ -277,8 +277,9 @@
     origin fixtures to accept checked-out branch updates safely.
   - Completed `t5312-prune-corruption.sh` (11/11) by making prune/repack fail safe on
     invalid or broken loose refs under ref paranoia.
-  - Partial progress on `t5537-fetch-shallow.sh`: now 14/16 after fixing update-shallow
-    submodule recursion handling; final repack/connectivity shallow cases remain.
+  - Partial progress on `t5537-fetch-shallow.sh`: now 15/16 after fixing update-shallow
+    submodule recursion handling and forwarding `repack -f` to `pack-objects --no-reuse-delta`;
+    final HTTP one-time-script shallow connectivity case remains.
   - Execution log: `logs/2026-06-03_2000-t5-family.md`.
 
 ---

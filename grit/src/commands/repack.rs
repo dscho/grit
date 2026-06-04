@@ -487,12 +487,12 @@ pub fn run(args: Args) -> Result<()> {
                 cmd.arg("-q");
             }
             if args.aggressive {
-                cmd.arg("-f");
+                cmd.arg("--no-reuse-delta");
                 cmd.arg("--window").arg("250");
                 cmd.arg("--depth").arg("250");
             } else {
                 if args.force {
-                    cmd.arg("-f");
+                    cmd.arg("--no-reuse-delta");
                 }
                 if let Some(w) = args.window {
                     cmd.arg("--window").arg(w.to_string());
@@ -1342,12 +1342,12 @@ fn run_pack_objects_stdin(
         cmd.arg("--no-write-bitmap-index");
     }
     if args.aggressive {
-        cmd.arg("-f");
+        cmd.arg("--no-reuse-delta");
         cmd.arg("--window").arg("250");
         cmd.arg("--depth").arg("250");
     } else {
         if args.force {
-            cmd.arg("-f");
+            cmd.arg("--no-reuse-delta");
         }
         if let Some(w) = args.window {
             cmd.arg("--window").arg(w.to_string());
@@ -1497,12 +1497,12 @@ fn run_filtered_followup_pack_objects(
         cmd.arg("-q");
     }
     if args.aggressive {
-        cmd.arg("-f");
+        cmd.arg("--no-reuse-delta");
         cmd.arg("--window").arg("250");
         cmd.arg("--depth").arg("250");
     } else {
         if args.force {
-            cmd.arg("-f");
+            cmd.arg("--no-reuse-delta");
         }
         if let Some(w) = args.window {
             cmd.arg("--window").arg(w.to_string());
