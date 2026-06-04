@@ -1509,3 +1509,14 @@ Updated: 2026-06-01
 - Remaining `t3418` failures: tests 8, 20, 23, 24, and 26.
 - Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
   grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).
+
+## 2026-06-04 — t3418-rebase-continue in-progress option partial
+
+- Harness `t3418-rebase-continue.sh` remains 25/30 after conflict continuations began invoking the
+  commit-message editor and in-progress `--edit-todo --no-reschedule-failed-exec` began returning
+  status 129.
+- Related verification: `./scripts/run-tests.sh t3418-rebase-continue.sh
+  t3422-rebase-incompatible-options.sh` kept `t3422` green at 52/52.
+- Remaining `t3418` failures: tests 8, 20, 23, 24, and 26.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty -p
+  grit-cli`, and `cargo test -p grit-lib --lib` completed (pre-existing warnings remain).

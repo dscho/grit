@@ -118,7 +118,8 @@
     merge todo comment parsing are fixed, and failed exec rescheduling now works for requested /
     configured modes. Current harness count is 25/30; remaining work is skipped fixup message
     cleanup, patch cleanup before `break`, no-reschedule continuation edge cases, and
-    conflict-message editor/comment handling.
+    conflict-message editor/comment handling; in-progress `--edit-todo --no-reschedule-failed-exec`
+    now rejects with status 129.
   - Execution log: `logs/2026-06-03_t3-family.md`.
 
 ## Active task — t6 family 100% pass
