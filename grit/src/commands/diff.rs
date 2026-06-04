@@ -3709,6 +3709,74 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    // `--quiet` suppressed the patch block above, so the external driver never
+    // ran. Git still invokes it (with stdout discarded) to learn `found_changes`
+    // from the exit code when an external diff is configured (t4020 #56-#64).
+    if quiet_suppresses_stdout && (args.exit_code || args.quiet) && !args.no_ext_diff {
+        let diff_config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
+            .unwrap_or_default();
+        let env_cfg_ext = resolve_env_config_external_diff(&diff_config);
+        // Run when env/config OR any attribute driver could apply.
+        let any_attr_driver = entries.iter().any(|e| {
+            grit_lib::merge_diff::diff_attr_external_driver(
+                &repo.git_dir,
+                &diff_config,
+                e.path(),
+            )
+            .is_some()
+        });
+        if env_cfg_ext.is_some() || any_attr_driver {
+            let mut sink = io::sink();
+            let empty_sm: HashMap<String, String> = HashMap::new();
+            let empty_gm: HashMap<String, String> = HashMap::new();
+            let summary = write_patch_with_prefix(
+                &mut sink,
+                &repo,
+                &entries,
+                &repo.odb,
+                &repo.git_dir,
+                &diff_config,
+                3,
+                false,
+                None,
+                wt_for_content,
+                false,
+                7,
+                0,
+                args.binary,
+                args.break_rewrites,
+                args.irreversible_delete,
+                !args.no_textconv,
+                &src_prefix,
+                &dst_prefix,
+                quote_path_fully,
+                args.submodule.as_deref(),
+                submodule_ignore_flags_from_diff_arg(ignore_sm.unwrap_or("none")),
+                ignore_sm,
+                &diff_config,
+                &path_to_sm_name,
+                &gm_sub_ignore,
+                line_ignore,
+                &ws_mode,
+                &diff_algo_ctx,
+                diff_algo_cli,
+                args.cached,
+                args.function_context,
+                args.no_ext_diff,
+                env_cfg_ext.as_ref().map(|(c, t)| (c.as_str(), *t)),
+                false,
+                relative_prefix_for_paths.as_deref(),
+                indent_heuristic,
+            )?;
+            if let Some(path) = summary.died_path {
+                eprintln!("fatal: external diff died, stopping at {path}");
+                std::process::exit(128);
+            }
+            ext_found_changes = summary.found_changes;
+            ext_diff_ran = true;
+        }
+    }
+
     if args.exit_code || args.quiet {
         // With an external driver, Git's `found_changes` (driven by the driver's
         // exit code under trustExitCode) overrides the entry-derived `has_diff`.
