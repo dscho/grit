@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
+use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::config::ConfigSet;
 use grit_lib::error::Error as GustError;
 use grit_lib::git_date::show::{date_mode_release, parse_date_format, show_date};
@@ -699,6 +700,11 @@ fn collect_loose_refs(
         if file_type.is_dir() {
             collect_loose_refs(git_dir, &entry.path(), &next_relative, out)?;
         } else if file_type.is_file() {
+            if check_refname_format(&next_relative, &RefNameOptions::default()).is_err() {
+                eprintln!("warning: ignoring ref with broken name {next_relative}");
+                out.remove(&next_relative);
+                continue;
+            }
             match read_loose_ref_oid(git_dir, &next_relative, &entry.path()) {
                 Ok(Some((oid, object_name, symref_target))) => {
                     out.insert(
@@ -736,6 +742,9 @@ fn read_loose_ref_oid(
     }
     if raw.starts_with("ref: ") {
         let target = raw["ref: ".len()..].trim().to_owned();
+        if check_refname_format(&target, &RefNameOptions::default()).is_err() {
+            return Ok(None);
+        }
         return match grit_lib::refs::resolve_ref(git_dir, refname) {
             Ok(oid) => Ok(Some((Some(oid), oid.to_string(), Some(target)))),
             Err(_) => Ok(None),

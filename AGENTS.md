@@ -109,7 +109,7 @@ On each iteration:
 8. After meaningful test runs, comment the resulting pass counts on the ticket (e.g. `ti comment "t3404: 92/132 after reword fix"`).
 9. Update this file only if you discover durable run/build/test knowledge.
 10. Update the log for this task as you go.
-11. Commit whenever an increment is coherent and validated, using **GitButler** (`but` — see **Committing** below), staging only the files you changed onto your ticket branch.
+11. Commit whenever an increment is coherent and validated, using **GitButler** (`but` — see **Committing** below), staging only the files you changed onto the existing workspace branch (never a new branch).
 12. Close the ticket **only after the work is committed**: `but commit` first, then `ti comment` with the commit SHA and final pass count, then `ti close <id>`. A closed ticket with uncommitted work is lost work — never close without a commit.
 13. Immediately continue to the next item unless the repo is truly complete, blocked, unsafe, or user-stopped.
 
@@ -219,25 +219,25 @@ This repository runs in **GitButler workspace mode** (the checked-out branch is 
 
 Before committing, always run `cargo fmt` and `cargo clippy --fix --allow-dirty` and ensure no warnings remain (`cargo test -p grit-lib --lib` must pass).
 
-**Per-ticket flow — commit BEFORE you `ti close`:**
+**Use the single existing workspace branch — do NOT create a branch per ticket or per commit.** Run `but status` first: if a branch is already applied in the workspace, that is the branch you commit to. Only if the workspace has no branch at all, create one with `but branch new` (once), and keep using it for all subsequent commits.
+
+**Commit flow — commit BEFORE you `ti close`:**
 
 ```bash
-but branch new <ticket-stem>          # e.g. but branch new t6436-merge-overwrite
-but status                            # see your modified files (and their short IDs)
+but status                            # find the existing workspace branch; see your modified files
 but stage <file> <branch>             # repeat for EACH file YOU changed, incl. the data/tests/ TOML
 but commit <branch> --only -m "fix: make t6436-merge-overwrite fully pass"
-ti comment -t <id> "committed <sha> on <branch>; 18/18 passing"
+ti comment -t <id> "committed <sha>; 18/18 passing"
 ti close <id>
 ```
 
 Rules:
 
-- **Always `--only`.** Several agents share this working copy; a bare `but commit` sweeps every unassigned change in the workspace — including other agents' in-flight work. Stage exactly the files you touched to your own branch and commit only those.
-- One branch per ticket, named after the test stem. Stage your `data/tests/<group>/<stem>.toml` update and your `logs/` work log along with the code.
-- Follow-up fixes for the same ticket: stage to the same branch and `but commit <branch> --only` again (or `but absorb`/`but rub` to amend into the prior commit).
+- **Always `--only`.** Several agents share this working copy; a bare `but commit` sweeps every unassigned change in the workspace — including other agents' in-flight work. Stage exactly the files you touched and commit only those.
+- **One shared branch, many commits.** Every ticket's work is its own commit (or a few) on the existing branch — never a new branch. Stage your `data/tests/<group>/<stem>.toml` update and your `logs/` work log along with the code.
+- Follow-up fixes for the same ticket: stage to the same branch and `but commit <branch> --only` again (or `but absorb`/`but rub` to amend into your earlier commit).
 - Partial progress is still worth committing — commit coherent increments as you go; do not wait for fully-passing to make your first commit.
 - If `but status` shows changes you do not recognize, leave them alone — they belong to another agent.
-- Optionally open a review linked to the ticket: `ti review new --branch <branch> --ticket <id>`.
 
 After running passing harness tests, regenerate dashboards only when needed: pass `--dashboard` to `run-tests.sh` or run `python3 scripts/generate-dashboard-from-test-files.py`.
 

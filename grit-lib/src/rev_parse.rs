@@ -20,6 +20,7 @@ use crate::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use crate::pack;
 use crate::reflog::read_reflog;
 use crate::refs;
+use crate::check_ref_format::{check_refname_format, RefNameOptions};
 use crate::repo::Repository;
 
 /// Return `Some(repo)` when a repository can be discovered at `start`.
@@ -1041,6 +1042,39 @@ pub fn resolve_revision_as_commit_without_index_dwim(
     }
     let oid = resolve_revision_for_range_end_without_index_dwim(repo, spec)?;
     peel_to_commit_for_merge_base(repo, oid)
+}
+
+fn resolve_ref_dwim_for_rev_parse(repo: &Repository, spec: &str) -> (usize, Option<ObjectId>) {
+    const RULES: &[&str] = &[
+        "{0}",
+        "refs/{0}",
+        "refs/tags/{0}",
+        "refs/heads/{0}",
+        "refs/remotes/{0}",
+        "refs/remotes/{0}/HEAD",
+    ];
+
+    let mut count = 0usize;
+    let mut first = None;
+    let refname_opts = RefNameOptions::default();
+    for rule in RULES {
+        let candidate = rule.replace("{0}", spec);
+        if let Ok(Some(target)) = refs::read_symbolic_ref(&repo.git_dir, &candidate) {
+            if check_refname_format(&target, &refname_opts).is_err()
+                || refs::resolve_ref(&repo.git_dir, &target).is_err()
+            {
+                eprintln!("warning: ignoring dangling symref {candidate}");
+                continue;
+            }
+        }
+        if let Ok(oid) = refs::resolve_ref(&repo.git_dir, &candidate) {
+            count += 1;
+            if first.is_none() {
+                first = Some(oid);
+            }
+        }
+    }
+    (count, first)
 }
 
 fn resolve_revision_impl(
@@ -2227,7 +2261,7 @@ fn resolve_base(
         }
     }
 
-    let (dwim_count, dwim_oid) = refs::resolve_ref_dwim(&repo.git_dir, spec);
+    let (dwim_count, dwim_oid) = resolve_ref_dwim_for_rev_parse(repo, spec);
     if dwim_count > 1 {
         eprintln!("warning: refname '{spec}' is ambiguous.");
     }
