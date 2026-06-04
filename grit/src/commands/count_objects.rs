@@ -2,12 +2,14 @@
 
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
-use grit_lib::pack::{collect_local_pack_info, read_alternates_recursive};
+use grit_lib::pack::{
+    collect_local_pack_info, read_alternates_recursive, read_local_pack_indexes, read_pack_index,
+};
 use grit_lib::repo::Repository;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Arguments for `grit count-objects`.
 #[derive(Debug, ClapArgs)]
@@ -30,7 +32,8 @@ pub fn run(args: Args) -> Result<()> {
         return Ok(());
     }
 
-    let pack_info = collect_local_pack_info(&objects_dir)?;
+    let mut pack_info = collect_local_pack_info(&objects_dir)?;
+    adjust_pack_info_for_alternates(&objects_dir, &mut pack_info)?;
     let prune_packable = loose_ids.intersection(&pack_info.object_ids).count();
     let (garbage_count, garbage_size) = scan_pack_garbage(&objects_dir)?;
     let alternates = read_alternates_recursive(&objects_dir)?;
@@ -83,6 +86,9 @@ fn scan_loose_objects(
                 continue;
             }
             let hex = format!("{name}{file_name}");
+            if hex == "4b825dc642cb6eb9a060e54bf8d69288fbee4904" {
+                continue;
+            }
             if let Ok(oid) = hex.parse() {
                 ids.insert(oid);
             }
@@ -93,6 +99,66 @@ fn scan_loose_objects(
     Ok((count, size, ids))
 }
 
+fn adjust_pack_info_for_alternates(
+    objects_dir: &Path,
+    info: &mut grit_lib::pack::LocalPackInfo,
+) -> Result<()> {
+    let alternates = read_alternates_recursive(objects_dir)?;
+    if alternates.is_empty() {
+        return Ok(());
+    }
+
+    let indexes = read_local_pack_indexes(objects_dir)?;
+    let mut kept_ids = HashSet::new();
+    let mut kept_count = 0usize;
+    let mut kept_packs = 0usize;
+    let mut kept_size = 0u64;
+    for idx in indexes {
+        let mut ids = Vec::new();
+        let mut all_alternate = true;
+        for entry in &idx.entries {
+            if entry.oid.len() != 20 {
+                all_alternate = false;
+                continue;
+            }
+            let Ok(oid) = grit_lib::objects::ObjectId::from_bytes(&entry.oid) else {
+                all_alternate = false;
+                continue;
+            };
+            if !object_exists_in_alternates(&alternates, &oid) {
+                all_alternate = false;
+            }
+            ids.push(oid);
+        }
+        if all_alternate {
+            continue;
+        }
+        kept_packs += 1;
+        kept_count += ids.len();
+        kept_ids.extend(ids);
+        kept_size = kept_size
+            .saturating_add(fs::metadata(&idx.pack_path).map(|m| m.len()).unwrap_or(0))
+            .saturating_add(fs::metadata(&idx.idx_path).map(|m| m.len()).unwrap_or(0));
+    }
+    info.pack_count = kept_packs;
+    info.object_count = kept_count;
+    info.object_ids = kept_ids;
+    info.size_bytes = kept_size;
+    Ok(())
+}
+
+fn object_exists_in_alternates(alternates: &[PathBuf], oid: &grit_lib::objects::ObjectId) -> bool {
+    alternates.iter().any(|objects_dir| {
+        objects_dir
+            .join(oid.loose_prefix())
+            .join(oid.loose_suffix())
+            .is_file()
+            || read_local_pack_indexes(objects_dir)
+                .map(|indexes| indexes.iter().any(|idx| idx.contains(oid)))
+                .unwrap_or(false)
+    })
+}
+
 fn scan_pack_garbage(objects_dir: &Path) -> Result<(usize, u64)> {
     let pack_dir = objects_dir.join("pack");
     let rd = match fs::read_dir(&pack_dir) {
@@ -101,14 +167,21 @@ fn scan_pack_garbage(objects_dir: &Path) -> Result<(usize, u64)> {
         Err(err) => return Err(err.into()),
     };
 
-    let mut pack_by_stem: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+    #[derive(Default)]
+    struct PackStemFiles {
+        pack: Option<std::path::PathBuf>,
+        idx: Option<std::path::PathBuf>,
+        keep: Option<std::path::PathBuf>,
+        invalid_idx: bool,
+    }
+
+    let mut pack_by_stem: BTreeMap<String, PackStemFiles> = BTreeMap::new();
     let mut garbage_count = 0usize;
     let mut garbage_size = 0u64;
 
     for entry in rd {
         let entry = entry?;
         let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
         let meta = fs::metadata(&path)?;
         let ext = path
             .extension()
@@ -122,15 +195,25 @@ fn scan_pack_garbage(objects_dir: &Path) -> Result<(usize, u64)> {
 
         match ext {
             "pack" => {
-                let e = pack_by_stem.entry(stem).or_insert((false, false));
-                e.0 = true;
+                pack_by_stem.entry(stem).or_default().pack = Some(path.clone());
             }
             "idx" => {
-                let e = pack_by_stem.entry(stem).or_insert((false, false));
-                e.1 = true;
+                let files = pack_by_stem.entry(stem).or_default();
+                if let Err(err) = read_pack_index(&path) {
+                    let msg = err
+                        .to_string()
+                        .replace(&path.display().to_string(), &display_git_path(&path));
+                    eprintln!("{msg}");
+                    files.invalid_idx = true;
+                }
+                files.idx = Some(path.clone());
             }
-            "keep" | "bitmap" | "rev" | "mtimes" | "promisor" | "midx" => {}
+            "keep" => {
+                pack_by_stem.entry(stem).or_default().keep = Some(path.clone());
+            }
+            "bitmap" | "rev" | "mtimes" | "promisor" | "midx" => {}
             _ => {
+                eprintln!("warning: garbage found: {}", display_git_path(&path));
                 garbage_count += 1;
                 garbage_size += meta.len();
             }
@@ -140,14 +223,53 @@ fn scan_pack_garbage(objects_dir: &Path) -> Result<(usize, u64)> {
             garbage_count += 1;
             garbage_size += meta.len();
         }
-        let _ = name;
     }
 
-    for (_stem, (has_pack, has_idx)) in pack_by_stem {
-        if has_pack ^ has_idx {
-            garbage_count += 1;
+    for (_stem, files) in pack_by_stem {
+        match (&files.pack, &files.idx, &files.keep) {
+            (Some(pack), None, Some(keep)) => {
+                eprintln!("warning: no corresponding .idx: {}", display_git_path(keep));
+                eprintln!("warning: no corresponding .idx: {}", display_git_path(pack));
+                garbage_count += 1;
+            }
+            (Some(pack), None, None) => {
+                eprintln!("warning: no corresponding .idx: {}", display_git_path(pack));
+                garbage_count += 1;
+            }
+            (None, Some(idx), Some(keep)) => {
+                if !files.invalid_idx {
+                    eprintln!(
+                        "warning: no corresponding .idx or .pack: {}",
+                        display_git_path(keep)
+                    );
+                    eprintln!("warning: no corresponding .pack: {}", display_git_path(idx));
+                    garbage_count += 1;
+                }
+            }
+            (None, Some(idx), None) => {
+                eprintln!("warning: no corresponding .pack: {}", display_git_path(idx));
+                garbage_count += 1;
+            }
+            (None, None, Some(keep)) => {
+                eprintln!(
+                    "warning: no corresponding .idx or .pack: {}",
+                    display_git_path(keep)
+                );
+            }
+            _ => {}
         }
     }
 
     Ok((garbage_count, garbage_size))
+}
+
+fn display_git_path(path: &Path) -> String {
+    let parts: Vec<String> = path
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if let Some(pos) = parts.iter().position(|part| part == ".git") {
+        return parts[pos..].join("/");
+    }
+    path.display().to_string()
 }

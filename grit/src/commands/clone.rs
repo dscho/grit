@@ -6,6 +6,7 @@
 use crate::protocol_wire;
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
+use filetime::{set_file_times, FileTime};
 use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::diff::zero_oid;
@@ -677,26 +678,10 @@ pub fn run(mut args: Args) -> Result<()> {
             match open_source_repo(&with_git) {
                 Ok(s) => (s, with_git),
                 Err(_) => {
-                    let without_git = source_path
-                        .to_string_lossy()
-                        .strip_suffix(".git")
-                        .map(PathBuf::from);
-                    if let Some(without_git) = without_git {
-                        match open_source_repo(&without_git) {
-                            Ok(s) => (s, without_git),
-                            Err(_) => {
-                                return Err(anyhow::anyhow!(
-                                    "'{}' does not appear to be a git repository",
-                                    args.repository
-                                ));
-                            }
-                        }
-                    } else {
-                        return Err(anyhow::anyhow!(
-                            "'{}' does not appear to be a git repository",
-                            args.repository
-                        ));
-                    }
+                    return Err(anyhow::anyhow!(
+                        "'{}' does not appear to be a git repository",
+                        args.repository
+                    ));
                 }
             }
         }
@@ -1406,6 +1391,10 @@ pub fn run(mut args: Args) -> Result<()> {
     // needed for the initial checkout must be copied into the clone explicitly.
     // Only for an explicit `--filter=blob:none` clone; cloning a promisor repo without `--filter`
     // inherits metadata (`partial_blob_none`) but must not pre-hydrate (t0411-clone-from-partial).
+    if clone_filter_omits_root_trees(filter_spec.as_deref()) && !args.bare && !args.no_checkout {
+        hydrate_tree_zero_checkout_objects(&dest).context("hydrating tree:0 checkout objects")?;
+    }
+
     if partial_blob_none
         && matches!(filter_spec.as_deref(), Some("blob:none"))
         && !args.bare
@@ -3128,6 +3117,10 @@ fn run_ssh_clone(args: Args) -> Result<()> {
             .context("initializing tree:0 partial-clone promisor state")?;
     }
 
+    if clone_filter_omits_root_trees(filter_spec.as_deref()) && !args.bare && !args.no_checkout {
+        hydrate_tree_zero_checkout_objects(&dest).context("hydrating tree:0 checkout objects")?;
+    }
+
     if partial_blob_none
         && matches!(filter_spec.as_deref(), Some("blob:none"))
         && !args.bare
@@ -4642,7 +4635,14 @@ fn copy_objects(src_git_dir: &Path, dst_git_dir: &Path, try_hardlink: bool) -> R
 /// the directory listing and the copy; aborting the clone in that case would be incorrect.
 fn copy_skip_vanished_source(src: &Path, dst: &Path) -> Result<()> {
     match fs::copy(src, dst) {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            if let Ok(meta) = fs::metadata(src) {
+                let atime = FileTime::from_last_access_time(&meta);
+                let mtime = FileTime::from_last_modification_time(&meta);
+                let _ = set_file_times(dst, atime, mtime);
+            }
+            Ok(())
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
@@ -5469,6 +5469,18 @@ fn materialize_blob_none_partial_layout(dest: &Repository) -> Result<()> {
         let _ = fs::remove_file(loose);
     }
 
+    Ok(())
+}
+
+fn hydrate_tree_zero_checkout_objects(dest: &Repository) -> Result<()> {
+    let dest_config = ConfigSet::load(Some(&dest.git_dir), true)?;
+    let Some(promisor) =
+        crate::commands::promisor_hydrate::find_promisor_source(&dest_config, &dest.git_dir)?
+    else {
+        return Ok(());
+    };
+    crate::commands::promisor_hydrate::hydrate_head_tree_blobs_from_promisor(dest, &promisor)?;
+    crate::commands::promisor_hydrate::trim_promisor_marker_to_missing_local(dest)?;
     Ok(())
 }
 
