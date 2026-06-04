@@ -3886,9 +3886,14 @@ Use '--' to separate paths from revisions, like this:\n\
 
         let mut effective_upstream_for_range = up_oid;
         if let Some(ref fp_spec) = fork_point_reflog_spec {
-            let fp_oid = fork_point(&repo, fp_spec, up_oid, head_oid_early)
-                .with_context(|| format!("fork-point resolution failed for '{fp_spec}'"))?;
-            effective_upstream_for_range = fp_oid;
+            match fork_point(&repo, fp_spec, up_oid, head_oid_early) {
+                Ok(fp_oid) => effective_upstream_for_range = fp_oid,
+                Err(e) if e.to_string().contains("no merge base") => {}
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("fork-point resolution failed for '{fp_spec}'"))
+                }
+            }
         }
 
         let (onto, onto_label) = if let Some(ref onto_spec) = args.onto {
@@ -5950,6 +5955,16 @@ fn cherry_pick_for_rebase(
             idx.entries = theirs_entries.values().cloned().collect();
             idx.sort();
             (idx, Vec::new())
+        } else if commit.parents.is_empty() {
+            let merge_result = three_way_merge_with_content(
+                repo,
+                &base_entries,
+                &ours_entries,
+                &theirs_entries,
+                &conflict_ctx,
+                merge_favor,
+            )?;
+            (merge_result.index, merge_result.conflict_files)
         } else {
             let tree_merge = merge_trees_for_single_cherry_pick(
                 repo,
