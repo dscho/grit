@@ -1633,3 +1633,10 @@ Updated: 2026-06-01
   `cargo test -p grit-lib --lib`. Adjacent official harnesses
   `./scripts/run-tests.sh t6019-rev-list-ancestry-path.sh t6012-rev-list-simplify.sh
   t6111-rev-list-treesame.sh` pass 18/18, 42/42, and 65/65 after the final TREESAME helper split.
+- t6402 rename/directory conflict focus: after making relocated D/F rename content merges work in
+  both directions and preserving pre-render unmerged diff entries for `git diff --quiet` exit-code
+  decisions, `./scripts/run-tests.sh t6402-merge-rename.sh --verbose` improves from 27/46 to
+  28/46 with refreshed `data/test-files.csv` plus dashboards. Also ran `cargo fmt`,
+  `cargo check -p grit-cli`, `cargo build --release -p grit-cli`, `cargo test -p grit-lib --lib`,
+  and `cargo clippy --fix --allow-dirty` (existing warning backlog remains and unrelated
+  auto-fixes were reverted).
