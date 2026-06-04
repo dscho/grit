@@ -11288,10 +11288,16 @@ fn write_commit_diff_body(
         } else {
             writeln!(out)?;
         }
+        // Limit the diffstat to the pathspec-matched entries (git stats only the shown files).
+        let stat_entries: &[DiffEntry] = if merge_stat_from_first_parent {
+            entries
+        } else {
+            &entries_f
+        };
         log_print_stat_summary(
             out,
             odb,
-            entries,
+            stat_entries,
             has_patch,
             args,
             graph_stat_prefix,
