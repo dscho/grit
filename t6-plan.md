@@ -59,7 +59,8 @@ dependency/topic groups. Mark an item `[~]` when claimed and `[x]` only after th
   `merge-base` used first-vs-rest semantics instead of octopus semantics.
 - [x] `t6011-rev-list-with-bad-commit.sh` — 6/6 passing after packed
   object reads and fsck detect corrupt pack entries.
-- [ ] `t6013-rev-list-reverse-parents.sh` — 2/3 passing, 1 failing.
+- [x] `t6013-rev-list-reverse-parents.sh` — 3/3 passing after
+  `--reverse --boundary` prints boundary commits before the reversed commit stream.
 
 Completed rev-list/revision files: `t6004`, `t6005`, `t6007-rev-list-cherry-pick-status`,
 `t6008`, `t6009`, `t6011-rev-list-with-hierarchies`, `t6014`, `t6017`, `t6100`, `t6102`,

@@ -1252,6 +1252,17 @@ pub fn run(args: Args) -> Result<()> {
         }
     };
 
+    let print_boundary_commits = || {
+        for oid in &result.boundary_commits {
+            if zero_terminated {
+                emit_record(&oid.to_string());
+                emit_record("boundary=yes");
+            } else {
+                println!("-{oid}");
+            }
+        }
+    };
+
     let graft_parents = load_graft_parents(&repo.git_dir);
     let selected_for_parent_rewrite: HashSet<ObjectId> = result.commits.iter().copied().collect();
     let rewrite_path_limited_parents = !options.paths.is_empty();
@@ -1416,6 +1427,10 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     if !options.quiet {
+        if options.boundary && options.reverse {
+            print_boundary_commits();
+        }
+
         let interleaved_objects = options.objects
             && options.use_bitmap_index
             && result.per_commit_object_counts.is_empty()
@@ -1541,16 +1556,8 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
-    // Print boundary commits
-    if options.boundary {
-        for oid in &result.boundary_commits {
-            if zero_terminated {
-                emit_record(&oid.to_string());
-                emit_record("boundary=yes");
-            } else {
-                println!("-{oid}");
-            }
-        }
+    if options.boundary && (!options.reverse || options.quiet) {
+        print_boundary_commits();
     }
 
     Ok(())

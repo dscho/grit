@@ -1,3 +1,15 @@
+## 2026-06-04 — t6013-rev-list-reverse-parents
+
+- Focus harness: `./scripts/run-tests.sh t6013-rev-list-reverse-parents.sh --verbose` passes 3/3
+  after `--reverse --boundary` emits boundary commits before the reversed commit stream.
+- Regression harness: `./scripts/run-tests.sh t6013-rev-list-reverse-parents.sh t6138-rev-list-boundary.sh t6001-rev-list-graft.sh t6101-rev-parse-parents.sh t6011-rev-list-with-bad-commit.sh t6012-rev-list-simplify.sh --verbose --timeout 180`
+  passes 3/3, 29/29, 14/14, 38/38, 6/6, and 42/42.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
 ## 2026-06-04 — t6011-rev-list-with-bad-commit
 
 - Focus harness: `./scripts/run-tests.sh t6011-rev-list-with-bad-commit.sh --verbose` passes 6/6
