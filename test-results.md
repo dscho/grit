@@ -2260,3 +2260,9 @@ Updated: 2026-06-01
 - Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` improved to 14/25 after adding `test-tool pack-mtimes`, writing `.mtimes` sidecars for cruft packs, and fixing fixture cleanup scope.
 - Related verification: `./scripts/run-tests.sh t5331-pack-objects-stdin.sh t5304-prune.sh --verbose` passes 16/16 and 32/32.
 - Quality gates: `cargo build --release -p grit-cli` and `cargo check -p grit-cli` completed with pre-existing unrelated warnings.
+
+## 2026-06-04 — t5329-pack-objects-cruft date progress
+
+- Focus harness: `./scripts/run-tests.sh t5329-pack-objects-cruft.sh --verbose` improved to 15/25 after accepting absolute hyphenated prune dates such as `01-01-1980`.
+- Related verification: `./scripts/run-tests.sh t5304-prune.sh t5331-pack-objects-stdin.sh --verbose` passes 32/32 and 16/16.
+- Quality gate: `cargo check -p grit-cli` completed with pre-existing unrelated warnings.

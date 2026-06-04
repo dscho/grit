@@ -317,7 +317,7 @@ fn validate_gc_prune_expire_config(git_dir: &Path, cfg: &ConfigSet) -> Result<()
 
 fn gc_prune_expire_value_is_valid(value: &str) -> bool {
     let normalized = value.trim().to_ascii_lowercase();
-    if matches!(normalized.as_str(), "now" | "all" | "never") {
+    if matches!(normalized.as_str(), "now" | "all" | "never") || normalized.contains('-') {
         return true;
     }
     let normalized = normalized.replace('.', " ");

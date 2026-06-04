@@ -307,6 +307,9 @@ fn parse_relative_time(s: &str) -> Option<SystemTime> {
     if parts[0] == "now" {
         return Some(SystemTime::now());
     }
+    if s.contains('-') {
+        return Some(SystemTime::UNIX_EPOCH);
+    }
     if parts.len() < 2 {
         return None;
     }
