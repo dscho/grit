@@ -4557,6 +4557,15 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let repo = Repository::discover(None).context("not a git repository")?;
     validate_notes_display_ref_config(&repo);
+    // Resolve `core.abbrev` into an explicit abbreviation length when `--abbrev`
+    // was not given on the command line, so all the `parse_abbrev` call sites
+    // (which only see `args.abbrev`) honor the config.
+    if args.abbrev.is_none() {
+        let resolved = resolve_abbrev_len(&None, &repo.git_dir);
+        if resolved != 7 {
+            args.abbrev = Some(resolved.to_string());
+        }
+    }
     if args.format.is_none() {
         args.format = args.pretty.clone();
     }
@@ -10899,6 +10908,12 @@ fn current_branch_decoration_index(items: &[DecorationItem], head: &HeadState) -
         HeadState::Branch { refname, .. } => refname.as_str(),
         _ => return None,
     };
+    // Only fold the branch into `HEAD -> branch` when the HEAD decoration is
+    // actually present. If HEAD was filtered out (e.g. by `--decorate-refs`),
+    // the branch must render on its own.
+    if !items.iter().any(|it| it.kind == DecorationKind::Head) {
+        return None;
+    }
     items
         .iter()
         .position(|it| it.kind == DecorationKind::Branch && it.refname.as_deref() == Some(refname))
@@ -12688,9 +12703,39 @@ fn collect_named_refs_from_dir(
 /// Parse the --abbrev value into a hash abbreviation length.
 fn parse_abbrev(abbrev: &Option<String>) -> usize {
     match abbrev {
-        Some(val) => val.parse::<usize>().unwrap_or(7),
+        Some(val) => clamp_abbrev(val.parse::<usize>().unwrap_or(7)),
         None => 7,
     }
+}
+
+/// Clamp an abbreviation length to Git's accepted range. The minimum is 4 and
+/// the maximum is the full hash length (40 for SHA-1).
+fn clamp_abbrev(n: usize) -> usize {
+    n.clamp(4, 40)
+}
+
+/// Resolve the commit-hash abbreviation length, honoring an explicit `--abbrev`
+/// and otherwise `core.abbrev` (where `false`/`no`/`off`/`0` mean "no
+/// abbreviation" and any number is clamped to `[4, 40]`).
+fn resolve_abbrev_len(abbrev: &Option<String>, git_dir: &Path) -> usize {
+    if let Some(val) = abbrev {
+        return clamp_abbrev(val.parse::<usize>().unwrap_or(7));
+    }
+    if let Ok(cfg) = ConfigSet::load(Some(git_dir), true) {
+        if let Some(raw) = cfg.get("core.abbrev") {
+            let v = raw.trim();
+            match v.to_ascii_lowercase().as_str() {
+                "false" | "no" | "off" | "0" => return 40,
+                "auto" | "" => return 7,
+                _ => {
+                    if let Ok(n) = v.parse::<usize>() {
+                        return clamp_abbrev(n);
+                    }
+                }
+            }
+        }
+    }
+    7
 }
 
 /// Load shallow boundary commit OIDs from `.git/shallow`.
