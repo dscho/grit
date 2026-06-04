@@ -2450,6 +2450,17 @@ fn cleanup_squash_editor_message(msg: &str, config: &ConfigSet) -> String {
     apply_commit_msg_cleanup(&cleaned, rebase_commit_msg_cleanup(config))
 }
 
+fn final_squash_template_after_fixups(fixup_message: &str, squash_body: &str) -> String {
+    let mut out = String::new();
+    out.push_str("# This is a combination of 2 commits.\n");
+    out.push_str("# This is the 1st commit message:\n\n");
+    out.push_str(fixup_message.trim_end_matches('\n'));
+    out.push_str("\n\n# This is the commit message #2:\n\n");
+    out.push_str(squash_body.trim_end_matches('\n'));
+    out.push('\n');
+    out
+}
+
 fn update_squash_message_file(
     repo: &Repository,
     rb_dir: &Path,
@@ -6357,7 +6368,9 @@ fn cherry_pick_for_rebase(
         let squash_path = rb_dir.join("message-squash");
         let fixup_path = rb_dir.join("message-fixup");
         let cleaned = if fixup_path.exists() {
-            let tmpl = fs::read_to_string(&fixup_path)?;
+            let fixup_msg = fs::read_to_string(&fixup_path)?;
+            let body = message_body_after_subject(&commit.message);
+            let tmpl = final_squash_template_after_fixups(&fixup_msg, body);
             let after_editor =
                 run_commit_editor_for_template(repo, git_dir, &tmpl, "squash", None)?;
             cleanup_squash_editor_message(&after_editor, &config)
@@ -7083,7 +7096,9 @@ fn do_continue() -> Result<()> {
             let squash_path = rb_dir.join("message-squash");
             let fixup_path = rb_dir.join("message-fixup");
             let cleaned = if fixup_path.exists() {
-                let tmpl = fs::read_to_string(&fixup_path)?;
+                let fixup_msg = fs::read_to_string(&fixup_path)?;
+                let body = message_body_after_subject(&original_commit.message);
+                let tmpl = final_squash_template_after_fixups(&fixup_msg, body);
                 let after_editor =
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "squash", None)?;
                 cleanup_squash_editor_message(&after_editor, &config)
