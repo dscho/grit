@@ -1971,6 +1971,7 @@ pub(crate) fn unstaged_patch_for_add_edit(
         false,
         true,
         None,
+        true,
         relative_prefix.as_deref(),
         resolve_indent_heuristic(&diff_config, false, false),
     )?;
@@ -3466,6 +3467,12 @@ pub fn run(mut args: Args) -> Result<()> {
     // `--no-patch` suppresses the unified patch without implying `--quiet`.
     let quiet_suppresses_stdout = args.quiet && !format_besides_unified_patch;
 
+    // External-diff exit-code bookkeeping: when an external driver runs, its
+    // `found_changes` (driven by the driver exit code under trustExitCode)
+    // overrides the entry-derived `has_diff` for `--exit-code` / `--quiet`.
+    let mut ext_diff_ran = false;
+    let mut ext_found_changes = false;
+
     for w in &dirstat_config_warnings {
         eprintln!("warning: {w}");
     }
@@ -3649,15 +3656,8 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
                 let diff_config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
                     .unwrap_or_default();
-                let external_diff_cmd = std::env::var("GIT_EXTERNAL_DIFF")
-                    .ok()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| {
-                        diff_config
-                            .get("diff.external")
-                            .filter(|s| !s.trim().is_empty())
-                    });
-                write_patch_with_prefix(
+                let external_diff = resolve_env_config_external_diff(&diff_config);
+                let summary = write_patch_with_prefix(
                     &mut out,
                     &repo,
                     &entries,
@@ -3691,16 +3691,31 @@ pub fn run(mut args: Args) -> Result<()> {
                     args.cached,
                     args.function_context,
                     args.no_ext_diff,
-                    external_diff_cmd.as_deref(),
+                    external_diff.as_ref().map(|(c, t)| (c.as_str(), *t)),
+                    true,
                     relative_prefix_for_paths.as_deref(),
                     indent_heuristic,
                 )?;
+                // Flush patch output before any external-diff "died" failure so the
+                // program's stdout (already written) is visible (t4020).
+                out.flush().ok();
+                if let Some(path) = summary.died_path {
+                    eprintln!("fatal: external diff died, stopping at {path}");
+                    std::process::exit(128);
+                }
+                ext_found_changes = summary.found_changes;
+                ext_diff_ran = true;
             }
         }
     }
 
-    if (args.exit_code || args.quiet) && has_diff {
-        std::process::exit(1);
+    if args.exit_code || args.quiet {
+        // With an external driver, Git's `found_changes` (driven by the driver's
+        // exit code under trustExitCode) overrides the entry-derived `has_diff`.
+        let changed = if ext_diff_ran { ext_found_changes } else { has_diff };
+        if changed {
+            std::process::exit(1);
+        }
     }
 
     Ok(())
@@ -3851,14 +3866,7 @@ fn run_diff_blob_vs_file(
         .map(|v| v == "true")
         .unwrap_or(false);
 
-    let external_diff_cmd = std::env::var("GIT_EXTERNAL_DIFF")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| {
-            diff_config
-                .get("diff.external")
-                .filter(|s| !s.trim().is_empty())
-        });
+    let external_diff = resolve_env_config_external_diff(&diff_config);
     let relative_prefix_for_paths =
         resolve_diff_relative_prefix(Some(wt.as_ref()), &repo.git_dir, args);
 
@@ -3920,7 +3928,8 @@ fn run_diff_blob_vs_file(
             false,
             args.function_context,
             args.no_ext_diff,
-            external_diff_cmd.as_deref(),
+            external_diff.as_ref().map(|(c, t)| (c.as_str(), *t)),
+            true,
             relative_prefix_for_paths.as_deref(),
             indent_heuristic,
         )?;
@@ -6683,73 +6692,209 @@ fn write_diff_header_with_prefix(
     Ok(())
 }
 
-/// Run `GIT_EXTERNAL_DIFF` / `diff.external` when set (Git-compatible argv: path, file, hex, mode ×2).
+/// One argv "side" (old or new) for an external diff invocation.
 ///
-/// Matches Git's `prepare_shell_cmd` + `run_command` with `use_shell=1`.
+/// Git's `prepare_temp_file` passes `/dev/null`, `"."`, `"."` for an invalid
+/// file side (the absent half of an add/delete) and a temp-file path, full hex,
+/// and 6-octal mode otherwise. We mirror that here.
+struct ExtDiffSide {
+    /// `temp->name`: temp-file path (or the worktree path for a borrowed file),
+    /// or `/dev/null` when the side is invalid.
+    name: String,
+    /// `temp->hex`: 40-char hex of the blob (`.` when invalid).
+    hex: String,
+    /// `temp->mode`: 6-octal mode (`.` when invalid).
+    mode: String,
+    /// Keep the temp file alive for the duration of the call.
+    _tmp: Option<tempfile::NamedTempFile>,
+}
+
+fn ext_diff_side(
+    raw: &[u8],
+    oid: &ObjectId,
+    mode: &str,
+    borrow_path: Option<&str>,
+    zero_hex: bool,
+) -> Result<ExtDiffSide> {
+    // mode "000000" marks the invalid side of an add/delete (DIFF_FILE_VALID == 0 in Git).
+    if mode == "000000" || mode.is_empty() {
+        return Ok(ExtDiffSide {
+            name: "/dev/null".to_owned(),
+            hex: ".".to_owned(),
+            mode: ".".to_owned(),
+            _tmp: None,
+        });
+    }
+    // Git's `reuse_worktree_file`: a regular worktree file is borrowed in place,
+    // so the argv carries the real path; the OID is null because the file is not
+    // a registered blob. Symlinks (and other non-regular content) still go to a
+    // temp blob but keep the null OID.
+    let hex = if zero_hex {
+        zero_oid().to_hex()
+    } else {
+        oid.to_hex()
+    };
+    if let Some(path) = borrow_path {
+        return Ok(ExtDiffSide {
+            name: path.to_owned(),
+            hex,
+            mode: mode.to_owned(),
+            _tmp: None,
+        });
+    }
+    let tmp = tempfile::NamedTempFile::new().context("temp file for external diff")?;
+    fs::write(tmp.path(), raw)?;
+    Ok(ExtDiffSide {
+        name: tmp.path().to_string_lossy().into_owned(),
+        hex,
+        mode: mode.to_owned(),
+        _tmp: Some(tmp),
+    })
+}
+
+/// Outcome of one external-diff invocation, mirroring `run_external_diff`.
+enum ExtDiffOutcome {
+    /// The program ran and was treated as a no-change (trustExitCode, rc==0).
+    NoChange,
+    /// The program ran (or was skipped) and a change is recorded.
+    Changed,
+    /// `fatal: external diff died, stopping at <name>` — caller must die(128).
+    Died(String),
+}
+
+/// Run `GIT_EXTERNAL_DIFF` / `diff.external` / a `diff.<name>.command` driver.
+///
+/// Mirrors Git's `run_external_diff` + `prepare_shell_cmd` (use_shell=1):
+/// argv is `cmd name old-file old-hex old-mode new-file new-hex new-mode [other]`,
+/// with `GIT_DIFF_PATH_COUNTER` / `GIT_DIFF_PATH_TOTAL` exported.
+#[allow(clippy::too_many_arguments)]
 fn run_external_diff_for_patch(
     out: &mut impl Write,
     cmd_line: &str,
     display_path: &str,
+    other_path: Option<&str>,
     old_raw: &[u8],
     new_raw: &[u8],
     old_oid: &ObjectId,
     new_oid: &ObjectId,
     old_mode: &str,
     new_mode: &str,
-) -> Result<()> {
+    old_borrow: Option<&str>,
+    old_zero_hex: bool,
+    new_borrow: Option<&str>,
+    new_zero_hex: bool,
+    path_counter: usize,
+    path_total: usize,
+    trust_exit_code: bool,
+    want_output: bool,
+) -> Result<ExtDiffOutcome> {
     let cmd_line = cmd_line.trim();
     if cmd_line.is_empty() {
         bail!("empty external diff command");
     }
-    let old_tmp = tempfile::NamedTempFile::new().context("temp file for external diff (old)")?;
-    let new_tmp = tempfile::NamedTempFile::new().context("temp file for external diff (new)")?;
-    fs::write(old_tmp.path(), old_raw)?;
-    fs::write(new_tmp.path(), new_raw)?;
-    let old_hex = old_oid.to_hex();
-    let new_hex = new_oid.to_hex();
+
+    // Git: `if (!pgm->trust_exit_code && !o->file) { o->found_changes = 1; return; }`
+    // Under --quiet with an untrusted driver we never even spawn the program.
+    if !trust_exit_code && !want_output {
+        return Ok(ExtDiffOutcome::Changed);
+    }
+
+    let old_side = ext_diff_side(old_raw, old_oid, old_mode, old_borrow, old_zero_hex)?;
+    let new_side = ext_diff_side(new_raw, new_oid, new_mode, new_borrow, new_zero_hex)?;
+
     const SHELL_META: &[char] = &[
         '|', '&', ';', '<', '>', '(', ')', '$', '`', '\\', '"', '\'', ' ', '\t', '\n', '*', '?',
         '[', '#', '~', '=', '%',
     ];
     let needs_c = cmd_line.chars().any(|c| SHELL_META.contains(&c));
-    let mut cmd = Command::new("sh");
-    if needs_c {
-        let c_script = format!("{cmd_line} \"$@\"");
-        cmd.arg("-c")
-            .arg(&c_script)
-            .arg(cmd_line)
-            .arg(display_path)
-            .arg(old_tmp.path())
-            .arg(&old_hex)
-            .arg(old_mode)
-            .arg(new_tmp.path())
-            .arg(&new_hex)
-            .arg(new_mode);
-    } else {
-        cmd.arg(cmd_line)
-            .arg(display_path)
-            .arg(old_tmp.path())
-            .arg(&old_hex)
-            .arg(old_mode)
-            .arg(new_tmp.path())
-            .arg(&new_hex)
-            .arg(new_mode);
+
+    // Positional args after the program name: name, old(3), new(3), [other].
+    let mut pos: Vec<&str> = vec![
+        display_path,
+        &old_side.name,
+        &old_side.hex,
+        &old_side.mode,
+        &new_side.name,
+        &new_side.hex,
+        &new_side.mode,
+    ];
+    if let Some(other) = other_path {
+        pos.push(other);
     }
-    let mut child = cmd
-        .current_dir(external_diff_worktree_root())
+
+    let mut cmd;
+    if needs_c {
+        // sh -c "<cmd> \"$@\"" <cmd> <pos...>
+        cmd = Command::new("sh");
+        let c_script = format!("{cmd_line} \"$@\"");
+        cmd.arg("-c").arg(&c_script).arg(cmd_line);
+        for a in &pos {
+            cmd.arg(a);
+        }
+    } else {
+        // No shell metacharacters: exec the program directly.
+        cmd = Command::new(cmd_line);
+        for a in &pos {
+            cmd.arg(a);
+        }
+    }
+
+    cmd.current_dir(external_diff_worktree_root())
         .env("GIT_PREFIX", external_diff_git_prefix())
+        .env("GIT_DIFF_PATH_COUNTER", path_counter.to_string())
+        .env("GIT_DIFF_PATH_TOTAL", path_total.to_string())
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    // Git: `if (!o->file) cmd.no_stdout = 1;` — under --quiet the program's
+    // stdout is discarded; only its exit status matters.
+    if want_output {
+        cmd.stdout(Stdio::piped());
+    } else {
+        cmd.stdout(Stdio::null());
+    }
+
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to spawn external diff {cmd_line:?}"))?;
-    let mut stdout = child.stdout.take().context("external diff stdout")?;
-    io::copy(&mut stdout, out)?;
-    let status = child.wait().context("waiting for external diff")?;
-    if !status.success() {
-        bail!("external diff exited with {status}");
+    if want_output {
+        let mut stdout = child.stdout.take().context("external diff stdout")?;
+        io::copy(&mut stdout, out)?;
     }
-    Ok(())
+    let status = child.wait().context("waiting for external diff")?;
+    let rc = status.code().unwrap_or(-1);
+
+    // Git's exit-code interpretation in run_external_diff().
+    Ok(if !trust_exit_code && rc == 0 {
+        ExtDiffOutcome::Changed
+    } else if trust_exit_code && rc == 0 {
+        ExtDiffOutcome::NoChange
+    } else if trust_exit_code && rc == 1 {
+        ExtDiffOutcome::Changed
+    } else {
+        ExtDiffOutcome::Died(display_path.to_owned())
+    })
+}
+
+/// Resolve the `GIT_EXTERNAL_DIFF` (env) / `diff.external` (config) driver and
+/// its trust-exit-code flag. Env takes precedence over config; env trust comes
+/// from `GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE`, config trust from `diff.trustExitCode`.
+fn resolve_env_config_external_diff(config: &grit_lib::config::ConfigSet) -> Option<(String, bool)> {
+    if let Ok(cmd) = std::env::var("GIT_EXTERNAL_DIFF") {
+        if !cmd.trim().is_empty() {
+            let trust = std::env::var("GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE")
+                .ok()
+                .and_then(|v| grit_lib::config::parse_bool(v.as_str()).ok())
+                .unwrap_or(false);
+            return Some((cmd, trust));
+        }
+    }
+    let cmd = config.get("diff.external").filter(|s| !s.trim().is_empty())?;
+    let trust = config
+        .get("diff.trustExitCode")
+        .and_then(|v| grit_lib::config::parse_bool(v.as_str()).ok())
+        .unwrap_or(false);
+    Some((cmd, trust))
 }
 
 fn external_diff_worktree_root() -> PathBuf {
@@ -7199,11 +7344,17 @@ fn write_patch_with_prefix(
     cached: bool,
     function_context: bool,
     no_ext_diff: bool,
-    external_diff_cmd: Option<&str>,
+    external_diff: Option<(&str, bool)>,
+    want_external_output: bool,
     relative_prefix: Option<&str>,
     indent_heuristic: bool,
-) -> Result<()> {
+) -> Result<ExtDiffSummary> {
     let ignore_blank = ws_mode.ignore_blank_lines;
+    // External-diff bookkeeping mirroring Git's diff_options found_changes / die.
+    let mut ext_found_changes = false;
+    let mut ext_died: Option<String> = None;
+    let mut ext_counter: usize = 0;
+    let mut ext_total: usize = 0;
     for entry in entries {
         let old_path = entry.old_path.as_deref().unwrap_or("/dev/null");
         let new_path = entry.new_path.as_deref().unwrap_or("/dev/null");
@@ -7288,23 +7439,80 @@ fn write_patch_with_prefix(
         let new_content_raw =
             read_content_raw_or_worktree(odb, &entry.new_oid, work_tree, &wt_path);
 
-        if !no_ext_diff {
-            if let Some(ext) = external_diff_cmd.filter(|s| !s.is_empty()) {
-                if entry.status != DiffStatus::Unmerged {
-                    let display = entry.path();
-                    run_external_diff_for_patch(
-                        out,
-                        ext,
-                        display,
-                        &old_content_raw,
-                        &new_content_raw,
-                        &entry.old_oid,
-                        &entry.new_oid,
-                        &entry.old_mode,
-                        &entry.new_mode,
-                    )?;
-                    continue;
+        if !no_ext_diff && entry.status != DiffStatus::Unmerged {
+            // Git precedence: a path's `diff=<name>` attribute driver
+            // (`diff.<name>.command`) trumps `GIT_EXTERNAL_DIFF` / `diff.external`.
+            let attr_driver = grit_lib::merge_diff::diff_attr_external_driver(
+                git_dir,
+                config,
+                path_for_attrs.as_str(),
+            );
+            let resolved: Option<(&str, bool)> = if let Some((ref c, t)) = attr_driver {
+                Some((c.as_str(), t))
+            } else {
+                external_diff.filter(|(s, _)| !s.is_empty())
+            };
+            if let Some((ext, trust)) = resolved {
+                ext_total = entries.len();
+                ext_counter += 1;
+                // `other` = the destination path for renames/copies (Git's `two->path`).
+                let display = entry.path();
+                let other = match entry.status {
+                    DiffStatus::Renamed | DiffStatus::Copied => entry
+                        .new_path
+                        .as_deref()
+                        .filter(|n| *n != display),
+                    _ => None,
+                };
+                // Git's `reuse_worktree_file`: the unstaged worktree side of a
+                // (non-`--cached`) diff carries a null OID. A *regular* worktree
+                // file is also borrowed in place — argv carries the real path
+                // instead of a temp file (t4020 #2/#68). Symlinks (#6) still go
+                // to a temp blob but keep the null OID. Gitlinks never borrow.
+                let new_is_worktree = !cached
+                    && work_tree.is_some()
+                    && entry.new_mode != "000000"
+                    && entry.new_mode != "160000";
+                let new_zero_hex = new_is_worktree;
+                let new_borrow: Option<String> = if new_is_worktree
+                    && mode_is_regular_blob_mode_str(&entry.new_mode)
+                {
+                    let p = repo_path_for_diff_side(new_path, relative_prefix);
+                    work_tree.and_then(|wt| {
+                        let full = wt.join(&p);
+                        full.symlink_metadata().ok().map(|_| p.clone())
+                    })
+                } else {
+                    None
+                };
+                match run_external_diff_for_patch(
+                    out,
+                    ext,
+                    display,
+                    other,
+                    &old_content_raw,
+                    &new_content_raw,
+                    &entry.old_oid,
+                    &entry.new_oid,
+                    &entry.old_mode,
+                    &entry.new_mode,
+                    None,
+                    false,
+                    new_borrow.as_deref(),
+                    new_zero_hex,
+                    ext_counter,
+                    ext_total,
+                    trust,
+                    want_external_output,
+                )? {
+                    ExtDiffOutcome::Changed => ext_found_changes = true,
+                    ExtDiffOutcome::NoChange => {}
+                    ExtDiffOutcome::Died(p) => {
+                        ext_died = Some(p);
+                        break;
+                    }
                 }
+                continue;
             }
         }
 
@@ -7747,7 +7955,18 @@ fn write_patch_with_prefix(
             }
         }
     }
-    Ok(())
+    Ok(ExtDiffSummary {
+        found_changes: ext_found_changes,
+        died_path: ext_died,
+    })
+}
+
+/// Summary of external-diff invocations across one patch run.
+struct ExtDiffSummary {
+    /// True if any external driver reported a change (Git's `found_changes`).
+    found_changes: bool,
+    /// If `Some(path)`, an external driver "died" at this path → exit 128.
+    died_path: Option<String>,
 }
 
 /// Strip trailing space from blank context lines in unified diff output.
