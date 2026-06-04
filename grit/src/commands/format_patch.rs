@@ -268,6 +268,10 @@ pub struct Args {
     #[arg(long = "numbered-files")]
     pub numbered_files: bool,
 
+    /// Filename suffix for generated patches (default `.patch`).
+    #[arg(long = "suffix")]
+    pub suffix: Option<String>,
+
     /// Include diffstat in patch body (`--stat[=width[,name-width[,count]]]`).
     #[arg(long = "stat", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub stat: Option<String>,
@@ -981,6 +985,9 @@ pub fn run(mut args: Args) -> Result<()> {
         .map(|v| format!("v{}-", sanitize_reroll(v)))
         .unwrap_or_default();
 
+    // Patch filename suffix (default `.patch`; `--suffix=` overrides, e.g. `.diff`).
+    let patch_suffix: &str = args.suffix.as_deref().unwrap_or(".patch");
+
     // Message-Id chain state for threading.
     let mut thread = ThreadState::new(thread_mode, opts.in_reply_to.clone(), want_cover);
 
@@ -1026,7 +1033,7 @@ pub fn run(mut args: Args) -> Result<()> {
             &mut single_buf,
             to_single,
             &out_dir,
-            &format!("{file_prefix}0000-cover-letter.patch"),
+            &format!("{file_prefix}0000-cover-letter{patch_suffix}"),
             &cover,
             args.quiet,
         )?;
@@ -1074,12 +1081,19 @@ pub fn run(mut args: Args) -> Result<()> {
         // Git derives the patch filename from only the FIRST line of the subject (it stops at the
         // first newline), even though the Subject header flattens a multi-line subject onto one line.
         let filename_subject = first_subject_line(&display_msg);
-        let filename = build_patch_filename(
-            &file_prefix,
-            patch_num,
-            filename_subject,
-            filename_max_length,
-        );
+        // `--numbered-files`: the patch file (and its MIME attachment name) is just the
+        // sequence number, with no prefix, subject, or suffix (matches Git).
+        let filename = if args.numbered_files {
+            patch_num.to_string()
+        } else {
+            build_patch_filename(
+                &file_prefix,
+                patch_num,
+                filename_subject,
+                filename_max_length,
+                patch_suffix,
+            )
+        };
 
         let patch = format_single_patch(
             &repo,
@@ -1639,10 +1653,21 @@ fn format_cover_letter(
     };
     out.push_str(&format!("From {cover_from_oid} Mon Sep 17 00:00:00 2001\n"));
 
+    // Git's cover letter uses the committer identity (`git_committer_info(0)`) for the
+    // `From`/`Date` headers, not the last commit's author. A `--from=<custom>` overrides
+    // only the address, keeping the committer date.
+    let committer_ident = current_committer_ident_line(repo);
     let charset_label = rfc2047_charset_label(log_output_encoding);
     let use_utf8_log = charset_label.eq_ignore_ascii_case("UTF-8");
     if !matches!(patch_opts.from_header, FromHeaderMode::Omit) {
-        let mailbox = mailbox_for_from_header(last_commit, &patch_opts.from_header);
+        let mailbox = match &patch_opts.from_header {
+            FromHeaderMode::Custom(s) => format_ident(
+                &grit_lib::commit_encoding::decode_rfc2047_mailbox_from_line(s),
+            ),
+            _ => format_ident(&grit_lib::commit_encoding::decode_rfc2047_mailbox_from_line(
+                &committer_ident,
+            )),
+        };
         write_addr_header(
             &mut out,
             "From",
@@ -1652,7 +1677,7 @@ fn format_cover_letter(
         );
     }
 
-    let date = format_date_rfc2822(&last_commit.author);
+    let date = format_date_rfc2822(&committer_ident);
     out.push_str(&format!("Date: {date}\n"));
 
     // Subject is pre-built; encode/fold it.
@@ -1827,6 +1852,44 @@ fn wrap_oneline(text: &str) -> String {
     out.push_str(&line);
     out.push('\n');
     out
+}
+
+/// Build the current committer ident line (`Name <email> <epoch> <tz>`) from the
+/// `GIT_COMMITTER_*` environment and config, matching Git's `git_committer_info(0)`.
+/// Used for the cover letter's `From`/`Date` headers (Git uses the committer, not the
+/// last commit's author).
+fn current_committer_ident_line(repo: &Repository) -> String {
+    let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+
+    let name = match read_git_identity_name_env("GIT_COMMITTER_NAME") {
+        GitIdentityNameEnv::Set(s) if !s.trim().is_empty() => s,
+        _ => config
+            .get("user.name")
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Unknown".to_owned()),
+    };
+    let email = std::env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| config.get("user.email").filter(|s| !s.trim().is_empty()))
+        .unwrap_or_default();
+
+    let date = std::env::var("GIT_COMMITTER_DATE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|d| crate::commands::commit::parse_date_to_git_timestamp(&d).or(Some(d)))
+        .unwrap_or_else(|| {
+            let now = time::OffsetDateTime::now_utc();
+            let off = now.offset();
+            format!(
+                "{} {:+03}{:02}",
+                now.unix_timestamp(),
+                off.whole_hours(),
+                off.minutes_past_hour().unsigned_abs()
+            )
+        });
+
+    format!("{name} <{email}> {date}")
 }
 
 /// Get the signoff identity, preferring GIT_COMMITTER_NAME/EMAIL env vars.
@@ -2584,9 +2647,9 @@ fn build_patch_filename(
     patch_num: usize,
     subject: &str,
     max_len: Option<usize>,
+    suffix: &str,
 ) -> String {
     let max = max_len.unwrap_or(64);
-    let suffix = ".patch";
     let head = format!("{file_prefix}{patch_num:04}-");
     let sanitized = sanitize_subject(subject);
     // Cap so that head + sanitized + suffix has length <= max - 1.
