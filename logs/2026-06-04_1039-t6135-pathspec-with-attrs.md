@@ -33,3 +33,16 @@ Finish `t6135-pathspec-with-attrs.sh`, currently the largest failing t6 row at 7
   `cargo build --release -p grit-cli`, direct and official
   `t6135-pathspec-with-attrs.sh`, traced `t6416-recursive-corner-cases.sh` refresh, and
   `git diff --check`.
+- Final increment completes the remaining `stash push`, `add`, `add -u`, `status`, subdirectory
+  exclude, pathspec-from-file, and `builtin_objectmode` cases. Worktree/index pathspec matching now
+  loads checkout attributes for attr magic, stash filters pathspec-limited entries object-aware, and
+  `restore --source=HEAD --staged --worktree .` removes staged additions that are absent from the
+  source tree.
+- Direct/official `./scripts/run-tests.sh t6135-pathspec-with-attrs.sh --quiet` records 37/37.
+  A clean-baseline check showed the temporary `t6416` non-TODO failure was not introduced by this
+  patch; after rebuilding with the patch, `./scripts/run-tests.sh t6416-recursive-corner-cases.sh
+  --quiet` refreshes its row back to 40 total, 37 passing, 0 failing, 3 expected failures.
+- Final validation: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`
+  (existing warning backlog remains; unrelated `filter_process.rs` auto-fix restored),
+  `cargo test -p grit-lib --lib`, `cargo build --release -p grit-cli`, focused `t6135` and `t6416`
+  harness refreshes, and `git diff --check`.

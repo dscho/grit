@@ -664,6 +664,7 @@ pub fn run(mut args: Args) -> Result<()> {
             && !args.pathspec.is_empty()
             && !is_root_pathspec
             && !args.pathspec.iter().any(|p| p == ".")
+            && !pathspecs_are_all_exclude(&resolved_specs)
         {
             add_all_for_pathspecs(
                 odb,
@@ -683,6 +684,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 &mut index,
                 work_tree,
                 effective_prefix,
+                &resolved_specs,
                 &args,
                 &repo,
                 &mut ignore_matcher,
@@ -1687,6 +1689,52 @@ fn pathspecs_need_match_walk(pathspecs: &[String]) -> bool {
         .any(|s| pathspec_uses_long_magic(s) && !grit_lib::pathspec::pathspec_is_exclude(s))
 }
 
+fn pathspecs_use_attr_magic(pathspecs: &[String]) -> bool {
+    pathspecs
+        .iter()
+        .any(|spec| spec.starts_with(":(attr:") || spec.contains(",attr:"))
+}
+
+fn add_pathspec_matches_worktree(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
+    rel_path: &str,
+    pathspecs: &[String],
+) -> bool {
+    if pathspecs.is_empty() {
+        return true;
+    }
+    if !pathspecs_use_attr_magic(pathspecs) {
+        return grit_lib::pathspec::matches_pathspec_list(rel_path, pathspecs);
+    }
+    let attrs =
+        grit_lib::crlf::load_gitattributes_for_checkout(work_tree, rel_path, index, &repo.odb);
+    let mode = fs::symlink_metadata(work_tree.join(rel_path))
+        .map(|meta| normalize_mode(meta.mode()))
+        .unwrap_or(0);
+    grit_lib::pathspec::matches_pathspec_list_for_object(rel_path, mode, &attrs, pathspecs)
+}
+
+fn add_pathspec_matches_index(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
+    rel_path: &str,
+    mode: u32,
+    pathspecs: &[String],
+) -> bool {
+    if pathspecs.is_empty() {
+        return true;
+    }
+    if !pathspecs_use_attr_magic(pathspecs) {
+        return grit_lib::pathspec::matches_pathspec_list(rel_path, pathspecs);
+    }
+    let attrs =
+        grit_lib::crlf::load_gitattributes_for_checkout(work_tree, rel_path, index, &repo.odb);
+    grit_lib::pathspec::matches_pathspec_list_for_object(rel_path, mode, &attrs, pathspecs)
+}
+
 fn pathspec_uses_long_magic(pathspec: &str) -> bool {
     !grit_lib::pathspec::literal_pathspecs_enabled()
         && pathspec
@@ -1721,7 +1769,7 @@ fn add_with_pathspec_list(
     let mut matched_any = false;
 
     for (rel_path, abs_path) in &paths {
-        if !grit_lib::pathspec::matches_pathspec_list(rel_path, pathspecs) {
+        if !add_pathspec_matches_worktree(repo, index, work_tree, rel_path, pathspecs) {
             continue;
         }
         matched_any = true;
@@ -1751,7 +1799,7 @@ fn add_with_pathspec_list(
                 return false;
             }
             let path_str = std::str::from_utf8(&ie.path).unwrap_or("");
-            grit_lib::pathspec::matches_pathspec_list(path_str, pathspecs)
+            add_pathspec_matches_index(repo, index, work_tree, path_str, ie.mode, pathspecs)
                 && !worktree_paths.contains(path_str)
         })
         .map(|ie| ie.path.clone())
@@ -1777,6 +1825,7 @@ fn add_all(
     index: &mut Index,
     work_tree: &Path,
     prefix: Option<&str>,
+    pathspecs: &[String],
     args: &Args,
     repo: &Repository,
     ignore_matcher: &mut Option<IgnoreMatcher>,
@@ -1805,6 +1854,9 @@ fn add_all(
     if !args.dry_run {
         let mut ignored_some = false;
         for (rel_path, abs_path) in &paths {
+            if !add_pathspec_matches_worktree(repo, index, work_tree, rel_path, pathspecs) {
+                continue;
+            }
             if add_cfg.sparse.sparse_enabled
                 && !add_cfg.sparse.path_in_sparse_definition(rel_path.as_str())
             {
@@ -1865,6 +1917,9 @@ fn add_all(
                 return false;
             }
             let path_str = std::str::from_utf8(&ie.path).unwrap_or("");
+            if !add_pathspec_matches_index(repo, index, work_tree, path_str, ie.mode, pathspecs) {
+                return false;
+            }
             !worktree_paths.contains(path_str)
         })
         .map(|ie| ie.path.clone())
@@ -1882,6 +1937,9 @@ fn add_all(
 
     if args.dry_run {
         for (rel_path, abs_path) in &paths {
+            if !add_pathspec_matches_worktree(repo, index, work_tree, rel_path, pathspecs) {
+                continue;
+            }
             if add_cfg.sparse.sparse_enabled
                 && !add_cfg.sparse.path_in_sparse_definition(rel_path.as_str())
             {
@@ -2074,7 +2132,12 @@ fn update_tracked(
 ) -> Result<()> {
     // If explicit pathspecs given with -u, validate that each matches a tracked file.
     let explicit_pathspecs = !args.pathspec.is_empty();
-    if explicit_pathspecs {
+    let resolved_pathspecs = if explicit_pathspecs {
+        resolved_pathspecs_for_add(&args.pathspec, work_tree, prefix)?
+    } else {
+        Vec::new()
+    };
+    if explicit_pathspecs && !pathspecs_are_all_exclude(&resolved_pathspecs) {
         let pfx = prefix.unwrap_or("");
         for spec in &args.pathspec {
             // Build the full path as it would appear in the index
@@ -2113,19 +2176,14 @@ fn update_tracked(
             };
             // Apply explicit pathspec filter
             let pathspec_ok = if explicit_pathspecs {
-                let pfx2 = prefix.unwrap_or("");
-                args.pathspec.iter().any(|spec| {
-                    let full = if pfx2.is_empty() {
-                        spec.clone()
-                    } else {
-                        format!("{pfx2}/{spec}")
-                    };
-                    spec == "."
-                        || path_str == full.as_str()
-                        || path_str.starts_with(&format!("{full}/"))
-                        || path_str == spec.as_str()
-                        || path_str.starts_with(&format!("{spec}/"))
-                })
+                add_pathspec_matches_index(
+                    repo,
+                    index,
+                    work_tree,
+                    path_str.as_ref(),
+                    ie.mode,
+                    &resolved_pathspecs,
+                )
             } else {
                 true
             };

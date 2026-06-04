@@ -2784,3 +2784,14 @@ Updated: 2026-06-01
   `cargo clippy --fix --allow-dirty` (existing warning backlog and failed auto-fix attempts remain;
   unrelated `filter_process.rs` auto-fix restored), `cargo test -p grit-lib --lib`,
   `cargo build --release -p grit-cli`, and `git diff --check`.
+- t6135 completion focus: attr-aware worktree/index pathspec matching now covers `stash push`,
+  `add`, `add -u`, `status`, pathspec-from-file, subdirectory excludes, and `builtin_objectmode`;
+  `restore --source=HEAD --staged --worktree .` also removes staged additions absent from the source
+  tree so the t6135 cleanup path matches Git. `./scripts/run-tests.sh
+  t6135-pathspec-with-attrs.sh --quiet` records 37/37. A clean-baseline t6416 rerun showed the
+  intermediate non-TODO failure was not introduced by this patch, and the final patched
+  `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --quiet` refresh records 40 total,
+  37 passing, 0 failing, 3 expected failures. Ran `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo clippy --fix --allow-dirty` (existing warning backlog remains; unrelated
+  `filter_process.rs` auto-fix restored), `cargo test -p grit-lib --lib`,
+  `cargo build --release -p grit-cli`, and `git diff --check`.

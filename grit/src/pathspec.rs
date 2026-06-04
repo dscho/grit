@@ -90,11 +90,10 @@ fn resolve_magic_pathspec_parts(magic_prefix: &str, tail: &str, cwd_prefix: &str
     if !cwd_base.is_empty()
         && (combined == cwd_base || combined.starts_with(&format!("{cwd_base}/")))
     {
-        let remainder = combined
+        let after_base = combined
             .strip_prefix(&cwd_base)
-            .unwrap_or(combined.as_str())
-            .strip_prefix('/')
             .unwrap_or(combined.as_str());
+        let remainder = after_base.strip_prefix('/').unwrap_or(after_base);
         let magic_with_prefix = inject_magic_prefix_token(magic_prefix, &format!("{cwd_base}/"));
         return format!("{magic_with_prefix}{remainder}");
     }

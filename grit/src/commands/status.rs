@@ -665,7 +665,15 @@ pub fn run(mut args: Args) -> Result<()> {
                         untracked_from_cache = Some(
                             untracked_cache::collect_untracked_from_cache(uc)
                                 .into_iter()
-                                .filter(|p| status_path_matches(p, &user_pathspecs))
+                                .filter(|p| {
+                                    status_path_matches_worktree(
+                                        &repo,
+                                        &index,
+                                        work_tree,
+                                        p,
+                                        &user_pathspecs,
+                                    )
+                                })
                                 .collect(),
                         );
                     }
@@ -757,11 +765,11 @@ pub fn run(mut args: Args) -> Result<()> {
     let unstaged: Vec<grit_lib::diff::DiffEntry> = unstaged;
     let untracked: Vec<String> = untracked
         .into_iter()
-        .filter(|p| status_path_matches(p, &pathspecs))
+        .filter(|p| status_path_matches_worktree(&repo, &index, work_tree, p, &pathspecs))
         .collect();
     let ignored_files: Vec<String> = ignored_files
         .into_iter()
-        .filter(|p| status_path_matches(p, &pathspecs))
+        .filter(|p| status_path_matches_worktree(&repo, &index, work_tree, p, &pathspecs))
         .collect();
 
     let staged_long = remap_diff_paths(&staged, &relativize);
@@ -1103,7 +1111,7 @@ fn visit_untracked_node(
                 ignored_out,
             )?;
         } else {
-            if !status_path_matches(&child_rel, pathspecs) {
+            if !status_path_matches_worktree(repo, index, work_tree, &child_rel, pathspecs) {
                 continue;
             }
             let (is_ign, _) = matcher.check_path(repo, Some(index), &child_rel, false)?;
@@ -1291,7 +1299,7 @@ fn traditional_normal_directory_only(
                 .unwrap_or_else(|_| name.clone());
             if !pathspec_may_match_directory(&rel_child, pathspecs)
                 && !(entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
-                    && status_path_matches(&rel_child, pathspecs))
+                    && status_path_matches_worktree(repo, index, work_tree, &rel_child, pathspecs))
             {
                 continue;
             }
@@ -3863,8 +3871,66 @@ fn status_path_matches(path: &str, pathspecs: &[String]) -> bool {
     !has_positive || positive_match
 }
 
+fn pathspecs_use_attr_magic(pathspecs: &[String]) -> bool {
+    pathspecs
+        .iter()
+        .any(|spec| spec.starts_with(":(attr:") || spec.contains(",attr:"))
+}
+
+fn status_path_matches_worktree(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
+    path: &str,
+    pathspecs: &[String],
+) -> bool {
+    if pathspecs.is_empty() {
+        return true;
+    }
+    if !pathspecs_use_attr_magic(pathspecs) {
+        return status_path_matches(path, pathspecs);
+    }
+
+    let normalized = path.trim_end_matches('/');
+    let attrs =
+        grit_lib::crlf::load_gitattributes_for_checkout(work_tree, normalized, index, &repo.odb);
+    let mode = worktree_path_mode(&work_tree.join(normalized));
+    grit_lib::pathspec::matches_pathspec_list_for_object(normalized, mode, &attrs, pathspecs)
+}
+
+fn worktree_path_mode(path: &Path) -> u32 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.file_type().is_symlink() {
+        return 0o120000;
+    }
+    if meta.is_dir() {
+        return MODE_TREE;
+    }
+    if is_executable_file(&meta) {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(unix)]
+fn is_executable_file(meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    meta.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(_meta: &fs::Metadata) -> bool {
+    false
+}
+
 fn pathspec_may_match_directory(rel_dir: &str, pathspecs: &[String]) -> bool {
     if pathspecs.is_empty() {
+        return true;
+    }
+    if pathspecs_use_attr_magic(pathspecs) {
         return true;
     }
     let rel_dir = rel_dir.trim_end_matches('/');

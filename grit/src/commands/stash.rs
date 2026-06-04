@@ -39,7 +39,6 @@ use grit_lib::objects::{
     TreeEntry,
 };
 use grit_lib::odb::Odb;
-use grit_lib::pathspec::pathspec_matches as lib_pathspec_matches;
 use grit_lib::reflog::{read_reflog, reflog_path};
 use grit_lib::refs::{resolve_ref, write_ref};
 use grit_lib::repo::Repository;
@@ -1649,16 +1648,17 @@ fn do_push_pathspec(
     // Filter by pathspec
     let matching_staged: Vec<_> = staged
         .iter()
-        .filter(|e| matches_pathspec(e.path(), pathspec))
+        .filter(|e| stash_pathspec_matches_worktree(repo, index, work_tree, e.path(), pathspec))
         .collect();
     let matching_unstaged: Vec<_> = unstaged
         .iter()
-        .filter(|e| matches_pathspec(e.path(), pathspec))
+        .filter(|e| stash_pathspec_matches_worktree(repo, index, work_tree, e.path(), pathspec))
         .collect();
 
     let mut matched_untracked: Vec<String> = untracked_files.to_vec();
     if opts.include_untracked {
-        matched_untracked.retain(|p| pathspec.iter().any(|s| lib_pathspec_matches(s, p)));
+        matched_untracked
+            .retain(|p| stash_pathspec_matches_worktree(repo, index, work_tree, p, pathspec));
     } else {
         matched_untracked.clear();
     }
@@ -4181,6 +4181,57 @@ fn matches_pathspec(path: &str, pathspecs: &[String]) -> bool {
         .map(|s| s.strip_prefix("--").unwrap_or(s.as_str()).to_owned())
         .collect();
     grit_lib::pathspec::matches_pathspec_list(path, &specs)
+}
+
+fn stash_pathspecs_use_attr_magic(pathspecs: &[String]) -> bool {
+    pathspecs
+        .iter()
+        .any(|spec| spec.starts_with(":(attr:") || spec.contains(",attr:"))
+}
+
+fn stash_pathspec_matches_worktree(
+    repo: &Repository,
+    index: &Index,
+    work_tree: &Path,
+    path: &str,
+    pathspecs: &[String],
+) -> bool {
+    if pathspecs.is_empty() {
+        return true;
+    }
+    if !stash_pathspecs_use_attr_magic(pathspecs) {
+        return matches_pathspec(path, pathspecs);
+    }
+    let attrs = grit_lib::crlf::load_gitattributes_for_checkout(work_tree, path, index, &repo.odb);
+    let mode = std::fs::symlink_metadata(work_tree.join(path))
+        .map(|meta| stash_worktree_mode(&meta))
+        .unwrap_or(0);
+    grit_lib::pathspec::matches_pathspec_list_for_object(path, mode, &attrs, pathspecs)
+}
+
+#[cfg(unix)]
+fn stash_worktree_mode(meta: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if meta.file_type().is_symlink() {
+        0o120000
+    } else if meta.is_dir() {
+        0o040000
+    } else if meta.permissions().mode() & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(not(unix))]
+fn stash_worktree_mode(meta: &std::fs::Metadata) -> u32 {
+    if meta.file_type().is_symlink() {
+        0o120000
+    } else if meta.is_dir() {
+        0o040000
+    } else {
+        0o100644
+    }
 }
 
 /// Simple glob matching (only supports * wildcard).

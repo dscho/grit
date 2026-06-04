@@ -209,9 +209,9 @@ pub fn run(args: Args) -> Result<()> {
             continue;
         }
 
-        if restore_staged
-            && do_restore_staged(&repo, &mut index, rel_path, source_tree_oid.as_ref())?
-        {
+        let staged_changed = restore_staged
+            && do_restore_staged(&repo, &mut index, rel_path, source_tree_oid.as_ref())?;
+        if staged_changed {
             index_modified = true;
         }
 
@@ -226,6 +226,7 @@ pub fn run(args: Args) -> Result<()> {
                         rel_path,
                         *tree_oid,
                         args.recurse_submodules,
+                        false,
                     )?;
                 } else {
                     // --source with --staged (and --worktree implied or explicit)
@@ -235,6 +236,7 @@ pub fn run(args: Args) -> Result<()> {
                         rel_path,
                         *tree_oid,
                         args.recurse_submodules,
+                        staged_changed,
                     )?;
                 }
             } else {
@@ -325,9 +327,14 @@ fn do_restore_worktree_from_tree(
     rel_path: &str,
     tree_oid: ObjectId,
     recurse_submodules: bool,
+    remove_missing: bool,
 ) -> Result<()> {
     match find_in_tree(repo, tree_oid, rel_path)? {
         None => {
+            if remove_missing {
+                remove_worktree_path(work_tree, rel_path)?;
+                return Ok(());
+            }
             bail!(
                 "pathspec '{}' did not match any file(s) in the source tree",
                 rel_path
@@ -349,6 +356,19 @@ fn do_restore_worktree_from_tree(
             }
             write_to_worktree(work_tree, rel_path, &obj.data, mode)?;
         }
+    }
+    Ok(())
+}
+
+fn remove_worktree_path(work_tree: &Path, rel_path: &str) -> Result<()> {
+    let abs_path = work_tree.join(rel_path);
+    if std::fs::symlink_metadata(&abs_path).is_err() {
+        return Ok(());
+    }
+    if abs_path.is_dir() && !abs_path.is_symlink() {
+        std::fs::remove_dir_all(&abs_path)?;
+    } else {
+        std::fs::remove_file(&abs_path)?;
     }
     Ok(())
 }
@@ -647,7 +667,18 @@ fn expand_pathspecs(
                 // Collect all paths from the source tree
                 let mut tree_paths = Vec::new();
                 collect_tree_paths(repo, *tree_oid, "", &mut tree_paths)?;
-                result.extend(tree_paths);
+                let mut seen = std::collections::BTreeSet::new();
+                for path in tree_paths {
+                    if seen.insert(path.clone()) {
+                        result.push(path);
+                    }
+                }
+                for entry in &index.entries {
+                    let path = String::from_utf8_lossy(&entry.path).into_owned();
+                    if seen.insert(path.clone()) {
+                        result.push(path);
+                    }
+                }
             } else {
                 // Collect all tracked paths from the index, including unmerged
                 // stage entries, so `restore .` can properly error/ignore on

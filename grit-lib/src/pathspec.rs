@@ -1475,6 +1475,7 @@ mod tree_entry_pathspec_tests {
 #[cfg(test)]
 mod pathspec_list_tests {
     use super::*;
+    use crate::crlf::parse_gitattributes_content;
 
     #[test]
     fn exclude_removes_paths_matching_icase_positive() {
@@ -1486,6 +1487,28 @@ mod pathspec_list_tests {
         assert!(!path_allowed_by_pathspec_list(
             &specs,
             "submodule/subsub/e.txt"
+        ));
+    }
+
+    #[test]
+    fn prefixed_attr_exclude_removes_matching_child_path() {
+        let specs = vec![
+            "sub".to_string(),
+            ":(exclude,attr:labelB,prefix:sub/)".to_string(),
+        ];
+        let exclude_only = vec![":(exclude,attr:labelB,prefix:sub/)".to_string()];
+        let attrs = parse_gitattributes_content("fileB labelB\n");
+        assert!(!matches_pathspec_list_for_object(
+            "sub/fileB",
+            0o100644,
+            &attrs,
+            &specs,
+        ));
+        assert!(!matches_pathspec_list_for_object(
+            "sub/fileB",
+            0o100644,
+            &attrs,
+            &exclude_only,
         ));
     }
 }
