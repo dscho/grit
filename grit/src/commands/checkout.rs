@@ -6570,10 +6570,6 @@ pub(crate) fn checkout_index_to_worktree(
         .map(|e| (e.path.as_slice(), e))
         .collect();
 
-    if preserve_dropped_gitlink_dirs {
-        refuse_populated_submodule_tree_replacement(old_index, new_index, work_tree)?;
-    }
-
     // Remove paths that are no longer present in the new index.
     for old_path in old_stage0.difference(&new_stage0) {
         if preserve_dropped_gitlink_dirs {

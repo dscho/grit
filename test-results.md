@@ -1,3 +1,16 @@
+## 2026-06-04 — t6430-merge-recursive checkout/submodule unblock
+
+- Focus harness: `./scripts/run-tests.sh t6430-merge-recursive.sh --verbose` improved from 11/36
+  to 28/36 after normal checkout stopped applying the rebase-only submodule replacement refusal.
+- Regression harness: `./scripts/run-tests.sh t6430-merge-recursive.sh t3426-rebase-submodule.sh t2013-checkout-submodule.sh t7112-reset-submodule.sh t6438-submodule-directory-file-conflicts.sh --verbose --timeout 180`
+  reports `t6430` 28/36, `t3426` 11/29, `t2013` 62/74, `t7112` 78/82 with no failing tests, and
+  `t6438` 56/56.
+- `cargo build --release -p grit-cli`, `cargo fmt`, `cargo check -p grit-cli`,
+  `cargo test -p grit-lib --lib`, and `cargo clippy --fix --allow-dirty` completed with the
+  existing warning backlog; unrelated clippy auto-fixes were restored.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment.
+
 ## 2026-06-04 — t6013-rev-list-reverse-parents
 
 - Focus harness: `./scripts/run-tests.sh t6013-rev-list-reverse-parents.sh --verbose` passes 3/3
