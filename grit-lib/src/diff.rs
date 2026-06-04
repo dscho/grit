@@ -2044,6 +2044,17 @@ pub fn detect_renames(
         let del = &deleted[*di];
         let add = &added[*ai];
 
+        // A "rename" whose source and destination are the same path with the
+        // same blob is not a change at all (this arises with pathological
+        // duplicate tree entries, t4058). Git pairs and then drops it, leaving
+        // no diff entry; mirror that by skipping emission.
+        if del.old_path == add.new_path
+            && del.old_oid == add.new_oid
+            && del.old_mode == add.new_mode
+        {
+            continue;
+        }
+
         renames.push(DiffEntry {
             status: DiffStatus::Renamed,
             old_path: del.old_path.clone(),
@@ -2550,18 +2561,24 @@ pub fn format_raw_abbrev(entry: &DiffEntry, abbrev_len: usize) -> String {
     let old_abbrev = &old_hex[..abbrev_len.min(old_hex.len())];
     let new_abbrev = &new_hex[..abbrev_len.min(new_hex.len())];
 
-    let path = entry.path();
+    // Renames/copies carry a similarity score and a `<old>\t<new>` path pair.
+    let path = match entry.status {
+        DiffStatus::Renamed | DiffStatus::Copied => format!(
+            "{}\t{}",
+            entry.old_path.as_deref().unwrap_or(""),
+            entry.new_path.as_deref().unwrap_or("")
+        ),
+        _ => entry.path().to_owned(),
+    };
+    let status_str = match (entry.status, entry.score) {
+        (DiffStatus::Renamed, Some(s)) => format!("R{s:03}"),
+        (DiffStatus::Copied, Some(s)) => format!("C{s:03}"),
+        _ => entry.status.letter().to_string(),
+    };
 
     format!(
         ":{} {} {}{} {}{} {}\t{}",
-        entry.old_mode,
-        entry.new_mode,
-        old_abbrev,
-        ellipsis,
-        new_abbrev,
-        ellipsis,
-        entry.status.letter(),
-        path
+        entry.old_mode, entry.new_mode, old_abbrev, ellipsis, new_abbrev, ellipsis, status_str, path
     )
 }
 
