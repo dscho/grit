@@ -1421,6 +1421,7 @@ fn run_line_log(
             None,
             None,
             None,
+            None,
         )?;
         let nparents = load_raw_parents(repo, *oid)?.len();
         if show_patch {
@@ -2691,6 +2692,7 @@ fn run_rev_list_log(
                 None,
                 None,
                 None,
+                None,
             )?;
         }
 
@@ -3077,6 +3079,7 @@ fn run_graph_log(
                         &repo.odb,
                         Some(node.parents.as_slice()),
                         false,
+                        None,
                         None,
                         None,
                         None,
@@ -3710,6 +3713,7 @@ fn render_graph_commit_text(
                 use_mailmap,
                 args.expand_tabs_in_log,
                 None,
+                None,
             );
         }
         if fmt.contains('%') {
@@ -3729,6 +3733,7 @@ fn render_graph_commit_text(
                 mailmap,
                 use_mailmap,
                 args.expand_tabs_in_log,
+                None,
                 None,
             );
         }
@@ -4872,6 +4877,39 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let merged_argv = merge_log_revision_argv(&repo, &args)?;
+    // `%S` (source) needs each commit labeled with the named revision it was
+    // reached from. Only build the map when the format actually uses `%S`.
+    let format_uses_percent_s = args
+        .format
+        .as_deref()
+        .map(|fmt| {
+            let template = fmt
+                .strip_prefix("format:")
+                .or_else(|| fmt.strip_prefix("tformat:"))
+                .unwrap_or(fmt);
+            // A real `%S` placeholder (not `%%S` literal). Scan for an odd run of
+            // `%` immediately before `S`.
+            let bytes = template.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    let mut pct = 0;
+                    while i < bytes.len() && bytes[i] == b'%' {
+                        pct += 1;
+                        i += 1;
+                    }
+                    if pct % 2 == 1 && i < bytes.len() && bytes[i] == b'S' {
+                        return true;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            false
+        })
+        .unwrap_or(false);
+    let mut percent_s_source_map: std::collections::HashMap<ObjectId, String> =
+        std::collections::HashMap::new();
     // Determine starting points and excluded commits (alternate / remote-tracking first; else
     // merged argv + stdin, matching Git `setup_revisions` for pseudo-options stripped before clap).
     let (mut start_oids, exclude_oids) = if args.alternate_refs {
@@ -4902,6 +4940,41 @@ pub fn run(mut args: Args) -> Result<()> {
 
         let mut start_oids = resolve_specs_to_commits_ignoring_missing(&repo, &pos_s, &args)?;
         let mut exclude_oids = resolve_specs_to_commits_ignoring_missing(&repo, &neg_s, &args)?;
+
+        if format_uses_percent_s {
+            // Label each commit with the named positive revision it was reached
+            // from. Each positive spec (in command-line order) seeds the walk
+            // with its own display name as the `%S` source.
+            // Seed from the *original* command-line specs so each side of a
+            // symmetric range `A...B` is labeled with its own name (positive
+            // splitting of `..`/`...` would otherwise drop the name).
+            let mut named_specs: Vec<String> = Vec::new();
+            for spec in &argv_specs {
+                if grit_lib::rev_list::is_symmetric_diff(spec) {
+                    if let Some((lhs, rhs)) = grit_lib::rev_list::split_symmetric_diff(spec) {
+                        named_specs.push(lhs);
+                        named_specs.push(rhs);
+                        continue;
+                    }
+                }
+                // Plain positive spec (skip `^neg` and `A..B` exclusion forms).
+                if !spec.starts_with('^') && grit_lib::rev_parse::split_double_dot_range(spec).is_none()
+                {
+                    named_specs.push(spec.clone());
+                }
+            }
+            let mut tips: Vec<(ObjectId, String)> = Vec::new();
+            for spec in &named_specs {
+                if let Ok(oid) = resolve_revision(&repo, spec) {
+                    // Peel annotated tags to the underlying commit so the walk
+                    // can follow parents; the label stays the spec name.
+                    let commit_oid = peel_to_commit_for_merge_base(&repo, oid).unwrap_or(oid);
+                    tips.push((commit_oid, spec.clone()));
+                }
+            }
+            percent_s_source_map =
+                build_named_source_map(&repo.odb, &tips, args.first_parent);
+        }
 
         if args.all {
             start_oids.extend(collect_all_ref_oids(&repo.git_dir)?);
@@ -5233,6 +5306,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     None,
                     source_for_oneline,
+                    percent_s_source_map.get(&oid).map(|s| s.as_str()),
                 )?;
             }
 
@@ -5443,6 +5517,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     None,
                     None,
                     source_for_oneline,
+                    percent_s_source_map.get(oid).map(|s| s.as_str()),
                 )?;
             }
 
@@ -5866,6 +5941,7 @@ pub fn run_no_walk(
                 &repo.odb,
                 None,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -8753,6 +8829,20 @@ fn run_symmetric_log(
         None
     };
 
+    // `%S` for a symmetric range labels each side's commits with its ref name.
+    let percent_s_source_map: std::collections::HashMap<ObjectId, String> = {
+        let template = args.format.as_deref().unwrap_or("");
+        if template.contains("%S") {
+            let tips = vec![
+                (lhs_oid, lhs_spec.to_owned()),
+                (rhs_oid, rhs_spec.to_owned()),
+            ];
+            build_named_source_map(&repo.odb, &tips, args.first_parent)
+        } else {
+            std::collections::HashMap::new()
+        }
+    };
+
     for (i, oid) in ordered.iter().enumerate() {
         if i > 0 && log_wants_blank_line_between_commits(args) {
             writeln!(out)?;
@@ -8786,6 +8876,7 @@ fn run_symmetric_log(
             log_marker,
             None,
             None,
+            percent_s_source_map.get(oid).map(|s| s.as_str()),
         )?;
     }
 
@@ -8865,6 +8956,7 @@ fn format_commit(
     log_marker: Option<char>,
     merge_from_parent: Option<&ObjectId>,
     source_for_oneline: Option<&str>,
+    percent_s_source: Option<&str>,
 ) -> Result<()> {
     let hex = oid.to_hex();
     let abbrev_len = if args.no_abbrev {
@@ -8990,6 +9082,7 @@ fn format_commit(
                 use_mailmap,
                 et,
                 signature_ref,
+                percent_s_source,
             );
             let bytes = encode_log_str(&formatted, args.log_output_encoding.as_deref());
             if is_tformat {
@@ -9228,6 +9321,7 @@ fn format_commit(
                 use_mailmap,
                 et,
                 signature_ref,
+                percent_s_source,
             );
             let bytes = encode_log_str(&formatted, args.log_output_encoding.as_deref());
             out.write_all(&bytes)?;
@@ -9253,6 +9347,7 @@ fn format_commit(
                 use_mailmap,
                 et,
                 signature_ref,
+                percent_s_source,
             );
             writeln!(out, "{formatted}")?;
         }
@@ -9429,6 +9524,7 @@ fn apply_format_string(
     use_mailmap: bool,
     expand_tabs_in_log: usize,
     signature: Option<&grit_lib::signing::SignatureCheck>,
+    percent_s_source: Option<&str>,
 ) -> String {
     let hex = oid.to_hex();
     let commit_color = || {
@@ -9959,6 +10055,15 @@ fn apply_format_string(
                         ));
                     } else {
                         result.push_str(subj);
+                    }
+                }
+                Some('S') => {
+                    chars.next();
+                    // Source: the named revision this commit was reached from
+                    // (only populated when `git log --source`-style tracking is
+                    // active for the given command-line revisions).
+                    if let Some(src) = percent_s_source {
+                        result.push_str(src);
                     }
                 }
                 Some('f') => {
@@ -11611,6 +11716,7 @@ fn write_commit_diff(
                 None,
                 Some(parent_oid),
                 None,
+                None,
             )?;
             write_commit_diff_body(
                 out,
@@ -12801,6 +12907,85 @@ fn follow_filter(
     }
 
     Ok(result)
+}
+
+/// Build a map from commit OID → source name for the `%S` placeholder, seeded
+/// from the named positive revisions given on the command line.
+///
+/// Git propagates each commit's "source" from the named ref it was reached
+/// from, walking in commit-date order so that, when two tips both reach a
+/// commit, the tip whose traversal arrives first (highest committer date)
+/// wins. We mirror that with a date-ordered priority queue: pop the
+/// highest-dated pending commit, fix its label, then enqueue its parents with
+/// the same label (an already-labeled commit keeps its first label).
+fn build_named_source_map(
+    odb: &Odb,
+    tips: &[(ObjectId, String)],
+    first_parent: bool,
+) -> std::collections::HashMap<ObjectId, String> {
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+
+    // Heap entry ordered by committer time (desc), then OID for determinism.
+    struct Entry {
+        time: i64,
+        oid: ObjectId,
+        label: String,
+    }
+    impl PartialEq for Entry {
+        fn eq(&self, other: &Self) -> bool {
+            self.time == other.time && self.oid == other.oid
+        }
+    }
+    impl Eq for Entry {}
+    impl Ord for Entry {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.time
+                .cmp(&other.time)
+                .then_with(|| self.oid.cmp(&other.oid))
+        }
+    }
+    impl PartialOrd for Entry {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+
+    let mut source_map: std::collections::HashMap<ObjectId, String> =
+        std::collections::HashMap::new();
+    let mut heap: BinaryHeap<Entry> = BinaryHeap::new();
+    for (oid, label) in tips {
+        heap.push(Entry {
+            time: read_commit_timestamp(odb, oid),
+            oid: *oid,
+            label: label.clone(),
+        });
+    }
+    while let Some(Entry { oid, label, .. }) = heap.pop() {
+        if source_map.contains_key(&oid) {
+            continue;
+        }
+        source_map.insert(oid, label.clone());
+        if let Ok(obj) = odb.read(&oid) {
+            if let Ok(commit) = parse_commit(&obj.data) {
+                let parents: &[ObjectId] = if first_parent {
+                    commit.parents.first().map(std::slice::from_ref).unwrap_or(&[])
+                } else {
+                    &commit.parents
+                };
+                for p in parents {
+                    if !source_map.contains_key(p) {
+                        heap.push(Entry {
+                            time: read_commit_timestamp(odb, p),
+                            oid: *p,
+                            label: label.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    source_map
 }
 
 /// Build a map from commit OID → source ref name for --source.
