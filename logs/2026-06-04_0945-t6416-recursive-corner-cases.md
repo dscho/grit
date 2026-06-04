@@ -47,3 +47,11 @@ Progress:
 - Ran `./scripts/run-tests.sh t6416-recursive-corner-cases.sh --verbose`; improved to
   36/40 passing, 1 failing, with 3 expected failures. Newly passing: virtual merge base with
   nested conflicts. Remaining ordinary failure: 38.
+- After merging `origin/main`, a fresh `./scripts/run-tests.sh t6416-recursive-corner-cases.sh
+  --verbose` regressed to 33/40. Normal branch checkout was applying the rebase-style populated
+  submodule replacement refusal, which broke the submodule-vs-symlink setup, and rename detection
+  could consume a real rename destination with a same-path no-op pair.
+- Narrowed the checkout guard to non-populating worktree updates and ranked same-path same-blob
+  rename pairs after path-changing candidates. Re-ran `./scripts/run-tests.sh
+  t6416-recursive-corner-cases.sh --verbose`; recovered to 36/40 passing, 1 failing, with
+  3 expected failures. Remaining ordinary failure: 38.

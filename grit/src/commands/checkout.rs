@@ -6613,7 +6613,7 @@ fn checkout_index_to_worktree_inner(
         .map(|e| (e.path.as_slice(), e))
         .collect();
 
-    if refuse_submodule_replacement && preserve_dropped_gitlink_dirs {
+    if refuse_submodule_replacement && preserve_dropped_gitlink_dirs && !populate_gitlinks {
         refuse_populated_submodule_tree_replacement(old_index, new_index, work_tree)?;
     }
 

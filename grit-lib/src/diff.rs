@@ -2068,6 +2068,10 @@ pub fn detect_renames(
         mode == "100644" || mode == "100755"
     }
 
+    fn same_path_same_blob(del: &DiffEntry, add: &DiffEntry) -> bool {
+        del.old_path == add.new_path && del.old_oid == add.new_oid && del.old_mode == add.new_mode
+    }
+
     for (di, del) in deleted.iter().enumerate() {
         for (ai, add) in added.iter().enumerate() {
             // Exact OID match → 100%
@@ -2093,12 +2097,18 @@ pub fn detect_renames(
         }
     }
 
-    // Sort: prefer same-basename pairs first, then by score descending.
+    // Sort: prefer real path-changing pairs before same-path no-op pairs, then
+    // same-basename pairs, then by score descending.
     // This matches Git's behavior where basename matches are checked first.
     scores.sort_by(|a, b| {
+        let a_noop = same_path_same_blob(&deleted[a.1], &added[a.2]);
+        let b_noop = same_path_same_blob(&deleted[b.1], &added[b.2]);
         let a_same = same_basename(&deleted[a.1], &added[a.2]);
         let b_same = same_basename(&deleted[b.1], &added[b.2]);
-        b_same.cmp(&a_same).then_with(|| b.0.cmp(&a.0))
+        a_noop
+            .cmp(&b_noop)
+            .then_with(|| b_same.cmp(&a_same))
+            .then_with(|| b.0.cmp(&a.0))
     });
 
     let mut used_deleted = vec![false; deleted.len()];
@@ -2119,10 +2129,7 @@ pub fn detect_renames(
         // same blob is not a change at all (this arises with pathological
         // duplicate tree entries, t4058). Git pairs and then drops it, leaving
         // no diff entry; mirror that by skipping emission.
-        if del.old_path == add.new_path
-            && del.old_oid == add.new_oid
-            && del.old_mode == add.new_mode
-        {
+        if same_path_same_blob(del, add) {
             continue;
         }
 

@@ -1,3 +1,13 @@
+## 2026-06-04 — t6416 post-main recovery
+
+- Focus harness: after fast-forwarding to `origin/main`, `./scripts/run-tests.sh
+  t6416-recursive-corner-cases.sh --verbose` first reported 33/40; after the checkout and rename
+  detection fixes it recovered to 36/40, with only the nested-conflicts ordinary failure remaining.
+- Quality gates: `cargo fmt`, `cargo check -p grit-cli`, `cargo clippy --fix --allow-dirty`,
+  and `cargo test -p grit-lib --lib` completed; the library test run passed 238/238.
+- Broader `cargo test --workspace` and `./tests/harness/run.sh` were skipped for this focused t6
+  increment. Unrelated `clippy --fix` cleanup in `grit-lib/src/filter_process.rs` was restored.
+
 ## 2026-06-04 — Cargo warnings cleanup
 
 - Quality gates: `cargo fmt`, `cargo check --workspace`, `cargo check --workspace --all-targets`,
