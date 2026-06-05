@@ -734,12 +734,26 @@
         }
       }
       .install-section {
+        background: #fff0dc;
+        box-shadow: 0 0 0 100vmax #fff0dc;
+        clip-path: inset(0 -100vmax);
         text-align: center;
       }
       .install-section .section-intro {
-        max-width: 46rem;
+        display: grid;
+        gap: 0.34rem;
+        max-width: none;
         margin-right: auto;
         margin-left: auto;
+      }
+      .install-primary {
+        color: var(--soft);
+        font-size: clamp(1rem, 1.7vw, 1.24rem);
+        font-weight: 650;
+      }
+      .install-secondary {
+        color: #8b7e72;
+        font-size: 0.88rem;
       }
       .install-block {
         display: grid;
@@ -747,11 +761,10 @@
         width: 100%;
       }
       .install-cmd {
-        display: flex;
+        display: inline-flex;
         align-items: center;
-        justify-content: space-between;
+        justify-content: center;
         gap: 0.8rem;
-        width: 100%;
         box-sizing: border-box;
         padding: 0.9rem 1.05rem 0.9rem 1.3rem;
         border: 1px solid #2d231d;
@@ -1403,9 +1416,8 @@ grit-lib = <span class="string">"0.1"</span>
       <section class="wrap section install-section" id="install">
         <h2>Try it out.</h2>
         <p class="section-intro">
-          Install the <code>grit</code> CLI and use it as a drop-in replacement
-          for <code>git</code>. Pre-built binaries for macOS and Linux, or
-          install via Cargo.
+          <span class="install-primary">Install the <code>grit</code> CLI and use it as a drop-in replacement for <code>git</code>.</span>
+          <span class="install-secondary">Pre-built binaries for macOS and Linux, or install via Cargo.</span>
         </p>
         <div class="install-block">
           <div class="install-cmd" data-install-cmd>
