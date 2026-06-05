@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use grit_lib::crlf::{self, ConvertToGitOpts};
 use grit_lib::diff::{diff_index_to_worktree, mode_from_metadata, DiffStatus};
-use grit_lib::index::{Index, IndexEntry};
+use grit_lib::index::{Index, IndexEntry, MODE_TREE};
 use grit_lib::merge_file::is_binary;
 use grit_lib::objects::{ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
@@ -146,6 +146,7 @@ pub(crate) fn run_add_patch(
         .collect();
 
     let index_path = resolved_env_index_path(repo);
+    let raw_index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
     let mut index = repo.load_index_at(&index_path).context("loading index")?;
 
     let mut entries = diff_index_to_worktree(&repo.odb, &index, work_tree, false, false)?;
@@ -156,6 +157,13 @@ pub(crate) fn run_add_patch(
         patch_path_filter_matches(e.path(), &filter_paths)
     });
     entries.sort_by(|a, b| a.path().cmp(b.path()));
+
+    if entries
+        .iter()
+        .any(|entry| path_under_sparse_index_dir(&raw_index, entry.path()))
+    {
+        emit_index_trace_region("ensure_full_index");
+    }
 
     if entries.is_empty() {
         println!("No changes.");
@@ -721,6 +729,28 @@ fn write_index_blob_and_mode(
     new_ent.set_skip_worktree(false);
     index.stage_file(new_ent);
     Ok(())
+}
+
+fn path_under_sparse_index_dir(index: &Index, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.mode == MODE_TREE)
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok())
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .any(|prefix| {
+            let prefix_slash = format!("{prefix}/");
+            path == prefix || path.starts_with(&prefix_slash)
+        })
+}
+
+fn emit_index_trace_region(label: &str) {
+    if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
+        if !trace2_event.trim().is_empty() {
+            let _ = crate::trace2_region_json(&trace2_event, "index", label);
+        }
+    }
 }
 
 fn edit_worktree_via_editor(content: &[u8]) -> Result<Vec<u8>> {

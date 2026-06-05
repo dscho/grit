@@ -18,6 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 use grit_lib::config::ConfigSet;
+use grit_lib::ignore::path_in_sparse_checkout as path_in_sparse_checkout_lines;
 use grit_lib::ignore::IgnoreMatcher;
 use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK};
 use grit_lib::objects::{parse_commit, parse_tree, ObjectId, ObjectKind};
@@ -28,6 +29,10 @@ use grit_lib::rev_parse::{
     abbreviate_object_id, resolve_revision, resolve_revision_as_commit,
     resolve_revision_as_commit_without_index_dwim, revision_spec_contains_ancestry_navigation,
     split_treeish_colon,
+};
+use grit_lib::sparse_checkout::{
+    effective_cone_mode_for_sparse_file, parse_sparse_checkout_file,
+    path_in_sparse_checkout_patterns,
 };
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::submodule_gitdir::submodule_modules_git_dir;
@@ -183,6 +188,27 @@ pub(crate) fn preserve_index_cache_flags_from(old: &Index, new: &mut Index) {
             }
         }
     }
+}
+
+fn sparse_index_was_partially_expanded(index: &Index) -> bool {
+    let sparse_roots: HashSet<Vec<u8>> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_directory_placeholder())
+        .filter_map(|entry| first_path_component(&entry.path))
+        .collect();
+    !sparse_roots.is_empty()
+        && index.entries.iter().any(|entry| {
+            entry.stage() == 0
+                && !entry.is_sparse_directory_placeholder()
+                && first_path_component(&entry.path)
+                    .is_some_and(|root| sparse_roots.contains(root.as_slice()))
+        })
+}
+
+fn first_path_component(path: &[u8]) -> Option<Vec<u8>> {
+    let slash = path.iter().position(|b| *b == b'/')?;
+    Some(path[..slash].to_vec())
 }
 
 /// The reset mode.
@@ -861,6 +887,7 @@ fn reset_patch(repo: &Repository, rest: &[String]) -> Result<()> {
         .collect();
 
     let index_path = repo.index_path();
+    let raw_index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
     let mut index = repo.load_index_at(&index_path).context("loading index")?;
 
     let mut staged_paths: Vec<Vec<u8>> = Vec::new();
@@ -897,6 +924,14 @@ fn reset_patch(repo: &Repository, rest: &[String]) -> Result<()> {
 
     if staged_paths.is_empty() {
         return Ok(());
+    }
+
+    if staged_paths.iter().any(|path| {
+        let path_str = String::from_utf8_lossy(path);
+        path_under_sparse_index_dir_bytes(&raw_index, path)
+            || path_outside_sparse_definition(repo, path_str.as_ref())
+    }) {
+        emit_index_trace_region("ensure_full_index");
     }
 
     staged_paths.sort();
@@ -1148,6 +1183,50 @@ fn emit_index_trace_region(label: &str) {
             let _ = crate::trace2_region_json(&trace2_event, "index", label);
         }
     }
+}
+
+fn path_under_sparse_index_dir_bytes(index: &Index, path: &[u8]) -> bool {
+    let path = String::from_utf8_lossy(path);
+    let path = path.trim_end_matches('/');
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.is_sparse_directory_placeholder())
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok())
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .any(|prefix| {
+            let prefix_slash = format!("{prefix}/");
+            path == prefix || path.starts_with(&prefix_slash)
+        })
+}
+
+fn path_outside_sparse_definition(repo: &Repository, path: &str) -> bool {
+    let Ok(config) = ConfigSet::load(Some(&repo.git_dir), true) else {
+        return false;
+    };
+    let sparse_enabled = config
+        .get("core.sparseCheckout")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return false;
+    }
+    let patterns = std::fs::read_to_string(repo.git_dir.join("info").join("sparse-checkout"))
+        .map(|content| parse_sparse_checkout_file(&content))
+        .unwrap_or_default();
+    if patterns.is_empty() {
+        return false;
+    }
+    let cone_cfg = config
+        .get("core.sparseCheckoutCone")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    let in_sparse = if effective_cone_mode_for_sparse_file(cone_cfg, &patterns) {
+        path_in_sparse_checkout_patterns(path, &patterns, true)
+    } else {
+        path_in_sparse_checkout_lines(path, &patterns, repo.work_tree.as_deref())
+    };
+    !in_sparse
 }
 
 fn reset_paths_require_sparse_index_expansion(index_path: &Path, paths: &[String]) -> bool {
@@ -1522,6 +1601,7 @@ Use '--' to separate paths from revisions, like this:\n\
     // Git updates the index before moving HEAD for mixed/hard/keep/merge (`reset_index` runs
     // before `reset_refs` in builtin/reset.c).
     let index_path = repo.index_path();
+    let old_index_raw = Index::load(&index_path).unwrap_or_else(|_| Index::new());
     let old_index = repo
         .load_index_at(&index_path)
         .context("loading old index")?;
@@ -1580,6 +1660,8 @@ Use '--' to separate paths from revisions, like this:\n\
 
     let needs_worktree_checkout =
         mode == ResetMode::Hard || mode == ResetMode::Keep || mode == ResetMode::Merge;
+    let preserve_partial_sparse_index =
+        needs_worktree_checkout && sparse_index_was_partially_expanded(&old_index_raw);
 
     if mode == ResetMode::Mixed && extra.intent_to_add {
         let new_paths: HashSet<Vec<u8>> =
@@ -1755,8 +1837,12 @@ Use '--' to separate paths from revisions, like this:\n\
         let cache_tree = build_cache_tree_from_index(&repo.odb, &new_index)?;
         new_index.set_cache_tree(cache_tree);
     }
-    repo.write_index_at(&index_path, &mut new_index)
-        .context("writing index")?;
+    if preserve_partial_sparse_index {
+        new_index.write(&index_path).context("writing index")?;
+    } else {
+        repo.write_index_at(&index_path, &mut new_index)
+            .context("writing index")?;
+    }
     // For MIXED (and SOFT) resets, do NOT re-apply sparse-checkout. Git's `reset`
     // only copies the existing entry's skip-worktree bit and never deletes
     // worktree files or re-runs sparse application (git/builtin/reset.c).
@@ -1768,7 +1854,7 @@ Use '--' to separate paths from revisions, like this:\n\
     // into the worktree without honoring skip-worktree, so they still need the
     // sparse re-apply to prune excluded paths back out (t1091 "cone mode: match
     // patterns").
-    if needs_worktree_checkout {
+    if needs_worktree_checkout && !preserve_partial_sparse_index {
         crate::commands::sparse_checkout::reapply_sparse_checkout_if_configured(repo)?;
     }
 

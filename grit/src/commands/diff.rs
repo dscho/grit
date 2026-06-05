@@ -17,7 +17,8 @@ use crate::pathspec::resolve_pathspec;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::attributes::{
-    collect_attrs_for_path, load_gitattributes_for_diff, AttrValue, ParsedGitAttributes,
+    collect_attrs_for_path, load_gitattributes_for_diff, load_gitattributes_from_index, AttrValue,
+    ParsedGitAttributes,
 };
 use grit_lib::combined_diff_patch::CombinedDiffWsOptions;
 use grit_lib::combined_tree_diff::{
@@ -2899,6 +2900,11 @@ pub fn run(mut args: Args) -> Result<()> {
         Ok(idx) => idx,
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
         Err(e) => return Err(e.into()),
+    };
+    let merged_attrs = if args.cached {
+        Arc::new(load_cached_diff_gitattributes(&repo, &index)?)
+    } else {
+        merged_attrs
     };
 
     // Get HEAD tree OID (None if unborn)
@@ -10475,6 +10481,39 @@ fn conflict_marker_size_for_path(
         }
     }
     size
+}
+
+fn load_cached_diff_gitattributes(repo: &Repository, index: &Index) -> Result<ParsedGitAttributes> {
+    let mut merged = load_gitattributes_for_diff(repo)?;
+    let Some(work_tree) = repo.work_tree.as_deref() else {
+        return Ok(merged);
+    };
+
+    let mut missing_attr_index = Index::new();
+    missing_attr_index.entries = index
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.stage() == 0
+                && entry.path.ends_with(b".gitattributes")
+                && std::str::from_utf8(&entry.path)
+                    .map(|path| !work_tree.join(path).exists())
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+
+    if missing_attr_index.entries.is_empty() {
+        return Ok(merged);
+    }
+
+    let mut from_index = load_gitattributes_from_index(&missing_attr_index, &repo.odb, work_tree)?;
+    merged.rules.append(&mut from_index.rules);
+    for (name, defs) in from_index.macros.defs.drain() {
+        merged.macros.defs.insert(name, defs);
+    }
+    merged.warnings.append(&mut from_index.warnings);
+    Ok(merged)
 }
 
 fn config_whitespace_rule_bits(config: &ConfigSet) -> Result<u32, ws::WhitespaceRuleError> {

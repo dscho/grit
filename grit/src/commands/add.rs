@@ -10,9 +10,10 @@ use clap::Args as ClapArgs;
 use grit_lib::attributes::{parse_gitattributes_file_content, validate_rules_for_add};
 use grit_lib::config::ConfigSet;
 use grit_lib::crlf::{self, ConversionConfig, GitAttributes};
+use grit_lib::diff::{diff_index_to_worktree, DiffStatus};
 use grit_lib::error::Error;
 use grit_lib::ignore::{path_in_sparse_checkout as path_in_sparse_checkout_lines, IgnoreMatcher};
-use grit_lib::index::{entry_from_metadata, normalize_mode, Index, IndexEntry};
+use grit_lib::index::{entry_from_metadata, normalize_mode, Index, IndexEntry, MODE_TREE};
 #[allow(unused_imports)]
 use grit_lib::objects::ObjectId;
 use grit_lib::objects::ObjectKind;
@@ -480,13 +481,6 @@ pub fn run(mut args: Args) -> Result<()> {
         return Ok(());
     }
 
-    // Interactive mode is not implemented; `--patch` falls through so scripted
-    // `git add -p -- <pathspec>` can update the index non-interactively (t6132-pathspec-exclude).
-    if args.interactive {
-        eprintln!("warning: -i/--interactive mode is not yet implemented; doing nothing");
-        return Ok(());
-    }
-
     let repo = Repository::discover(None).context("not a git repository")?;
     let work_tree = repo
         .work_tree
@@ -523,6 +517,11 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
     let idx_exists = index_path.exists();
+    let raw_index = if idx_exists {
+        Index::load(&index_path).unwrap_or_else(|_| Index::new())
+    } else {
+        Index::new()
+    };
     let mut index = if idx_exists {
         repo.load_index_at(&index_path)?
     } else {
@@ -578,6 +577,7 @@ pub fn run(mut args: Args) -> Result<()> {
         return super::add_patch::run_add_patch(&repo, &args.pathspec, &add_cfg, &patch_opts);
     }
     if args.interactive {
+        maybe_emit_interactive_add_sparse_index_trace(&repo, &raw_index, &index, work_tree)?;
         eprintln!("warning: -i/--interactive mode is not yet implemented; doing nothing");
         return Ok(());
     }
@@ -985,6 +985,43 @@ impl AddSparseState {
             return true;
         }
         false
+    }
+}
+
+fn maybe_emit_interactive_add_sparse_index_trace(
+    repo: &Repository,
+    raw_index: &Index,
+    index: &Index,
+    work_tree: &Path,
+) -> Result<()> {
+    let entries = diff_index_to_worktree(&repo.odb, index, work_tree, false, false)?;
+    if entries.iter().any(|entry| {
+        entry.status != DiffStatus::Unmerged && path_under_sparse_index_dir(raw_index, entry.path())
+    }) {
+        emit_index_trace_region("ensure_full_index");
+    }
+    Ok(())
+}
+
+fn path_under_sparse_index_dir(index: &Index, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.mode == MODE_TREE)
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok())
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .any(|prefix| {
+            let prefix_slash = format!("{prefix}/");
+            path == prefix || path.starts_with(&prefix_slash)
+        })
+}
+
+fn emit_index_trace_region(label: &str) {
+    if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
+        if !trace2_event.trim().is_empty() {
+            let _ = crate::trace2_region_json(&trace2_event, "index", label);
+        }
     }
 }
 
@@ -1921,6 +1958,7 @@ fn add_all(
     };
 
     let mut skipped_outside_sparse = false;
+    let mut matched_any = false;
     let mut paths: Vec<(String, PathBuf)> = Vec::new();
     walk_directory(
         &scan_root,
@@ -1965,19 +2003,13 @@ fn add_all(
                 } else {
                     return Err(e);
                 }
+            } else {
+                matched_any = true;
             }
         }
         if add_cfg.ignore_errors && ignored_some {
             return Ok((true, chmod_err));
         }
-    }
-
-    if args.pathspec.iter().any(|s| s == ".")
-        && prefix.map(|p| p.is_empty()).unwrap_or(true)
-        && skipped_outside_sparse
-        && !add_cfg.include_sparse
-    {
-        sparse_advice_paths.push(".".to_string());
     }
 
     // Build a set of worktree paths for fast deletion detection
@@ -2011,6 +2043,7 @@ fn add_all(
         .collect();
 
     for path in removed {
+        matched_any = true;
         if args.verbose {
             let path_str = String::from_utf8_lossy(&path);
             eprintln!("remove '{path_str}'");
@@ -2018,6 +2051,15 @@ fn add_all(
         if !args.dry_run {
             index.remove(&path);
         }
+    }
+
+    if !matched_any
+        && args.pathspec.iter().any(|s| s == ".")
+        && prefix.map(|p| p.is_empty()).unwrap_or(true)
+        && skipped_outside_sparse
+        && !add_cfg.include_sparse
+    {
+        sparse_advice_paths.push(".".to_string());
     }
 
     if args.dry_run {
