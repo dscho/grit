@@ -1706,11 +1706,18 @@ fn pathspec_may_match_descendant(path: &str, pathspecs: &[String]) -> bool {
     if pathspecs.is_empty() {
         return true;
     }
-    let probes = [
+    let mut probes = vec![
         format!("{path}/a"),
         format!("{path}/file"),
         format!("{path}/sub/a"),
     ];
+    probes.extend(
+        pathspecs
+            .iter()
+            .filter_map(|spec| spec.split_once('/').map(|(_, tail)| tail))
+            .map(pathspec_tail_probe)
+            .map(|tail| format!("{path}/{tail}")),
+    );
     probes.iter().any(|probe| {
         any_pathspec_matches(
             probe,
@@ -1718,6 +1725,26 @@ fn pathspec_may_match_descendant(path: &str, pathspecs: &[String]) -> bool {
             grit_lib::pathspec::PathspecMatchContext::default(),
         )
     })
+}
+
+fn pathspec_tail_probe(tail: &str) -> String {
+    let mut out = String::new();
+    let mut chars = tail.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' | '?' | '\\' => out.push('a'),
+            '[' => {
+                out.push('a');
+                for inner in chars.by_ref() {
+                    if inner == ']' {
+                        break;
+                    }
+                }
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// Collapse `.`, `..`, and empty segments in a `/`-separated repo-relative path.
