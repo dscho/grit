@@ -4698,7 +4698,7 @@ pub fn run(mut args: Args) -> Result<()> {
     );
 
     // Resolve the effective log output encoding: --encoding overrides
-    // i18n.logOutputEncoding; absent both, output stays UTF-8 (no reencoding).
+    // i18n.logOutputEncoding; absent both, Git falls back to i18n.commitEncoding.
     {
         let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
         let mut enc = args
@@ -4710,6 +4710,10 @@ pub fn run(mut args: Args) -> Result<()> {
             .or_else(|| {
                 cfg.get("i18n.logOutputEncoding")
                     .or_else(|| cfg.get("i18n.logoutputencoding"))
+            })
+            .or_else(|| {
+                cfg.get("i18n.commitEncoding")
+                    .or_else(|| cfg.get("i18n.commitencoding"))
             });
         if let Some(label) = enc.as_deref() {
             if label.eq_ignore_ascii_case("UTF-8") || label.eq_ignore_ascii_case("UTF8") {

@@ -83,6 +83,10 @@ pub struct Args {
     )]
     pub pretty: Option<String>,
 
+    /// Re-code commit messages to the given encoding, or `none` for raw bytes.
+    #[arg(long = "encoding", value_name = "ENCODING")]
+    pub encoding: Option<String>,
+
     /// Expand tabs in commit log message to spaces (`--expand-tabs` is `--expand-tabs=8`).
     #[arg(long = "expand-tabs", value_name = "N", require_equals = true)]
     pub expand_tabs: Option<String>,
@@ -359,6 +363,13 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             } else if tok == "-s" || tok == "--no-patch" {
                 args.no_patch = true;
+            } else if let Some(v) = tok.strip_prefix("--encoding=") {
+                args.encoding = Some(v.to_owned());
+            } else if tok == "--encoding" {
+                if let Some(v) = iter.peek() {
+                    args.encoding = Some((*v).clone());
+                    iter.next();
+                }
             } else {
                 kept.push(tok.clone());
             }
@@ -903,6 +914,89 @@ fn write_formatted_line(out: &mut impl Write, formatted: &str) -> Result<()> {
     Ok(())
 }
 
+enum ShowOutputEncoding {
+    Utf8,
+    Reencode(String),
+    Raw,
+}
+
+fn resolve_show_output_encoding(config: &ConfigSet, args: &Args) -> ShowOutputEncoding {
+    let explicit = args
+        .encoding
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if explicit.is_some_and(|label| label.eq_ignore_ascii_case("none")) {
+        return ShowOutputEncoding::Raw;
+    }
+    let label = explicit
+        .map(str::to_owned)
+        .or_else(|| {
+            config
+                .get("i18n.logOutputEncoding")
+                .or_else(|| config.get("i18n.logoutputencoding"))
+        })
+        .or_else(|| {
+            config
+                .get("i18n.commitEncoding")
+                .or_else(|| config.get("i18n.commitencoding"))
+        });
+    match label {
+        Some(label)
+            if !(label.eq_ignore_ascii_case("utf-8") || label.eq_ignore_ascii_case("utf8")) =>
+        {
+            ShowOutputEncoding::Reencode(label)
+        }
+        _ => ShowOutputEncoding::Utf8,
+    }
+}
+
+fn write_medium_message_lines(
+    out: &mut impl Write,
+    commit: &grit_lib::objects::CommitData,
+    expand_tabs_in_log: usize,
+    output_encoding: &ShowOutputEncoding,
+) -> Result<()> {
+    if matches!(output_encoding, ShowOutputEncoding::Raw) {
+        let raw = commit
+            .raw_message
+            .as_deref()
+            .unwrap_or_else(|| commit.message.as_bytes());
+        return write_indented_raw_message(out, raw);
+    }
+
+    for line in commit.message.lines() {
+        let line = grit_lib::tab_expand::indent_and_expand_tabs(line, 4, expand_tabs_in_log);
+        match output_encoding {
+            ShowOutputEncoding::Utf8 | ShowOutputEncoding::Raw => {
+                writeln!(out, "{line}")?;
+            }
+            ShowOutputEncoding::Reencode(label) => {
+                out.write_all(b"    ")?;
+                let unindented = line.strip_prefix("    ").unwrap_or(&line);
+                let bytes = grit_lib::commit_encoding::encode_header_text(label, unindented)
+                    .unwrap_or_else(|| unindented.as_bytes().to_vec());
+                out.write_all(&bytes)?;
+                out.write_all(b"\n")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_indented_raw_message(out: &mut impl Write, raw: &[u8]) -> Result<()> {
+    let mut lines = raw.split(|b| *b == b'\n').peekable();
+    while let Some(line) = lines.next() {
+        if line.is_empty() && lines.peek().is_none() {
+            break;
+        }
+        out.write_all(b"    ")?;
+        out.write_all(line)?;
+        out.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
 /// Git porcelain (`show`, `log -p`) splits a blob↔symlink type change into a delete hunk plus an add
 /// hunk so textconv applies only to the deleted regular file (t4030-diff-textconv).
 fn expand_typechange_entries_for_porcelain(entries: Vec<DiffEntry>) -> Vec<DiffEntry> {
@@ -1038,6 +1132,7 @@ fn show_commit(
     let odb = &repo.odb;
     let commit = parse_commit(data).context("parsing commit")?;
     let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let output_encoding = resolve_show_output_encoding(&config, args);
     let hex = oid.to_hex();
 
     // `--show-signature` (or `log.showSignature`) emits the GPG verification
@@ -1139,12 +1234,14 @@ fn show_commit(
 
     // A root commit with no diff to show (no `--root` and `log.showroot=false`) prints only
     // the header/message — without the trailing blank that normally separates message and diff.
-    let root_diff_shown = !commit.parents.is_empty()
-        || want_root
-        || config
-            .get_bool("log.showroot")
-            .and_then(|r| r.ok())
-            .unwrap_or(true);
+    let root_diff_shown = !args.quiet
+        && !args.no_patch
+        && (!commit.parents.is_empty()
+            || want_root
+            || config
+                .get_bool("log.showroot")
+                .and_then(|r| r.ok())
+                .unwrap_or(true));
 
     // Git's `log-tree.c` rule: when a verbose header is followed by BOTH a diffstat
     // and a patch (`--patch-with-stat`), it emits a `---` line (no extra blank)
@@ -1312,13 +1409,7 @@ fn show_commit(
             writeln!(out, "Author: {}", format_ident_display(&commit.author))?;
             writeln!(out, "Date:   {}", format_date(&commit.author))?;
             writeln!(out)?;
-            for line in commit.message.lines() {
-                writeln!(
-                    out,
-                    "{}",
-                    grit_lib::tab_expand::indent_and_expand_tabs(line, 4, expand_tabs_in_log)
-                )?;
-            }
+            write_medium_message_lines(out, &commit, expand_tabs_in_log, &output_encoding)?;
             if show_notes_display_enabled() {
                 if let Some(note_data) = notes_map.get(oid) {
                     let note_text = String::from_utf8_lossy(note_data);
