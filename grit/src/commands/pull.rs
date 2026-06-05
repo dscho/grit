@@ -1410,12 +1410,30 @@ fn do_merge_or_rebase_after_fetch(
         // rebase must still run so the editor opens with the todo list even on a fast-forward
         // (t5520 `pull.rebase=interactive`), so do not take the shortcut for it.
         if can_ff && rebase_kind != PullRebaseKind::Interactive {
+            // This shortcut stands in for a fast-forwarding rebase, so an unspecified autostash
+            // decision falls back to `rebase.autostash` (not `merge.autostash`) — git's rebase
+            // would autostash the dirty tree before fast-forwarding (t5520 "--rebase with
+            // rebase.autostash succeeds on ff").
+            let ff_autostash = match pull_autostash {
+                AutostashTri::Unset => {
+                    if config
+                        .get_bool("rebase.autostash")
+                        .map(|r| r.unwrap_or(false))
+                        .unwrap_or(false)
+                    {
+                        AutostashTri::On
+                    } else {
+                        AutostashTri::Unset
+                    }
+                }
+                other => other,
+            };
             let merge_args = build_pull_merge_args(
                 args,
                 false,
                 false,
                 true,
-                pull_autostash,
+                ff_autostash,
                 vec!["FETCH_HEAD".to_owned()],
             )?;
             super::merge::run(merge_args)?;
