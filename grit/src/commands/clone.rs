@@ -554,6 +554,12 @@ fn checkout_index_into_clone_worktree(repo: &Repository) -> Result<()> {
 }
 
 pub fn run(mut args: Args) -> Result<()> {
+    // `git clone` always sets `TRANS_OPT_KEEP` (builtin/clone.c), so fetch-pack keeps the
+    // received pack as a real `.pack` file instead of unpacking it into loose objects — the
+    // `transfer.unpackLimit` heuristic only applies to plain `git fetch`. Mirror this so a
+    // `--no-local` clone leaves objects under `objects/pack/` (`t5710` moves `pack-*` around).
+    std::env::set_var("GRIT_FETCH_KEEP_PACK", "1");
+
     // `git clone --mirror` is a bare clone into `<name>.git` with a full ref mirror;
     // the object store must live at `<repo>/objects/...`, not `<repo>/.git/objects/...`.
     if args.mirror {
@@ -4620,9 +4626,24 @@ fn copy_objects(src_git_dir: &Path, dst_git_dir: &Path, try_hardlink: bool) -> R
         fs::create_dir_all(&dst_info)?;
         for entry in fs::read_dir(&src_info)? {
             let entry = entry?;
-            if entry.path().is_file() {
+            let path = entry.path();
+            if path.is_file() {
                 let dst_file = dst_info.join(entry.file_name());
-                copy_skip_vanished_source(&entry.path(), &dst_file)?;
+                copy_skip_vanished_source(&path, &dst_file)?;
+            } else if path.is_dir() && entry.file_name().to_string_lossy() == "commit-graphs" {
+                // A local clone copies the split commit-graph chain (Git's
+                // local-clone copies the whole objects tree). Recurse into
+                // `info/commit-graphs/` so the cloned repo keeps the chain file
+                // and its graph-*.graph layers.
+                let dst_cg = dst_info.join(entry.file_name());
+                fs::create_dir_all(&dst_cg)?;
+                for inner in fs::read_dir(&path)? {
+                    let inner = inner?;
+                    if inner.path().is_file() {
+                        let dst_file = dst_cg.join(inner.file_name());
+                        copy_skip_vanished_source(&inner.path(), &dst_file)?;
+                    }
+                }
             }
         }
     }
