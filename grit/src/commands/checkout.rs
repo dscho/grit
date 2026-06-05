@@ -2973,24 +2973,35 @@ fn detach_head_inner(
 /// Git drops the carry-over of a staged entry when it would imply both a file and a
 /// descendant path (e.g. staged blob `d` while the target tree has `d/e`).
 fn staged_path_conflicts_with_tree_paths(staged: &[u8], tree_paths: &HashSet<Vec<u8>>) -> bool {
+    staged_path_tree_conflict_ancestor(staged, tree_paths).is_some()
+}
+
+fn staged_path_tree_conflict_ancestor(
+    staged: &[u8],
+    tree_paths: &HashSet<Vec<u8>>,
+) -> Option<Vec<u8>> {
     for tp in tree_paths {
         let b = tp.as_slice();
         if staged == b {
             continue;
         }
-        let (shorter, longer) = if staged.len() <= b.len() {
-            (staged, b)
-        } else {
-            (b, staged)
-        };
-        if longer.len() > shorter.len()
-            && longer.starts_with(shorter)
-            && longer[shorter.len()] == b'/'
-        {
-            return true;
+        if staged.len() > b.len() && staged.starts_with(b) && staged[b.len()] == b'/' {
+            return Some(b.to_vec());
+        }
+        if b.len() > staged.len() && b.starts_with(staged) && b[staged.len()] == b'/' {
+            return Some(staged.to_vec());
         }
     }
-    false
+    None
+}
+
+fn tree_path_has_same_prefix_sibling(path: &[u8], tree_paths: &HashSet<Vec<u8>>) -> bool {
+    tree_paths.iter().any(|candidate| {
+        candidate.as_slice() != path
+            && candidate.len() > path.len()
+            && candidate.starts_with(path)
+            && candidate.get(path.len()) != Some(&b'/')
+    })
 }
 
 /// Switch the working tree and index from the current HEAD tree to a new tree.
@@ -3009,6 +3020,7 @@ fn switch_to_tree(
     };
 
     let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let sparse_checkout_enabled = sparse_checkout_config_enabled(&repo.git_dir);
     if grit_lib::promisor::repo_treats_promisor_packs(&repo.git_dir, &cfg)
         && !crate::commands::promisor_hydrate::git_no_lazy_fetch_env_disables_lazy()?
     {
@@ -3045,6 +3057,9 @@ fn switch_to_tree(
     let index_path = repo
         .index_path_for_env()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let raw_index_had_sparse_dirs = Index::load(&index_path)
+        .map(|idx| idx.has_sparse_directory_placeholders())
+        .unwrap_or(false);
     let old_index = repo.load_index_at(&index_path).context("loading index")?;
 
     // Build the new index from the target tree
@@ -3086,6 +3101,7 @@ fn switch_to_tree(
             })()
             .unwrap_or_default();
 
+        let mut df_conflict_reports: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         for old_entry in &old_index.entries {
             if old_entry.stage() != 0 {
                 continue;
@@ -3121,12 +3137,28 @@ fn switch_to_tree(
             } else {
                 // File not in target tree: preserve staged change unless it would
                 // collide with a different shape under the same path prefix (D/F).
-                if !staged_path_conflicts_with_tree_paths(&old_entry.path, &new_paths) {
+                if let Some(ancestor) =
+                    staged_path_tree_conflict_ancestor(&old_entry.path, &new_paths)
+                {
+                    let report_git_df_oddity = !raw_index_had_sparse_dirs
+                        && (sparse_checkout_enabled
+                            || tree_path_has_same_prefix_sibling(&ancestor, &new_paths));
+                    if report_git_df_oddity {
+                        df_conflict_reports.push((ancestor, old_entry.path.clone()));
+                    }
+                } else {
                     new_index.add_or_replace(old_entry.clone());
                 }
             }
         }
         new_index.sort();
+
+        df_conflict_reports.sort();
+        df_conflict_reports.dedup();
+        for (removed, added) in df_conflict_reports {
+            println!("D\t{}", String::from_utf8_lossy(&removed));
+            println!("A\t{}", String::from_utf8_lossy(&added));
+        }
     }
 
     apply_sparse_checkout_skip_worktree(

@@ -110,3 +110,9 @@
   files before comparing stats, while plain `ls-files --sparse` still preserves placeholders.
 - Direct `--run=1,71` passes, and canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `91/106`.
+- Subtests 75 and 76 (`checkout behaves oddly with df-conflict-*`) documented Git's unusual
+  branch-checkout stdout for staged directory/file conflicts. Checkout now records staged paths
+  dropped because a target file replaces their parent directory and prints the matching `D`/`A`
+  path updates for non-sparse-index cases, while preserving sparse-index's quiet output.
+- Direct `--run=1,75,76` passes, and canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `93/106`.
