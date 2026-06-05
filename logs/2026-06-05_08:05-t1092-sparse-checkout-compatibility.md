@@ -13,3 +13,25 @@
   `add --refresh` to refresh sparse entries, and honored `add --sparse .` for out-of-cone paths.
 - Latest harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `70/106`.
   Ticket remains open; next direct failure is still within `status/add: outside sparse cone`.
+- After commit `c8a1bc3`, direct verbose execution showed subtest 15 now passes; first direct
+  failure moved to subtest 18 (`diff with renames and conflicts`).
+- Found that `checkout <current-branch>` rebuilt the index whenever staged changes made it differ
+  from HEAD. That rejected staged D/F changes in the full checkout while sparse checkouts skipped
+  the path. Adjusted the already-on-branch path to preserve staged work unless forced, sparse
+  reapply is needed, or the index is empty.
+- A follow-up direct run showed sparse checkout still failed the same loop because current-branch
+  checkout re-applied sparse rules even with staged D/F changes. Narrowed current-branch checkout
+  further: only force or an empty index rebuilds; ordinary `checkout <current-branch>` preserves
+  staged work.
+- Direct execution then passed subtest 18 and failed subtest 19. The remaining mismatch was a
+  tracked D/F descendant (`folder2/0/1/1`) still marked skip-worktree in sparse repos after
+  restoring `folder2/0/1` as a file from another tree. Added a path-checkout helper that clears
+  skip-worktree on tracked descendants that can no longer exist on disk.
+- Direct execution then passed subtest 19 and failed subtest 22. `blame` was allowing a missing
+  working-copy path to proceed when the index knew the path; Git's no-revision working-copy blame
+  lstat check fails immediately for missing sparse paths. Tightened that guard.
+- Direct execution then passed subtest 22 and failed subtest 26. `reset base -- nonexistent-file`
+  should be a no-op for an explicit non-HEAD tree-ish, while `reset HEAD -- nonexistent` remains an
+  error. Narrowed the unmatched pathspec behavior accordingly.
+- Direct execution now passes through subtest 35 and stops at read-tree subtest 36. Canonical
+  harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `74/106`.
