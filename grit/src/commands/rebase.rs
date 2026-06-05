@@ -280,8 +280,12 @@ pub struct Args {
     pub no_autosquash: bool,
 
     /// Keep commits that do not change any file (empty patch).
-    #[arg(short = 'k', long = "keep-empty")]
+    #[arg(short = 'k', long = "keep-empty", overrides_with = "no_keep_empty")]
     pub keep_empty: bool,
+
+    /// Drop commits that start empty before the rebase.
+    #[arg(long = "no-keep-empty", overrides_with = "keep_empty")]
+    pub no_keep_empty: bool,
 
     /// Ignore whitespace when applying patches (merge backend: `ignore-space-change`).
     #[arg(long = "ignore-whitespace")]
@@ -4131,9 +4135,10 @@ Use '--' to separate paths from revisions, like this:\n\
         commits = filter_merge_commits(&repo, &commits)?;
     }
 
-    // `--reset-author-date` / `--ignore-date` must still replay empty commits so author timestamps
-    // are rewritten (t3436). Merge-replay scripts may reference empty merge commits.
-    if !args.keep_empty && !args.interactive && !rebase_merges_on && !args.reset_author_date {
+    // Commits that start empty are kept by default. `--reset-author-date` / `--ignore-date` must
+    // still replay them even when the historical `--no-keep-empty` opt-out is used so author
+    // timestamps are rewritten (t3436). Merge-replay scripts may reference empty merge commits.
+    if args.no_keep_empty && !args.interactive && !rebase_merges_on && !args.reset_author_date {
         commits.retain(|oid| !is_commit_tree_unchanged(&repo, oid).unwrap_or(false));
     }
 
@@ -4199,7 +4204,7 @@ Use '--' to separate paths from revisions, like this:\n\
             filter_cherry_equivalents,
             rebase_cousins,
             args.root,
-            args.keep_empty,
+            !args.no_keep_empty || args.keep_empty,
             &config,
         )?;
         generated_merge_script = Some(script.clone());
@@ -4384,6 +4389,9 @@ Use '--' to separate paths from revisions, like this:\n\
     }
     if args.keep_empty || want_autosquash {
         fs::write(rb_dir.join("keep-empty"), "")?;
+    }
+    if args.no_keep_empty {
+        fs::write(rb_dir.join("no-keep-empty"), "")?;
     }
     // Persist the GPG/SSH signing decision so each pick (including those run from
     // a clean child process or after `--continue`) signs the replayed commit
@@ -5664,6 +5672,10 @@ fn rebase_keep_empty(rb_dir: &Path) -> bool {
     rb_dir.join("keep-empty").exists()
 }
 
+fn rebase_keep_start_empty(rb_dir: &Path) -> bool {
+    !rb_dir.join("no-keep-empty").exists()
+}
+
 fn rebase_quiet(rb_dir: &Path) -> bool {
     rb_dir.join("quiet").exists()
 }
@@ -5795,6 +5807,7 @@ fn cherry_pick_for_rebase(
 ) -> Result<()> {
     let git_dir = &repo.git_dir;
     let keep_empty = rebase_keep_empty(rb_dir);
+    let keep_start_empty = rebase_keep_start_empty(rb_dir);
     let replay_opts = load_rebase_replay_commit_opts(rb_dir);
     let now = time::OffsetDateTime::now_utc();
 
@@ -5812,7 +5825,9 @@ fn cherry_pick_for_rebase(
         .map_err(|e| anyhow::anyhow!("invalid empty tree oid: {e}"))?;
     let head_at_empty_tree = head_oid.is_zero();
 
-    if keep_empty && todo_cmd == RebaseTodoCmd::Pick && is_commit_tree_unchanged(repo, commit_oid)?
+    if keep_start_empty
+        && todo_cmd == RebaseTodoCmd::Pick
+        && is_commit_tree_unchanged(repo, commit_oid)?
     {
         if head_at_empty_tree {
             bail!("internal: keep-empty pick with null HEAD during rebase");

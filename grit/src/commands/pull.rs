@@ -868,6 +868,7 @@ fn do_merge_or_rebase_after_fetch(
             autosquash: false,
             no_autosquash: false,
             keep_empty: false,
+            no_keep_empty: false,
             ignore_whitespace: false,
             rerere_autoupdate: false,
             no_rerere_autoupdate: false,
