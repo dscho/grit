@@ -1007,12 +1007,39 @@ fn fetch_recurse_submodules_mode(
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok((mode != FetchRecurseSubmodules::Off).then_some(mode));
     }
-    if let Some(raw) = config
-        .get("fetch.recursesubmodules")
-        .or_else(|| config.get("fetch.recurseSubmodules"))
-    {
-        let mode = parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", raw.trim())
-            .map_err(|e| anyhow::anyhow!(e))?;
+    // Both `fetch.recurseSubmodules` and `submodule.recurse` feed the same `recurse_submodules`
+    // field in Git (builtin/fetch.c `fetch_config_callback`); the *last* one in config order wins.
+    // `submodule.recurse` is a boolean → on/off; `fetch.recurseSubmodules` is the on/off/on-demand
+    // enum. Scan config entries in order so a later key overrides an earlier one.
+    let mut from_config: Option<FetchRecurseSubmodules> = None;
+    for entry in config.entries() {
+        let key_lc = entry.key.to_ascii_lowercase();
+        if key_lc == "fetch.recursesubmodules" {
+            if let Some(v) = entry.value.as_deref() {
+                let mode = parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", v.trim())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                from_config = Some(mode);
+            }
+        } else if key_lc == "submodule.recurse" {
+            // `-c submodule.recurse` with no value parses as boolean true.
+            let on = entry
+                .value
+                .as_deref()
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "false" | "no" | "off" | "0"
+                    )
+                })
+                .unwrap_or(true);
+            from_config = Some(if on {
+                FetchRecurseSubmodules::On
+            } else {
+                FetchRecurseSubmodules::Off
+            });
+        }
+    }
+    if let Some(mode) = from_config {
         return Ok((mode != FetchRecurseSubmodules::Off).then_some(mode));
     }
     Ok(Some(FetchRecurseSubmodules::Default))
@@ -2959,7 +2986,9 @@ fn fetch_remote(
                     // which would write malformed refs from the URL path (t5515 `main ../.git`).
                     Vec::new()
                 } else if config.get(&format!("remote.{remote_name}.url")).is_some()
-                    || config.get(&format!("remote.{remote_name}.pushurl")).is_some()
+                    || config
+                        .get(&format!("remote.{remote_name}.pushurl"))
+                        .is_some()
                 {
                     // A configured remote with a url but no fetch refspec performs no opportunistic
                     // remote-tracking updates (e.g. a `--single-branch` clone of a detached HEAD,
@@ -3231,17 +3260,13 @@ fn fetch_remote(
                 if old != *remote_oid {
                     // Distinguish an explicit tag refspec (force semantics, clobber rejection)
                     // from opportunistic auto-follow (add-only: leave an existing local tag as is).
-                    let forced = match tag_update_kind(
-                        refname,
-                        args,
-                        &refspecs,
-                        &cli_refspecs_parsed,
-                    ) {
-                        TagUpdateKind::Opportunistic => continue,
-                        TagUpdateKind::Explicit { force } => {
-                            force || should_force_tag_update(config, remote_name, args)
-                        }
-                    };
+                    let forced =
+                        match tag_update_kind(refname, args, &refspecs, &cli_refspecs_parsed) {
+                            TagUpdateKind::Opportunistic => continue,
+                            TagUpdateKind::Explicit { force } => {
+                                force || should_force_tag_update(config, remote_name, args)
+                            }
+                        };
                     if !forced {
                         let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
                         if !args.quiet {
