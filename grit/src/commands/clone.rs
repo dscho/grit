@@ -888,6 +888,14 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let git_work_tree_env = std::env::var_os("GIT_WORK_TREE").filter(|v| !v.is_empty());
 
+    // Whether the `--separate-git-dir` target already existed (as an empty directory) before the
+    // clone. Mirrors upstream Git's `real_dest_exists`: if it pre-existed, a failed clone only
+    // clears its contents instead of removing the directory the user created.
+    let real_dest_exists = args
+        .separate_git_dir
+        .as_ref()
+        .is_some_and(|sep_git| sep_git.exists());
+
     let dest = if let Some(ref sep_git) = args.separate_git_dir {
         if sep_git.exists() && sep_git.read_dir()?.next().is_some() {
             bail!(
@@ -944,6 +952,34 @@ pub fn run(mut args: Args) -> Result<()> {
             ref_storage,
         )
         .with_context(|| format!("failed to initialize '{}'", target_path.display()))?
+    };
+
+    // Arm the cleanup guard now that the destination directories exist. On any later failure
+    // (object fetch, checkout, submodule clone, …) Drop removes what we wrote, matching upstream
+    // Git's `atexit(remove_junk)`. The git dir is the separate git dir, the bare target, or the
+    // work tree's `.git`; the work tree (when not bare) is the target directory. Pre-existing empty
+    // directories keep their top level (only their contents are cleaned).
+    let mut junk_guard = {
+        let work_tree = if args.bare {
+            None
+        } else {
+            dest.work_tree.clone().or_else(|| Some(target_path.clone()))
+        };
+        let git_dir = Some(dest.git_dir.clone());
+        // The separate git dir keeps its top level when it pre-existed; otherwise the rule follows
+        // whether the destination/work-tree directory pre-existed (empty_dir_ok).
+        let git_dir_keep_toplevel = if args.separate_git_dir.is_some() {
+            real_dest_exists
+        } else {
+            empty_dir_ok
+        };
+        JunkGuard {
+            work_tree,
+            work_tree_keep_toplevel: empty_dir_ok,
+            git_dir,
+            git_dir_keep_toplevel,
+            disarmed: false,
+        }
     };
 
     let mut head_branch = head_branch;
@@ -1125,7 +1161,8 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
             Err(e) => {
-                let _ = fs::remove_dir_all(&target_path);
+                // `junk_guard` (armed above) removes the partially created destination on return,
+                // honoring keep-toplevel for pre-existing empty directories.
                 return Err(e).context("clone via upload-pack (protocol.version=1) failed");
             }
         }
@@ -1158,7 +1195,8 @@ pub fn run(mut args: Args) -> Result<()> {
                 propagate_extensions_object_format(&source.git_dir, &dest.git_dir)?;
             }
             Err(e) => {
-                let _ = fs::remove_dir_all(&target_path);
+                // `junk_guard` (armed above) removes the partially created destination on return,
+                // honoring keep-toplevel for pre-existing empty directories.
                 return Err(e).context("clone via upload-pack (--no-local) failed");
             }
         }
@@ -1262,6 +1300,14 @@ pub fn run(mut args: Args) -> Result<()> {
                         format!("ref: refs/heads/{branch}\n"),
                     )?;
                 } else if let Some(ref oid) = source_head_oid {
+                    // A detached HEAD writes a raw OID. Upstream updates HEAD via
+                    // `UPDATE_REFS_DIE_ON_ERR` (no skip-verification), so the target object must
+                    // exist; if the source object store is missing it (e.g. a corrupted source),
+                    // the clone fails and `junk_guard` removes the partial destination. Branch
+                    // (symref) HEADs are written via an INITIAL transaction upstream, which skips
+                    // object verification, so only the detached case is checked here.
+                    verify_detached_head_object_present(&dest, oid)
+                        .context("setting detached HEAD")?;
                     fs::write(dest.git_dir.join("HEAD"), format!("{oid}\n"))?;
                 }
             }
@@ -1570,6 +1616,8 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    // Clone succeeded: keep the directories we created (upstream `junk_mode = JUNK_LEAVE_ALL`).
+    junk_guard.disarm();
     Ok(())
 }
 
@@ -4221,6 +4269,88 @@ fn path_is_empty_directory(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+/// Recursively remove the contents of `dir` but keep `dir` itself.
+///
+/// Mirrors `remove_dir_recursively(..., REMOVE_DIR_KEEP_TOPLEVEL)` from upstream Git: every entry
+/// inside `dir` (files and nested directories) is deleted, but the top-level directory is left in
+/// place. Used when a clone fails into a directory the user created beforehand — Git only removes
+/// what it wrote, leaving the pre-existing (empty) directory behind.
+fn remove_dir_contents_keep_toplevel(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map(|ft| ft.is_dir())
+            .unwrap_or_else(|_| path.is_dir());
+        if is_dir {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// Remove a junk path created during a failed clone.
+///
+/// When `keep_toplevel` is true the directory itself is preserved and only its contents are
+/// removed (the directory pre-existed, so the user owns it); otherwise the whole path is deleted.
+fn remove_junk_path(path: &Path, keep_toplevel: bool) {
+    if keep_toplevel {
+        remove_dir_contents_keep_toplevel(path);
+    } else {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+/// RAII cleanup guard mirroring upstream Git's `remove_junk` (builtin/clone.c).
+///
+/// On a failed clone, Git removes the git dir and work tree it created so the user does not have to
+/// clean up manually before retrying. If those directories already existed (empty) before the
+/// clone, only their contents are removed — the pre-existing directory is preserved.
+///
+/// The guard runs cleanup when dropped unless [`JunkGuard::disarm`] is called after a successful
+/// clone. This matches Git's `atexit(remove_junk)` plus the `junk_mode = JUNK_LEAVE_ALL` reset on
+/// success.
+struct JunkGuard {
+    /// Work tree directory to remove (absent for bare clones).
+    work_tree: Option<PathBuf>,
+    /// Keep the work tree's top-level directory (it pre-existed and was empty).
+    work_tree_keep_toplevel: bool,
+    /// Git directory to remove (e.g. `<dir>/.git`, the bare `<dir>`, or the separate git dir).
+    git_dir: Option<PathBuf>,
+    /// Keep the git dir's top-level directory (it pre-existed and was empty).
+    git_dir_keep_toplevel: bool,
+    /// When true, drop performs no cleanup (clone succeeded).
+    disarmed: bool,
+}
+
+impl JunkGuard {
+    /// Disarm the guard so dropping it performs no cleanup (the clone succeeded).
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for JunkGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // Upstream removes the git dir first, then the work tree. For a normal (non-separate)
+        // clone the git dir lives inside the work tree, so removing the work tree afterwards
+        // (keeping its top level when it pre-existed) also clears the leftover `.git` directory.
+        if let Some(ref git_dir) = self.git_dir {
+            remove_junk_path(git_dir, self.git_dir_keep_toplevel);
+        }
+        if let Some(ref work_tree) = self.work_tree {
+            remove_junk_path(work_tree, self.work_tree_keep_toplevel);
+        }
+    }
+}
+
 fn uploadpack_filter_allowed(git_dir: &Path) -> bool {
     let set = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
     matches!(
@@ -5630,6 +5760,32 @@ fn promisor_ref_list(repo: &Repository) -> Result<String> {
 /// remote), which upstream tolerates ("tolerate server not sending target of tag"). It only fails
 /// when a ref itself points directly at an object the server neither sent nor promised — Git's
 /// "did not send all necessary objects" ("upon cloning, check that all refs point to objects").
+/// Verify that the object a detached HEAD will point to exists in the destination object store.
+///
+/// Mirrors upstream Git, which writes a detached HEAD via `refs_update_ref(..., REF_NO_DEREF,
+/// UPDATE_REFS_DIE_ON_ERR)` — an update that verifies the target object is present. A bare local
+/// clone of a source whose object store is missing the HEAD commit (e.g. corrupted source) must
+/// therefore fail rather than silently produce a dangling HEAD.
+///
+/// Promisor (partially cloned) objects are treated as present, matching upstream's allowance for
+/// objects the promisor remote will lazily provide.
+///
+/// # Errors
+/// Returns an error when `oid_hex` is not a valid object id, or when the object is absent from the
+/// destination object store and is not a promised (promisor) object.
+fn verify_detached_head_object_present(dest: &Repository, oid_hex: &str) -> Result<()> {
+    let oid = ObjectId::from_hex(oid_hex)
+        .with_context(|| format!("invalid HEAD object id '{oid_hex}'"))?;
+    if dest.odb.read(&oid).is_ok() {
+        return Ok(());
+    }
+    let promised = grit_lib::promisor::promisor_pack_object_ids(&dest.git_dir.join("objects"));
+    if promised.contains(&oid) {
+        return Ok(());
+    }
+    bail!("unable to update HEAD: object {oid_hex} is missing")
+}
+
 fn check_clone_ref_tip_connectivity(dest: &Repository) -> Result<()> {
     let promised = grit_lib::promisor::promisor_pack_object_ids(&dest.git_dir.join("objects"));
 
