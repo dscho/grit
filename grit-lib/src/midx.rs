@@ -2143,9 +2143,9 @@ fn scrub_root_midx_sidecars_except(pack_dir: &Path, keep_hex: Option<&str>) -> R
             .strip_suffix(".bitmap")
             .or_else(|| rest.strip_suffix(".rev"))
             .unwrap_or(rest);
-        if hash_part.len() != 40 {
-            continue;
-        }
+        // Git's `clear_midx_files_ext` removes any `multi-pack-index-<hash>.<ext>`
+        // sidecar that does not belong to the current MIDX, regardless of the
+        // hash's textual length (t5319 plants a `multi-pack-index-abc.rev`).
         if keep_hex.is_some_and(|k| k == hash_part) {
             continue;
         }
