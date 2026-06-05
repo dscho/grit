@@ -29,16 +29,22 @@ pub fn spawn_pack_objects_upload(
     thin: bool,
     filter_spec: Option<&str>,
 ) -> Result<Child> {
-    spawn_pack_objects_upload_shallow(git_dir, thin, filter_spec, false)
+    spawn_pack_objects_upload_shallow(git_dir, thin, filter_spec, false, true)
 }
 
 /// Like [`spawn_pack_objects_upload`], but passes `--shallow` so `--shallow <oid>` stdin lines cut
 /// the parent chains of those commits (used to produce a depth-limited shallow pack).
+///
+/// `progress` controls whether `pack-objects` is run with `--progress` (emitting the
+/// `Total N (delta ...)` summary on stderr) or `--quiet`. Git's upload-pack passes `--progress`
+/// only when the client did **not** request `no-progress`; honoring that keeps a non-tty fetch's
+/// stderr clean (t5574).
 pub fn spawn_pack_objects_upload_shallow(
     git_dir: &Path,
     thin: bool,
     filter_spec: Option<&str>,
     shallow: bool,
+    progress: bool,
 ) -> Result<Child> {
     let protected = ConfigSet::load_protected(true).unwrap_or_default();
     let hook_raw = protected.get("uploadpack.packobjectshook");
@@ -63,7 +69,7 @@ pub fn spawn_pack_objects_upload_shallow(
             c.arg(format!("--filter={spec}"));
         }
         c.arg("--stdout")
-            .arg("--progress")
+            .arg(if progress { "--progress" } else { "--quiet" })
             .arg("--delta-base-offset");
         c
     } else {
@@ -79,7 +85,7 @@ pub fn spawn_pack_objects_upload_shallow(
             c.arg(format!("--filter={spec}"));
         }
         c.arg("--stdout")
-            .arg("--progress")
+            .arg(if progress { "--progress" } else { "--quiet" })
             .arg("--delta-base-offset");
         c
     };

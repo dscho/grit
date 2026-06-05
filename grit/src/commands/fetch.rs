@@ -181,8 +181,12 @@ pub struct Args {
     pub server_options: Vec<String>,
 
     /// Machine-readable porcelain output.
-    #[arg(long)]
+    #[arg(long, overrides_with = "no_porcelain")]
     pub porcelain: bool,
+
+    /// Disable porcelain output (overrides a previous `--porcelain`).
+    #[arg(long = "no-porcelain", overrides_with = "porcelain", hide = true)]
+    pub no_porcelain: bool,
 
     /// Do not show forced updates.
     #[arg(long = "no-show-forced-updates")]
@@ -259,6 +263,266 @@ enum PendingRefOp {
     },
 }
 
+/// Output style for the per-ref update report (mirrors Git's `fetch.output`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FetchOutputFormat {
+    Full,
+    Compact,
+    Porcelain,
+}
+
+/// Resolve the effective fetch output format. `--porcelain` (CLI) wins over `fetch.output`;
+/// otherwise `fetch.output=compact|porcelain` selects the style, defaulting to `full`.
+fn effective_output_format(config: &ConfigSet, args: &Args) -> FetchOutputFormat {
+    if args.porcelain {
+        return FetchOutputFormat::Porcelain;
+    }
+    match config.get("fetch.output").as_deref() {
+        Some("compact") => FetchOutputFormat::Compact,
+        Some("porcelain") => FetchOutputFormat::Porcelain,
+        _ => FetchOutputFormat::Full,
+    }
+}
+
+/// Whether forced-update detection (`+`/`(forced update)`) is enabled. Defaults on; disabled by
+/// `--no-show-forced-updates` or `fetch.showForcedUpdates=false` (CLI flags win over config).
+fn effective_show_forced_updates(config: &ConfigSet, args: &Args) -> bool {
+    if args.show_forced_updates {
+        return true;
+    }
+    if args.no_show_forced_updates {
+        return false;
+    }
+    config
+        .get("fetch.showforcedupdates")
+        .as_deref()
+        .map(|v| parse_bool(v).unwrap_or(true))
+        .unwrap_or(true)
+}
+
+/// Compute the display record fields for a non-deleting ref update.
+///
+/// Returns `(code, summary, error)` matching Git's `update_local_ref`:
+/// - new ref (no old): `*` / `[new branch|tag|ref]`
+/// - fast-forward: ` ` / `old..new`
+/// - forced (non-ff) update: `+` / `old...new` with `(forced update)` error note
+fn classify_ref_update(
+    repo: &Repository,
+    remote_refname: &str,
+    old_oid: Option<&ObjectId>,
+    new_oid: &ObjectId,
+    show_forced_updates: bool,
+) -> (char, String, Option<&'static str>) {
+    let Some(old) = old_oid else {
+        let summary = if remote_refname.starts_with("refs/tags/") {
+            "[new tag]"
+        } else if remote_refname.starts_with("refs/heads/") {
+            "[new branch]"
+        } else {
+            "[new ref]"
+        };
+        return ('*', summary.to_string(), None);
+    };
+    let old_short = &old.to_string()[..7];
+    let new_short = &new_oid.to_string()[..7];
+    let fast_forward = if show_forced_updates {
+        merge_base::is_ancestor(repo, *old, *new_oid).unwrap_or(true)
+    } else {
+        true
+    };
+    if fast_forward {
+        (' ', format!("{old_short}..{new_short}"), None)
+    } else {
+        (
+            '+',
+            format!("{old_short}...{new_short}"),
+            Some("forced update"),
+        )
+    }
+}
+
+/// Fallback summary when we can't open the repo for a fast-forward check: treat as a new ref.
+fn classify_new_ref_summary(remote_refname: &str) -> (char, String, Option<&'static str>) {
+    let summary = if remote_refname.starts_with("refs/tags/") {
+        "[new tag]"
+    } else if remote_refname.starts_with("refs/heads/") {
+        "[new branch]"
+    } else {
+        "[new ref]"
+    };
+    ('*', summary.to_string(), None)
+}
+
+/// One reported ref update, accumulated so the column widths (which depend on the full set of
+/// updates) can be computed before any line is printed — matching Git's `display_state` model.
+struct FetchDisplayRecord {
+    code: char,
+    summary: String,
+    /// Prettified remote ref name (the left column for full/compact).
+    remote: String,
+    /// Prettified local ref name (the right column).
+    local: String,
+    /// Full local ref name (used as the porcelain ref column).
+    local_full: String,
+    old_oid: ObjectId,
+    new_oid: ObjectId,
+    error: Option<String>,
+}
+
+/// Accumulates ref-update display records and renders them in the selected output format.
+struct FetchDisplay {
+    format: FetchOutputFormat,
+    /// `From <url>` header text (trailing slashes / `.git` already trimmed).
+    from_url: String,
+    records: Vec<FetchDisplayRecord>,
+    shown_url: bool,
+}
+
+impl FetchDisplay {
+    fn new(format: FetchOutputFormat, from_url: String) -> Self {
+        Self {
+            format,
+            from_url,
+            records: Vec::new(),
+            shown_url: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        code: char,
+        summary: &str,
+        remote: &str,
+        local: &str,
+        local_full: &str,
+        old_oid: ObjectId,
+        new_oid: ObjectId,
+        error: Option<&str>,
+    ) {
+        self.records.push(FetchDisplayRecord {
+            code,
+            summary: summary.to_string(),
+            remote: prettify_refname(remote).to_string(),
+            local: prettify_refname(local).to_string(),
+            local_full: local_full.to_string(),
+            old_oid,
+            new_oid,
+            error: error.map(ToString::to_string),
+        });
+    }
+
+    /// Git's `refcol_width`: widest remote ref-name column, floor 10.
+    fn refcol_width(&self) -> usize {
+        let compact = self.format == FetchOutputFormat::Compact;
+        let mut width = 10usize;
+        for r in &self.records {
+            let rlen = r.remote.chars().count();
+            let llen = if compact { 0 } else { r.local.chars().count() };
+            // Rough over-long-line guard mirrors Git, but with no terminal width here we keep all
+            // visible lines; the floor/`max` below still yields the expected padding for tests.
+            let _ = (rlen, llen);
+            if width < rlen {
+                width = rlen;
+            }
+        }
+        width
+    }
+
+    /// Render `remote -> local`, applying compact `*` substitution when in compact mode.
+    fn remote_to_local(&self, width: usize, remote: &str, local: &str) -> String {
+        if self.format == FetchOutputFormat::Compact {
+            if remote == local {
+                return format!("{remote:<width$} -> *");
+            }
+            let mut r = remote.to_string();
+            let mut l = local.to_string();
+            if !find_and_replace(&mut r, local, "*") {
+                find_and_replace(&mut l, remote, "*");
+            }
+            format!("{r:<width$} -> {l}")
+        } else {
+            format!("{remote:<width$} -> {local}")
+        }
+    }
+
+    /// Emit all accumulated records. For full/compact, lines go to stderr (with a single `From`
+    /// header); for porcelain, lines go to stdout.
+    fn flush(&mut self) {
+        if self.records.is_empty() {
+            return;
+        }
+        match self.format {
+            FetchOutputFormat::Porcelain => {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                for r in &self.records {
+                    let _ = writeln!(
+                        out,
+                        "{} {} {} {}",
+                        r.code, r.old_oid, r.new_oid, r.local_full
+                    );
+                }
+            }
+            FetchOutputFormat::Full | FetchOutputFormat::Compact => {
+                let width = self.refcol_width();
+                let mut buf = String::new();
+                if !self.shown_url {
+                    buf.push_str(&format!("From {}\n", self.from_url));
+                    self.shown_url = true;
+                }
+                for r in &self.records {
+                    let rtl = self.remote_to_local(width, &r.remote, &r.local);
+                    // ` %c %-17s %s` — code, summary padded to 17, then remote->local.
+                    buf.push_str(&format!(" {} {:<17} {rtl}", r.code, r.summary));
+                    if let Some(err) = &r.error {
+                        buf.push_str(&format!("  ({err})"));
+                    }
+                    buf.push('\n');
+                }
+                eprint!("{buf}");
+            }
+        }
+        self.records.clear();
+    }
+}
+
+/// Git's `prettify_refname`: strip the well-known ref prefixes for display.
+fn prettify_refname(name: &str) -> &str {
+    name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .or_else(|| name.strip_prefix("refs/remotes/"))
+        .unwrap_or(name)
+}
+
+/// Git's `find_and_replace`: replace `needle` with `placeholder` in `haystack` when it appears as
+/// a whole path component at the start or end. Returns true on replacement.
+fn find_and_replace(haystack: &mut String, needle: &str, placeholder: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let nlen = needle.len();
+    let pos = if haystack.ends_with(needle) {
+        Some(haystack.len() - nlen)
+    } else {
+        haystack.find(needle)
+    };
+    let Some(p) = pos else {
+        return false;
+    };
+    // Must be preceded by '/' (or be at the start).
+    if p > 0 && haystack.as_bytes()[p - 1] != b'/' {
+        return false;
+    }
+    // Must be followed by '/' (or be at the end).
+    let after = p + nlen;
+    if after < haystack.len() && haystack.as_bytes()[after] != b'/' {
+        return false;
+    }
+    haystack.replace_range(p..after, placeholder);
+    true
+}
+
 pub fn run(mut args: Args) -> Result<()> {
     if args.keep {
         std::env::set_var("GRIT_FETCH_KEEP_PACK", "1");
@@ -321,12 +585,38 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
-    // Validate fetch.output config if set
-    if let Some(val) = config.get("fetch.output") {
-        match val.as_str() {
-            "full" | "compact" => {}
-            _ => bail!("invalid value for 'fetch.output': '{}'", val),
+    // Validate fetch.output config if set. A value-less key (`git -c fetch.output`)
+    // is a boolean-true with no string value: Git fails to parse it as a string.
+    if let Some(entry) = config.get_last_entry("fetch.output") {
+        match entry.value.as_deref() {
+            None => {
+                eprintln!("error: missing value for 'fetch.output'");
+                eprintln!("fatal: unable to parse 'fetch.output' from command-line config");
+                std::process::exit(128);
+            }
+            Some("full") | Some("compact") | Some("porcelain") => {}
+            Some(val) => exit_fatal(&format!("invalid value for 'fetch.output': '{val}'")),
         }
+    }
+
+    // `--porcelain` is incompatible with an explicit `--recurse-submodules=<yes|on-demand>`
+    // (ref updates in submodules would be ambiguous in porcelain mode). An implicit/off value
+    // (no flag, `--no-recurse-submodules`, or `=no`) is fine; porcelain forces it off.
+    if args.porcelain {
+        let explicit_recurse = args
+            .recurse_submodules
+            .as_deref()
+            .map(|v| {
+                let l = v.to_ascii_lowercase();
+                l != "no" && l != "false"
+            })
+            .unwrap_or(false);
+        if explicit_recurse {
+            exit_fatal("options '--porcelain' and '--recurse-submodules' cannot be used together");
+        }
+        // Porcelain mode disables submodule recursion.
+        args.recurse_submodules = None;
+        args.no_recurse_submodules = true;
     }
 
     let mut recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
@@ -1207,6 +1497,9 @@ fn fetch_remote(
     let display_url = resolve_fetch_display_url(git_dir, &url, url_override, remote_repo.as_ref())?;
     let from_display_url =
         resolve_fetch_from_line_url(&url, url_override, remote_repo.as_ref(), &display_url);
+    let output_format = effective_output_format(config, args);
+    let mut display = FetchDisplay::new(output_format, from_display_url.clone());
+    let show_forced_updates = effective_show_forced_updates(config, args);
     let follow_remote_head = parse_follow_remote_head(config, remote_name);
     let include_head_ref_prefix = follow_remote_head.mode != FollowRemoteHead::Never;
     // Only remap tracking namespace for path/URL fetches (`git fetch ./repo`). When the user
@@ -2433,10 +2726,6 @@ fn fetch_remote(
                 if local_ref_path.is_dir() {
                     let conflict_prefix = format!("{local_ref}/");
                     let stale_refs = refs::list_refs(git_dir, &conflict_prefix)?;
-                    if !stale_refs.is_empty() && !has_updates && !args.quiet {
-                        eprintln!("From {from_display_url}");
-                        has_updates = true;
-                    }
                     for (stale_ref, stale_oid) in stale_refs {
                         apply_single_ref_delete(
                             args,
@@ -2447,12 +2736,16 @@ fn fetch_remote(
                             &mut ref_update_failures,
                         )?;
                         if !args.quiet {
-                            let short = stale_ref
-                                .strip_prefix("refs/remotes/")
-                                .or_else(|| stale_ref.strip_prefix("refs/heads/"))
-                                .or_else(|| stale_ref.strip_prefix("refs/tags/"))
-                                .unwrap_or(&stale_ref);
-                            eprintln!(" - [deleted]         (none)     -> {short}");
+                            display.push(
+                                '-',
+                                "[deleted]",
+                                "(none)",
+                                &stale_ref,
+                                &stale_ref,
+                                stale_oid,
+                                ObjectId::zero(),
+                                None,
+                            );
                         }
                     }
                     // If we removed all child refs, clear now-empty directories so the
@@ -2477,11 +2770,6 @@ fn fetch_remote(
                 }
             }
 
-            if !has_updates && !args.quiet {
-                eprintln!("From {from_display_url}");
-                has_updates = true;
-            }
-
             apply_single_ref_update(
                 args,
                 git_dir,
@@ -2502,53 +2790,29 @@ fn fetch_remote(
                 );
             }
 
-            if args.porcelain {
-                let zero = "0".repeat(40);
-                let old_hex = old_oid
-                    .as_ref()
-                    .map(|o| o.to_string())
-                    .unwrap_or_else(|| zero.clone());
-                let flag = if old_oid.is_none() { "*" } else { " " };
-                println!("{flag} {old_hex} {remote_oid} {local_ref}");
-            } else if !args.quiet {
-                let dst_display = local_ref
-                    .strip_prefix("refs/remotes/")
-                    .or_else(|| local_ref.strip_prefix("refs/heads/"))
-                    .or_else(|| local_ref.strip_prefix("refs/tags/"))
-                    .unwrap_or(local_ref.as_str());
-                if refname.starts_with("refs/heads/") {
-                    let src_branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);
-                    if old_oid.is_none() {
-                        if local_ref.starts_with("refs/remotes/") {
-                            let tracking_print = local_ref
-                                .strip_prefix("refs/remotes/")
-                                .and_then(|s| s.find('/').map(|i| &s[..i]))
-                                .unwrap_or(remote_name);
-                            eprintln!(
-                                " * [new branch]      {src_branch:<17} -> {tracking_print}/{src_branch}"
-                            );
-                        } else {
-                            eprintln!(" * [new branch]      {src_branch:<17} -> {dst_display}");
-                        }
-                    } else if let Some(old) = old_oid.as_ref() {
-                        eprintln!(
-                            "   {}..{}  {src_branch:<17} -> {dst_display}",
-                            &old.to_string()[..7],
-                            &remote_oid.to_string()[..7],
-                        );
-                    }
-                } else {
-                    let src_display = refname.strip_prefix("refs/").unwrap_or(refname);
-                    if let Some(old) = old_oid.as_ref() {
-                        eprintln!(
-                            "   {}..{}  {src_display:<17} -> {dst_display}",
-                            &old.to_string()[..7],
-                            &remote_oid.to_string()[..7],
-                        );
-                    } else {
-                        eprintln!(" * [new ref]         {src_display:<17} -> {dst_display}");
-                    }
-                }
+            if !args.quiet {
+                let display_repo = Repository::open(git_dir, None).ok();
+                let (code, summary, error) = match display_repo.as_ref() {
+                    Some(repo) => classify_ref_update(
+                        repo,
+                        refname,
+                        old_oid.as_ref(),
+                        &remote_oid,
+                        show_forced_updates,
+                    ),
+                    None => classify_new_ref_summary(refname),
+                };
+                let old_for_porcelain = old_oid.unwrap_or_else(ObjectId::zero);
+                display.push(
+                    code,
+                    &summary,
+                    refname,
+                    &local_ref,
+                    &local_ref,
+                    old_for_porcelain,
+                    remote_oid,
+                    error,
+                );
             }
         }
         if user_passed_cli_refspecs {
@@ -2575,15 +2839,21 @@ fn fetch_remote(
                 continue;
             }
 
-            if !has_updates && !args.quiet {
-                eprintln!("From {from_display_url}");
-                has_updates = true;
-            }
-
             if let Some(old) = old_oid {
                 if old != *remote_oid && !should_force_tag_update(config, remote_name, args) {
                     let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
-                    eprintln!(" ! [rejected]        {tag_name}  (would clobber existing tag)");
+                    if !args.quiet {
+                        display.push(
+                            '!',
+                            "[rejected]",
+                            refname,
+                            refname,
+                            refname,
+                            old,
+                            *remote_oid,
+                            Some("would clobber existing tag"),
+                        );
+                    }
                     tag_clobber_failures.push(tag_name.to_owned());
                     continue;
                 }
@@ -2604,16 +2874,28 @@ fn fetch_remote(
             }
 
             if !args.quiet {
-                let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
-                if let Some(old) = old_oid {
-                    eprintln!(
-                        "   {}..{}  {tag_name:<17} -> {tag_name}",
-                        &old.to_string()[..7],
-                        &remote_oid.to_string()[..7],
-                    );
+                let (code, summary) = if let Some(old) = old_oid {
+                    (
+                        ' ',
+                        format!(
+                            "{}..{}",
+                            &old.to_string()[..7],
+                            &remote_oid.to_string()[..7]
+                        ),
+                    )
                 } else {
-                    eprintln!(" * [new tag]         {tag_name:<17} -> {tag_name}");
-                }
+                    ('*', "[new tag]".to_string())
+                };
+                display.push(
+                    code,
+                    &summary,
+                    refname,
+                    refname,
+                    refname,
+                    old_oid.unwrap_or_else(ObjectId::zero),
+                    *remote_oid,
+                    None,
+                );
             }
         }
     }
@@ -2676,10 +2958,6 @@ fn fetch_remote(
         for (local_tag_ref, _oid) in &local_tags {
             let exists_on_remote = remote_tags.iter().any(|(r, _)| r == local_tag_ref);
             if !exists_on_remote {
-                if !has_updates && !args.quiet {
-                    eprintln!("From {from_display_url}");
-                    has_updates = true;
-                }
                 apply_single_ref_delete(
                     args,
                     git_dir,
@@ -2689,10 +2967,16 @@ fn fetch_remote(
                     &mut ref_update_failures,
                 )?;
                 if !args.quiet {
-                    let tag_name = local_tag_ref
-                        .strip_prefix("refs/tags/")
-                        .unwrap_or(local_tag_ref);
-                    eprintln!(" - [deleted]         (none)     -> {tag_name}");
+                    display.push(
+                        '-',
+                        "[deleted]",
+                        "(none)",
+                        local_tag_ref,
+                        local_tag_ref,
+                        *_oid,
+                        ObjectId::zero(),
+                        None,
+                    );
                 }
             }
         }
@@ -2736,35 +3020,6 @@ fn fetch_remote(
         let skip_remote_tracking_prune =
             prune_prefixes.is_empty() && (user_passed_cli_refspecs || !has_tracking_prune_scope);
 
-        if !skip_remote_tracking_prune && !has_updates && !args.quiet {
-            let mut will_prune = false;
-            let is_stale = |r: &String| {
-                !updated_refs.contains(r)
-                    && !local_ref_protected_by_negative(r, &prune_protection_refspecs)
-            };
-            if prune_prefixes.is_empty() {
-                for rn in &coalesced_remotes {
-                    let prefix = format!("refs/remotes/{rn}/");
-                    let existing = refs::list_refs(git_dir, &prefix)?;
-                    if existing.iter().any(|(r, _)| is_stale(r)) {
-                        will_prune = true;
-                        break;
-                    }
-                }
-            } else {
-                for prefix in &prune_prefixes {
-                    let existing = refs::list_refs(git_dir, prefix)?;
-                    if existing.iter().any(|(r, _)| is_stale(r)) {
-                        will_prune = true;
-                        break;
-                    }
-                }
-            }
-            if will_prune {
-                eprintln!("From {from_display_url}");
-            }
-        }
-
         if !skip_remote_tracking_prune {
             if prune_prefixes.is_empty() {
                 for rn in &coalesced_remotes {
@@ -2779,6 +3034,7 @@ fn fetch_remote(
                         args.quiet,
                         &mut ref_update_failures,
                         &prune_protection_refspecs,
+                        &mut display,
                     )?;
                 }
             } else {
@@ -2797,11 +3053,15 @@ fn fetch_remote(
                         args.quiet,
                         &mut ref_update_failures,
                         &prune_protection_refspecs,
+                        &mut display,
                     )?;
                 }
             }
         }
     }
+
+    // Emit all accumulated ref-update report lines now that column widths are known.
+    display.flush();
 
     // Update `refs/remotes/<remote>/HEAD` to match the remote's default branch (Git `set_head`).
     let follow = follow_remote_head;
@@ -2929,8 +3189,6 @@ fn fetch_remote(
             } else {
                 fs::write(&fetch_head_path, content).context("writing FETCH_HEAD")?;
             }
-        } else if args.dry_run && !args.no_write_fetch_head {
-            eprintln!("would write to .git/FETCH_HEAD");
         }
     }
     if !tag_clobber_failures.is_empty() {
@@ -4579,6 +4837,7 @@ fn has_hide_refs_for_fetch_connectivity(git_dir: &Path) -> bool {
 
 /// Remove remote-tracking refs that no longer exist on the remote.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn prune_stale_refs(
     args: &Args,
     git_dir: &Path,
@@ -4589,6 +4848,7 @@ fn prune_stale_refs(
     quiet: bool,
     ref_update_failures: &mut Vec<String>,
     prune_refspecs: &[FetchRefspec],
+    display: &mut FetchDisplay,
 ) -> Result<()> {
     let existing = refs::list_refs(git_dir, prefix)?;
     for (refname, oid) in &existing {
@@ -4611,12 +4871,16 @@ fn prune_stale_refs(
             )
             .with_context(|| format!("pruning {refname}"))?;
             if !quiet {
-                // Show short name: "origin/branch" instead of "refs/remotes/origin/branch"
-                let short = refname.strip_prefix("refs/remotes/").unwrap_or(refname);
-                let branch = short
-                    .strip_prefix(&format!("{remote_name}/"))
-                    .unwrap_or(short);
-                eprintln!(" - [deleted]         (none)     -> {remote_name}/{branch}");
+                display.push(
+                    '-',
+                    "[deleted]",
+                    "(none)",
+                    refname,
+                    refname,
+                    *oid,
+                    ObjectId::zero(),
+                    None,
+                );
             }
         }
     }

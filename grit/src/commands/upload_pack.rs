@@ -114,6 +114,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut requested_depth: Option<usize> = None;
     let mut filter_spec: Option<String> = None;
     let mut multi_ack_detailed = false;
+    let mut no_progress = false;
     loop {
         match pkt_line::read_packet(&mut stdin)? {
             None => break,
@@ -124,6 +125,9 @@ pub fn run(args: Args) -> Result<()> {
                     let features = rest.strip_prefix(hex).unwrap_or("").trim();
                     if wants.is_empty() && features.contains("multi_ack_detailed") {
                         multi_ack_detailed = true;
+                    }
+                    if wants.is_empty() && features.split_whitespace().any(|f| f == "no-progress") {
+                        no_progress = true;
                     }
                     if wants.is_empty() {
                         if let Some(sid) = trace2_transfer::extract_session_id_feature(features) {
@@ -296,6 +300,7 @@ pub fn run(args: Args) -> Result<()> {
             thin,
             filter_spec.as_deref(),
             !shallow_commits.is_empty(),
+            !no_progress,
         )?;
         {
             let mut pin = child.stdin.take().context("pack-objects stdin")?;

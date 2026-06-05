@@ -406,10 +406,12 @@ fn cmd_fetch(
     let mut filter_spec: Option<String> = None;
     let mut wait_for_done = false;
     let mut seen_done = false;
+    let mut no_progress = false;
 
     for arg in args {
         match arg.as_str() {
-            "thin-pack" | "no-progress" | "include-tag" | "ofs-delta" => {}
+            "no-progress" => no_progress = true,
+            "thin-pack" | "include-tag" | "ofs-delta" => {}
             "wait-for-done" => wait_for_done = true,
             "done" => seen_done = true,
             "deepen-relative" => deepen_relative = true,
@@ -564,6 +566,7 @@ fn cmd_fetch(
         thin,
         filter_spec.as_deref(),
         !shallow_commits.is_empty(),
+        !no_progress,
     )?;
     {
         let mut pin = child
