@@ -4486,6 +4486,82 @@ fn transfer_fsck_objects_enabled() -> bool {
         Some(Ok(true))
     )
 }
+
+/// Whether a bundle-source fetch/clone should fsck its objects.
+///
+/// Mirrors git's `fetch_pack_fsck_objects`: `fetch.fsckObjects` wins when set,
+/// otherwise `transfer.fsckObjects`, defaulting to off. (`fetch.fsckObjects=false`
+/// therefore overrides `transfer.fsckObjects=true`.)
+fn bundle_fetch_fsck_enabled() -> bool {
+    let config = ConfigSet::load(None, true).unwrap_or_default();
+    let fetch = config
+        .get_bool("fetch.fsckobjects")
+        .or_else(|| config.get_bool("fetch.fsckObjects"));
+    if let Some(Ok(v)) = fetch {
+        return v;
+    }
+    matches!(
+        config
+            .get_bool("transfer.fsckobjects")
+            .or_else(|| config.get_bool("transfer.fsckObjects")),
+        Some(Ok(true))
+    )
+}
+
+/// Read per-message fsck severity overrides from `fetch.fsck.<msg-id>`.
+///
+/// Returns a lowercase-keyed map of message id to severity string (e.g.
+/// `"missingemail" -> "ignore"`). Mirrors git's `fetch.fsck.*` handling: a value
+/// of `ignore` demotes the check, anything else (`warn`, `error`, …) keeps it
+/// fatal for our purposes (we only distinguish ignore vs. not).
+fn bundle_fetch_fsck_severities() -> std::collections::HashMap<String, String> {
+    let config = ConfigSet::load(None, true).unwrap_or_default();
+    let mut map = std::collections::HashMap::new();
+    for entry in config.entries() {
+        if let Some(msg_id) = entry.key.strip_prefix("fetch.fsck.") {
+            if msg_id == "skiplist" {
+                continue;
+            }
+            if let Some(value) = entry.value.as_deref() {
+                map.insert(msg_id.to_ascii_lowercase(), value.to_ascii_lowercase());
+            }
+        }
+    }
+    map
+}
+
+/// fsck every object in a bundle's pack and fail on the first non-ignored issue.
+///
+/// `index-pack --fsck-objects` reports `error: object <oid>: <id>: <detail>` for a
+/// malformed object and exits non-zero; the t5607 test only requires the message
+/// id (e.g. `missingEmail`) to appear on stderr. A `fetch.fsck.<id>=ignore`
+/// override demotes the matching check so the clone still succeeds.
+fn bundle_clone_fsck_pack(pack_data: &[u8], odb: &grit_lib::odb::Odb) -> Result<()> {
+    let objects = grit_lib::unpack_objects::pack_bytes_to_object_map(pack_data, odb)
+        .map_err(|e| anyhow::anyhow!("unbundle failed: {e}"))?;
+    let severities = bundle_fetch_fsck_severities();
+
+    // Sort by oid for deterministic reporting order.
+    let mut entries: Vec<_> = objects.iter().collect();
+    entries.sort_by(|a, b| a.0.to_hex().cmp(&b.0.to_hex()));
+
+    for (oid, obj) in entries {
+        if let Err(err) = grit_lib::fsck_standalone::fsck_object(obj.kind, &obj.data) {
+            // A severity override of `ignore` demotes this specific check.
+            if severities
+                .get(&err.id.to_ascii_lowercase())
+                .map(String::as_str)
+                == Some("ignore")
+            {
+                continue;
+            }
+            eprintln!("error: object {}: {}", oid.to_hex(), err.report_line());
+            eprintln!("fatal: fsck error in pack objects");
+            return Err(crate::explicit_exit::SilentNonZeroExit { code: 128 }.into());
+        }
+    }
+    Ok(())
+}
 fn clone_filter_omits_root_trees(filter_spec: Option<&str>) -> bool {
     let Some(spec) = filter_spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return false;
@@ -6855,6 +6931,13 @@ fn run_bundle_clone(args: Args) -> Result<()> {
     // Unbundle pack data
     let pack_data = &data[pos..];
     if pack_data.len() >= 12 + 20 {
+        // Git's bundle-fetch transport runs `index-pack --fsck-objects` when
+        // fetch/transfer.fsckObjects is set (transport.c `fetch_refs_from_bundle`),
+        // so a bundle carrying malformed objects aborts the clone. Reproduce that
+        // content fsck before writing anything to the ODB.
+        if bundle_fetch_fsck_enabled() {
+            bundle_clone_fsck_pack(pack_data, &dest.odb)?;
+        }
         let opts = grit_lib::unpack_objects::UnpackOptions {
             strict: false,
             dry_run: false,

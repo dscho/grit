@@ -763,7 +763,12 @@ pub fn run(mut args: Args) -> Result<()> {
             } else if remote_name.starts_with('.')
                 || remote_name.contains('/')
                 || std::path::Path::new(&remote_name).is_dir()
+                || std::path::Path::new(&remote_name).is_file()
             {
+                // A bare filename that exists on disk (e.g. `git fetch foo.bundle`)
+                // is a path-style URL, not a configured remote. Without the
+                // is_file() arm it would fall through to a config lookup and die
+                // with "does not appear to be a git repository".
                 if remote_name.starts_with('-') {
                     bail!("fatal: repository '{remote_name}' does not exist");
                 }

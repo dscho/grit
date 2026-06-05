@@ -1160,7 +1160,11 @@ fn run_bundle_ls_remote(path: &Path, args: &Args) -> Result<()> {
         return Ok(());
     }
 
-    for (refname, oid) in &refs {
+    // Git's bundle transport (`get_refs_from_bundle`) prepends each header ref to
+    // the result list, so the refs it returns are in reverse header order. With no
+    // `--sort` given, `git ls-remote` applies no default ordering, so it prints
+    // them in exactly that reversed order. Reproduce that here.
+    for (refname, oid) in refs.iter().rev() {
         if args.branches && !refname.starts_with("refs/heads/") {
             continue;
         }

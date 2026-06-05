@@ -332,6 +332,31 @@ fn run_create(args: CreateArgs) -> Result<()> {
         }
     }
 
+    // Git's `write_bundle_refs` skips a ref whose tip is a *commit* that the
+    // revision walk never showed (e.g. `main..main`, where every tip is excluded
+    // by the rev-list options). Tags and other non-commit tips are unaffected.
+    // After this filtering, an empty ref set means the bundle would be empty, so
+    // git dies with "Refusing to create empty bundle" — and crucially leaves no
+    // bundle (or lock) file behind, which `fail.bundle.lock` checks for.
+    //
+    // Restrict this to plain range/tip arguments: `--all` always lists every ref
+    // (its tips are unconditionally shown by git's walk) and `--max-count`/cutoff
+    // bundles already do their own ref retention above, so only a bare positive
+    // range like `main..main` needs the "unshown commit" exclusion here.
+    if !include_all && max_count.is_none() && cutoffs.since.is_none() && cutoffs.until.is_none() {
+        let shown_commits: BTreeSet<ObjectId> = listed.commits.iter().copied().collect();
+        refs.retain(|_, oid| {
+            match read_object(&repo, oid) {
+                Ok(obj) if obj.kind == ObjectKind::Commit => shown_commits.contains(oid),
+                // Unreadable or non-commit tip: keep it (git only excludes unshown commits).
+                _ => true,
+            }
+        });
+        if refs.is_empty() {
+            bail!("Refusing to create empty bundle.");
+        }
+    }
+
     // Read all objects.
     let mut objects: Vec<(ObjectId, ObjectKind, Vec<u8>)> = Vec::new();
     for oid in &oids {
@@ -961,7 +986,16 @@ fn walk_refs_dir(
 // ---------------------------------------------------------------------------
 
 fn run_verify(args: VerifyArgs) -> Result<()> {
-    let repo = Repository::discover(None).ok();
+    // Git's `cmd_bundle_verify` requires a repository up front (it needs the ODB
+    // to check prerequisite connectivity); outside one it errors before even
+    // opening the bundle. Match that exact diagnostic and exit code.
+    let repo = match Repository::discover(None) {
+        Ok(repo) => Some(repo),
+        Err(_) => {
+            eprintln!("error: need a repository to verify a bundle");
+            return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
+        }
+    };
     let data = read_bundle_arg(&args.file)?;
     let header = parse_bundle_header(&data)?;
 
@@ -1158,13 +1192,21 @@ fn bundle_refs_for_output(refs: &BundleRefs) -> Vec<(&String, &ObjectId)> {
 }
 
 /// Parse the bundle header, returning refs/prerequisites and the pack byte offset.
+///
+/// Mirrors git's `read_bundle_header_fd` (bundle.c): the signature selects the
+/// version, then header lines are processed until a blank line. In a v3 bundle a
+/// line starting with `@` is a capability; an unrecognized capability is a fatal
+/// `unknown capability '<cap>'` error (matching `parse_capability`). The error
+/// surfaces before any blank/pack line is required so a capability-only header
+/// (as written by the t5607 "unknown capabilities" test) is rejected, not
+/// reported as truncated.
 fn parse_bundle_header(data: &[u8]) -> Result<BundleHeader> {
     let header_v2 = b"# v2 git bundle\n";
     let header_v3 = b"# v3 git bundle\n";
-    let mut pos = if data.starts_with(header_v2) {
-        header_v2.len()
+    let (mut pos, version) = if data.starts_with(header_v2) {
+        (header_v2.len(), 2u8)
     } else if data.starts_with(header_v3) {
-        header_v3.len()
+        (header_v3.len(), 3u8)
     } else {
         bail!("not a git bundle");
     };
@@ -1190,21 +1232,33 @@ fn parse_bundle_header(data: &[u8]) -> Result<BundleHeader> {
 
         let line_str = std::str::from_utf8(line).context("invalid UTF-8 in bundle header")?;
 
+        // A leading '@' introduces a capability. The known capabilities
+        // (`object-format=`, `filter=`) are consumed in any version. In a v3
+        // bundle an *unknown* capability aborts the parse just like git's
+        // `parse_capability`; v2 bundles ignore stray '@' lines (grit itself
+        // emits `@filter=` on a v2 filtered bundle, so we must keep reading it).
+        if let Some(cap) = line_str.strip_prefix('@') {
+            if let Some(value) = cap.strip_prefix("object-format=") {
+                object_format = value.to_string();
+                pos = eol + 1;
+                continue;
+            } else if let Some(value) = cap.strip_prefix("filter=") {
+                filter = Some(value.to_string());
+                pos = eol + 1;
+                continue;
+            } else if version == 3 {
+                eprintln!("error: unknown capability '{cap}'");
+                return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
+            }
+            // v2: fall through and let the line be treated as (ignored) non-ref.
+        }
+
         // Prerequisite lines start with '-'.
         if let Some(rest) = line_str.strip_prefix('-') {
             let (hex, comment) = rest.split_once(' ').unwrap_or((rest, ""));
             let oid = ObjectId::from_hex(hex)
                 .map_err(|e| anyhow::anyhow!("bad prerequisite oid in bundle header: {e}"))?;
             prerequisites.push((oid, comment.to_string()));
-            pos = eol + 1;
-            continue;
-        }
-        if let Some(cap) = line_str.strip_prefix('@') {
-            if let Some(value) = cap.strip_prefix("object-format=") {
-                object_format = value.to_string();
-            } else if let Some(value) = cap.strip_prefix("filter=") {
-                filter = Some(value.to_string());
-            }
             pos = eol + 1;
             continue;
         }
