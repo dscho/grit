@@ -2229,13 +2229,19 @@ variable i18n.commitEncoding to the encoding your project uses.\n"
         grit_lib::commit_encoding::finalize_stored_commit_message(message, commit_enc.as_deref())
     };
 
+    let (author_raw, committer_raw) = grit_lib::commit_encoding::identity_raw_for_serialized_commit(
+        &encoding,
+        &author_ident,
+        &committer_ident,
+    );
+
     let commit_data = CommitData {
         tree: tree_oid,
         parents,
         author: author_ident,
         committer: committer_ident,
-        author_raw: Vec::new(),
-        committer_raw: Vec::new(),
+        author_raw,
+        committer_raw,
         encoding,
         message: stored_msg,
         raw_message,
