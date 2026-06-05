@@ -360,6 +360,7 @@ pub(crate) fn v2_fetch_supports_sideband_all(caps: &[String]) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_v2_fetch_request(
     stdin: &mut impl Write,
     object_format: &str,
@@ -375,6 +376,7 @@ pub(crate) fn write_v2_fetch_request(
     shallow_since: Option<&str>,
     shallow_exclude: &[String],
     unshallow: bool,
+    promisor_remote_reply: Option<&str>,
 ) -> Result<()> {
     trace_packet_git('>', "command=fetch");
     pkt_line::write_line(stdin, "command=fetch")?;
@@ -395,6 +397,13 @@ pub(crate) fn write_v2_fetch_request(
     }
     for opt in server_options {
         let line = format!("server-option={opt}");
+        trace_packet_git('>', &line);
+        pkt_line::write_line(stdin, &line)?;
+    }
+    // `promisor-remote` is a v2 capability (connect.c `send_capabilities`): the client's accepted
+    // reply belongs in the request capability list, before the `0001` delimiter (`t5710`).
+    if let Some(reply) = promisor_remote_reply.filter(|r| !r.is_empty()) {
+        let line = format!("promisor-remote={reply}");
         trace_packet_git('>', &line);
         pkt_line::write_line(stdin, &line)?;
     }
@@ -688,6 +697,7 @@ pub(crate) fn clone_preflight_file_v2_if_needed(
         None,
         &[],
         false,
+        None,
     )?;
     drop(stdin);
     drain_v2_fetch_response(&mut stdout, fetch_supports_sideband_all)?;
