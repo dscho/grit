@@ -1318,14 +1318,14 @@ grit-lib = <span class="string">"0.3"</span>
             href="progress/"
             aria-label="Open progress dashboard"
           >
-            <div class="big-stat">94.9%</div>
-            <div class="bar" aria-hidden="true"><span style="width: 94.9%"></span></div>
+            <div class="big-stat">95.1%</div>
+            <div class="bar" aria-hidden="true"><span style="width: 95.1%"></span></div>
             <div class="suite-grid" aria-label="Pass rate by Git test suite">
               <div class="suite-stat" style="--pct: 98.5%">
                 <span>t0 basics</span><strong>98.5%</strong>
               </div>
-              <div class="suite-stat" style="--pct: 99.3%">
-                <span>t1 database</span><strong>99.3%</strong>
+              <div class="suite-stat" style="--pct: 99.5%">
+                <span>t1 database</span><strong>99.5%</strong>
               </div>
               <div class="suite-stat" style="--pct: 98.6%">
                 <span>t2 worktree</span><strong>98.6%</strong>
@@ -1336,8 +1336,8 @@ grit-lib = <span class="string">"0.3"</span>
               <div class="suite-stat" style="--pct: 96.0%">
                 <span>t4 diff</span><strong>96.0%</strong>
               </div>
-              <div class="suite-stat" style="--pct: 75.2%">
-                <span>t5 fetch/push</span><strong>75.2%</strong>
+              <div class="suite-stat" style="--pct: 76.9%">
+                <span>t5 fetch/push</span><strong>76.9%</strong>
               </div>
               <div class="suite-stat" style="--pct: 97.3%">
                 <span>t6 revisions</span><strong>97.3%</strong>
@@ -1353,7 +1353,7 @@ grit-lib = <span class="string">"0.3"</span>
               </div>
             </div>
             <p>
-              Latest generated harness pass rate: 40,306 of
+              Latest generated harness pass rate: 40,385 of
               42,483 in-scope tests. Open the dashboard for exact
               counts.
             </p>
@@ -1827,7 +1827,7 @@ grit-lib = <span class="string">"0.3"</span>
           "examples/patch-id.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/patch_ids/fn.compute_patch_ids_from_text.html\nuse grit_lib::patch_ids::{compute_patch_ids_from_text, PatchIdMode};\n\nfn main() {\n    let patch = b\"diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n\";\n    let ids = compute_patch_ids_from_text(patch, PatchIdMode::Stable);\n\n    println!(\"computed {} patch-id record(s)\", ids.len());\n}\n",
           "examples/push.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/protocol/index.html\nuse grit_lib::protocol::{check_protocol_allowed_with, ProtocolPolicyInputs};\n\nfn main() -> Result<(), grit_lib::protocol::ProtocolError> {\n    check_protocol_allowed_with(\n        \"https\",\n        &ProtocolPolicyInputs {\n            git_allow_protocol: None,\n            git_protocol_from_user: Some(\"1\".into()),\n            specific_allow: None,\n            blanket_allow: None,\n        },\n    )?;\n\n    println!(\"https transport is allowed for a user-requested push\");\n    Ok(())\n}\n",
           "examples/reflog.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/reflog/index.html\nuse grit_lib::reflog::{reflog_path, read_reflog};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let git_dir = Path::new(\".git\");\n    println!(\"HEAD reflog path: {}\", reflog_path(git_dir, \"HEAD\").display());\n\n    for entry in read_reflog(git_dir, \"HEAD\")?.iter().take(5) {\n        println!(\"{} -> {} {}\", entry.old_oid, entry.new_oid, entry.message);\n    }\n    Ok(())\n}\n",
-          "examples/refs.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/refs/index.html\nuse grit_lib::refs::{list_refs, read_head};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let git_dir = Path::new(\".git\");\n    println!(\"HEAD = {:?}\", read_head(git_dir)?);\n    // cool\n\n    for (name, oid) in list_refs(git_dir, \"refs/heads\")? {\n        println!(\"{name} {oid}\");\n    }\n    Ok(())\n}\n",
+          "examples/refs.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/refs/index.html\nuse grit_lib::refs::{list_refs, read_head};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let git_dir = Path::new(\".git\");\n    println!(\"HEAD = {:?}\", read_head(git_dir)?);\n\n    for (name, oid) in list_refs(git_dir, \"refs/heads\")? {\n        println!(\"{name} {oid}\");\n    }\n    Ok(())\n}\n",
           "examples/rev-list.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_list/enum.ObjectFilter.html\nuse grit_lib::rev_list::ObjectFilter;\n\nfn main() -> Result<(), String> {\n    let filter = ObjectFilter::parse(\"blob:limit=1m\")?;\n\n    println!(\"small blob included? {}\", filter.includes_blob(512));\n    println!(\"large blob included? {}\", filter.includes_blob(2 * 1024 * 1024));\n    Ok(())\n}\n",
           "examples/rev-parse.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_parse/index.html\nuse grit_lib::rev_parse::{abbreviate_ref_name, split_double_dot_range};\n\nfn main() {\n    let short = abbreviate_ref_name(\"refs/heads/main\");\n    let range = split_double_dot_range(\"main..feature\");\n\n    println!(\"short ref: {short}\");\n    println!(\"range: {range:?}\");\n}\n",
           "examples/status.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/diff/enum.DiffStatus.html\nuse grit_lib::diff::DiffStatus;\n\nfn main() {\n    let statuses = [DiffStatus::Added, DiffStatus::Modified, DiffStatus::Deleted];\n\n    for status in statuses {\n        println!(\"{}\", status.letter());\n    }\n}\n",

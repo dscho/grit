@@ -16,9 +16,7 @@ Grit started from a simple question: what would Git look like if it were designe
 
 ## What we want from it
 
-The project is focused on compatibility before novelty. Passing Git's own tests gives us a concrete target and keeps the work honest. If Grit behaves differently, that difference should be intentional and understood.
-
-At the same time, Rust gives us a chance to expose Git internals through typed APIs: objects, refs, the index, trees, revisions, diffs, merges, and transport protocols as library surfaces instead of command output that callers have to parse.
+The project is focused on compatibility. Passing Git's own tests gives us a concrete target and lets us use agents to give us a solid starting point.
 
 ## Why now?
 
