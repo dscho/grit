@@ -31,3 +31,22 @@ Upstream test "Merge logic in fetch". Started 1/65 passing.
 
 Remaining: remote-explicit/glob, branches-default/one groups, `main`/`br-unconfig` default-fetch
 and CLI-url cases. Investigating.
+
+## Round 2 (after PR #800 merged round 1)
+
+5. **Legacy `.git/remotes/<name>` default-remote resolution**: `git fetch` (no args) on a branch
+   whose `branch.<b>.remote` names a legacy `.git/remotes/<name>` / `.git/branches/<name>` remote
+   fell back to `origin` because `default_fetch_remote_name` only accepted remotes with a
+   `remote.<name>.url` config. Now also accepts remotes defined by those files.
+
+6. **Legacy remote tracking refspecs ignored**: `union_refspecs` (used for the actual ref writes)
+   fell back to the synthetic `refs/remotes/<name>/*` for remotes with no `remote.<name>.fetch`,
+   ignoring the legacy `Pull:`/branches refspecs. Now uses the computed `refspecs` for legacy and
+   `.git/branches` remotes.
+
+7. **`.git/branches/<name>` refspec shape**: implemented Git `read_branches_file` semantics —
+   fetch `refs/heads/<frag>:refs/heads/<name>` (frag = `#frag` or repo default branch). Added
+   `repo_default_branch_name`.
+
+Progress 13/65 -> 39/65. Remaining: branches-one (#frag), branches-default merge/octopus variants,
+and the CLI `../.git` url cases (main/br-unconfig + tag args). Investigating.

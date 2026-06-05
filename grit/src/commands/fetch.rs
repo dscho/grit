@@ -838,6 +838,23 @@ fn parse_git_bool(value: &str) -> Option<bool> {
     parse_bool(value.trim()).ok()
 }
 
+/// The repository default branch name (Git `repo_default_branch_name`): `init.defaultBranch`
+/// config when set and valid, otherwise `master`. Used to pick the branch a `#frag`-less
+/// `.git/branches/<name>` remote fetches.
+fn repo_default_branch_name(git_dir: &Path, config: &ConfigSet) -> String {
+    if let Ok(env) = std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME") {
+        let env = env.trim();
+        if !env.is_empty() {
+            return env.to_owned();
+        }
+    }
+    config
+        .get("init.defaultBranch")
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "master".to_owned())
+}
+
 /// Whether `abbrev` (a possibly-abbreviated ref name) matches `full_name` using Git's
 /// `ref_rev_parse_rules` (`refs.c` `refname_match`). Used to match `branch.<name>.merge` entries
 /// like `two` against the advertised full ref `refs/heads/two`.
@@ -944,8 +961,14 @@ fn default_fetch_remote_name(git_dir: &Path, config: &ConfigSet) -> String {
     if remote.is_empty() {
         return pick_default_remote_name(&remotes);
     }
+    // The branch's configured remote may be defined by `remote.<name>.url` config or by a legacy
+    // `.git/remotes/<name>` / `.git/branches/<name>` file (t5515 `remote-explicit`,
+    // `branches-default`). Honor any of these before falling back to the default remote.
     let url_key = format!("remote.{remote}.url");
-    if config.get(&url_key).is_some() {
+    let remote_is_defined = config.get(&url_key).is_some()
+        || git_dir.join("remotes").join(remote).is_file()
+        || git_dir.join("branches").join(remote).is_file();
+    if remote_is_defined {
         remote.to_owned()
     } else {
         pick_default_remote_name(&remotes)
@@ -1685,21 +1708,19 @@ fn fetch_remote(
     } else if let Some(leg) = &legacy_remote {
         parse_legacy_pull_lines(&leg.pull_lines)?
     } else if let Some(br) = &branches_remote {
-        if let Some(ref b) = br.default_branch {
-            vec![FetchRefspec {
-                src: format!("refs/heads/{b}"),
-                dst: format!("refs/remotes/origin/{b}"),
-                force: false,
-                negative: false,
-            }]
-        } else {
-            vec![FetchRefspec {
-                src: "refs/heads/*".to_owned(),
-                dst: "refs/remotes/origin/*".to_owned(),
-                force: false,
-                negative: false,
-            }]
-        }
+        // `.git/branches/<name>` (Git `read_branches_file`): the URL's optional `#frag` (or the
+        // repository default branch when absent) is fetched into the *local branch* matching the
+        // remote/file name, i.e. `refs/heads/<frag>:refs/heads/<name>`.
+        let frag = br
+            .default_branch
+            .clone()
+            .unwrap_or_else(|| repo_default_branch_name(git_dir, config));
+        vec![FetchRefspec {
+            src: format!("refs/heads/{frag}"),
+            dst: format!("refs/heads/{remote_name}"),
+            force: false,
+            negative: false,
+        }]
     } else {
         configured_refspecs.clone()
     };
@@ -2880,7 +2901,16 @@ fn fetch_remote(
         };
         let mut primary = collect(&primary_key);
         if primary.is_empty() && !args.prefetch {
-            primary = default_fetch_refspecs(remote_name);
+            // Legacy `.git/remotes/<name>` (Pull:) and `.git/branches/<name>` remotes have no
+            // `remote.<name>.fetch` config; their tracking refspecs live in `refspecs`. Use those
+            // instead of the synthetic `refs/remotes/<name>/*` default (t5515 remote-explicit /
+            // branches-default), otherwise fetched branches land under the wrong namespace.
+            primary =
+                if (legacy_remote.is_some() || branches_remote.is_some()) && !refspecs.is_empty() {
+                    refspecs.clone()
+                } else {
+                    default_fetch_refspecs(remote_name)
+                };
         }
         union_refspecs.extend(primary);
         for rn in &coalesced_remotes {
