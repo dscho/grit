@@ -407,7 +407,7 @@ pub fn run(args: Args) -> Result<()> {
             && args.no_merged.is_empty()
         {
             // Reject invalid branch names (Git `check_branch_ref` / `die` + advice.refSyntax hint).
-            validate_new_branch_name_or_die(&repo, name);
+            validate_new_branch_name_or_die(&repo, name, 1);
             if branch_creation_recurse_submodules(&repo, &args) {
                 return create_branch_recursing_submodules(
                     &repo,
@@ -2540,8 +2540,9 @@ fn create_branch(
 }
 
 /// Validate a new branch name (`git check-ref-format refs/heads/<name>` with onelevel allowed).
-/// On failure, prints Git's `fatal:` line plus the `advice.refSyntax` hints and exits 128.
-fn validate_new_branch_name_or_die(repo: &Repository, name: &str) {
+/// On failure, prints Git's `fatal:` line plus the `advice.refSyntax` hints and exits with
+/// `exit_code`.
+fn validate_new_branch_name_or_die(repo: &Repository, name: &str, exit_code: i32) {
     use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
 
     let refname = format!("refs/heads/{name}");
@@ -2565,7 +2566,7 @@ fn validate_new_branch_name_or_die(repo: &Repository, name: &str) {
         eprintln!("hint: See 'git help check-ref-format'");
         eprintln!("hint: Disable this message with \"git config set advice.refSyntax false\"");
     }
-    std::process::exit(128);
+    std::process::exit(exit_code);
 }
 
 /// Mirror Git's `branch.autosetuprebase` config validation (`environment.c`): a missing value or a
@@ -3102,7 +3103,7 @@ fn rename_branch(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
     if old_name == new_name {
         return Ok(());
     }
-    validate_new_branch_name_or_die(repo, new_name);
+    validate_new_branch_name_or_die(repo, new_name, 128);
 
     let force = args.force_rename || args.force;
     let old_ref = format!("refs/heads/{old_name}");
