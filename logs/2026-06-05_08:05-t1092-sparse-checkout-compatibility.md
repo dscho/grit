@@ -67,3 +67,8 @@
   expected worktree deletions from sparse status. Clearing skip-worktree for stash-touched paths
   makes the status match full checkout.
 - Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `83/106`.
+- Subtests 48 and 49 (`checkout-index`) exposed that `checkout-index -- <path>` printed
+  "already exists, no checkout" for a modified existing file but still exited successfully. Git
+  treats that as a failed checkout unless `-f` is provided, so the command now returns an error in
+  that path while preserving the force behavior.
+- Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `85/106`.
