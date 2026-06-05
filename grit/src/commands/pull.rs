@@ -1438,12 +1438,19 @@ fn do_merge_or_rebase_after_fetch(
         if args.verify_signatures {
             eprintln!("warning: ignoring --verify-signatures for rebase");
         }
+        // git pull.c `get_rebase_newbase_and_upstream`: when the upstream itself was rebased, the
+        // commits between the *old* fork point and HEAD must be replayed onto the new tip — not the
+        // commits between the new tip and HEAD (which would re-apply the upstream's own, now
+        // rewritten, commits and conflict). Compute `--onto <merge_head>` with `<upstream>` set to
+        // the `merge-base --fork-point` of the tracking branch, falling back to `merge_head`.
+        let (onto_hex, upstream_for_rebase_hex) =
+            compute_rebase_onto_and_upstream(repo, config, args, head_oid, upstream_oid)?;
         // git pull.c run_rebase(): `--rebase=merges` -> `--rebase-merges`, `--rebase=interactive`
         // -> `--interactive`; a plain rebase passes neither.
         let rebase_args = super::rebase::Args {
             upstream_explicit: true,
-            upstream: Some(upstream_hex),
-            onto: None,
+            upstream: Some(upstream_for_rebase_hex),
+            onto: onto_hex,
             root: false,
             interactive: rebase_kind == PullRebaseKind::Interactive,
             r#continue: false,
@@ -1514,6 +1521,86 @@ fn do_merge_or_rebase_after_fetch(
         build_pull_merge_args(args, ff, no_ff, ff_only, pull_autostash, merge_commits)?;
     super::merge::run(merge_args)?;
     Ok(PullIntegrateKind::Merge)
+}
+
+/// Resolve the remote-tracking branch a `pull --rebase` would fork-point against, mirroring
+/// git pull.c `get_rebase_fork_point` (`get_tracking_branch(repo, refspec)` or
+/// `get_upstream_branch(repo)`). Returns the ref name (e.g. `refs/remotes/me/copy`) and its oid.
+fn rebase_tracking_branch(
+    repo: &Repository,
+    config: &ConfigSet,
+    args: &Args,
+) -> Option<(String, ObjectId)> {
+    // `pull <remote> <branch>`: tracking ref is `refs/remotes/<remote>/<branch>`.
+    if let (Some(remote), Some(branch)) = (args.remote.as_deref(), args.refspecs.first()) {
+        if !remote_token_looks_like_path(remote)
+            && config.get(&format!("remote.{remote}.url")).is_some()
+        {
+            let (src, _dst) = split_pull_refspec(branch);
+            let short = src.strip_prefix("refs/heads/").unwrap_or(src);
+            let track = format!("refs/remotes/{remote}/{short}");
+            if let Ok(oid) = refs::resolve_ref(&repo.git_dir, &track) {
+                return Some((track, oid));
+            }
+        }
+        return None;
+    }
+    // `pull` (no args): use the current branch's upstream tracking ref.
+    if args.refspecs.is_empty() {
+        if let Some(branch) = resolve_head(&repo.git_dir)
+            .ok()
+            .and_then(|h| h.branch_name().map(str::to_owned))
+        {
+            let remote = config.get(&format!("branch.{branch}.remote"))?;
+            if remote_token_looks_like_path(&remote) || remote == "." {
+                return None;
+            }
+            let merge = config.get(&format!("branch.{branch}.merge"))?;
+            let short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+            let track = format!("refs/remotes/{remote}/{short}");
+            if let Ok(oid) = refs::resolve_ref(&repo.git_dir, &track) {
+                return Some((track, oid));
+            }
+        }
+    }
+    None
+}
+
+/// Compute the `--onto` and `<upstream>` arguments for a `pull --rebase`, applying the fork-point
+/// logic of git pull.c `get_rebase_newbase_and_upstream`. `merge_head` is the fetched tip
+/// (FETCH_HEAD), which is always the new base; the upstream defaults to the fork point unless that
+/// fork point is the plain octopus merge base (in which case it falls back to `merge_head`).
+fn compute_rebase_onto_and_upstream(
+    repo: &Repository,
+    config: &ConfigSet,
+    args: &Args,
+    head_oid: ObjectId,
+    merge_head: ObjectId,
+) -> Result<(Option<String>, String)> {
+    let fork_point = rebase_tracking_branch(repo, config, args)
+        .and_then(|(spec, tip)| grit_lib::merge_base::fork_point(repo, &spec, tip, head_oid).ok());
+
+    let upstream = if let Some(fp) = fork_point {
+        // If the octopus merge base of (HEAD, merge_head, fork_point) equals the fork point, the
+        // fork point adds nothing — use merge_head as the upstream (git drops fork_point).
+        let bases = grit_lib::merge_base::merge_bases_octopus(repo, &[head_oid, merge_head, fp])?;
+        if bases.len() == 1 && bases[0] == fp {
+            merge_head
+        } else {
+            fp
+        }
+    } else {
+        merge_head
+    };
+
+    // Only set `--onto` when it differs from the upstream (the no-fork-point case behaves like a
+    // plain `rebase <merge_head>`, which grit already handles without an explicit onto).
+    let onto = if upstream != merge_head {
+        Some(merge_head.to_hex())
+    } else {
+        None
+    };
+    Ok((onto, upstream.to_hex()))
 }
 
 fn build_pull_merge_args(
