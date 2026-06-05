@@ -1480,6 +1480,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Update HEAD
     let old_oid = head.oid().copied().unwrap_or_else(ObjectId::zero);
+    ensure_head_unchanged(&repo.git_dir, &head)?;
     update_head(&repo.git_dir, &head, &commit_oid)?;
 
     let zero_oid = ObjectId::zero();
@@ -3980,6 +3981,38 @@ fn prepare_commit_message(
 
     if !args.message.is_empty() && fixup.map(|f| matches!(f.mode, FixupMode::Fixup)) != Some(true) {
         let msg = args.message.join("\n\n");
+        if use_editor {
+            let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
+            let mut file_body = msg;
+            if !file_body.ends_with('\n') {
+                file_body.push('\n');
+            }
+            if !args.no_status {
+                commit_template_status_append(args, repo, head, config, &mut file_body)?;
+            }
+            if verbose_level > 0 {
+                append_commit_verbose_diffs(
+                    args,
+                    repo,
+                    config,
+                    head,
+                    staged,
+                    unstaged,
+                    verbose_level,
+                    &mut file_body,
+                )?;
+            }
+            fs::write(&edit_path, &file_body)?;
+            launch_commit_editor(repo, &edit_path)?;
+            let edited = fs::read_to_string(&edit_path)?;
+            let cleaned =
+                apply_cleanup_message(&edited, verbose_level, comment_prefix, cleanup_mode);
+            return Ok(MessageResult {
+                message: ensure_trailing_newline(&cleaned),
+                raw_bytes: None,
+                from_merge_msg: false,
+            });
+        }
         let no_editor_cleanup = resolve_commit_cleanup_mode(args, config, false);
         let cleaned = apply_cleanup_message(&msg, 0, comment_prefix, no_editor_cleanup);
         return Ok(MessageResult {
@@ -4590,6 +4623,33 @@ fn update_head(git_dir: &Path, head: &HeadState, commit_oid: &ObjectId) -> Resul
         }
     }
     Ok(())
+}
+
+fn ensure_head_unchanged(git_dir: &Path, expected: &HeadState) -> Result<()> {
+    let current = resolve_head(git_dir)?;
+    let unchanged = match (expected, &current) {
+        (
+            HeadState::Branch {
+                refname: expected_ref,
+                oid: expected_oid,
+                ..
+            },
+            HeadState::Branch {
+                refname: current_ref,
+                oid: current_oid,
+                ..
+            },
+        ) => expected_ref == current_ref && expected_oid == current_oid,
+        (HeadState::Detached { oid: expected_oid }, HeadState::Detached { oid: current_oid }) => {
+            expected_oid == current_oid
+        }
+        (HeadState::Invalid, HeadState::Invalid) => true,
+        _ => false,
+    };
+    if unchanged {
+        return Ok(());
+    }
+    bail!("cannot lock ref 'HEAD': is at a different commit than expected");
 }
 
 /// Extract the trailing `# Conflicts:` comment block from `MERGE_MSG` for re-attaching to
