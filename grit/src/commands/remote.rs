@@ -930,6 +930,17 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     }
 
     let identity = git_identity_line()?;
+    // Capture each ref's existing reflog before deletion so it can be carried over to the new ref
+    // (Git renames the reflog along with the ref).
+    let saved_reflogs: HashMap<String, String> = refs_to_move
+        .iter()
+        .filter_map(|(old_ref, _, _)| {
+            let p = git_dir.join("logs").join(old_ref);
+            std::fs::read_to_string(&p)
+                .ok()
+                .map(|c| (old_ref.clone(), c))
+        })
+        .collect();
     // Delete every old ref first so nesting `parent` into `parent/child` does not leave a file
     // blocking the new directory, then recreate at the renamed path.
     for (old_ref, _, _) in &refs_to_move {
@@ -953,9 +964,13 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
             continue;
         };
         refs::write_ref(&git_dir, &new_ref, oid)?;
-        // Move the existing reflog (if any) to the new ref, then append the rename entry with the
-        // ref's current OID for both old and new value (matching Git's reflog rename).
-        move_reflog_file(&git_dir, old_ref, &new_ref);
+        // Restore the carried-over reflog, then append the rename entry (current OID for both
+        // old and new value), matching Git's reflog rename.
+        restore_reflog(
+            &git_dir,
+            &new_ref,
+            saved_reflogs.get(old_ref).map(String::as_str),
+        );
         let msg = format!("remote: renamed {old_ref} to {new_ref}");
         refs::append_reflog(&git_dir, &new_ref, oid, oid, &identity, &msg, true)?;
     }
@@ -963,17 +978,22 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     Ok(())
 }
 
-/// Move the loose reflog file from `old_ref` to `new_ref` under `.git/logs/`, if it exists.
-fn move_reflog_file(git_dir: &Path, old_ref: &str, new_ref: &str) {
-    let old_log = git_dir.join("logs").join(old_ref);
+/// Restore a previously captured reflog (`old_contents`) at the `new_ref`'s loose log path. When
+/// no reflog was carried over, any reflog stub created by `write_ref` is removed so only the
+/// subsequent rename entry remains.
+fn restore_reflog(git_dir: &Path, new_ref: &str, old_contents: Option<&str>) {
     let new_log = git_dir.join("logs").join(new_ref);
-    if !old_log.is_file() {
-        return;
-    }
     if let Some(parent) = new_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::rename(&old_log, &new_log);
+    match old_contents {
+        Some(contents) => {
+            let _ = std::fs::write(&new_log, contents);
+        }
+        None => {
+            let _ = std::fs::remove_file(&new_log);
+        }
+    }
 }
 
 /// Whether creating `new_ref` would clash with an existing ref in the store as a name-prefix or

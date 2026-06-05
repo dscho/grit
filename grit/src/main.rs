@@ -1081,6 +1081,8 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             Ok(())
         }
         "resolve-ref" => commands::test_tool_ref_store::run(&rest[2..]),
+        // The module entry point expects `<store> <function> ...`, so pass the backend too.
+        "for-each-reflog" => commands::test_tool_ref_store::run(&rest[1..]),
         other => bail!("test-tool ref-store: unsupported subcommand '{other}'"),
     }
 }
