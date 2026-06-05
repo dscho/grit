@@ -728,6 +728,28 @@ fn cmd_write(
         infos.insert(*oid, load_commit_graph_commit_info(&odb, *oid)?);
     }
 
+    // Git's close_reachable() parses every reachable commit and fails the write
+    // if a parent commit object is missing from the object store (it cannot be
+    // placed in the graph). Mirror that: every parent of a commit we are about
+    // to write must either be present in a base layer or be readable from the
+    // ODB. Otherwise abort (and the just-created temporary layer is discarded —
+    // we have not written any file yet at this point). t5324 "temporary graph
+    // layer is discarded upon failure" relies on this.
+    {
+        let in_layer: HashSet<ObjectId> = layer_oids.iter().copied().collect();
+        for oid in &layer_oids {
+            let info = &infos[oid];
+            for p in &info.parents {
+                if in_layer.contains(p) || base_oids_kept.contains(p) || base_oids_all.contains(p) {
+                    continue;
+                }
+                if odb.read(p).is_err() {
+                    bail!("unable to parse commit {p}");
+                }
+            }
+        }
+    }
+
     // Delayed progress: like Git's start_delayed_progress, a fast operation stays silent under
     // the default GIT_PROGRESS_DELAY (2s) unless stderr is a TTY. Only GIT_PROGRESS_DELAY=0 (or a
     // TTY) forces the meter to display. Avoid sleeping; just decide whether to emit the line.
@@ -856,6 +878,24 @@ fn cmd_write(
         fs::write(&chain_path, format!("{}\n", chain_lines.join("\n")))
             .with_context(|| format!("writing {:?}", chain_path))?;
         let _ = fs::remove_file(&graph_path);
+
+        // Apply core.sharedRepository permissions to the new layer file and the
+        // chain file (commit-graph.c uses the same `adjust_shared_perm` path).
+        // Both files are read-only (0444); the shared-repo setting masks that so
+        // 0666 → -r--r--r-- and 0600 → -r-------- (t5324).
+        let shared = grit_lib::shared_repo::shared_repository_from_config_value(
+            cfg.get("core.sharedrepository").as_deref(),
+        )
+        .unwrap_or(0);
+        if shared != 0 {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&chain_path, fs::Permissions::from_mode(0o444));
+            }
+            let _ = grit_lib::shared_repo::adjust_shared_perm_path(shared, &layer_path);
+            let _ = grit_lib::shared_repo::adjust_shared_perm_path(shared, &chain_path);
+        }
 
         // Expire (delete) old layer files that are no longer referenced by the
         // new chain (commit-graph.c:expire_commit_graphs). Only files older than
