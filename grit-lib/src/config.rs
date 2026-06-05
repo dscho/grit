@@ -2613,18 +2613,102 @@ pub fn parse_color(s: &str) -> std::result::Result<String, String> {
     Ok(out)
 }
 
+#[derive(Debug, Clone)]
+struct UrlParts {
+    scheme: String,
+    user: Option<String>,
+    host: String,
+    port: Option<String>,
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct UrlMatchScore {
+    host_len: usize,
+    path_len: usize,
+    user_matched: bool,
+}
+
+fn parse_config_url(url: &str) -> Option<UrlParts> {
+    let (scheme, rest) = url.split_once("://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    let (user, host_port) = match authority.rsplit_once('@') {
+        Some((user, host)) => (Some(user.to_owned()), host),
+        None => (None, authority),
+    };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.contains(']') => (host, Some(port.to_owned())),
+        _ => (host_port, None),
+    };
+    Some(UrlParts {
+        scheme: scheme.to_lowercase(),
+        user,
+        host: host.to_lowercase(),
+        port,
+        path: if path.is_empty() {
+            "/".to_owned()
+        } else {
+            path.trim_end_matches('/').to_owned()
+        },
+    })
+}
+
+fn host_matches(pattern: &str, target: &str) -> bool {
+    let pattern_parts: Vec<&str> = pattern.split('.').collect();
+    let target_parts: Vec<&str> = target.split('.').collect();
+    pattern_parts.len() == target_parts.len()
+        && pattern_parts
+            .iter()
+            .zip(target_parts)
+            .all(|(pattern, target)| *pattern == "*" || *pattern == target)
+}
+
+fn path_match_len(pattern: &str, target: &str) -> Option<usize> {
+    let pattern = if pattern.is_empty() { "/" } else { pattern };
+    let target = if target.is_empty() { "/" } else { target };
+    if pattern == "/" {
+        return Some(1);
+    }
+    let pattern = pattern.trim_end_matches('/');
+    if target == pattern
+        || target
+            .strip_prefix(pattern)
+            .is_some_and(|rest| rest.starts_with('/'))
+    {
+        Some(pattern.len() + 1)
+    } else {
+        None
+    }
+}
+
+fn url_match_score(pattern_url: &str, target_url: &str) -> Option<UrlMatchScore> {
+    let pattern = parse_config_url(pattern_url)?;
+    let target = parse_config_url(target_url)?;
+    if pattern.scheme != target.scheme {
+        return None;
+    }
+    let user_matched = match pattern.user.as_deref() {
+        Some(user) if target.user.as_deref() == Some(user) => true,
+        Some(_) => return None,
+        None => false,
+    };
+    if !host_matches(&pattern.host, &target.host) || pattern.port != target.port {
+        return None;
+    }
+    let path_len = path_match_len(&pattern.path, &target.path)?;
+    Some(UrlMatchScore {
+        host_len: pattern.host.len(),
+        path_len,
+        user_matched,
+    })
+}
+
 /// Match a URL against a URL pattern from config.
 pub fn url_matches(pattern_url: &str, target_url: &str) -> bool {
-    let pattern = pattern_url.trim_end_matches('/');
-    let target = target_url.trim_end_matches('/');
-    if target == pattern {
-        return true;
-    }
-    if let Some(rest) = target.strip_prefix(pattern) {
-        return rest.starts_with('/') || rest.is_empty();
-    }
-    let pattern_slash = format!("{}/", pattern);
-    target.starts_with(&pattern_slash)
+    url_match_score(pattern_url, target_url).is_some()
 }
 
 /// Get the best URL match for a specific key.
@@ -2636,7 +2720,7 @@ pub fn get_urlmatch_entries<'a>(
 ) -> Vec<&'a ConfigEntry> {
     let section_lower = section.to_lowercase();
     let variable_lower = variable.to_lowercase();
-    let mut matches: Vec<(usize, &'a ConfigEntry)> = Vec::new();
+    let mut matches: Vec<(UrlMatchScore, &'a ConfigEntry)> = Vec::new();
 
     for entry in entries {
         let key = &entry.key;
@@ -2656,11 +2740,18 @@ pub fn get_urlmatch_entries<'a>(
             continue;
         }
         if first_dot == last_dot {
-            matches.push((0, entry));
+            matches.push((
+                UrlMatchScore {
+                    host_len: 0,
+                    path_len: 0,
+                    user_matched: false,
+                },
+                entry,
+            ));
         } else {
             let subsection = &key[first_dot + 1..last_dot];
-            if url_matches(subsection, url) {
-                matches.push((subsection.len(), entry));
+            if let Some(score) = url_match_score(subsection, url) {
+                matches.push((score, entry));
             }
         }
     }
@@ -2675,7 +2766,7 @@ pub fn get_urlmatch_all_in_section(
     url: &str,
 ) -> Vec<(String, String, ConfigScope)> {
     let section_lower = section.to_lowercase();
-    let mut matches: Vec<(String, usize, String, String, ConfigScope)> = Vec::new();
+    let mut matches: Vec<(String, UrlMatchScore, String, String, ConfigScope)> = Vec::new();
 
     for entry in entries {
         let key = &entry.key;
@@ -2697,18 +2788,22 @@ pub fn get_urlmatch_all_in_section(
             let canonical = format!("{}.{}", section_lower, entry_variable);
             matches.push((
                 entry_variable.to_lowercase(),
-                0,
+                UrlMatchScore {
+                    host_len: 0,
+                    path_len: 0,
+                    user_matched: false,
+                },
                 val.to_owned(),
                 canonical,
                 entry.scope,
             ));
         } else {
             let subsection = &key[first_dot + 1..last_dot];
-            if url_matches(subsection, url) {
+            if let Some(score) = url_match_score(subsection, url) {
                 let canonical = format!("{}.{}", section_lower, entry_variable);
                 matches.push((
                     entry_variable.to_lowercase(),
-                    subsection.len(),
+                    score,
                     val.to_owned(),
                     canonical,
                     entry.scope,
@@ -2717,12 +2812,19 @@ pub fn get_urlmatch_all_in_section(
         }
     }
 
-    let mut best: std::collections::BTreeMap<String, (usize, String, String, ConfigScope)> =
+    let mut best: std::collections::BTreeMap<String, (UrlMatchScore, String, String, ConfigScope)> =
         std::collections::BTreeMap::new();
     for (var, specificity, val, canonical, scope) in matches {
-        let entry = best
-            .entry(var)
-            .or_insert((0, String::new(), String::new(), scope));
+        let entry = best.entry(var).or_insert((
+            UrlMatchScore {
+                host_len: 0,
+                path_len: 0,
+                user_matched: false,
+            },
+            String::new(),
+            String::new(),
+            scope,
+        ));
         if specificity >= entry.0 {
             *entry = (specificity, val, canonical, scope);
         }
