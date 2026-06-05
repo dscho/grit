@@ -393,6 +393,11 @@ impl<'a> From<&'a Args> for StageFileContext<'a> {
 
 /// Run the `add` command.
 pub fn run(mut args: Args) -> Result<()> {
+    if args.pathspec.iter().any(|arg| arg == "--sparse") {
+        args.sparse = true;
+        args.pathspec.retain(|arg| arg != "--sparse");
+    }
+
     if args.pathspec_file_nul && args.pathspec_from_file.is_none() {
         bail!("the option '--pathspec-file-nul' requires '--pathspec-from-file'");
     }
@@ -1533,9 +1538,8 @@ fn run_refresh(
     work_tree: &Path,
     prefix: Option<&str>,
     args: &Args,
-    sparse: &AddSparseState,
+    _sparse: &AddSparseState,
 ) -> Result<()> {
-    let mut sparse_advice: Vec<String> = Vec::new();
     if args.pathspec.is_empty() {
         // Refresh all entries
         for ie in &mut index.entries {
@@ -1547,9 +1551,6 @@ fn run_refresh(
                 if !path_str.starts_with(p) {
                     continue;
                 }
-            }
-            if sparse.add_update_blocked(args.sparse, Some(ie), path_str.as_str()) {
-                continue;
             }
             let abs_path = work_tree.join(&path_str);
             if let Ok(meta) = fs::symlink_metadata(&abs_path) {
@@ -1565,10 +1566,8 @@ fn run_refresh(
             }
         }
     } else {
-        let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
         for pathspec in &args.pathspec {
             let mut matched_any = false;
-            let mut all_matches_blocked = true;
             let mut refreshed = false;
             for ie in &mut index.entries {
                 if ie.stage() != 0 {
@@ -1579,10 +1578,6 @@ fn run_refresh(
                     continue;
                 }
                 matched_any = true;
-                if sparse.add_update_blocked(args.sparse, Some(ie), path_str.as_ref()) {
-                    continue;
-                }
-                all_matches_blocked = false;
                 let abs_path = work_tree.join(path_str.as_ref());
                 if let Ok(meta) = fs::symlink_metadata(&abs_path) {
                     ie.ctime_sec = meta.ctime() as u32;
@@ -1602,21 +1597,10 @@ fn run_refresh(
                 eprintln!("fatal: pathspec '{}' did not match any files", pathspec);
                 std::process::exit(128);
             }
-            if matched_any && all_matches_blocked && !args.sparse {
-                sparse_advice.push(pathspec.clone());
-            } else if matched_any && !all_matches_blocked && !refreshed && !args.ignore_missing {
+            if matched_any && !refreshed && !args.ignore_missing {
                 eprintln!("fatal: pathspec '{}' did not match any files", pathspec);
                 std::process::exit(128);
             }
-        }
-        if !sparse_advice.is_empty() {
-            sparse_advice.sort();
-            sparse_advice.dedup();
-            emit_sparse_path_advice(&mut std::io::stderr(), &config, &sparse_advice)?;
-            if !args.dry_run {
-                write_index_or_lock_err(repo, index, &resolved_env_index_path(repo))?;
-            }
-            std::process::exit(1);
         }
     }
 
@@ -1957,6 +1941,7 @@ fn add_all(
                 continue;
             }
             if add_cfg.sparse.sparse_enabled
+                && !add_cfg.include_sparse
                 && !add_cfg.sparse.path_in_sparse_definition(rel_path.as_str())
             {
                 skipped_outside_sparse = true;
@@ -1990,6 +1975,7 @@ fn add_all(
     if args.pathspec.iter().any(|s| s == ".")
         && prefix.map(|p| p.is_empty()).unwrap_or(true)
         && skipped_outside_sparse
+        && !add_cfg.include_sparse
     {
         sparse_advice_paths.push(".".to_string());
     }

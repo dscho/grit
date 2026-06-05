@@ -3489,14 +3489,19 @@ fn preprocess_commit_argv(rest: &[String]) -> Vec<String> {
     }
 
     let before = &rest[..i];
-    let msg_block = &rest[i..i + 2];
+    let mut msg_block = Vec::with_capacity(2);
+    if rest[i + 1].starts_with('-') {
+        msg_block.push(format!("--message={}", rest[i + 1]));
+    } else {
+        msg_block.extend_from_slice(&rest[i..i + 2]);
+    }
     let after = &rest[i + 2..];
 
     let before_is_pathspec_prefix =
         !before.is_empty() && before.iter().all(|a| !a.starts_with('-'));
 
     let mut out = Vec::with_capacity(rest.len() + 2);
-    out.extend_from_slice(msg_block);
+    out.extend_from_slice(&msg_block);
 
     if before_is_pathspec_prefix {
         out.push("--".to_owned());
