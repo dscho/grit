@@ -2636,6 +2636,110 @@ fn collect_revs_pack_objects_sparse(
     Ok(oids)
 }
 
+/// Build the set of candidate OIDs that `pack-objects` must omit because of the locality flags
+/// `--local`, `--honor-pack-keep`, and `--incremental`, mirroring `want_found_object` /
+/// `want_object_in_pack_mtime` in `git/builtin/pack-objects.c`.
+///
+/// Semantics (only objects in `candidates` are inspected, since that is all that can be packed):
+/// - `--incremental`: omit any object already present in **any** pack (local or alternate).
+/// - `--local`: omit objects that are loose in a non-local (alternate) object dir, or that appear
+///   in a non-local pack. Objects whose only copy is local are kept.
+/// - `--honor-pack-keep`: omit objects present in a pack marked with a `.keep` file.
+///
+/// Returns the union of OIDs to exclude. When no locality flag is set, the result is empty.
+fn pack_objects_locality_excludes(
+    repo: &Repository,
+    args: &Args,
+    candidates: &BTreeSet<ObjectId>,
+) -> Result<HashSet<ObjectId>> {
+    let mut excludes: HashSet<ObjectId> = HashSet::new();
+    if !args.local && !args.honor_pack_keep && !args.incremental {
+        return Ok(excludes);
+    }
+    if candidates.is_empty() {
+        return Ok(excludes);
+    }
+
+    let local_objects_dir = repo.odb.objects_dir().to_path_buf();
+
+    // Local packs, optionally filtered to those marked with a `.keep` sidecar.
+    let local_indexes = grit_lib::pack::read_local_pack_indexes(&local_objects_dir)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    for idx in &local_indexes {
+        let keep = idx.idx_path.with_extension("keep").is_file();
+        for entry in &idx.entries {
+            if entry.oid.len() != 20 {
+                continue;
+            }
+            let Ok(oid) = ObjectId::from_bytes(&entry.oid) else {
+                continue;
+            };
+            if !candidates.contains(&oid) {
+                continue;
+            }
+            if args.incremental || (args.honor_pack_keep && keep) {
+                excludes.insert(oid);
+            }
+        }
+    }
+
+    if args.local || args.incremental || args.honor_pack_keep {
+        let alternates = grit_lib::pack::read_alternates_recursive(&local_objects_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for alt_dir in &alternates {
+            // Loose objects in a non-local source exclude under `--local`.
+            if args.local {
+                let mut alt_loose = HashSet::new();
+                collect_all_loose_in_dir(alt_dir, &mut alt_loose)?;
+                for oid in &alt_loose {
+                    if candidates.contains(oid) {
+                        excludes.insert(*oid);
+                    }
+                }
+            }
+            let alt_indexes = grit_lib::pack::read_local_pack_indexes(alt_dir)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            for idx in &alt_indexes {
+                let keep = idx.idx_path.with_extension("keep").is_file();
+                for entry in &idx.entries {
+                    if entry.oid.len() != 20 {
+                        continue;
+                    }
+                    let Ok(oid) = ObjectId::from_bytes(&entry.oid) else {
+                        continue;
+                    };
+                    if !candidates.contains(&oid) {
+                        continue;
+                    }
+                    if args.incremental || args.local || (args.honor_pack_keep && keep) {
+                        excludes.insert(oid);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(excludes)
+}
+
+/// Apply `--local` / `--honor-pack-keep` / `--incremental` exclusions to a `--revs` pack object
+/// list, dropping any OID that one of the locality flags says we must omit.
+fn apply_locality_excludes(
+    repo: &Repository,
+    args: &Args,
+    ordered: &mut Vec<ObjectId>,
+) -> Result<()> {
+    if !args.local && !args.honor_pack_keep && !args.incremental {
+        return Ok(());
+    }
+    let candidates: BTreeSet<ObjectId> = ordered.iter().copied().collect();
+    let excludes = pack_objects_locality_excludes(repo, args, &candidates)?;
+    if !excludes.is_empty() {
+        ordered.retain(|o| !excludes.contains(o));
+    }
+    Ok(())
+}
+
 fn collect_pack_objects_from_rev_stdin_lines(
     repo: &Repository,
     args: &Args,
@@ -2795,6 +2899,8 @@ fn collect_pack_objects_from_rev_stdin_lines(
             Vec::new()
         };
 
+        apply_locality_excludes(repo, args, &mut ordered)?;
+
         return Ok(PackObjectList {
             oids: ordered,
             force_include: force_include.clone(),
@@ -2856,6 +2962,8 @@ fn collect_pack_objects_from_rev_stdin_lines(
     } else {
         Vec::new()
     };
+
+    apply_locality_excludes(repo, args, &mut ordered)?;
 
     Ok(PackObjectList {
         oids: ordered,
