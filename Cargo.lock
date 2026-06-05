@@ -484,6 +484,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "grit-examples"
+version = "0.3.94"
+dependencies = [
+ "anyhow",
+ "clap",
+ "grit-lib",
+ "tempfile",
+]
+
+[[package]]
 name = "grit-http-server"
 version = "0.3.94"
 dependencies = [
