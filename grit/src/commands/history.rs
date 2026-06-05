@@ -30,7 +30,7 @@ const EMPTY_TREE_OID: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Launch the configured editor on `path`, matching Git's `launch_editor`.
 ///
-/// Unlike [`crate::commands::commit::launch_commit_editor`], this resolves the editor with
+/// Like [`crate::commands::commit::launch_commit_editor`], this resolves the editor with
 /// `for_launch = true` so harness placeholders (`EDITOR=:` / `VISUAL=:`) are ignored and the
 /// real fake editor installed via `test_set_editor` is honoured.
 fn launch_history_editor(repo: &Repository, path: &Path) -> Result<()> {

@@ -3278,7 +3278,7 @@ fn build_initial_commit_buffer(
 
 pub(crate) fn launch_commit_editor(repo: &Repository, path: &Path) -> Result<()> {
     let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
-    let editor = crate::editor::resolve_git_editor(&config, false)
+    let editor = crate::editor::resolve_git_editor(&config, true)
         .ok_or_else(|| anyhow::anyhow!("Terminal is dumb, but EDITOR unset"))?;
 
     // Git treats `:` as a no-op editor (`launch_specified_editor`).

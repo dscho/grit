@@ -23,11 +23,10 @@ fn env_editor_candidate(key: &str, for_launch: bool) -> Option<String> {
     if t.is_empty() {
         return None;
     }
-    // `launch_specified_editor` treats `:` as a no-op. The test harness sets `EDITOR=:` /
-    // `VISUAL=:` globally; `git var GIT_EDITOR` must still report `:` (matches Git). When
-    // actually launching an editor, ignore those placeholders so a subshell that only adjusts
-    // `PATH` (t7005 "Using vi") still runs the default `vi` instead of skipping the edit.
-    if for_launch && t == ":" {
+    // `launch_specified_editor` treats an explicit `GIT_EDITOR=:` as a no-op. The test harness
+    // also sets `EDITOR=:` / `VISUAL=:` globally; when actually launching an editor, ignore
+    // those placeholders so a later fake editor can win.
+    if for_launch && t == ":" && matches!(key, "EDITOR" | "VISUAL") {
         return None;
     }
     Some(v)
