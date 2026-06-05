@@ -1078,6 +1078,23 @@ pub(crate) fn get_default_remote_for_path(path: &str) -> Result<String> {
     get_default_remote_for_path_in_super(path, wt)
 }
 
+/// Default remote name for a submodule by reading its git dir directly (used when the submodule
+/// work tree is absent — e.g. recursing into a submodule that is changed by newly-fetched
+/// superproject commits but not present in the current index). Mirrors Git's `get_default_remote`:
+/// `branch.<HEAD-branch>.remote`, else `origin`.
+pub(crate) fn get_default_remote_from_git_dir(git_dir: &Path) -> String {
+    let config_path = git_dir.join("config");
+    let content = fs::read_to_string(&config_path).unwrap_or_default();
+    let config = match ConfigFile::parse(&config_path, &content, ConfigScope::Local) {
+        Ok(c) => c,
+        Err(_) => return "origin".to_string(),
+    };
+    let branch = resolve_head(git_dir)
+        .ok()
+        .and_then(|h| h.branch_name().map(str::to_owned));
+    default_remote_for_config(&config, branch.as_deref())
+}
+
 fn resolve_submodule_chain(
     top_repo: &Repository,
     display_path: &str,

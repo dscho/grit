@@ -138,7 +138,14 @@ struct SubmoduleFetchWork {
     display_path: String,
     remote: String,
     default_token: &'static str,
-    oids: Vec<ObjectId>,
+    /// Submodule git dir, used for the post-fetch "are the needed commits present?" check.
+    git_dir: std::path::PathBuf,
+    /// Superproject commit that recorded the change — drives the `at commit <oid>` display only.
+    at_commit: Option<ObjectId>,
+    /// Commits the superproject now references; if a normal fetch doesn't bring them in (commit
+    /// outside the standard refspec), a follow-up by-oid fetch is issued. Empty for index-only
+    /// recursion (git's `oid_fetch_tasks` second pass).
+    needed_commits: Vec<ObjectId>,
 }
 
 fn head_tree_oid(repo: &Repository) -> Option<ObjectId> {
@@ -254,9 +261,14 @@ pub(crate) fn recursive_fetch_submodules_after_fetch(
                 continue;
             };
             if seen.insert(sm.name.clone()) {
-                let remote = get_default_remote_for_path(&path)?;
                 let abs_sm = work_tree.join(&path);
-                let (process_cwd, work_tree_dot) = if abs_sm.join(".git").exists() {
+                let populated = abs_sm.join(".git").exists();
+                let remote = if populated {
+                    get_default_remote_for_path(&path)?
+                } else {
+                    crate::commands::submodule::get_default_remote_from_git_dir(&gd)
+                };
+                let (process_cwd, work_tree_dot) = if populated {
                     (abs_sm, false)
                 } else {
                     (gd.clone(), true)
@@ -271,7 +283,16 @@ pub(crate) fn recursive_fetch_submodules_after_fetch(
                     } else {
                         "on-demand"
                     },
-                    oids: Vec::new(),
+                    git_dir: gd.clone(),
+                    at_commit: None,
+                    // If the superproject's new commits reference commits outside the submodule's
+                    // standard refspec, a by-OID follow-up fetch brings them in (git's
+                    // `oid_fetch_tasks` second pass) — needed for name-conflicted submodules (t5526
+                    // #52) where the populated submodule's remote differs from the recorded URL.
+                    needed_commits: changed_by_name
+                        .get(&sm.name)
+                        .map(|c| c.new_commits.clone())
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -312,9 +333,17 @@ pub(crate) fn recursive_fetch_submodules_after_fetch(
             );
         };
         seen.insert(name.clone());
-        let remote = get_default_remote_for_path(&cs.path)?;
         let abs_sm = work_tree.join(&cs.path);
-        let (process_cwd, work_tree_dot) = if abs_sm.join(".git").exists() {
+        let populated = abs_sm.join(".git").exists();
+        // When the submodule work tree is gone (e.g. the current index has no submodules but a
+        // newly-fetched superproject commit changes one), `get_default_remote_for_path` cannot
+        // walk the work tree — read the default remote from the module git dir directly.
+        let remote = if populated {
+            get_default_remote_for_path(&cs.path)?
+        } else {
+            crate::commands::submodule::get_default_remote_from_git_dir(&gd)
+        };
+        let (process_cwd, work_tree_dot) = if populated {
             (abs_sm, false)
         } else {
             (gd.clone(), true)
@@ -325,7 +354,9 @@ pub(crate) fn recursive_fetch_submodules_after_fetch(
             display_path: cs.path.clone(),
             remote,
             default_token: "on-demand",
-            oids: cs.new_commits.clone(),
+            git_dir: gd.clone(),
+            at_commit: Some(cs.super_oid),
+            needed_commits: cs.new_commits.clone(),
         });
     }
 
@@ -349,56 +380,73 @@ pub(crate) fn recursive_fetch_submodules_after_fetch(
             format!("{prefix_trim}/{}", w.display_path)
         };
         if !args.quiet {
-            if w.oids.is_empty() {
-                eprintln!("Fetching submodule {stderr_path}");
-            } else {
-                let abbrev = cs_super_abbrev(super_git_dir, &changed_by_name, &stderr_path);
-                eprintln!("Fetching submodule {stderr_path} at commit {abbrev}");
+            match &w.at_commit {
+                Some(super_oid) => {
+                    let abbrev = short_oid(super_oid, super_git_dir);
+                    eprintln!("Fetching submodule {stderr_path} at commit {abbrev}");
+                }
+                None => eprintln!("Fetching submodule {stderr_path}"),
             }
         }
 
-        let mut argv: Vec<String> = vec!["fetch".into()];
-        argv.extend(forward.clone());
-        argv.push("--recurse-submodules-default".into());
-        argv.push(w.default_token.to_string());
-        argv.push(format!("--submodule-prefix={full_prefix}"));
-        if w.work_tree_dot {
-            argv.push("--work-tree=.".into());
-        }
-        argv.push(w.remote.clone());
-        for o in &w.oids {
-            argv.push(o.to_hex());
-        }
+        // First, a normal fetch (default refspec). `--work-tree=.` is a *global* git option (must
+        // precede the `fetch` subcommand) used when the submodule work tree is gone so the child
+        // doesn't chdir into a stale core.worktree (git submodule.c `get_fetch_task_from_changed`).
+        let build_argv = |extra_oids: &[ObjectId]| -> Vec<String> {
+            let mut argv: Vec<String> = Vec::new();
+            if w.work_tree_dot {
+                argv.push("--work-tree=.".into());
+            }
+            argv.push("fetch".into());
+            argv.extend(forward.clone());
+            argv.push("--recurse-submodules-default".into());
+            argv.push(w.default_token.to_string());
+            argv.push(format!("--submodule-prefix={full_prefix}"));
+            argv.push(w.remote.clone());
+            for o in extra_oids {
+                argv.push(o.to_hex());
+            }
+            argv
+        };
 
-        let trace_argv: Vec<String> = std::iter::once("git".to_string())
-            .chain(argv.iter().cloned())
-            .collect();
-        crate::trace2_emit_git_subcommand_argv(&trace_argv);
+        let run_child = |argv: &[String]| -> Result<bool> {
+            let trace_argv: Vec<String> = std::iter::once("git".to_string())
+                .chain(argv.iter().cloned())
+                .collect();
+            crate::trace2_emit_git_subcommand_argv(&trace_argv);
+            let status = std::process::Command::new(&grit_bin)
+                .current_dir(&w.process_cwd)
+                .args(argv)
+                .status()
+                .with_context(|| format!("submodule fetch {}", w.display_path))?;
+            Ok(status.success())
+        };
 
-        let status = std::process::Command::new(&grit_bin)
-            .current_dir(&w.process_cwd)
-            .args(&argv)
-            .status()
-            .with_context(|| format!("submodule fetch {}", w.display_path))?;
-        if !status.success() {
+        let argv = build_argv(&[]);
+        if !run_child(&argv)? {
             bail!("submodule fetch failed for {}", w.display_path);
+        }
+
+        // Git's second `oid_fetch_tasks` pass: if a referenced commit is still missing after the
+        // normal fetch (commit lives outside the standard refspec), retry by explicit OID.
+        if !w.needed_commits.is_empty() {
+            let odb = Odb::new(&w.git_dir.join("objects"));
+            let missing: Vec<ObjectId> = w
+                .needed_commits
+                .iter()
+                .filter(|oid| !odb.exists(oid))
+                .copied()
+                .collect();
+            if !missing.is_empty() {
+                let argv = build_argv(&missing);
+                if !run_child(&argv)? {
+                    bail!("submodule fetch failed for {}", w.display_path);
+                }
+            }
         }
     }
 
     Ok(())
-}
-
-fn cs_super_abbrev(
-    super_git_dir: &Path,
-    changed: &HashMap<String, ChangedSubmoduleFetch>,
-    path: &str,
-) -> String {
-    for cs in changed.values() {
-        if cs.path == path {
-            return short_oid(&cs.super_oid, super_git_dir);
-        }
-    }
-    "???????".to_string()
 }
 
 fn short_oid(oid: &ObjectId, _super_git_dir: &Path) -> String {

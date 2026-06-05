@@ -40,7 +40,41 @@ fetch.rs is being concurrently edited by another agent — my `resolve_fetch_fro
 change was reverted once mid-run by their commit landing on disk; re-applied. If t5526
 regresses to the `/.`-on-submodule failure, re-apply that one-liner.
 
-## Remaining failures (22): 4, 27, 28, 30, 31, 33-36, 38-45, 52-56
-Still to diagnose — mostly on-demand recursion edge cases (changed-but-not-in-index,
-custom remote names, FETCH_HEAD, name-conflicted submodules, fetch --all recursion,
-broken-repo handling).
+## Round 2 fixes (→ 37/56)
+
+4. **`submodule.recurse` config now triggers recursive fetch** (fetch.rs
+   `fetch_recurse_submodules_mode`): scan config entries in order, last of
+   {`fetch.recurseSubmodules`, `submodule.recurse`} wins (matches git fetch_config_callback).
+
+5. **Recursion into a submodule whose work tree is gone** (index has no submodule but a
+   newly-fetched super commit changes one — subtests 27/28/31). Three parts:
+   - `get_default_remote_from_git_dir()` in submodule.rs: read the default remote from the
+     module git dir directly when the work tree is absent (the old `get_default_remote_for_path`
+     walked the work tree and died "could not get a repository handle").
+   - fetch_submodule_recurse.rs: `--work-tree=.` must be a *global* git option (before `fetch`),
+     not a fetch arg, else "unexpected argument '--work-tree'".
+   - Separate the `at commit <oid>` *display* (from the changed-submodule super_oid) from the
+     actual fetch: do a NORMAL fetch first (default refspec), then a by-OID follow-up only if the
+     needed commits are still missing (git's two-pass index/changed + oid_fetch_tasks). Passing
+     the oids on the first fetch wrongly produced `-> FETCH_HEAD` instead of `-> origin/sub`.
+   This got 52/53 (name-conflicted submodules) passing too.
+
+## Remaining failures (19): 27, 28, 30-36, 38-45, 55, 56
+
+- **30** (`setup downstream branch with other submodule`) fails on
+  `git checkout --recurse-submodules super`: "pathspec '<oid>' did not match" / "failed to
+  checkout submodule at 'submodule' to <oid>". This is a **checkout --recurse-submodules** bug
+  (submodule needs a commit that `submodule update --init` didn't fetch), NOT fetch — and it
+  cascades into 31-36 (downstream left in an inconsistent state). Fixing checkout recursion
+  would likely unblock most of 31-36.
+- **27/28** (changed-but-not-in-index, deep nested): the *deep* submodule reached via the nested
+  fetch is shown as `Fetching submodule .../deepsubmodule` (no `at commit`) but git shows
+  `at commit <sub_head>`. In git the deep module in the nested fetch is processed via the
+  *changed* path (not the index path) so it gets the annotation. grit's nested fetch sees deep
+  in the submodule's git-dir index and uses the index path. Needs: in the nested fetch, when a
+  submodule is BOTH in the index AND changed by the parent's new commits, prefer the
+  changed-path annotation.
+- **40-45** (on-demand outside standard refspec / FETCH_HEAD / custom remote): the by-OID
+  follow-up exists now but these need the FETCH_HEAD recording and custom-remote-name plumbing
+  verified.
+- **38** broken-repo handling, **39** renamed submodule, **55/56** `fetch --all` recursion.
