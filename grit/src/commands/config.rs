@@ -448,7 +448,11 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     if let Some(ref pattern_raw) = args.get_regexp {
-        let pattern = if pattern_raw.is_empty() {
+        let mut show_origin = args.show_origin;
+        let pattern = if pattern_raw == "--show-origin" {
+            show_origin = true;
+            args.positional.first().cloned().unwrap_or_default()
+        } else if pattern_raw.is_empty() {
             args.positional.first().cloned().unwrap_or_default()
         } else {
             pattern_raw.clone()
@@ -463,7 +467,7 @@ pub fn run(args: Args) -> Result<()> {
             show_names: true,
             default: args.default_value.clone(),
             url: None,
-            show_origin: false,
+            show_origin,
             show_scope: false,
         };
         return cmd_get(&args, &get_args, git_dir.as_deref(), None);
@@ -726,9 +730,9 @@ fn cmd_get(
                     let val = entry.value.as_deref().unwrap_or("true");
                     let val = format_typed_value(args, Some(&entry.key), val)?;
                     if args.null_terminated {
-                        print!("{}\n{}{}", entry.key, val, terminator);
+                        print!("{}{}\n{}{}", prefix, entry.key, val, terminator);
                     } else {
-                        print!("{} {}{}", entry.key, val, terminator);
+                        print!("{}{} {}{}", prefix, entry.key, val, terminator);
                     }
                 }
             } else {
@@ -959,22 +963,26 @@ fn cmd_unset(
     Ok(())
 }
 
-fn config_origin_prefix(entry: &grit_lib::config::ConfigEntry, cwd: Option<&Path>) -> String {
+fn config_origin_prefix_with_separator(
+    entry: &grit_lib::config::ConfigEntry,
+    cwd: Option<&Path>,
+    separator: char,
+) -> String {
     if entry.scope == ConfigScope::Command {
-        return "command line:\t".to_owned();
+        return format!("command line:{separator}");
     }
     let Some(file) = entry.file.as_deref() else {
         return if entry.scope == ConfigScope::Command {
-            "command line:\t".to_owned()
+            format!("command line:{separator}")
         } else {
             String::new()
         };
     };
     if file == Path::new("-") {
-        return "standard input:\t".to_owned();
+        return format!("standard input:{separator}");
     }
     if file.to_string_lossy().starts_with(':') {
-        return "command line:\t".to_owned();
+        return format!("command line:{separator}");
     }
     let display_path = if entry.scope == ConfigScope::Global {
         file.display().to_string()
@@ -985,7 +993,11 @@ fn config_origin_prefix(entry: &grit_lib::config::ConfigEntry, cwd: Option<&Path
     } else {
         file.display().to_string()
     };
-    format!("file:{}\t", quote_origin_path(&display_path))
+    format!("file:{}{}", quote_origin_path(&display_path), separator)
+}
+
+fn config_origin_prefix(entry: &grit_lib::config::ConfigEntry, cwd: Option<&Path>) -> String {
+    config_origin_prefix_with_separator(entry, cwd, '\t')
 }
 
 fn quote_origin_path(path: &str) -> String {
@@ -1012,6 +1024,22 @@ fn config_entry_prefix(
     prefix
 }
 
+fn config_entry_prefix_for_list(
+    args: &Args,
+    entry: &grit_lib::config::ConfigEntry,
+    cwd: Option<&Path>,
+) -> String {
+    let mut prefix = String::new();
+    if args.show_scope {
+        prefix.push_str(&format!("{}\t", entry.scope));
+    }
+    if args.show_origin {
+        let separator = if args.null_terminated { '\0' } else { '\t' };
+        prefix.push_str(&config_origin_prefix_with_separator(entry, cwd, separator));
+    }
+    prefix
+}
+
 fn config_entry_prefix_for_get(
     args: &Args,
     get_args: &GetArgs,
@@ -1034,7 +1062,7 @@ fn cmd_list(args: &Args, git_dir: Option<&Path>) -> Result<()> {
     let cwd = std::env::current_dir().ok();
 
     for entry in config.entries() {
-        let prefix = config_entry_prefix(args, entry, cwd.as_deref());
+        let prefix = config_entry_prefix_for_list(args, entry, cwd.as_deref());
         let raw_val = entry.value.as_deref().unwrap_or("true");
         let formatted = if args.type_int
             || args.type_bool
