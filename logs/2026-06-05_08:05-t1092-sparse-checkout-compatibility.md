@@ -128,3 +128,9 @@
   `index/ensure_full_index`.
 - Direct `--run=1,80,81` passes, and canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `95/106`.
+- Subtest 84 (`grep within submodules is not expanded`) failed because recursive cached grep did
+  not descend into submodules for a superproject wildcard pathspec like `*/folder1/*`. The
+  submodule descendant probe now synthesizes a candidate from the pathspec tail, allowing the grep
+  to recurse and find sparse-directory matches without emitting an index expansion trace.
+- Direct `--run=1,84` and `--run=1,85` pass, and canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `96/106`.
