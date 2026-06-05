@@ -453,7 +453,7 @@ fn primary_merge_strategy(args: &Args) -> Option<&str> {
 fn is_builtin_merge_strategy(name: &str) -> bool {
     matches!(
         name,
-        "recursive" | "ort" | "resolve" | "octopus" | "ours" | "theirs" | "subtree"
+        "recursive" | "ort" | "resolve" | "octopus" | "ours" | "subtree"
     )
 }
 
@@ -839,7 +839,7 @@ pub fn run(mut args: Args) -> Result<()> {
     // Handle -s help early (before commit check)
     if args.strategy.iter().any(|s| s == "help") {
         eprintln!("Could not find merge strategy 'help'.");
-        eprintln!("Available strategies are: octopus ours recursive resolve subtree theirs.");
+        eprintln!("Available strategies are: octopus ours recursive resolve subtree.");
         std::process::exit(1);
     }
 
