@@ -901,14 +901,25 @@ pub fn run(args: Args) -> Result<()> {
     // --ignored implies --others only when --cached is not explicitly set
     let show_others = args.others || (args.ignored && !args.cached);
     if show_others {
-        let indexed_paths: BTreeSet<Vec<u8>> =
+        let mut indexed_paths: BTreeSet<Vec<u8>> =
             index.entries.iter().map(|e| e.path.clone()).collect();
-        let indexed_gitlink_paths: BTreeSet<Vec<u8>> = index
+        let mut indexed_gitlink_paths: BTreeSet<Vec<u8>> = index
             .entries
             .iter()
             .filter(|e| e.mode == grit_lib::index::MODE_GITLINK)
             .map(|e| e.path.clone())
             .collect();
+        if precompose_walk {
+            for entry in &index.entries {
+                if let Ok(path) = std::str::from_utf8(&entry.path) {
+                    indexed_paths.insert(precompose_utf8_path(path).into_owned().into_bytes());
+                    if entry.mode == grit_lib::index::MODE_GITLINK {
+                        indexed_gitlink_paths
+                            .insert(precompose_utf8_path(path).into_owned().into_bytes());
+                    }
+                }
+            }
+        }
         let mut untracked = Vec::new();
         // With `--ignored --directory`, Git collapses a directory to `dir/` only when the
         // directory itself is ignored; directories that merely *contain* ignored files are

@@ -268,9 +268,9 @@ pub fn run(args: Args) -> Result<()> {
             src_rel.clone()
         };
         let mut src_abs = work_tree.join(&src_rel);
-        if precompose_unicode && !src_abs.exists() {
+        if precompose_unicode && !path_exists_or_symlink(&src_abs) {
             let nfc_path = work_tree.join(&key);
-            if nfc_path.exists() {
+            if path_exists_or_symlink(&nfc_path) {
                 src_abs = nfc_path;
             } else if !src_rel.contains('/') {
                 if let Ok(rd) = fs::read_dir(work_tree) {
@@ -307,7 +307,9 @@ pub fn run(args: Args) -> Result<()> {
             } else {
                 expand_dir_sources(&index_src_rel, &dst_rel, &index)
             }
-        } else if !src_abs.exists() && empty_dir_has_sparse_contents(&index_src_rel, &index) {
+        } else if !path_exists_or_symlink(&src_abs)
+            && empty_dir_has_sparse_contents(&index_src_rel, &index)
+        {
             expand_dir_sources(&index_src_rel, &dst_rel, &index)
         } else {
             vec![(index_src_rel.clone(), dst_rel.clone())]
@@ -332,7 +334,7 @@ pub fn run(args: Args) -> Result<()> {
 
         let mut sparse_source = false;
 
-        if src_abs.exists() {
+        if path_exists_or_symlink(&src_abs) {
             if src_abs.is_dir() {
                 if index.get(index_src_rel.as_bytes(), 0).is_some() {
                     // Must match the collision rules used for normal renames. Without this,
@@ -425,7 +427,7 @@ pub fn run(args: Args) -> Result<()> {
                         == precompose_utf8_path(&index_src_rel).as_ref()
             });
             if pos.is_none()
-                && !src_abs.exists()
+                && !path_exists_or_symlink(&src_abs)
                 && empty_dir_has_sparse_contents(&index_src_rel, &index)
             {
                 let expanded = sparse_path_pairs;
@@ -698,7 +700,7 @@ pub fn run(args: Args) -> Result<()> {
                     fs::create_dir_all(parent)?;
                 }
             }
-            if src_abs.exists() {
+            if path_exists_or_symlink(&src_abs) {
                 rename_worktree_path(&src_abs, &dst_abs, ignore_case, &row.src, &row.dst)
                     .with_context(|| format!("renaming '{}' failed", row.src))?;
             }
@@ -728,7 +730,12 @@ pub fn run(args: Args) -> Result<()> {
         };
 
         let mut sparse_and_dirty = false;
-        if args.sparse && sparse_enabled && cone_cfg && !row.sparse_source && src_abs.exists() {
+        if args.sparse
+            && sparse_enabled
+            && cone_cfg
+            && !row.sparse_source
+            && path_exists_or_symlink(&src_abs)
+        {
             sparse_and_dirty =
                 worktree_differs_from_index_entry(&repo.odb, work_tree, &old_entry, false)?;
         }
@@ -779,7 +786,7 @@ pub fn run(args: Args) -> Result<()> {
                         if let Some(parent) = dst_abs.parent() {
                             fs::create_dir_all(parent)?;
                         }
-                        if src_abs.exists() {
+                        if path_exists_or_symlink(&src_abs) {
                             rename_worktree_path(
                                 &src_abs,
                                 &dst_abs,
@@ -1241,6 +1248,10 @@ fn normalise_path(path: &str) -> String {
         }
     }
     parts.join("/")
+}
+
+fn path_exists_or_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
 }
 
 /// When the work tree is on a case-insensitive volume, `rename("a", "A")` can fail or no-op because

@@ -1455,7 +1455,12 @@ fn find_name_extended_header(rest: &str, p_extended: usize) -> Option<String> {
 /// Parse a unified diff into a list of `FilePatch` entries.
 ///
 /// `strip` is Git's `p_value` (`-p` count, default 1).
-fn parse_patch(input: &str, strip: usize, input_name: &str) -> Result<Vec<FilePatch>> {
+fn parse_patch(
+    input: &str,
+    strip: usize,
+    input_name: &str,
+    recount: bool,
+) -> Result<Vec<FilePatch>> {
     let lines: Vec<&str> = input.lines().collect();
     let mut patches = Vec::new();
     let mut i = 0;
@@ -1639,7 +1644,7 @@ fn parse_patch(input: &str, strip: usize, input_name: &str) -> Result<Vec<FilePa
 
             // Parse hunks
             while i < lines.len() && lines[i].starts_with("@@ ") {
-                let (hunk, next_i) = parse_hunk(&lines, i, input_name)?;
+                let (hunk, next_i) = parse_hunk(&lines, i, input_name, recount)?;
                 fp.hunks.push(hunk);
                 i = next_i;
             }
@@ -1663,7 +1668,7 @@ fn parse_patch(input: &str, strip: usize, input_name: &str) -> Result<Vec<FilePa
 
             // Parse hunks
             while i < lines.len() && lines[i].starts_with("@@ ") {
-                let (hunk, next_i) = parse_hunk(&lines, i, input_name)?;
+                let (hunk, next_i) = parse_hunk(&lines, i, input_name, recount)?;
                 fp.hunks.push(hunk);
                 i = next_i;
             }
@@ -1935,7 +1940,12 @@ fn split_diff_git_paths(s: &str) -> Option<(String, String)> {
 }
 
 /// Parse a single hunk starting at line `i` (which should be an `@@` line).
-fn parse_hunk(lines: &[&str], start: usize, input_name: &str) -> Result<(Hunk, usize)> {
+fn parse_hunk(
+    lines: &[&str],
+    start: usize,
+    input_name: &str,
+    recount: bool,
+) -> Result<(Hunk, usize)> {
     let header = lines[start];
     let (old_start, old_count, new_start, new_count) =
         parse_hunk_header(header).with_context(|| format!("invalid hunk header: {header}"))?;
@@ -1993,7 +2003,10 @@ fn parse_hunk(lines: &[&str], start: usize, input_name: &str) -> Result<(Hunk, u
         i += 1;
     }
 
-    if old_seen < old_count || new_seen < new_count {
+    if recount {
+        hunk.old_count = old_seen;
+        hunk.new_count = new_seen;
+    } else if old_seen < old_count || new_seen < new_count {
         bail!("corrupt patch at {input_name}:{}", i + 1);
     }
 
@@ -4231,7 +4244,7 @@ pub fn run(mut args: Args) -> Result<()> {
         "<stdin>".to_string()
     };
 
-    let mut patches = parse_patch(&input, args.strip, &patch_input_display)?;
+    let mut patches = parse_patch(&input, args.strip, &patch_input_display, args.recount)?;
     normalize_mismatched_diff_git_paths(&mut patches, args.strip);
     postprocess_gitlink_file_patches(&mut patches);
     merge_adjacent_blob_to_gitlink_patches(&mut patches);
