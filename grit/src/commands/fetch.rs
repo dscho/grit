@@ -341,6 +341,20 @@ fn classify_ref_update(
     }
 }
 
+/// Git's `kind` for a FETCH_HEAD-only display line (no local peer ref). Defaults to "branch"
+/// for `HEAD`/object-id sources, matching `store_updated_refs`.
+fn fetch_head_ref_kind(remote_refname: &str) -> &'static str {
+    if remote_refname.starts_with("refs/heads/") {
+        "branch"
+    } else if remote_refname.starts_with("refs/tags/") {
+        "tag"
+    } else if remote_refname.starts_with("refs/remotes/") {
+        "remote-tracking branch"
+    } else {
+        "branch"
+    }
+}
+
 /// Fallback summary when we can't open the repo for a fast-forward check: treat as a new ref.
 fn classify_new_ref_summary(remote_refname: &str) -> (char, String, Option<&'static str>) {
     let summary = if remote_refname.starts_with("refs/tags/") {
@@ -2501,10 +2515,6 @@ fn fetch_remote(
                 }
 
                 if old_oid.as_ref() != Some(&remote_oid) {
-                    if !has_updates && !args.quiet {
-                        eprintln!("From {from_display_url}");
-                        has_updates = true;
-                    }
                     apply_single_ref_update(
                         args,
                         git_dir,
@@ -2516,36 +2526,39 @@ fn fetch_remote(
                     )?;
 
                     if !args.quiet {
-                        let short = local_ref
-                            .strip_prefix("refs/heads/")
-                            .or_else(|| local_ref.strip_prefix("refs/tags/"))
-                            .unwrap_or(&local_ref);
-                        match old_oid {
-                            None => {
-                                eprintln!(" * [new branch]      {branch_label:<17} -> {short}");
-                            }
-                            Some(old) => {
-                                eprintln!(
-                                    "   {}..{}  {branch_label:<17} -> {short}",
-                                    &old.to_string()[..7],
-                                    &remote_oid.to_string()[..7],
-                                );
-                            }
-                        }
+                        // Classify based on the *remote* ref name: a resolved branch/tag, else the
+                        // raw OID source (which yields `[new ref]`, matching Git's update_local_ref).
+                        let classify_name = resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                        let (code, summary, error) = classify_ref_update(
+                            &ff_repo,
+                            classify_name,
+                            old_oid.as_ref(),
+                            &remote_oid,
+                            show_forced_updates,
+                        );
+                        display.push(
+                            code,
+                            &summary,
+                            branch_label,
+                            &local_ref,
+                            &local_ref,
+                            old_oid.unwrap_or_else(ObjectId::zero),
+                            remote_oid,
+                            error,
+                        );
                     }
                 }
-            } else if let Some(remote_ref_name) = resolved_remote_ref.as_deref() {
-                if let Some(local_ref) =
-                    map_ref_through_refspecs(remote_ref_name, &cli_tracking_refspecs)
-                {
+            } else {
+                // No explicit destination. If a configured tracking refspec maps the resolved
+                // remote ref to a local ref, update that ref; otherwise the fetch lands only in
+                // FETCH_HEAD and Git reports a ` * <kind>  <remote> -> FETCH_HEAD` line.
+                let tracking_local = resolved_remote_ref
+                    .as_deref()
+                    .and_then(|rrn| map_ref_through_refspecs(rrn, &cli_tracking_refspecs));
+                if let Some(local_ref) = tracking_local {
                     updated_refs.push(local_ref.clone());
                     let old_oid = read_ref_oid(git_dir, &local_ref);
                     if old_oid.as_ref() != Some(&remote_oid) {
-                        if !has_updates && !args.quiet {
-                            eprintln!("From {from_display_url}");
-                            has_updates = true;
-                        }
-
                         if local_ref.starts_with("refs/heads/")
                             && !args.update_head_ok
                             && !is_bare_repo
@@ -2567,7 +2580,42 @@ fn fetch_remote(
                             remote_oid,
                             &mut ref_update_failures,
                         )?;
+                        if !args.quiet {
+                            let classify_name =
+                                resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                            let (code, summary, error) = classify_ref_update(
+                                &ff_repo,
+                                classify_name,
+                                old_oid.as_ref(),
+                                &remote_oid,
+                                show_forced_updates,
+                            );
+                            display.push(
+                                code,
+                                &summary,
+                                branch_label,
+                                &local_ref,
+                                &local_ref,
+                                old_oid.unwrap_or_else(ObjectId::zero),
+                                remote_oid,
+                                error,
+                            );
+                        }
                     }
+                } else if !args.quiet {
+                    // FETCH_HEAD-only update (e.g. `git fetch origin HEAD`).
+                    let remote_ref_name = resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                    let kind = fetch_head_ref_kind(remote_ref_name);
+                    display.push(
+                        '*',
+                        kind,
+                        branch_label,
+                        "FETCH_HEAD",
+                        "FETCH_HEAD",
+                        ObjectId::zero(),
+                        remote_oid,
+                        None,
+                    );
                 }
             }
         }
@@ -4022,6 +4070,10 @@ fn apply_single_ref_update(
     new_oid: ObjectId,
     ref_update_failures: &mut Vec<String>,
 ) -> Result<()> {
+    // A dry-run reports what would happen but must not touch any refs.
+    if args.dry_run {
+        return Ok(());
+    }
     if args.atomic {
         pending_atomic_ref_ops.push(PendingRefOp::Write {
             refname: refname.to_owned(),
@@ -4045,6 +4097,10 @@ fn apply_single_ref_delete(
     old_oid: Option<ObjectId>,
     ref_update_failures: &mut Vec<String>,
 ) -> Result<()> {
+    // A dry-run reports what would happen but must not touch any refs.
+    if args.dry_run {
+        return Ok(());
+    }
     if args.atomic {
         pending_atomic_ref_ops.push(PendingRefOp::Delete {
             refname: refname.to_owned(),
