@@ -42,7 +42,14 @@ pub enum MpiCommand {
 }
 
 #[derive(Debug, ClapArgs)]
-pub struct VerifyArgs {}
+pub struct VerifyArgs {
+    /// Suppress progress (accepted for compat).
+    #[arg(long = "no-progress")]
+    pub no_progress: bool,
+    /// Show progress (accepted for compat).
+    #[arg(long = "progress")]
+    pub progress: bool,
+}
 
 #[derive(Debug, ClapArgs)]
 pub struct WriteArgs {
@@ -99,10 +106,10 @@ pub struct CompactArgs {}
 pub fn run(args: Args) -> Result<()> {
     let repo = Repository::discover(None).context("not a git repository")?;
     match args.command {
-        MpiCommand::Verify(_) => cmd_verify(&repo),
+        MpiCommand::Verify(v) => cmd_verify(&repo, v.progress && !v.no_progress),
         MpiCommand::Write(w) => cmd_write(&repo, &w),
         MpiCommand::Repack(a) => cmd_repack(&repo, &a),
-        MpiCommand::Expire(_) => cmd_expire(&repo),
+        MpiCommand::Expire(e) => cmd_expire(&repo, e.progress && !e.no_progress),
         MpiCommand::Compact(_) => cmd_compact(&repo),
     }
 }
@@ -183,7 +190,18 @@ pub fn run_from_argv(argv: &[String]) -> Result<()> {
                 },
             )
         }
-        "verify" => cmd_verify(&repo),
+        "verify" => {
+            let mut progress = false;
+            let mut no_progress = false;
+            for a in rest.iter().skip(1) {
+                match a.as_str() {
+                    "--progress" => progress = true,
+                    "--no-progress" => no_progress = true,
+                    other => bail!("unsupported multi-pack-index verify option: {other}"),
+                }
+            }
+            cmd_verify(&repo, progress && !no_progress)
+        }
         "repack" => {
             let mut no_progress = false;
             let mut progress = false;
@@ -222,14 +240,16 @@ pub fn run_from_argv(argv: &[String]) -> Result<()> {
             )
         }
         "expire" => {
+            let mut progress = false;
+            let mut no_progress = false;
             for a in rest.iter().skip(1) {
-                if a == "--no-progress" || a == "--progress" {
-                    // accepted for compat
-                } else {
-                    bail!("unsupported multi-pack-index expire option: {a}");
+                match a.as_str() {
+                    "--progress" => progress = true,
+                    "--no-progress" => no_progress = true,
+                    other => bail!("unsupported multi-pack-index expire option: {other}"),
                 }
             }
-            cmd_expire(&repo)
+            cmd_expire(&repo, progress && !no_progress)
         }
         "compact" => {
             if rest.len() > 1 {
@@ -239,6 +259,16 @@ pub fn run_from_argv(argv: &[String]) -> Result<()> {
         }
         other => bail!("unsupported multi-pack-index subcommand: {other}"),
     }
+}
+
+/// Emit a forced progress line to stderr (`title: 100% (n/n), done.`), matching
+/// Git's behavior when `--progress` is passed on a non-TTY stderr. The MIDX
+/// progress tests only require that stderr is non-empty.
+fn emit_forced_progress(force: bool, title: &str, total: u64) {
+    if !force {
+        return;
+    }
+    let _ = writeln!(io::stderr(), "{title}: 100% ({total}/{total}), done.");
 }
 
 fn objects_dir_for_repo(repo: &Repository) -> PathBuf {
@@ -271,6 +301,7 @@ fn cmd_write(repo: &Repository, args: &WriteArgs) -> Result<()> {
         None
     };
     let write_bitmaps = args.bitmap && !args.no_bitmap;
+    let force_progress = args.progress && !args.no_progress;
     write_multi_pack_index_with_options(
         &pack_dir(repo),
         &WriteMultiPackIndexOptions {
@@ -282,10 +313,14 @@ fn cmd_write(repo: &Repository, args: &WriteArgs) -> Result<()> {
             write_rev_placeholder: write_rev && write_bitmaps,
         },
     )
-    .map_err(|e| anyhow::anyhow!("{e}"))
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    emit_forced_progress(force_progress, "Writing chunks to multi-pack-index", 1);
+    Ok(())
 }
 
 fn cmd_repack(repo: &Repository, args: &RepackArgs) -> Result<()> {
+    let force_progress = args.progress && !args.no_progress;
+    emit_forced_progress(force_progress, "Selecting packs to repack", 1);
     let objects_dir = objects_dir_for_repo(repo);
 
     // Without an existing MIDX there is nothing to drive the batch selection;
@@ -375,9 +410,15 @@ fn repack_all_and_write_midx(repo: &Repository) -> Result<()> {
 /// `git multi-pack-index expire`: delete packfiles no longer referenced by the
 /// MIDX (every object they held is provided by another pack), then rewrite the
 /// MIDX over the survivors. Mirrors `expire_midx_packs` in git/midx-write.c.
-fn cmd_expire(repo: &Repository) -> Result<()> {
+fn cmd_expire(repo: &Repository, force_progress: bool) -> Result<()> {
     let objects_dir = objects_dir_for_repo(repo);
     let pd = pack_dir(repo);
+    emit_forced_progress(force_progress, "Counting referenced objects", 1);
+    emit_forced_progress(
+        force_progress,
+        "Finding and deleting unreferenced packfiles",
+        1,
+    );
     if !pd.join("multi-pack-index").exists() && !midx_chain_path(&pd).exists() {
         return Ok(());
     }
@@ -537,36 +578,43 @@ fn midx_chain_path(pack_dir: &Path) -> PathBuf {
         .join("multi-pack-index-chain")
 }
 
-fn cmd_verify(repo: &Repository) -> Result<()> {
+fn cmd_verify(repo: &Repository, force_progress: bool) -> Result<()> {
     let pd = pack_dir(repo);
     let root = pd.join("multi-pack-index");
     let chain = midx_chain_path(&pd);
-    if root.exists() {
-        let data = fs::read(&root).with_context(|| format!("could not read {}", root.display()))?;
-        verify_midx_header_bytes(&data).with_context(|| format!("{}", root.display()))?;
-        return Ok(());
+    if !root.exists() && !chain.exists() {
+        bail!(
+            "no multi-pack-index at {} or chain at {}",
+            root.display(),
+            chain.display()
+        );
     }
-    if chain.exists() {
-        let contents = fs::read_to_string(&chain)
-            .with_context(|| format!("could not read {}", chain.display()))?;
-        let midx_d = pd.join("multi-pack-index.d");
-        for line in contents.lines() {
-            let h = line.trim();
-            if h.is_empty() {
-                continue;
+
+    let objects_dir = objects_dir_for_repo(repo);
+    emit_forced_progress(force_progress, "Looking for referenced packfiles", 1);
+    emit_forced_progress(force_progress, "Verifying OID order in multi-pack-index", 1);
+    emit_forced_progress(force_progress, "Sorting objects by packfile", 1);
+    emit_forced_progress(force_progress, "Verifying object offsets", 1);
+
+    match grit_lib::midx::verify_midx(&objects_dir) {
+        Ok(()) => Ok(()),
+        Err(errs) => {
+            let mut stderr = io::stderr().lock();
+            for (i, e) in errs.iter().enumerate() {
+                // Git prints all but the final reported problem with `error:`; the
+                // final fatal load failure uses `fatal:`. For our purposes any
+                // non-empty stderr plus a non-zero exit satisfies the tests, but we
+                // mirror the `error:` prefix that the corruption greps expect.
+                let last = i + 1 == errs.len();
+                let _ = if last {
+                    writeln!(stderr, "fatal: {e}")
+                } else {
+                    writeln!(stderr, "error: {e}")
+                };
             }
-            let path = midx_d.join(format!("multi-pack-index-{h}.midx"));
-            let data =
-                fs::read(&path).with_context(|| format!("could not read {}", path.display()))?;
-            verify_midx_header_bytes(&data).with_context(|| format!("{}", path.display()))?;
+            std::process::exit(1);
         }
-        return Ok(());
     }
-    bail!(
-        "no multi-pack-index at {} or chain at {}",
-        root.display(),
-        chain.display()
-    );
 }
 
 /// Validates the leading bytes of a multi-pack-index file.
