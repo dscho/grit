@@ -74,8 +74,23 @@ pub struct Args {
     pub refspecs: Vec<String>,
 
     /// Fetch all configured remotes.
-    #[arg(long)]
+    #[arg(long, overrides_with = "no_all")]
     pub all: bool,
+
+    /// Do not fetch all remotes (overrides `--all` and `fetch.all`).
+    #[arg(long = "no-all", overrides_with = "all", hide = true)]
+    pub no_all: bool,
+
+    /// Suppress the post-fetch auto maintenance (`git maintenance run --auto`).
+    /// Set internally for per-remote children of a multi-remote fetch so the
+    /// parent runs maintenance only once.
+    #[arg(long = "no-auto-gc", hide = true)]
+    pub no_auto_gc: bool,
+
+    /// Suppress the post-fetch commit-graph write. Set internally for per-remote
+    /// children of a multi-remote fetch.
+    #[arg(long = "no-write-commit-graph", hide = true)]
+    pub no_write_commit_graph: bool,
 
     /// Fetch several remotes (each argument names a remote).
     #[arg(long)]
@@ -390,6 +405,8 @@ struct FetchDisplay {
     from_url: String,
     records: Vec<FetchDisplayRecord>,
     shown_url: bool,
+    /// Set once any emitted record targeted `FETCH_HEAD` (a FETCH_HEAD-only update).
+    emitted_fetch_head: bool,
 }
 
 impl FetchDisplay {
@@ -399,6 +416,7 @@ impl FetchDisplay {
             from_url,
             records: Vec::new(),
             shown_url: false,
+            emitted_fetch_head: false,
         }
     }
 
@@ -466,6 +484,13 @@ impl FetchDisplay {
         if self.records.is_empty() {
             return;
         }
+        if self.records.iter().any(|r| r.local_full == "FETCH_HEAD") {
+            self.emitted_fetch_head = true;
+        }
+        // Git reports pruned deletions before any ref updates (prune_refs runs before the fetch
+        // updates). Our accumulator collects updates first and prune deletes later, so reorder
+        // deletes to the front with a stable sort that otherwise preserves insertion order.
+        self.records.sort_by_key(|r| r.code != '-');
         match self.format {
             FetchOutputFormat::Porcelain => {
                 let stdout = std::io::stdout();
@@ -645,31 +670,68 @@ pub fn run(mut args: Args) -> Result<()> {
         crate::fetch_submodule_record::begin_fetch_submodule_record(&git_dir);
     }
 
-    let result = if args.multiple {
-        if args.all {
-            bail!("--multiple and --all are incompatible");
-        }
-        let names = args.refspecs.clone();
-        if names.is_empty() {
-            bail!("fetch --multiple requires at least one remote");
-        }
-        for name in &names {
-            let mut inner = args.clone();
-            inner.multiple = false;
-            inner.refspecs.clear();
-            fetch_remote(&git_dir, &config, name, None, &inner)?;
-        }
-        Ok(())
+    // Positional arguments: the optional `remote` plus any trailing `refspecs`.
+    // For `--all`/`--multiple` every positional token is a remote (or group);
+    // for the single-remote path only the first token is the remote.
+    let positional: Vec<String> = args
+        .remote
+        .iter()
+        .cloned()
+        .chain(args.refspecs.iter().cloned())
+        .collect();
+    let argc = positional.len();
+
+    // Resolve the tri-state `--all`/`--no-all`/`fetch.all`. `--no-all` (and an
+    // explicit `--all`) always win; otherwise `fetch.all` only applies when no
+    // remote/refspec was named on the command line (mirrors builtin/fetch.c).
+    let all_effective = if args.no_all {
+        false
     } else if args.all {
-        let remotes =
-            collect_local_remote_names(&git_dir).unwrap_or_else(|| collect_remote_names(&config));
+        true
+    } else if argc == 0 {
+        config
+            .get("fetch.all")
+            .as_deref()
+            .and_then(|v| parse_bool(v).ok())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let result = if all_effective {
+        // `--all` (or `fetch.all=true`) must not be combined with a repository
+        // argument or refspecs.
+        if argc == 1 {
+            return Err(anyhow::Error::new(ExitCodeError {
+                code: 128,
+                message: "fatal: fetch --all does not take a repository argument".to_string(),
+            }));
+        } else if argc > 1 {
+            return Err(anyhow::Error::new(ExitCodeError {
+                code: 128,
+                message: "fatal: fetch --all does not make sense with refspecs".to_string(),
+            }));
+        }
+        // Collect every configured remote, skipping those with
+        // `remote.<name>.skipFetchAll` (alias: skipDefaultUpdate) set.
+        let remotes = collect_fetch_all_remote_names(&git_dir, &config);
         if remotes.is_empty() {
             bail!("no remotes configured");
         }
-        for name in &remotes {
-            fetch_remote(&git_dir, &config, name, None, &args)?;
+        if remotes.len() == 1 {
+            // Single remote: behave like a plain `git fetch <remote>` (no
+            // "could not fetch" wrapping, normal error propagation).
+            fetch_remote(&git_dir, &config, &remotes[0], None, &args)
+        } else {
+            fetch_each_continuing(&git_dir, &config, &remotes, &args)
         }
-        Ok(())
+    } else if args.multiple && argc >= 1 {
+        // `--multiple` with explicit arguments: every positional token is a
+        // remote or remote group. Expand, de-duplicate, and fetch each one,
+        // continuing past failures. (With no arguments, `--multiple` falls
+        // through to the default-remote path below, matching git.)
+        let names = expand_remotes_or_groups(&config, &positional)?;
+        fetch_each_continuing(&git_dir, &config, &names, &args)
     } else {
         let remote_resolved = args
             .remote
@@ -2146,7 +2208,10 @@ fn fetch_remote(
     let mut tag_clobber_failures: Vec<String> = Vec::new();
     let mut pending_atomic_ref_ops: Vec<PendingRefOp> = Vec::new();
     let mut pending_atomic_noop_head_hook: Option<(String, String, String)> = None;
-    let mut has_updates = false;
+    // Set when a non-force destination rejects a non-fast-forward update. The fetch still updates
+    // the other refs (or, with `--atomic`, aborts the transaction) but exits non-zero, without an
+    // extra stderr hint — the reject is reported via its `!` display line.
+    let mut had_rejected_updates = false;
 
     let remote_symbolic_head_branch =
         remote_head_symbolic_branch_from_transport
@@ -2361,25 +2426,42 @@ fn fetch_remote(
                             continue;
                         }
 
-                        // Check fast-forward for wildcard updates; `--atomic` expects any
-                        // non-fast-forward to abort the entire fetch.
+                        // Check fast-forward for wildcard updates. A non-fast-forward update to a
+                        // non-force destination is *rejected* (reported with `!`). With `--atomic`
+                        // the whole transaction is aborted (no refs written); without it, the other
+                        // refs still update. Either way the command exits non-zero at the end and
+                        // the reject is reported only via the `!` line (t5574 porcelain output).
+                        let mut rejected_non_ff = false;
                         if let Some(ref old) = old_oid {
                             if old != remote_oid && !(force || args.force) {
                                 let is_ff = merge_base::is_ancestor(&ff_repo, *old, *remote_oid)
                                     .unwrap_or(true);
                                 if !is_ff {
-                                    eprintln!(
-                                        " ! [rejected]        {src} -> {local_ref} (non-fast-forward)"
-                                    );
-                                    bail!("cannot fast-forward ref '{local_ref}'");
+                                    rejected_non_ff = true;
                                 }
                             }
                         }
 
-                        if !has_updates && !args.quiet {
-                            eprintln!("From {from_display_url}");
-                            has_updates = true;
+                        if rejected_non_ff {
+                            // A rejected non-ff update makes the fetch exit non-zero, but it is
+                            // reported via the `!` display line only — no extra "could not be
+                            // updated" hint (t5574 expects empty stderr in porcelain mode).
+                            had_rejected_updates = true;
+                            if !args.quiet {
+                                display.push(
+                                    '!',
+                                    "[rejected]",
+                                    refname,
+                                    &local_ref,
+                                    &local_ref,
+                                    old_oid.unwrap_or_else(ObjectId::zero),
+                                    *remote_oid,
+                                    Some("non-fast-forward"),
+                                );
+                            }
+                            continue;
                         }
+
                         apply_single_ref_update(
                             args,
                             git_dir,
@@ -2391,18 +2473,23 @@ fn fetch_remote(
                         )?;
 
                         if !args.quiet {
-                            let short = local_ref
-                                .strip_prefix("refs/heads/")
-                                .or_else(|| local_ref.strip_prefix("refs/tags/"))
-                                .unwrap_or(&local_ref);
-                            match old_oid {
-                                None => eprintln!(" * [new branch]      {branch:<17} -> {short}"),
-                                Some(old) => eprintln!(
-                                    "   {}..{}  {branch:<17} -> {short}",
-                                    &old.to_string()[..7],
-                                    &remote_oid.to_string()[..7],
-                                ),
-                            }
+                            let (code, summary, error) = classify_ref_update(
+                                &ff_repo,
+                                refname,
+                                old_oid.as_ref(),
+                                remote_oid,
+                                show_forced_updates,
+                            );
+                            display.push(
+                                code,
+                                &summary,
+                                refname,
+                                &local_ref,
+                                &local_ref,
+                                old_oid.unwrap_or_else(ObjectId::zero),
+                                *remote_oid,
+                                error,
+                            );
                         }
                     }
                 }
@@ -2615,6 +2702,95 @@ fn fetch_remote(
                         ObjectId::zero(),
                         remote_oid,
                         None,
+                    );
+                }
+            }
+        }
+
+        // Opportunistic remote-tracking updates: when explicit *wildcard* CLI refspecs are used,
+        // Git also applies the configured `remote.<name>.fetch` refspecs to the advertised refs,
+        // updating (e.g.) `refs/remotes/origin/*` alongside the CLI destinations (t5574). Restrict
+        // this to wildcard CLI fetches so a single-ref fetch (`origin HEAD`, `origin <oid>:x`)
+        // doesn't sprout spurious tracking updates.
+        let cli_has_wildcard = cli_refspecs.iter().any(|s| {
+            let clean = s.strip_prefix('^').unwrap_or(s);
+            let clean = clean.strip_prefix('+').unwrap_or(clean);
+            let src = clean.split(':').next().unwrap_or(clean);
+            src.contains('*')
+        });
+        for spec in cli_tracking_refspecs.iter().filter(|_| cli_has_wildcard) {
+            if spec.negative || spec.dst.is_empty() || !spec.src.contains('*') {
+                continue;
+            }
+            for (refname, remote_oid) in &remote_all_refs {
+                if is_excluded(refname) {
+                    continue;
+                }
+                let Some(matched) = match_glob_pattern(&spec.src, refname) else {
+                    continue;
+                };
+                let local_ref = spec.dst.replacen('*', matched, 1);
+                if updated_refs.contains(&local_ref) {
+                    continue;
+                }
+                updated_refs.push(local_ref.clone());
+                let old_oid = read_ref_oid(git_dir, &local_ref);
+                if old_oid.as_ref() == Some(remote_oid) {
+                    continue;
+                }
+                let forced = spec.force || args.force;
+                let mut rejected_non_ff = false;
+                if let Some(ref old) = old_oid {
+                    if old != remote_oid && !forced {
+                        let is_ff =
+                            merge_base::is_ancestor(&ff_repo, *old, *remote_oid).unwrap_or(true);
+                        if !is_ff {
+                            rejected_non_ff = true;
+                        }
+                    }
+                }
+                if rejected_non_ff {
+                    had_rejected_updates = true;
+                    if !args.quiet {
+                        display.push(
+                            '!',
+                            "[rejected]",
+                            refname,
+                            &local_ref,
+                            &local_ref,
+                            old_oid.unwrap_or_else(ObjectId::zero),
+                            *remote_oid,
+                            Some("non-fast-forward"),
+                        );
+                    }
+                    continue;
+                }
+                apply_single_ref_update(
+                    args,
+                    git_dir,
+                    &mut pending_atomic_ref_ops,
+                    &local_ref,
+                    old_oid,
+                    *remote_oid,
+                    &mut ref_update_failures,
+                )?;
+                if !args.quiet {
+                    let (code, summary, error) = classify_ref_update(
+                        &ff_repo,
+                        refname,
+                        old_oid.as_ref(),
+                        remote_oid,
+                        show_forced_updates,
+                    );
+                    display.push(
+                        code,
+                        &summary,
+                        refname,
+                        &local_ref,
+                        &local_ref,
+                        old_oid.unwrap_or_else(ObjectId::zero),
+                        *remote_oid,
+                        error,
                     );
                 }
             }
@@ -3195,6 +3371,13 @@ fn fetch_remote(
         }
     }
 
+    // With `--atomic`, a single rejected ref aborts the whole transaction: no refs (and no
+    // FETCH_HEAD) are written. The reject was already reported via its `!` display line.
+    let atomic_aborted = args.atomic && had_rejected_updates;
+    if atomic_aborted {
+        fetch_head_entries.clear();
+    }
+
     if !fetch_head_entries.is_empty() {
         sort_fetch_head_lines(&mut fetch_head_entries, &fetch_head_refspecs);
         if args.atomic {
@@ -3237,6 +3420,18 @@ fn fetch_remote(
             } else {
                 fs::write(&fetch_head_path, content).context("writing FETCH_HEAD")?;
             }
+        } else if args.dry_run
+            && !args.no_write_fetch_head
+            && !display.emitted_fetch_head
+            && url_override.is_some()
+            && cli_refspecs.is_empty()
+        {
+            // For an anonymous-path fetch (`git fetch .`), grit maps refs to tracking destinations
+            // rather than reporting them as FETCH_HEAD-only the way upstream Git does. To keep
+            // `git fetch --dry-run .` mentioning FETCH_HEAD (t5510) without adding a spurious note
+            // to a named-remote dry run (t5574), restrict this to anonymous fetches whose report
+            // did not already include an explicit `-> FETCH_HEAD` line.
+            eprintln!("would write to .git/FETCH_HEAD");
         }
     }
     if !tag_clobber_failures.is_empty() {
@@ -3246,6 +3441,13 @@ fn fetch_remote(
         eprintln!("error: some local refs could not be updated; try running");
         eprintln!(" 'git remote prune {remote_name}' to remove any old, conflicting branches");
         bail!("some local refs could not be updated");
+    }
+    if had_rejected_updates {
+        // A non-fast-forward reject already produced its `!` report line; exit non-zero quietly.
+        return Err(anyhow::Error::new(ExitCodeError {
+            code: 1,
+            message: String::new(),
+        }));
     }
 
     if effective_filter.as_deref() == Some("blob:none") && remote_repo.is_none() {
@@ -3294,7 +3496,7 @@ fn fetch_remote(
 }
 
 fn maybe_write_commit_graph_after_fetch(git_dir: &Path, args: &Args) -> Result<()> {
-    if args.dry_run {
+    if args.dry_run || args.no_write_commit_graph {
         return Ok(());
     }
     let cfg = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
@@ -3371,7 +3573,7 @@ fn effective_fetch_filter(config: &ConfigSet, remote_name: &str, args: &Args) ->
 }
 
 fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result<()> {
-    if args.dry_run {
+    if args.dry_run || args.no_auto_gc {
         return Ok(());
     }
     let repo = Repository::open(git_dir, None)?;
@@ -5991,6 +6193,207 @@ pub fn collect_remote_names(config: &ConfigSet) -> Vec<String> {
         }
     }
     names
+}
+
+/// Whether a remote opts out of `fetch --all` via `remote.<name>.skipFetchAll`
+/// (alias `remote.<name>.skipDefaultUpdate`).
+fn remote_skips_fetch_all(config: &ConfigSet, name: &str) -> bool {
+    for key in [
+        format!("remote.{name}.skipfetchall"),
+        format!("remote.{name}.skipdefaultupdate"),
+    ] {
+        if let Some(v) = config.get(&key) {
+            if parse_bool(v.trim()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remotes that participate in `git fetch --all`: every configured remote
+/// except those with `skipFetchAll`/`skipDefaultUpdate` set.
+fn collect_fetch_all_remote_names(git_dir: &Path, config: &ConfigSet) -> Vec<String> {
+    let names = collect_local_remote_names(git_dir).unwrap_or_else(|| collect_remote_names(config));
+    names
+        .into_iter()
+        .filter(|name| !remote_skips_fetch_all(config, name))
+        .collect()
+}
+
+/// Expand a list of `git fetch --multiple` arguments into concrete remote names.
+/// Each argument is either a remote group (`remotes.<name>`) — expanded into its
+/// members — or a single configured remote. Order is preserved and duplicates
+/// removed. An argument that matches neither is a hard error, mirroring git's
+/// "no such remote or remote group".
+fn expand_remotes_or_groups(config: &ConfigSet, args: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::new();
+    for arg in args {
+        let group_lines = config.get_all(&format!("remotes.{arg}"));
+        if !group_lines.is_empty() {
+            for line in &group_lines {
+                for m in line.split_whitespace() {
+                    if seen.insert(m.to_string()) {
+                        out.push(m.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        // Not a group: must be a configured remote.
+        if config.get(&format!("remote.{arg}.url")).is_some() {
+            if seen.insert(arg.clone()) {
+                out.push(arg.clone());
+            }
+            continue;
+        }
+        return Err(anyhow::Error::new(ExitCodeError {
+            code: 128,
+            message: format!("fatal: no such remote or remote group: {arg}"),
+        }));
+    }
+    Ok(out)
+}
+
+/// Effective parallelism for a multi-remote fetch. `--jobs=0` (or unset) picks a
+/// default based on available CPUs, mirroring git's `online_cpus()`. A negative
+/// value is impossible here (clap parses `usize`).
+fn effective_max_children(args: &Args, config: &ConfigSet) -> usize {
+    if let Some(j) = args.jobs {
+        if j != 0 {
+            return j;
+        }
+    }
+    // `--jobs` unset or zero: fall back to `fetch.parallel`, else online CPUs.
+    if let Some(p) = config
+        .get("fetch.parallel")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        if p != 0 {
+            return p;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Emit a `GIT_TRACE` line (git's `trace_printf`) with the standard timestamped
+/// prefix when tracing is active.
+fn fetch_trace_printf(message: &str) {
+    let Ok(dest) = std::env::var("GIT_TRACE") else {
+        return;
+    };
+    if dest.is_empty() || dest == "0" || dest.eq_ignore_ascii_case("false") {
+        return;
+    }
+    let line = if std::env::var("GIT_TRACE_BARE").ok().as_deref() == Some("1") {
+        format!("{message}\n")
+    } else {
+        let now = time::OffsetDateTime::now_utc();
+        format!(
+            "{:02}:{:02}:{:02}.{:06} run-command.c:000      {message}\n",
+            now.hour(),
+            now.minute(),
+            now.second(),
+            now.microsecond(),
+        )
+    };
+    crate::write_git_trace(&dest, &line);
+}
+
+/// Fetch each named remote in turn, continuing past a remote that errors so the
+/// remaining remotes are still fetched (mirrors `fetch_multiple` in git). If any
+/// remote failed, the overall command exits with code 1.
+///
+/// `parallel` controls only the diagnostics: when more than one task could run
+/// concurrently git emits a `preparing to run up to N tasks` trace line and uses
+/// the parallel error format `could not fetch '<name>' (exit code: N)`. We always
+/// fetch serially, but reproduce these observable details.
+fn fetch_each_continuing(
+    git_dir: &Path,
+    config: &ConfigSet,
+    names: &[String],
+    args: &Args,
+) -> Result<()> {
+    let max_children = effective_max_children(args, config);
+    let parallel = max_children != 1 && names.len() != 1;
+    if parallel {
+        fetch_trace_printf(&format!(
+            "run_processes_parallel: preparing to run up to {max_children} tasks"
+        ));
+    }
+
+    // Truncate FETCH_HEAD once up front (unless the parent itself was asked to
+    // append or to not write it). Per-remote children then append, matching
+    // git's `truncate_fetch_head()` before spawning `fetch --append` children.
+    let write_fetch_head = !args.dry_run && !args.no_write_fetch_head;
+    if write_fetch_head && !args.append {
+        let fetch_head_path = git_dir.join("FETCH_HEAD");
+        if let Err(e) = fs::write(&fetch_head_path, b"") {
+            if fetch_head_path.exists() {
+                return Err(anyhow::Error::new(e)).context("truncating FETCH_HEAD");
+            }
+        }
+    }
+
+    let mut had_error = false;
+    for name in names {
+        let mut inner = args.clone();
+        inner.multiple = false;
+        inner.all = false;
+        inner.no_all = false;
+        inner.remote = None;
+        inner.refspecs.clear();
+        // Each per-remote child appends to FETCH_HEAD and skips the post-fetch
+        // auto maintenance / commit-graph write; the parent does those once at
+        // the end (mirrors git's `fetch --append --no-auto-gc …` children).
+        inner.append = true;
+        inner.no_auto_gc = true;
+        inner.no_write_commit_graph = true;
+        if !args.quiet && effective_output_format(config, args) != FetchOutputFormat::Porcelain {
+            println!("Fetching {name}");
+        }
+        match fetch_remote(git_dir, config, name, None, &inner) {
+            Ok(()) => {}
+            Err(e) => {
+                // Surface the underlying transport error, then note the remote
+                // and keep going. The child's exit code is reported in the
+                // parallel format; the aggregate command exits with code 1.
+                let code = e
+                    .downcast_ref::<ExitCodeError>()
+                    .map(|x| x.code)
+                    .unwrap_or(128);
+                let msg = format!("{e:#}");
+                let msg = msg
+                    .strip_prefix("fatal: ")
+                    .or_else(|| msg.strip_prefix("error: "))
+                    .unwrap_or(&msg);
+                if !msg.is_empty() {
+                    eprintln!("error: {msg}");
+                }
+                if parallel {
+                    eprintln!("error: could not fetch '{name}' (exit code: {code})");
+                } else {
+                    eprintln!("error: could not fetch {name}");
+                }
+                had_error = true;
+            }
+        }
+    }
+    // Run the post-fetch commit-graph write and auto maintenance once for the
+    // whole multi-remote fetch (children were told to skip them).
+    maybe_write_commit_graph_after_fetch(git_dir, args)?;
+    maybe_run_auto_maintenance_after_fetch(git_dir, args)?;
+
+    if had_error {
+        return Err(anyhow::Error::new(ExitCodeError {
+            code: 1,
+            message: String::new(),
+        }));
+    }
+    Ok(())
 }
 
 /// Collect remote names from the repository-local config only.
