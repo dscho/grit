@@ -384,6 +384,15 @@ pub(crate) fn write_v2_fetch_request(
     let of = format!("object-format={object_format}");
     trace_packet_git('>', &of);
     pkt_line::write_line(stdin, &of)?;
+    // `session-id` is a v2 capability (serve.c lists it with a `.receive` handler), so it belongs
+    // in the request's capability list — before the `0001` delimiter — alongside agent and
+    // object-format, not among the per-command fetch arguments (`t5705`).
+    if let Some(sid) = session_id_on_wire {
+        let esc = crate::trace2_transfer::json_escape_trace_value(sid);
+        let line = format!("session-id={esc}");
+        trace_packet_git('>', &line);
+        pkt_line::write_line(stdin, &line)?;
+    }
     for opt in server_options {
         let line = format!("server-option={opt}");
         trace_packet_git('>', &line);
@@ -407,12 +416,6 @@ pub(crate) fn write_v2_fetch_request(
         pkt_line::write_line(stdin, "include-tag")?;
     }
 
-    if let Some(sid) = session_id_on_wire {
-        let esc = crate::trace2_transfer::json_escape_trace_value(sid);
-        let line = format!("session-id={esc}");
-        trace_packet_git('>', &line);
-        pkt_line::write_line(stdin, &line)?;
-    }
     for w in wants {
         let line = format!("want {}", w.to_hex());
         trace_packet_git('>', line.trim_end());
