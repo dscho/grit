@@ -114,6 +114,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut requested_depth: Option<usize> = None;
     let mut filter_spec: Option<String> = None;
     let mut multi_ack_detailed = false;
+    let mut no_progress = false;
     loop {
         match pkt_line::read_packet(&mut stdin)? {
             None => break,
@@ -124,6 +125,9 @@ pub fn run(args: Args) -> Result<()> {
                     let features = rest.strip_prefix(hex).unwrap_or("").trim();
                     if wants.is_empty() && features.contains("multi_ack_detailed") {
                         multi_ack_detailed = true;
+                    }
+                    if wants.is_empty() && features.split_whitespace().any(|f| f == "no-progress") {
+                        no_progress = true;
                     }
                     if wants.is_empty() {
                         if let Some(sid) = trace2_transfer::extract_session_id_feature(features) {
@@ -271,13 +275,18 @@ pub fn run(args: Args) -> Result<()> {
             // Avoid excluding those unseen ancestors from the generated pack.
             Vec::new()
         };
-        if let Some(depth) = requested_depth {
-            exclusion_commits.extend(crate::pack_objects_upload::compute_depth_exclude_commits(
-                &repo,
-                &want_unique,
-                depth,
-            )?);
-        }
+        // For a depth-limited request, cut the parent chains of the boundary commits via
+        // `--shallow <oid>` rather than excluding the boundary's *parents* via `--not`. A plain
+        // `--not <parent>` exclusion drops every object reachable from the cut-off history,
+        // including trees/blobs still referenced by an in-depth commit (e.g. a file added in the
+        // very first commit and never changed). That yields a corrupt shallow pack whose refs
+        // point at objects with missing blobs, which `git fsck` rejects
+        // (t5537 "shallow fetches check connectivity before writing shallow file").
+        let shallow_commits: Vec<ObjectId> = if let Some(depth) = requested_depth {
+            crate::pack_objects_upload::compute_depth_boundary_commits(&repo, &want_unique, depth)?
+        } else {
+            Vec::new()
+        };
         exclusion_commits.sort_by_key(|oid| oid.to_hex());
         exclusion_commits.dedup();
         // Thin packs subtract the full closure of `have` commits. That is only safe when every
@@ -286,17 +295,20 @@ pub fn run(args: Args) -> Result<()> {
         let thin = client_shallow_boundaries.is_empty()
             && !exclusion_commits.is_empty()
             && wants_include_only_commits(&repo, &want_unique);
-        let mut child = crate::pack_objects_upload::spawn_pack_objects_upload(
+        let mut child = crate::pack_objects_upload::spawn_pack_objects_upload_shallow(
             &repo.git_dir,
             thin,
             filter_spec.as_deref(),
+            !shallow_commits.is_empty(),
+            !no_progress,
         )?;
         {
             let mut pin = child.stdin.take().context("pack-objects stdin")?;
-            crate::pack_objects_upload::write_pack_objects_revs_stdin(
+            crate::pack_objects_upload::write_pack_objects_revs_stdin_shallow(
                 &mut pin,
                 &want_unique,
                 &exclusion_commits,
+                &shallow_commits,
             )?;
         }
         crate::pack_objects_upload::drain_pack_objects_child(child, &mut out, true)?;

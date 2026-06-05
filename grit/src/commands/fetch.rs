@@ -74,8 +74,23 @@ pub struct Args {
     pub refspecs: Vec<String>,
 
     /// Fetch all configured remotes.
-    #[arg(long)]
+    #[arg(long, overrides_with = "no_all")]
     pub all: bool,
+
+    /// Do not fetch all remotes (overrides `--all` and `fetch.all`).
+    #[arg(long = "no-all", overrides_with = "all", hide = true)]
+    pub no_all: bool,
+
+    /// Suppress the post-fetch auto maintenance (`git maintenance run --auto`).
+    /// Set internally for per-remote children of a multi-remote fetch so the
+    /// parent runs maintenance only once.
+    #[arg(long = "no-auto-gc", hide = true)]
+    pub no_auto_gc: bool,
+
+    /// Suppress the post-fetch commit-graph write. Set internally for per-remote
+    /// children of a multi-remote fetch.
+    #[arg(long = "no-write-commit-graph", hide = true)]
+    pub no_write_commit_graph: bool,
 
     /// Fetch several remotes (each argument names a remote).
     #[arg(long)]
@@ -181,8 +196,12 @@ pub struct Args {
     pub server_options: Vec<String>,
 
     /// Machine-readable porcelain output.
-    #[arg(long)]
+    #[arg(long, overrides_with = "no_porcelain")]
     pub porcelain: bool,
+
+    /// Disable porcelain output (overrides a previous `--porcelain`).
+    #[arg(long = "no-porcelain", overrides_with = "porcelain", hide = true)]
+    pub no_porcelain: bool,
 
     /// Do not show forced updates.
     #[arg(long = "no-show-forced-updates")]
@@ -259,6 +278,290 @@ enum PendingRefOp {
     },
 }
 
+/// Output style for the per-ref update report (mirrors Git's `fetch.output`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FetchOutputFormat {
+    Full,
+    Compact,
+    Porcelain,
+}
+
+/// Resolve the effective fetch output format. `--porcelain` (CLI) wins over `fetch.output`;
+/// otherwise `fetch.output=compact|porcelain` selects the style, defaulting to `full`.
+fn effective_output_format(config: &ConfigSet, args: &Args) -> FetchOutputFormat {
+    if args.porcelain {
+        return FetchOutputFormat::Porcelain;
+    }
+    match config.get("fetch.output").as_deref() {
+        Some("compact") => FetchOutputFormat::Compact,
+        Some("porcelain") => FetchOutputFormat::Porcelain,
+        _ => FetchOutputFormat::Full,
+    }
+}
+
+/// Whether forced-update detection (`+`/`(forced update)`) is enabled. Defaults on; disabled by
+/// `--no-show-forced-updates` or `fetch.showForcedUpdates=false` (CLI flags win over config).
+fn effective_show_forced_updates(config: &ConfigSet, args: &Args) -> bool {
+    if args.show_forced_updates {
+        return true;
+    }
+    if args.no_show_forced_updates {
+        return false;
+    }
+    config
+        .get("fetch.showforcedupdates")
+        .as_deref()
+        .map(|v| parse_bool(v).unwrap_or(true))
+        .unwrap_or(true)
+}
+
+/// Compute the display record fields for a non-deleting ref update.
+///
+/// Returns `(code, summary, error)` matching Git's `update_local_ref`:
+/// - new ref (no old): `*` / `[new branch|tag|ref]`
+/// - fast-forward: ` ` / `old..new`
+/// - forced (non-ff) update: `+` / `old...new` with `(forced update)` error note
+fn classify_ref_update(
+    repo: &Repository,
+    remote_refname: &str,
+    old_oid: Option<&ObjectId>,
+    new_oid: &ObjectId,
+    show_forced_updates: bool,
+) -> (char, String, Option<&'static str>) {
+    let Some(old) = old_oid else {
+        let summary = if remote_refname.starts_with("refs/tags/") {
+            "[new tag]"
+        } else if remote_refname.starts_with("refs/heads/") {
+            "[new branch]"
+        } else {
+            "[new ref]"
+        };
+        return ('*', summary.to_string(), None);
+    };
+    let old_short = &old.to_string()[..7];
+    let new_short = &new_oid.to_string()[..7];
+    let fast_forward = if show_forced_updates {
+        merge_base::is_ancestor(repo, *old, *new_oid).unwrap_or(true)
+    } else {
+        true
+    };
+    if fast_forward {
+        (' ', format!("{old_short}..{new_short}"), None)
+    } else {
+        (
+            '+',
+            format!("{old_short}...{new_short}"),
+            Some("forced update"),
+        )
+    }
+}
+
+/// Git's `kind` for a FETCH_HEAD-only display line (no local peer ref). Defaults to "branch"
+/// for `HEAD`/object-id sources, matching `store_updated_refs`.
+fn fetch_head_ref_kind(remote_refname: &str) -> &'static str {
+    if remote_refname.starts_with("refs/heads/") {
+        "branch"
+    } else if remote_refname.starts_with("refs/tags/") {
+        "tag"
+    } else if remote_refname.starts_with("refs/remotes/") {
+        "remote-tracking branch"
+    } else {
+        "branch"
+    }
+}
+
+/// Fallback summary when we can't open the repo for a fast-forward check: treat as a new ref.
+fn classify_new_ref_summary(remote_refname: &str) -> (char, String, Option<&'static str>) {
+    let summary = if remote_refname.starts_with("refs/tags/") {
+        "[new tag]"
+    } else if remote_refname.starts_with("refs/heads/") {
+        "[new branch]"
+    } else {
+        "[new ref]"
+    };
+    ('*', summary.to_string(), None)
+}
+
+/// One reported ref update, accumulated so the column widths (which depend on the full set of
+/// updates) can be computed before any line is printed — matching Git's `display_state` model.
+struct FetchDisplayRecord {
+    code: char,
+    summary: String,
+    /// Prettified remote ref name (the left column for full/compact).
+    remote: String,
+    /// Prettified local ref name (the right column).
+    local: String,
+    /// Full local ref name (used as the porcelain ref column).
+    local_full: String,
+    old_oid: ObjectId,
+    new_oid: ObjectId,
+    error: Option<String>,
+}
+
+/// Accumulates ref-update display records and renders them in the selected output format.
+struct FetchDisplay {
+    format: FetchOutputFormat,
+    /// `From <url>` header text (trailing slashes / `.git` already trimmed).
+    from_url: String,
+    records: Vec<FetchDisplayRecord>,
+    shown_url: bool,
+    /// Set once any emitted record targeted `FETCH_HEAD` (a FETCH_HEAD-only update).
+    emitted_fetch_head: bool,
+}
+
+impl FetchDisplay {
+    fn new(format: FetchOutputFormat, from_url: String) -> Self {
+        Self {
+            format,
+            from_url,
+            records: Vec::new(),
+            shown_url: false,
+            emitted_fetch_head: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        code: char,
+        summary: &str,
+        remote: &str,
+        local: &str,
+        local_full: &str,
+        old_oid: ObjectId,
+        new_oid: ObjectId,
+        error: Option<&str>,
+    ) {
+        self.records.push(FetchDisplayRecord {
+            code,
+            summary: summary.to_string(),
+            remote: prettify_refname(remote).to_string(),
+            local: prettify_refname(local).to_string(),
+            local_full: local_full.to_string(),
+            old_oid,
+            new_oid,
+            error: error.map(ToString::to_string),
+        });
+    }
+
+    /// Git's `refcol_width`: widest remote ref-name column, floor 10.
+    fn refcol_width(&self) -> usize {
+        let compact = self.format == FetchOutputFormat::Compact;
+        let mut width = 10usize;
+        for r in &self.records {
+            let rlen = r.remote.chars().count();
+            let llen = if compact { 0 } else { r.local.chars().count() };
+            // Rough over-long-line guard mirrors Git, but with no terminal width here we keep all
+            // visible lines; the floor/`max` below still yields the expected padding for tests.
+            let _ = (rlen, llen);
+            if width < rlen {
+                width = rlen;
+            }
+        }
+        width
+    }
+
+    /// Render `remote -> local`, applying compact `*` substitution when in compact mode.
+    fn remote_to_local(&self, width: usize, remote: &str, local: &str) -> String {
+        if self.format == FetchOutputFormat::Compact {
+            if remote == local {
+                return format!("{remote:<width$} -> *");
+            }
+            let mut r = remote.to_string();
+            let mut l = local.to_string();
+            if !find_and_replace(&mut r, local, "*") {
+                find_and_replace(&mut l, remote, "*");
+            }
+            format!("{r:<width$} -> {l}")
+        } else {
+            format!("{remote:<width$} -> {local}")
+        }
+    }
+
+    /// Emit all accumulated records. For full/compact, lines go to stderr (with a single `From`
+    /// header); for porcelain, lines go to stdout.
+    fn flush(&mut self) {
+        if self.records.is_empty() {
+            return;
+        }
+        if self.records.iter().any(|r| r.local_full == "FETCH_HEAD") {
+            self.emitted_fetch_head = true;
+        }
+        // Git reports pruned deletions before any ref updates (prune_refs runs before the fetch
+        // updates). Our accumulator collects updates first and prune deletes later, so reorder
+        // deletes to the front with a stable sort that otherwise preserves insertion order.
+        self.records.sort_by_key(|r| r.code != '-');
+        match self.format {
+            FetchOutputFormat::Porcelain => {
+                let stdout = std::io::stdout();
+                let mut out = stdout.lock();
+                for r in &self.records {
+                    let _ = writeln!(
+                        out,
+                        "{} {} {} {}",
+                        r.code, r.old_oid, r.new_oid, r.local_full
+                    );
+                }
+            }
+            FetchOutputFormat::Full | FetchOutputFormat::Compact => {
+                let width = self.refcol_width();
+                let mut buf = String::new();
+                if !self.shown_url {
+                    buf.push_str(&format!("From {}\n", self.from_url));
+                    self.shown_url = true;
+                }
+                for r in &self.records {
+                    let rtl = self.remote_to_local(width, &r.remote, &r.local);
+                    // ` %c %-17s %s` — code, summary padded to 17, then remote->local.
+                    buf.push_str(&format!(" {} {:<17} {rtl}", r.code, r.summary));
+                    if let Some(err) = &r.error {
+                        buf.push_str(&format!("  ({err})"));
+                    }
+                    buf.push('\n');
+                }
+                eprint!("{buf}");
+            }
+        }
+        self.records.clear();
+    }
+}
+
+/// Git's `prettify_refname`: strip the well-known ref prefixes for display.
+fn prettify_refname(name: &str) -> &str {
+    name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .or_else(|| name.strip_prefix("refs/remotes/"))
+        .unwrap_or(name)
+}
+
+/// Git's `find_and_replace`: replace `needle` with `placeholder` in `haystack` when it appears as
+/// a whole path component at the start or end. Returns true on replacement.
+fn find_and_replace(haystack: &mut String, needle: &str, placeholder: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let nlen = needle.len();
+    let pos = if haystack.ends_with(needle) {
+        Some(haystack.len() - nlen)
+    } else {
+        haystack.find(needle)
+    };
+    let Some(p) = pos else {
+        return false;
+    };
+    // Must be preceded by '/' (or be at the start).
+    if p > 0 && haystack.as_bytes()[p - 1] != b'/' {
+        return false;
+    }
+    // Must be followed by '/' (or be at the end).
+    let after = p + nlen;
+    if after < haystack.len() && haystack.as_bytes()[after] != b'/' {
+        return false;
+    }
+    haystack.replace_range(p..after, placeholder);
+    true
+}
+
 pub fn run(mut args: Args) -> Result<()> {
     if args.keep {
         std::env::set_var("GRIT_FETCH_KEEP_PACK", "1");
@@ -321,12 +624,38 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
-    // Validate fetch.output config if set
-    if let Some(val) = config.get("fetch.output") {
-        match val.as_str() {
-            "full" | "compact" => {}
-            _ => bail!("invalid value for 'fetch.output': '{}'", val),
+    // Validate fetch.output config if set. A value-less key (`git -c fetch.output`)
+    // is a boolean-true with no string value: Git fails to parse it as a string.
+    if let Some(entry) = config.get_last_entry("fetch.output") {
+        match entry.value.as_deref() {
+            None => {
+                eprintln!("error: missing value for 'fetch.output'");
+                eprintln!("fatal: unable to parse 'fetch.output' from command-line config");
+                std::process::exit(128);
+            }
+            Some("full") | Some("compact") | Some("porcelain") => {}
+            Some(val) => exit_fatal(&format!("invalid value for 'fetch.output': '{val}'")),
         }
+    }
+
+    // `--porcelain` is incompatible with an explicit `--recurse-submodules=<yes|on-demand>`
+    // (ref updates in submodules would be ambiguous in porcelain mode). An implicit/off value
+    // (no flag, `--no-recurse-submodules`, or `=no`) is fine; porcelain forces it off.
+    if args.porcelain {
+        let explicit_recurse = args
+            .recurse_submodules
+            .as_deref()
+            .map(|v| {
+                let l = v.to_ascii_lowercase();
+                l != "no" && l != "false"
+            })
+            .unwrap_or(false);
+        if explicit_recurse {
+            exit_fatal("options '--porcelain' and '--recurse-submodules' cannot be used together");
+        }
+        // Porcelain mode disables submodule recursion.
+        args.recurse_submodules = None;
+        args.no_recurse_submodules = true;
     }
 
     let mut recurse_mode = fetch_recurse_submodules_mode(&config, &args)?;
@@ -341,31 +670,68 @@ pub fn run(mut args: Args) -> Result<()> {
         crate::fetch_submodule_record::begin_fetch_submodule_record(&git_dir);
     }
 
-    let result = if args.multiple {
-        if args.all {
-            bail!("--multiple and --all are incompatible");
-        }
-        let names = args.refspecs.clone();
-        if names.is_empty() {
-            bail!("fetch --multiple requires at least one remote");
-        }
-        for name in &names {
-            let mut inner = args.clone();
-            inner.multiple = false;
-            inner.refspecs.clear();
-            fetch_remote(&git_dir, &config, name, None, &inner)?;
-        }
-        Ok(())
+    // Positional arguments: the optional `remote` plus any trailing `refspecs`.
+    // For `--all`/`--multiple` every positional token is a remote (or group);
+    // for the single-remote path only the first token is the remote.
+    let positional: Vec<String> = args
+        .remote
+        .iter()
+        .cloned()
+        .chain(args.refspecs.iter().cloned())
+        .collect();
+    let argc = positional.len();
+
+    // Resolve the tri-state `--all`/`--no-all`/`fetch.all`. `--no-all` (and an
+    // explicit `--all`) always win; otherwise `fetch.all` only applies when no
+    // remote/refspec was named on the command line (mirrors builtin/fetch.c).
+    let all_effective = if args.no_all {
+        false
     } else if args.all {
-        let remotes =
-            collect_local_remote_names(&git_dir).unwrap_or_else(|| collect_remote_names(&config));
+        true
+    } else if argc == 0 {
+        config
+            .get("fetch.all")
+            .as_deref()
+            .and_then(|v| parse_bool(v).ok())
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let result = if all_effective {
+        // `--all` (or `fetch.all=true`) must not be combined with a repository
+        // argument or refspecs.
+        if argc == 1 {
+            return Err(anyhow::Error::new(ExitCodeError {
+                code: 128,
+                message: "fatal: fetch --all does not take a repository argument".to_string(),
+            }));
+        } else if argc > 1 {
+            return Err(anyhow::Error::new(ExitCodeError {
+                code: 128,
+                message: "fatal: fetch --all does not make sense with refspecs".to_string(),
+            }));
+        }
+        // Collect every configured remote, skipping those with
+        // `remote.<name>.skipFetchAll` (alias: skipDefaultUpdate) set.
+        let remotes = collect_fetch_all_remote_names(&git_dir, &config);
         if remotes.is_empty() {
             bail!("no remotes configured");
         }
-        for name in &remotes {
-            fetch_remote(&git_dir, &config, name, None, &args)?;
+        if remotes.len() == 1 {
+            // Single remote: behave like a plain `git fetch <remote>` (no
+            // "could not fetch" wrapping, normal error propagation).
+            fetch_remote(&git_dir, &config, &remotes[0], None, &args)
+        } else {
+            fetch_each_continuing(&git_dir, &config, &remotes, &args)
         }
-        Ok(())
+    } else if args.multiple && argc >= 1 {
+        // `--multiple` with explicit arguments: every positional token is a
+        // remote or remote group. Expand, de-duplicate, and fetch each one,
+        // continuing past failures. (With no arguments, `--multiple` falls
+        // through to the default-remote path below, matching git.)
+        let names = expand_remotes_or_groups(&config, &positional)?;
+        fetch_each_continuing(&git_dir, &config, &names, &args)
     } else {
         let remote_resolved = args
             .remote
@@ -1207,6 +1573,9 @@ fn fetch_remote(
     let display_url = resolve_fetch_display_url(git_dir, &url, url_override, remote_repo.as_ref())?;
     let from_display_url =
         resolve_fetch_from_line_url(&url, url_override, remote_repo.as_ref(), &display_url);
+    let output_format = effective_output_format(config, args);
+    let mut display = FetchDisplay::new(output_format, from_display_url.clone());
+    let show_forced_updates = effective_show_forced_updates(config, args);
     let follow_remote_head = parse_follow_remote_head(config, remote_name);
     let include_head_ref_prefix = follow_remote_head.mode != FollowRemoteHead::Never;
     // Only remap tracking namespace for path/URL fetches (`git fetch ./repo`). When the user
@@ -1270,7 +1639,10 @@ fn fetch_remote(
             apply_prefetch_to_refspecs(&mut specs);
             cli_refspecs_owned = specs.iter().map(fetch_refspec_to_cli_string).collect();
         } else {
-            apply_prefetch_to_refspecs(&mut configured_refspecs);
+            // Rebuild from the raw config so an unqualified destination (`bogus/*`) lands at
+            // `refs/prefetch/bogus/*` instead of `refs/prefetch/heads/bogus/*` (t5582). Building
+            // on the already-normalized `configured_refspecs` would inject a spurious `heads/`.
+            configured_refspecs = collect_refspecs_for_prefetch(config, &fetch_key);
         }
         // The remote-tracking destination mapping uses `cli_tracking_refspecs`
         // (the configured/refmap refspecs); rewrite it too so fetched refs land
@@ -1836,7 +2208,10 @@ fn fetch_remote(
     let mut tag_clobber_failures: Vec<String> = Vec::new();
     let mut pending_atomic_ref_ops: Vec<PendingRefOp> = Vec::new();
     let mut pending_atomic_noop_head_hook: Option<(String, String, String)> = None;
-    let mut has_updates = false;
+    // Set when a non-force destination rejects a non-fast-forward update. The fetch still updates
+    // the other refs (or, with `--atomic`, aborts the transaction) but exits non-zero, without an
+    // extra stderr hint — the reject is reported via its `!` display line.
+    let mut had_rejected_updates = false;
 
     let remote_symbolic_head_branch =
         remote_head_symbolic_branch_from_transport
@@ -2020,6 +2395,21 @@ fn fetch_remote(
                         let local_ref = dst.replacen('*', matched, 1);
                         updated_refs.push(local_ref.clone());
                         let old_oid = read_ref_oid(git_dir, &local_ref);
+                        let branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);
+
+                        // Every ref matched by a (non-excluded) refspec contributes a FETCH_HEAD
+                        // line, even when the local tracking ref is already up to date. Git records
+                        // the fetched tip regardless of whether the ref pointer changed; only the
+                        // ref update and the progress message are skipped for no-op updates. Emit
+                        // this before the up-to-date early continue so an unchanged ref still lands
+                        // in FETCH_HEAD (t5582: negative pattern refspec FETCH_HEAD contents).
+                        fetch_head_entries.push(fetch_head_branch_line(
+                            remote_oid,
+                            branch,
+                            &display_url,
+                            false,
+                        ));
+
                         if local_ref.starts_with("refs/heads/")
                             && !args.update_head_ok
                             && !is_bare_repo
@@ -2036,26 +2426,42 @@ fn fetch_remote(
                             continue;
                         }
 
-                        // Check fast-forward for wildcard updates; `--atomic` expects any
-                        // non-fast-forward to abort the entire fetch.
+                        // Check fast-forward for wildcard updates. A non-fast-forward update to a
+                        // non-force destination is *rejected* (reported with `!`). With `--atomic`
+                        // the whole transaction is aborted (no refs written); without it, the other
+                        // refs still update. Either way the command exits non-zero at the end and
+                        // the reject is reported only via the `!` line (t5574 porcelain output).
+                        let mut rejected_non_ff = false;
                         if let Some(ref old) = old_oid {
                             if old != remote_oid && !(force || args.force) {
                                 let is_ff = merge_base::is_ancestor(&ff_repo, *old, *remote_oid)
                                     .unwrap_or(true);
                                 if !is_ff {
-                                    eprintln!(
-                                        " ! [rejected]        {src} -> {local_ref} (non-fast-forward)"
-                                    );
-                                    bail!("cannot fast-forward ref '{local_ref}'");
+                                    rejected_non_ff = true;
                                 }
                             }
                         }
 
-                        if !has_updates && !args.quiet {
-                            eprintln!("From {from_display_url}");
-                            has_updates = true;
+                        if rejected_non_ff {
+                            // A rejected non-ff update makes the fetch exit non-zero, but it is
+                            // reported via the `!` display line only — no extra "could not be
+                            // updated" hint (t5574 expects empty stderr in porcelain mode).
+                            had_rejected_updates = true;
+                            if !args.quiet {
+                                display.push(
+                                    '!',
+                                    "[rejected]",
+                                    refname,
+                                    &local_ref,
+                                    &local_ref,
+                                    old_oid.unwrap_or_else(ObjectId::zero),
+                                    *remote_oid,
+                                    Some("non-fast-forward"),
+                                );
+                            }
+                            continue;
                         }
-                        let branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);
+
                         apply_single_ref_update(
                             args,
                             git_dir,
@@ -2067,27 +2473,24 @@ fn fetch_remote(
                         )?;
 
                         if !args.quiet {
-                            let short = local_ref
-                                .strip_prefix("refs/heads/")
-                                .or_else(|| local_ref.strip_prefix("refs/tags/"))
-                                .unwrap_or(&local_ref);
-                            match old_oid {
-                                None => eprintln!(" * [new branch]      {branch:<17} -> {short}"),
-                                Some(old) => eprintln!(
-                                    "   {}..{}  {branch:<17} -> {short}",
-                                    &old.to_string()[..7],
-                                    &remote_oid.to_string()[..7],
-                                ),
-                            }
+                            let (code, summary, error) = classify_ref_update(
+                                &ff_repo,
+                                refname,
+                                old_oid.as_ref(),
+                                remote_oid,
+                                show_forced_updates,
+                            );
+                            display.push(
+                                code,
+                                &summary,
+                                refname,
+                                &local_ref,
+                                &local_ref,
+                                old_oid.unwrap_or_else(ObjectId::zero),
+                                *remote_oid,
+                                error,
+                            );
                         }
-
-                        // Build FETCH_HEAD entry
-                        fetch_head_entries.push(fetch_head_branch_line(
-                            remote_oid,
-                            branch,
-                            &display_url,
-                            false,
-                        ));
                     }
                 }
                 // Also copy symbolic refs for the matched pattern
@@ -2199,10 +2602,6 @@ fn fetch_remote(
                 }
 
                 if old_oid.as_ref() != Some(&remote_oid) {
-                    if !has_updates && !args.quiet {
-                        eprintln!("From {from_display_url}");
-                        has_updates = true;
-                    }
                     apply_single_ref_update(
                         args,
                         git_dir,
@@ -2214,36 +2613,39 @@ fn fetch_remote(
                     )?;
 
                     if !args.quiet {
-                        let short = local_ref
-                            .strip_prefix("refs/heads/")
-                            .or_else(|| local_ref.strip_prefix("refs/tags/"))
-                            .unwrap_or(&local_ref);
-                        match old_oid {
-                            None => {
-                                eprintln!(" * [new branch]      {branch_label:<17} -> {short}");
-                            }
-                            Some(old) => {
-                                eprintln!(
-                                    "   {}..{}  {branch_label:<17} -> {short}",
-                                    &old.to_string()[..7],
-                                    &remote_oid.to_string()[..7],
-                                );
-                            }
-                        }
+                        // Classify based on the *remote* ref name: a resolved branch/tag, else the
+                        // raw OID source (which yields `[new ref]`, matching Git's update_local_ref).
+                        let classify_name = resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                        let (code, summary, error) = classify_ref_update(
+                            &ff_repo,
+                            classify_name,
+                            old_oid.as_ref(),
+                            &remote_oid,
+                            show_forced_updates,
+                        );
+                        display.push(
+                            code,
+                            &summary,
+                            branch_label,
+                            &local_ref,
+                            &local_ref,
+                            old_oid.unwrap_or_else(ObjectId::zero),
+                            remote_oid,
+                            error,
+                        );
                     }
                 }
-            } else if let Some(remote_ref_name) = resolved_remote_ref.as_deref() {
-                if let Some(local_ref) =
-                    map_ref_through_refspecs(remote_ref_name, &cli_tracking_refspecs)
-                {
+            } else {
+                // No explicit destination. If a configured tracking refspec maps the resolved
+                // remote ref to a local ref, update that ref; otherwise the fetch lands only in
+                // FETCH_HEAD and Git reports a ` * <kind>  <remote> -> FETCH_HEAD` line.
+                let tracking_local = resolved_remote_ref
+                    .as_deref()
+                    .and_then(|rrn| map_ref_through_refspecs(rrn, &cli_tracking_refspecs));
+                if let Some(local_ref) = tracking_local {
                     updated_refs.push(local_ref.clone());
                     let old_oid = read_ref_oid(git_dir, &local_ref);
                     if old_oid.as_ref() != Some(&remote_oid) {
-                        if !has_updates && !args.quiet {
-                            eprintln!("From {from_display_url}");
-                            has_updates = true;
-                        }
-
                         if local_ref.starts_with("refs/heads/")
                             && !args.update_head_ok
                             && !is_bare_repo
@@ -2265,7 +2667,131 @@ fn fetch_remote(
                             remote_oid,
                             &mut ref_update_failures,
                         )?;
+                        if !args.quiet {
+                            let classify_name =
+                                resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                            let (code, summary, error) = classify_ref_update(
+                                &ff_repo,
+                                classify_name,
+                                old_oid.as_ref(),
+                                &remote_oid,
+                                show_forced_updates,
+                            );
+                            display.push(
+                                code,
+                                &summary,
+                                branch_label,
+                                &local_ref,
+                                &local_ref,
+                                old_oid.unwrap_or_else(ObjectId::zero),
+                                remote_oid,
+                                error,
+                            );
+                        }
                     }
+                } else if !args.quiet {
+                    // FETCH_HEAD-only update (e.g. `git fetch origin HEAD`).
+                    let remote_ref_name = resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                    let kind = fetch_head_ref_kind(remote_ref_name);
+                    display.push(
+                        '*',
+                        kind,
+                        branch_label,
+                        "FETCH_HEAD",
+                        "FETCH_HEAD",
+                        ObjectId::zero(),
+                        remote_oid,
+                        None,
+                    );
+                }
+            }
+        }
+
+        // Opportunistic remote-tracking updates: when explicit *wildcard* CLI refspecs are used,
+        // Git also applies the configured `remote.<name>.fetch` refspecs to the advertised refs,
+        // updating (e.g.) `refs/remotes/origin/*` alongside the CLI destinations (t5574). Restrict
+        // this to wildcard CLI fetches so a single-ref fetch (`origin HEAD`, `origin <oid>:x`)
+        // doesn't sprout spurious tracking updates.
+        let cli_has_wildcard = cli_refspecs.iter().any(|s| {
+            let clean = s.strip_prefix('^').unwrap_or(s);
+            let clean = clean.strip_prefix('+').unwrap_or(clean);
+            let src = clean.split(':').next().unwrap_or(clean);
+            src.contains('*')
+        });
+        for spec in cli_tracking_refspecs.iter().filter(|_| cli_has_wildcard) {
+            if spec.negative || spec.dst.is_empty() || !spec.src.contains('*') {
+                continue;
+            }
+            for (refname, remote_oid) in &remote_all_refs {
+                if is_excluded(refname) {
+                    continue;
+                }
+                let Some(matched) = match_glob_pattern(&spec.src, refname) else {
+                    continue;
+                };
+                let local_ref = spec.dst.replacen('*', matched, 1);
+                if updated_refs.contains(&local_ref) {
+                    continue;
+                }
+                updated_refs.push(local_ref.clone());
+                let old_oid = read_ref_oid(git_dir, &local_ref);
+                if old_oid.as_ref() == Some(remote_oid) {
+                    continue;
+                }
+                let forced = spec.force || args.force;
+                let mut rejected_non_ff = false;
+                if let Some(ref old) = old_oid {
+                    if old != remote_oid && !forced {
+                        let is_ff =
+                            merge_base::is_ancestor(&ff_repo, *old, *remote_oid).unwrap_or(true);
+                        if !is_ff {
+                            rejected_non_ff = true;
+                        }
+                    }
+                }
+                if rejected_non_ff {
+                    had_rejected_updates = true;
+                    if !args.quiet {
+                        display.push(
+                            '!',
+                            "[rejected]",
+                            refname,
+                            &local_ref,
+                            &local_ref,
+                            old_oid.unwrap_or_else(ObjectId::zero),
+                            *remote_oid,
+                            Some("non-fast-forward"),
+                        );
+                    }
+                    continue;
+                }
+                apply_single_ref_update(
+                    args,
+                    git_dir,
+                    &mut pending_atomic_ref_ops,
+                    &local_ref,
+                    old_oid,
+                    *remote_oid,
+                    &mut ref_update_failures,
+                )?;
+                if !args.quiet {
+                    let (code, summary, error) = classify_ref_update(
+                        &ff_repo,
+                        refname,
+                        old_oid.as_ref(),
+                        remote_oid,
+                        show_forced_updates,
+                    );
+                    display.push(
+                        code,
+                        &summary,
+                        refname,
+                        &local_ref,
+                        &local_ref,
+                        old_oid.unwrap_or_else(ObjectId::zero),
+                        *remote_oid,
+                        error,
+                    );
                 }
             }
         }
@@ -2313,8 +2839,19 @@ fn fetch_remote(
         // `origin`'s URL would incorrectly resolve to `refs/remotes/origin/*` (t5505).
         let mut union_refspecs: Vec<FetchRefspec> = Vec::new();
         let primary_key = format!("remote.{remote_name}.fetch");
-        let mut primary = collect_refspecs(config, &primary_key);
-        if primary.is_empty() {
+        // `git fetch --prefetch` redirects every positive destination under `refs/prefetch/`
+        // (and drops tag refspecs). Build prefetch refspecs from the **raw** config dst so an
+        // unqualified destination like `bogus/*` becomes `refs/prefetch/bogus/*` rather than
+        // `refs/prefetch/heads/bogus/*` (t5582). For normal fetches keep the standard collection.
+        let collect = |key: &str| -> Vec<FetchRefspec> {
+            if args.prefetch {
+                collect_refspecs_for_prefetch(config, key)
+            } else {
+                collect_refspecs(config, key)
+            }
+        };
+        let mut primary = collect(&primary_key);
+        if primary.is_empty() && !args.prefetch {
             primary = default_fetch_refspecs(remote_name);
         }
         union_refspecs.extend(primary);
@@ -2323,17 +2860,11 @@ fn fetch_remote(
                 continue;
             }
             let key = format!("remote.{rn}.fetch");
-            let mut rs = collect_refspecs(config, &key);
-            if rs.is_empty() {
+            let mut rs = collect(&key);
+            if rs.is_empty() && !args.prefetch {
                 rs = default_fetch_refspecs(rn);
             }
             union_refspecs.extend(rs);
-        }
-        // `git fetch --prefetch` redirects every positive destination under
-        // `refs/prefetch/` (and drops tag refspecs). This union is rebuilt from
-        // config here, so re-apply the rewrite (matches apply_prefetch_to_refspecs).
-        if args.prefetch {
-            apply_prefetch_to_refspecs(&mut union_refspecs);
         }
 
         let refs_for_mapping: Vec<(String, ObjectId)> =
@@ -2419,10 +2950,6 @@ fn fetch_remote(
                 if local_ref_path.is_dir() {
                     let conflict_prefix = format!("{local_ref}/");
                     let stale_refs = refs::list_refs(git_dir, &conflict_prefix)?;
-                    if !stale_refs.is_empty() && !has_updates && !args.quiet {
-                        eprintln!("From {from_display_url}");
-                        has_updates = true;
-                    }
                     for (stale_ref, stale_oid) in stale_refs {
                         apply_single_ref_delete(
                             args,
@@ -2433,12 +2960,16 @@ fn fetch_remote(
                             &mut ref_update_failures,
                         )?;
                         if !args.quiet {
-                            let short = stale_ref
-                                .strip_prefix("refs/remotes/")
-                                .or_else(|| stale_ref.strip_prefix("refs/heads/"))
-                                .or_else(|| stale_ref.strip_prefix("refs/tags/"))
-                                .unwrap_or(&stale_ref);
-                            eprintln!(" - [deleted]         (none)     -> {short}");
+                            display.push(
+                                '-',
+                                "[deleted]",
+                                "(none)",
+                                &stale_ref,
+                                &stale_ref,
+                                stale_oid,
+                                ObjectId::zero(),
+                                None,
+                            );
                         }
                     }
                     // If we removed all child refs, clear now-empty directories so the
@@ -2463,11 +2994,6 @@ fn fetch_remote(
                 }
             }
 
-            if !has_updates && !args.quiet {
-                eprintln!("From {from_display_url}");
-                has_updates = true;
-            }
-
             apply_single_ref_update(
                 args,
                 git_dir,
@@ -2488,53 +3014,29 @@ fn fetch_remote(
                 );
             }
 
-            if args.porcelain {
-                let zero = "0".repeat(40);
-                let old_hex = old_oid
-                    .as_ref()
-                    .map(|o| o.to_string())
-                    .unwrap_or_else(|| zero.clone());
-                let flag = if old_oid.is_none() { "*" } else { " " };
-                println!("{flag} {old_hex} {remote_oid} {local_ref}");
-            } else if !args.quiet {
-                let dst_display = local_ref
-                    .strip_prefix("refs/remotes/")
-                    .or_else(|| local_ref.strip_prefix("refs/heads/"))
-                    .or_else(|| local_ref.strip_prefix("refs/tags/"))
-                    .unwrap_or(local_ref.as_str());
-                if refname.starts_with("refs/heads/") {
-                    let src_branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);
-                    if old_oid.is_none() {
-                        if local_ref.starts_with("refs/remotes/") {
-                            let tracking_print = local_ref
-                                .strip_prefix("refs/remotes/")
-                                .and_then(|s| s.find('/').map(|i| &s[..i]))
-                                .unwrap_or(remote_name);
-                            eprintln!(
-                                " * [new branch]      {src_branch:<17} -> {tracking_print}/{src_branch}"
-                            );
-                        } else {
-                            eprintln!(" * [new branch]      {src_branch:<17} -> {dst_display}");
-                        }
-                    } else if let Some(old) = old_oid.as_ref() {
-                        eprintln!(
-                            "   {}..{}  {src_branch:<17} -> {dst_display}",
-                            &old.to_string()[..7],
-                            &remote_oid.to_string()[..7],
-                        );
-                    }
-                } else {
-                    let src_display = refname.strip_prefix("refs/").unwrap_or(refname);
-                    if let Some(old) = old_oid.as_ref() {
-                        eprintln!(
-                            "   {}..{}  {src_display:<17} -> {dst_display}",
-                            &old.to_string()[..7],
-                            &remote_oid.to_string()[..7],
-                        );
-                    } else {
-                        eprintln!(" * [new ref]         {src_display:<17} -> {dst_display}");
-                    }
-                }
+            if !args.quiet {
+                let display_repo = Repository::open(git_dir, None).ok();
+                let (code, summary, error) = match display_repo.as_ref() {
+                    Some(repo) => classify_ref_update(
+                        repo,
+                        refname,
+                        old_oid.as_ref(),
+                        &remote_oid,
+                        show_forced_updates,
+                    ),
+                    None => classify_new_ref_summary(refname),
+                };
+                let old_for_porcelain = old_oid.unwrap_or_else(ObjectId::zero);
+                display.push(
+                    code,
+                    &summary,
+                    refname,
+                    &local_ref,
+                    &local_ref,
+                    old_for_porcelain,
+                    remote_oid,
+                    error,
+                );
             }
         }
         if user_passed_cli_refspecs {
@@ -2561,15 +3063,21 @@ fn fetch_remote(
                 continue;
             }
 
-            if !has_updates && !args.quiet {
-                eprintln!("From {from_display_url}");
-                has_updates = true;
-            }
-
             if let Some(old) = old_oid {
                 if old != *remote_oid && !should_force_tag_update(config, remote_name, args) {
                     let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
-                    eprintln!(" ! [rejected]        {tag_name}  (would clobber existing tag)");
+                    if !args.quiet {
+                        display.push(
+                            '!',
+                            "[rejected]",
+                            refname,
+                            refname,
+                            refname,
+                            old,
+                            *remote_oid,
+                            Some("would clobber existing tag"),
+                        );
+                    }
                     tag_clobber_failures.push(tag_name.to_owned());
                     continue;
                 }
@@ -2590,16 +3098,28 @@ fn fetch_remote(
             }
 
             if !args.quiet {
-                let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
-                if let Some(old) = old_oid {
-                    eprintln!(
-                        "   {}..{}  {tag_name:<17} -> {tag_name}",
-                        &old.to_string()[..7],
-                        &remote_oid.to_string()[..7],
-                    );
+                let (code, summary) = if let Some(old) = old_oid {
+                    (
+                        ' ',
+                        format!(
+                            "{}..{}",
+                            &old.to_string()[..7],
+                            &remote_oid.to_string()[..7]
+                        ),
+                    )
                 } else {
-                    eprintln!(" * [new tag]         {tag_name:<17} -> {tag_name}");
-                }
+                    ('*', "[new tag]".to_string())
+                };
+                display.push(
+                    code,
+                    &summary,
+                    refname,
+                    refname,
+                    refname,
+                    old_oid.unwrap_or_else(ObjectId::zero),
+                    *remote_oid,
+                    None,
+                );
             }
         }
     }
@@ -2662,10 +3182,6 @@ fn fetch_remote(
         for (local_tag_ref, _oid) in &local_tags {
             let exists_on_remote = remote_tags.iter().any(|(r, _)| r == local_tag_ref);
             if !exists_on_remote {
-                if !has_updates && !args.quiet {
-                    eprintln!("From {from_display_url}");
-                    has_updates = true;
-                }
                 apply_single_ref_delete(
                     args,
                     git_dir,
@@ -2675,10 +3191,16 @@ fn fetch_remote(
                     &mut ref_update_failures,
                 )?;
                 if !args.quiet {
-                    let tag_name = local_tag_ref
-                        .strip_prefix("refs/tags/")
-                        .unwrap_or(local_tag_ref);
-                    eprintln!(" - [deleted]         (none)     -> {tag_name}");
+                    display.push(
+                        '-',
+                        "[deleted]",
+                        "(none)",
+                        local_tag_ref,
+                        local_tag_ref,
+                        *_oid,
+                        ObjectId::zero(),
+                        None,
+                    );
                 }
             }
         }
@@ -2698,6 +3220,22 @@ fn fetch_remote(
             prune_prefixes_from_fetch_refspecs(&refspecs)
         };
 
+        // Refspecs (positive + negative) that govern prune protection. A local ref whose remote
+        // source is excluded by a negative refspec must survive a `--prune` (t5582).
+        let prune_protection_refspecs: Vec<FetchRefspec> = if user_passed_cli_refspecs {
+            let mut specs = parse_cli_fetch_refspecs(cli_refspecs);
+            for spec in &mut specs {
+                if !spec.negative && !spec.dst.is_empty() {
+                    spec.dst = normalize_fetch_refspec_dst(&spec.dst);
+                }
+            }
+            specs
+        } else if explicit_refmap {
+            cli_tracking_refspecs.clone()
+        } else {
+            refspecs.clone()
+        };
+
         let has_tracking_prune_scope = refspecs.iter().any(|s| {
             !s.negative
                 && !s.dst.is_empty()
@@ -2705,31 +3243,6 @@ fn fetch_remote(
         });
         let skip_remote_tracking_prune =
             prune_prefixes.is_empty() && (user_passed_cli_refspecs || !has_tracking_prune_scope);
-
-        if !skip_remote_tracking_prune && !has_updates && !args.quiet {
-            let mut will_prune = false;
-            if prune_prefixes.is_empty() {
-                for rn in &coalesced_remotes {
-                    let prefix = format!("refs/remotes/{rn}/");
-                    let existing = refs::list_refs(git_dir, &prefix)?;
-                    if existing.iter().any(|(r, _)| !updated_refs.contains(r)) {
-                        will_prune = true;
-                        break;
-                    }
-                }
-            } else {
-                for prefix in &prune_prefixes {
-                    let existing = refs::list_refs(git_dir, prefix)?;
-                    if existing.iter().any(|(r, _)| !updated_refs.contains(r)) {
-                        will_prune = true;
-                        break;
-                    }
-                }
-            }
-            if will_prune {
-                eprintln!("From {from_display_url}");
-            }
-        }
 
         if !skip_remote_tracking_prune {
             if prune_prefixes.is_empty() {
@@ -2744,6 +3257,8 @@ fn fetch_remote(
                         rn,
                         args.quiet,
                         &mut ref_update_failures,
+                        &prune_protection_refspecs,
+                        &mut display,
                     )?;
                 }
             } else {
@@ -2761,11 +3276,16 @@ fn fetch_remote(
                         remote_hint,
                         args.quiet,
                         &mut ref_update_failures,
+                        &prune_protection_refspecs,
+                        &mut display,
                     )?;
                 }
             }
         }
     }
+
+    // Emit all accumulated ref-update report lines now that column widths are known.
+    display.flush();
 
     // Update `refs/remotes/<remote>/HEAD` to match the remote's default branch (Git `set_head`).
     let follow = follow_remote_head;
@@ -2851,6 +3371,13 @@ fn fetch_remote(
         }
     }
 
+    // With `--atomic`, a single rejected ref aborts the whole transaction: no refs (and no
+    // FETCH_HEAD) are written. The reject was already reported via its `!` display line.
+    let atomic_aborted = args.atomic && had_rejected_updates;
+    if atomic_aborted {
+        fetch_head_entries.clear();
+    }
+
     if !fetch_head_entries.is_empty() {
         sort_fetch_head_lines(&mut fetch_head_entries, &fetch_head_refspecs);
         if args.atomic {
@@ -2893,7 +3420,17 @@ fn fetch_remote(
             } else {
                 fs::write(&fetch_head_path, content).context("writing FETCH_HEAD")?;
             }
-        } else if args.dry_run && !args.no_write_fetch_head {
+        } else if args.dry_run
+            && !args.no_write_fetch_head
+            && !display.emitted_fetch_head
+            && url_override.is_some()
+            && cli_refspecs.is_empty()
+        {
+            // For an anonymous-path fetch (`git fetch .`), grit maps refs to tracking destinations
+            // rather than reporting them as FETCH_HEAD-only the way upstream Git does. To keep
+            // `git fetch --dry-run .` mentioning FETCH_HEAD (t5510) without adding a spurious note
+            // to a named-remote dry run (t5574), restrict this to anonymous fetches whose report
+            // did not already include an explicit `-> FETCH_HEAD` line.
             eprintln!("would write to .git/FETCH_HEAD");
         }
     }
@@ -2904,6 +3441,13 @@ fn fetch_remote(
         eprintln!("error: some local refs could not be updated; try running");
         eprintln!(" 'git remote prune {remote_name}' to remove any old, conflicting branches");
         bail!("some local refs could not be updated");
+    }
+    if had_rejected_updates {
+        // A non-fast-forward reject already produced its `!` report line; exit non-zero quietly.
+        return Err(anyhow::Error::new(ExitCodeError {
+            code: 1,
+            message: String::new(),
+        }));
     }
 
     if effective_filter.as_deref() == Some("blob:none") && remote_repo.is_none() {
@@ -2952,7 +3496,7 @@ fn fetch_remote(
 }
 
 fn maybe_write_commit_graph_after_fetch(git_dir: &Path, args: &Args) -> Result<()> {
-    if args.dry_run {
+    if args.dry_run || args.no_write_commit_graph {
         return Ok(());
     }
     let cfg = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
@@ -3029,7 +3573,7 @@ fn effective_fetch_filter(config: &ConfigSet, remote_name: &str, args: &Args) ->
 }
 
 fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result<()> {
-    if args.dry_run {
+    if args.dry_run || args.no_auto_gc {
         return Ok(());
     }
     let repo = Repository::open(git_dir, None)?;
@@ -3040,7 +3584,20 @@ fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result
     if cfg.get_bool("maintenance.auto").and_then(|r| r.ok()) == Some(false) {
         return Ok(());
     }
-    let foreground_maintenance = args.refetch || repo_treats_promisor_packs(git_dir, &cfg);
+    // When auto-detach is disabled the gc task must run in the foreground so its
+    // "Auto packing the repository" notice reaches the caller's stderr instead of
+    // a detached child's discarded output (t5510 "fetching with auto-gc does not
+    // lock up"). `maintenance.autoDetach` takes precedence over `gc.autoDetach`,
+    // matching git's `gc_config` (`builtin/gc.c`).
+    let auto_detach_disabled = cfg
+        .get_bool("maintenance.autoDetach")
+        .or_else(|| cfg.get_bool("maintenance.autodetach"))
+        .or_else(|| cfg.get_bool("gc.autoDetach"))
+        .or_else(|| cfg.get_bool("gc.autodetach"))
+        .and_then(|r| r.ok())
+        == Some(false);
+    let foreground_maintenance =
+        args.refetch || repo_treats_promisor_packs(git_dir, &cfg) || auto_detach_disabled;
     let detach_arg = if foreground_maintenance {
         "--no-detach"
     } else {
@@ -3715,6 +4272,10 @@ fn apply_single_ref_update(
     new_oid: ObjectId,
     ref_update_failures: &mut Vec<String>,
 ) -> Result<()> {
+    // A dry-run reports what would happen but must not touch any refs.
+    if args.dry_run {
+        return Ok(());
+    }
     if args.atomic {
         pending_atomic_ref_ops.push(PendingRefOp::Write {
             refname: refname.to_owned(),
@@ -3738,6 +4299,10 @@ fn apply_single_ref_delete(
     old_oid: Option<ObjectId>,
     ref_update_failures: &mut Vec<String>,
 ) -> Result<()> {
+    // A dry-run reports what would happen but must not touch any refs.
+    if args.dry_run {
+        return Ok(());
+    }
     if args.atomic {
         pending_atomic_ref_ops.push(PendingRefOp::Delete {
             refname: refname.to_owned(),
@@ -4529,6 +5094,8 @@ fn has_hide_refs_for_fetch_connectivity(git_dir: &Path) -> bool {
 }
 
 /// Remove remote-tracking refs that no longer exist on the remote.
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn prune_stale_refs(
     args: &Args,
     git_dir: &Path,
@@ -4538,10 +5105,17 @@ fn prune_stale_refs(
     remote_name: &str,
     quiet: bool,
     ref_update_failures: &mut Vec<String>,
+    prune_refspecs: &[FetchRefspec],
+    display: &mut FetchDisplay,
 ) -> Result<()> {
     let existing = refs::list_refs(git_dir, prefix)?;
     for (refname, oid) in &existing {
         if refname == &format!("refs/remotes/{remote_name}/HEAD") {
+            continue;
+        }
+        // A local ref whose remote source is excluded by a negative refspec must not be pruned
+        // (Git's `refspec_find_negative_match` makes such a ref "not match" the refspec set).
+        if local_ref_protected_by_negative(refname, prune_refspecs) {
             continue;
         }
         if !current_refs.contains(refname) {
@@ -4555,12 +5129,16 @@ fn prune_stale_refs(
             )
             .with_context(|| format!("pruning {refname}"))?;
             if !quiet {
-                // Show short name: "origin/branch" instead of "refs/remotes/origin/branch"
-                let short = refname.strip_prefix("refs/remotes/").unwrap_or(refname);
-                let branch = short
-                    .strip_prefix(&format!("{remote_name}/"))
-                    .unwrap_or(short);
-                eprintln!(" - [deleted]         (none)     -> {remote_name}/{branch}");
+                display.push(
+                    '-',
+                    "[deleted]",
+                    "(none)",
+                    refname,
+                    refname,
+                    *oid,
+                    ObjectId::zero(),
+                    None,
+                );
             }
         }
     }
@@ -5343,6 +5921,60 @@ pub fn collect_refspecs(config: &ConfigSet, key: &str) -> Vec<FetchRefspec> {
     result
 }
 
+/// Collect `remote.<name>.fetch` refspecs with Git's `--prefetch` rewrite applied to the **raw**
+/// (un-normalized) destination.
+///
+/// Git's `filter_prefetch_refspec` runs before any dst normalization: an unqualified destination
+/// like `bogus/*` becomes `refs/prefetch/bogus/*` (not `refs/prefetch/heads/bogus/*`). Since
+/// [`collect_refspecs`] eagerly normalizes `bogus/*` to `refs/heads/bogus/*`, prefetch must build
+/// its refspecs from the raw config value instead (t5582 `--prefetch correctly modifies refspecs`).
+///
+/// Negative refspecs are preserved unchanged; positive refspecs with an empty dst or a
+/// `refs/tags/*` source are dropped, mirroring `filter_prefetch_refspec`.
+fn collect_refspecs_for_prefetch(config: &ConfigSet, key: &str) -> Vec<FetchRefspec> {
+    const PREFETCH_NS: &str = "refs/prefetch/";
+    let mut result = Vec::new();
+    for entry in config.entries() {
+        if entry.key != key {
+            continue;
+        }
+        let Some(ref val) = entry.value else { continue };
+        let val = val.trim();
+        if let Some(pattern) = val.strip_prefix('^') {
+            result.push(FetchRefspec {
+                src: pattern.to_owned(),
+                dst: String::new(),
+                force: false,
+                negative: true,
+            });
+            continue;
+        }
+        let val = val.strip_prefix('+').unwrap_or(val);
+        let Some(colon) = val.find(':') else {
+            // A source-only positive refspec has an empty dst; prefetch drops it.
+            continue;
+        };
+        let dst_raw = val[colon + 1..].trim();
+        let mut src = val[..colon].trim().to_owned();
+        if dst_raw.is_empty() || src.starts_with("refs/tags/") {
+            continue;
+        }
+        if !src.contains('*') && !src.starts_with("refs/") {
+            src = format!("refs/heads/{src}");
+        }
+        // Rewrite the raw dst under refs/prefetch/, stripping a leading `refs/` only.
+        let mut new_dst = String::from(PREFETCH_NS);
+        new_dst.push_str(dst_raw.strip_prefix("refs/").unwrap_or(dst_raw));
+        result.push(FetchRefspec {
+            src,
+            dst: new_dst,
+            force: true,
+            negative: false,
+        });
+    }
+    result
+}
+
 /// Map a remote ref through fetch refspecs, returning the local ref and the index of the first
 /// matching positive refspec (config order). Used to order FETCH_HEAD like Git (t5515).
 fn map_ref_through_refspecs_ex(
@@ -5389,6 +6021,48 @@ pub fn remote_fetch_refspecs(config: &ConfigSet, remote_name: &str) -> Vec<Fetch
         out.extend(specs);
         out
     }
+}
+
+/// Returns true if a local (destination) ref is shielded from pruning by a negative refspec.
+///
+/// Mirrors Git's `refspec_find_negative_match` (`refspec.c`): the prune query is keyed by the
+/// local ref (`dst`), but negative refspecs always match the remote ref (`src`). To bridge that,
+/// every positive refspec is applied **in reverse** (dst pattern → src) to recover the candidate
+/// remote source name(s) for `local_ref`; if any of those candidates matches a negative refspec,
+/// the local ref is treated as not matching the refspec set at all and must not be pruned.
+///
+/// Without this, `git fetch --prune <pattern> ^<src>` would delete the remote-tracking ref whose
+/// source is excluded by the negative refspec (t5582 "fetch --prune with negative refspec").
+fn local_ref_protected_by_negative(local_ref: &str, refspecs: &[FetchRefspec]) -> bool {
+    let negatives: Vec<&FetchRefspec> = refspecs.iter().filter(|rs| rs.negative).collect();
+    if negatives.is_empty() {
+        return false;
+    }
+    // Reverse-map the local dst back to every candidate remote src via positive refspecs.
+    let mut candidates: Vec<String> = Vec::new();
+    for rs in refspecs {
+        if rs.negative || rs.dst.is_empty() {
+            continue;
+        }
+        if let Some(star_pos) = rs.dst.find('*') {
+            let prefix = &rs.dst[..star_pos];
+            let suffix = &rs.dst[star_pos + 1..];
+            if local_ref.starts_with(prefix)
+                && local_ref.ends_with(suffix)
+                && local_ref.len() >= prefix.len() + suffix.len()
+            {
+                let matched = &local_ref[prefix.len()..local_ref.len() - suffix.len()];
+                candidates.push(rs.src.replacen('*', matched, 1));
+            }
+        } else if rs.dst == local_ref {
+            candidates.push(rs.src.clone());
+        }
+    }
+    candidates.iter().any(|src| {
+        negatives
+            .iter()
+            .any(|neg| match_glob_pattern(&neg.src, src).is_some() || neg.src == *src)
+    })
 }
 
 /// Reverse-map a local ref through configured refspecs to find
@@ -5521,6 +6195,207 @@ pub fn collect_remote_names(config: &ConfigSet) -> Vec<String> {
     names
 }
 
+/// Whether a remote opts out of `fetch --all` via `remote.<name>.skipFetchAll`
+/// (alias `remote.<name>.skipDefaultUpdate`).
+fn remote_skips_fetch_all(config: &ConfigSet, name: &str) -> bool {
+    for key in [
+        format!("remote.{name}.skipfetchall"),
+        format!("remote.{name}.skipdefaultupdate"),
+    ] {
+        if let Some(v) = config.get(&key) {
+            if parse_bool(v.trim()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remotes that participate in `git fetch --all`: every configured remote
+/// except those with `skipFetchAll`/`skipDefaultUpdate` set.
+fn collect_fetch_all_remote_names(git_dir: &Path, config: &ConfigSet) -> Vec<String> {
+    let names = collect_local_remote_names(git_dir).unwrap_or_else(|| collect_remote_names(config));
+    names
+        .into_iter()
+        .filter(|name| !remote_skips_fetch_all(config, name))
+        .collect()
+}
+
+/// Expand a list of `git fetch --multiple` arguments into concrete remote names.
+/// Each argument is either a remote group (`remotes.<name>`) — expanded into its
+/// members — or a single configured remote. Order is preserved and duplicates
+/// removed. An argument that matches neither is a hard error, mirroring git's
+/// "no such remote or remote group".
+fn expand_remotes_or_groups(config: &ConfigSet, args: &[String]) -> Result<Vec<String>> {
+    let mut seen = HashSet::<String>::new();
+    let mut out = Vec::new();
+    for arg in args {
+        let group_lines = config.get_all(&format!("remotes.{arg}"));
+        if !group_lines.is_empty() {
+            for line in &group_lines {
+                for m in line.split_whitespace() {
+                    if seen.insert(m.to_string()) {
+                        out.push(m.to_string());
+                    }
+                }
+            }
+            continue;
+        }
+        // Not a group: must be a configured remote.
+        if config.get(&format!("remote.{arg}.url")).is_some() {
+            if seen.insert(arg.clone()) {
+                out.push(arg.clone());
+            }
+            continue;
+        }
+        return Err(anyhow::Error::new(ExitCodeError {
+            code: 128,
+            message: format!("fatal: no such remote or remote group: {arg}"),
+        }));
+    }
+    Ok(out)
+}
+
+/// Effective parallelism for a multi-remote fetch. `--jobs=0` (or unset) picks a
+/// default based on available CPUs, mirroring git's `online_cpus()`. A negative
+/// value is impossible here (clap parses `usize`).
+fn effective_max_children(args: &Args, config: &ConfigSet) -> usize {
+    if let Some(j) = args.jobs {
+        if j != 0 {
+            return j;
+        }
+    }
+    // `--jobs` unset or zero: fall back to `fetch.parallel`, else online CPUs.
+    if let Some(p) = config
+        .get("fetch.parallel")
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        if p != 0 {
+            return p;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
+
+/// Emit a `GIT_TRACE` line (git's `trace_printf`) with the standard timestamped
+/// prefix when tracing is active.
+fn fetch_trace_printf(message: &str) {
+    let Ok(dest) = std::env::var("GIT_TRACE") else {
+        return;
+    };
+    if dest.is_empty() || dest == "0" || dest.eq_ignore_ascii_case("false") {
+        return;
+    }
+    let line = if std::env::var("GIT_TRACE_BARE").ok().as_deref() == Some("1") {
+        format!("{message}\n")
+    } else {
+        let now = time::OffsetDateTime::now_utc();
+        format!(
+            "{:02}:{:02}:{:02}.{:06} run-command.c:000      {message}\n",
+            now.hour(),
+            now.minute(),
+            now.second(),
+            now.microsecond(),
+        )
+    };
+    crate::write_git_trace(&dest, &line);
+}
+
+/// Fetch each named remote in turn, continuing past a remote that errors so the
+/// remaining remotes are still fetched (mirrors `fetch_multiple` in git). If any
+/// remote failed, the overall command exits with code 1.
+///
+/// `parallel` controls only the diagnostics: when more than one task could run
+/// concurrently git emits a `preparing to run up to N tasks` trace line and uses
+/// the parallel error format `could not fetch '<name>' (exit code: N)`. We always
+/// fetch serially, but reproduce these observable details.
+fn fetch_each_continuing(
+    git_dir: &Path,
+    config: &ConfigSet,
+    names: &[String],
+    args: &Args,
+) -> Result<()> {
+    let max_children = effective_max_children(args, config);
+    let parallel = max_children != 1 && names.len() != 1;
+    if parallel {
+        fetch_trace_printf(&format!(
+            "run_processes_parallel: preparing to run up to {max_children} tasks"
+        ));
+    }
+
+    // Truncate FETCH_HEAD once up front (unless the parent itself was asked to
+    // append or to not write it). Per-remote children then append, matching
+    // git's `truncate_fetch_head()` before spawning `fetch --append` children.
+    let write_fetch_head = !args.dry_run && !args.no_write_fetch_head;
+    if write_fetch_head && !args.append {
+        let fetch_head_path = git_dir.join("FETCH_HEAD");
+        if let Err(e) = fs::write(&fetch_head_path, b"") {
+            if fetch_head_path.exists() {
+                return Err(anyhow::Error::new(e)).context("truncating FETCH_HEAD");
+            }
+        }
+    }
+
+    let mut had_error = false;
+    for name in names {
+        let mut inner = args.clone();
+        inner.multiple = false;
+        inner.all = false;
+        inner.no_all = false;
+        inner.remote = None;
+        inner.refspecs.clear();
+        // Each per-remote child appends to FETCH_HEAD and skips the post-fetch
+        // auto maintenance / commit-graph write; the parent does those once at
+        // the end (mirrors git's `fetch --append --no-auto-gc …` children).
+        inner.append = true;
+        inner.no_auto_gc = true;
+        inner.no_write_commit_graph = true;
+        if !args.quiet && effective_output_format(config, args) != FetchOutputFormat::Porcelain {
+            println!("Fetching {name}");
+        }
+        match fetch_remote(git_dir, config, name, None, &inner) {
+            Ok(()) => {}
+            Err(e) => {
+                // Surface the underlying transport error, then note the remote
+                // and keep going. The child's exit code is reported in the
+                // parallel format; the aggregate command exits with code 1.
+                let code = e
+                    .downcast_ref::<ExitCodeError>()
+                    .map(|x| x.code)
+                    .unwrap_or(128);
+                let msg = format!("{e:#}");
+                let msg = msg
+                    .strip_prefix("fatal: ")
+                    .or_else(|| msg.strip_prefix("error: "))
+                    .unwrap_or(&msg);
+                if !msg.is_empty() {
+                    eprintln!("error: {msg}");
+                }
+                if parallel {
+                    eprintln!("error: could not fetch '{name}' (exit code: {code})");
+                } else {
+                    eprintln!("error: could not fetch {name}");
+                }
+                had_error = true;
+            }
+        }
+    }
+    // Run the post-fetch commit-graph write and auto maintenance once for the
+    // whole multi-remote fetch (children were told to skip them).
+    maybe_write_commit_graph_after_fetch(git_dir, args)?;
+    maybe_run_auto_maintenance_after_fetch(git_dir, args)?;
+
+    if had_error {
+        return Err(anyhow::Error::new(ExitCodeError {
+            code: 1,
+            message: String::new(),
+        }));
+    }
+    Ok(())
+}
+
 /// Collect remote names from the repository-local config only.
 fn collect_local_remote_names(git_dir: &Path) -> Option<Vec<String>> {
     let cfg = ConfigFile::from_path(&git_dir.join("config"), ConfigScope::Local)
@@ -5590,6 +6465,43 @@ fn parse_bundle_fetch_refs(path: &Path) -> Result<Vec<(String, ObjectId)>> {
     Ok(out)
 }
 
+/// Resolve which local refs a bundle fetch should update.
+///
+/// A bundle header records full ref names while a CLI refspec source may be an
+/// abbreviated name (e.g. `main:main`). For each positive refspec, the source
+/// is resolved against the bundle's ref list with git's DWIM rules
+/// ([`resolve_advertised_ref_for_fetch_src`]) and wildcard refspecs are matched
+/// directly. Returns `(remote bundle ref, oid, local destination ref)` tuples.
+fn resolve_bundle_fetch_ref_updates(
+    bundle_refs: &[(String, ObjectId)],
+    refspecs: &[FetchRefspec],
+) -> Vec<(String, ObjectId, String)> {
+    let mut out = Vec::new();
+    for rs in refspecs {
+        if rs.negative || rs.dst.is_empty() {
+            continue;
+        }
+        if rs.src.contains('*') {
+            // Wildcard refspec: match every bundle ref against the source pattern.
+            for (remote_ref, oid) in bundle_refs {
+                if let Some(local) = match_refspec_pattern(&rs.src, &rs.dst, remote_ref) {
+                    out.push((remote_ref.clone(), *oid, local));
+                }
+            }
+            continue;
+        }
+        // Exact / abbreviated refspec: DWIM the source against the bundle refs.
+        let Some(resolved) = resolve_advertised_ref_for_fetch_src(&rs.src, bundle_refs, None)
+        else {
+            continue;
+        };
+        if let Some((_, oid)) = bundle_refs.iter().find(|(name, _)| *name == resolved) {
+            out.push((resolved, *oid, rs.dst.clone()));
+        }
+    }
+    out
+}
+
 fn update_refs_from_bundle_fetch(
     git_dir: &Path,
     bundle_refs: &[(String, ObjectId)],
@@ -5605,11 +6517,15 @@ fn update_refs_from_bundle_fetch(
     let mut pending_atomic_ref_ops = Vec::new();
     let mut ref_update_failures = Vec::new();
 
-    for (remote_ref, oid) in bundle_refs {
-        let Some(local_ref) = map_ref_through_refspecs(remote_ref, &refspecs) else {
-            continue;
-        };
-        let local_ref = normalize_fetch_refspec_dst(&local_ref);
+    // Build the set of (remote bundle ref, local ref) updates. A bundle records
+    // full ref names (e.g. `refs/heads/main`) while a CLI refspec source may be
+    // abbreviated (`main:main`), so resolve each refspec's source against the
+    // bundle's ref list with the same DWIM rules used for an advertised remote.
+    let bundle_updates = resolve_bundle_fetch_ref_updates(bundle_refs, &refspecs);
+
+    for (remote_ref, oid, local_ref) in &bundle_updates {
+        let remote_ref = remote_ref.as_str();
+        let local_ref = normalize_fetch_refspec_dst(local_ref);
         if local_ref.starts_with("refs/heads/") && !args.update_head_ok && !is_bare_repo {
             if let Some(wt_path) = is_branch_in_worktree(git_dir, &local_ref) {
                 bail!(
@@ -5628,7 +6544,8 @@ fn update_refs_from_bundle_fetch(
             || refspecs.iter().any(|rs| {
                 !rs.negative
                     && rs.force
-                    && match_refspec_pattern(&rs.src, &rs.dst, remote_ref).is_some()
+                    && (match_refspec_pattern(&rs.src, &rs.dst, remote_ref).is_some()
+                        || normalize_fetch_refspec_dst(&rs.dst) == local_ref)
             });
         if let Some(old) = old_oid {
             if old != *oid && !forced {

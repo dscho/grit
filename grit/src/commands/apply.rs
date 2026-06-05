@@ -6221,12 +6221,11 @@ fn prepare_patch_modes_for_apply(patches: &mut [FilePatch], args: &Args) -> Resu
                     if can_apply_with_empty_preimage(fp) {
                         None
                     } else {
-                        return Err(err)
-                            .with_context(|| format!("failed to stat {}", path.display()));
+                        return Err(err).with_context(|| format!("failed to stat {adjusted}"));
                     }
                 }
                 Err(err) => {
-                    return Err(err).with_context(|| format!("failed to stat {}", path.display()));
+                    return Err(err).with_context(|| format!("failed to stat {adjusted}"));
                 }
             };
             let Some(st) = st_stat else {

@@ -690,9 +690,21 @@ pub fn write_ref(git_dir: &Path, refname: &str, oid: &ObjectId) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     let content = format!("{oid}\n");
-    // Write via lock file for atomicity
+    // Write via lock file for atomicity. Use `O_CREAT | O_EXCL` (create_new) so
+    // that a pre-existing `<ref>.lock` surfaces an `AlreadyExists` error instead
+    // of being silently clobbered, matching Git's `lock_ref_oid_basic`. Callers
+    // (e.g. fetch) translate that into the
+    // "cannot lock ref '<ref>': Unable to create '<lock>': File exists." message
+    // and skip just that ref while still updating the rest.
     let lock = lock_path_for_ref(&path);
-    fs::write(&lock, &content)?;
+    {
+        use std::io::Write as _;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)?;
+        file.write_all(content.as_bytes())?;
+    }
     fs::rename(&lock, &path)?;
     Ok(())
 }

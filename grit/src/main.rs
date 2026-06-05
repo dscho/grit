@@ -5997,7 +5997,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                 },
                 "read-midx" => {
                     use grit_lib::midx::{
-                        format_midx_dump, format_midx_show_objects, midx_checksum_hex,
+                        format_midx_dump_layer, format_midx_show_objects_layer, midx_checksum_hex,
                         read_midx_preferred_idx_name,
                     };
                     let sub = rest.get(1).map(|s| s.as_str()).unwrap_or("");
@@ -6006,9 +6006,22 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                             let dir = rest.get(2).map(Path::new).context(
                                 "usage: test-tool read-midx --preferred-pack <object-dir>",
                             )?;
-                            let name = read_midx_preferred_idx_name(dir)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            println!("{name}");
+                            match read_midx_preferred_idx_name(dir) {
+                                Ok(name) => println!("{name}"),
+                                Err(e) => {
+                                    // Match `test-read-midx.c`: a missing reverse index
+                                    // yields a warning and a non-zero exit.
+                                    let msg = e.to_string();
+                                    if msg.contains("could not determine MIDX preferred pack") {
+                                        eprintln!(
+                                            "warning: could not determine MIDX preferred pack"
+                                        );
+                                    } else {
+                                        eprintln!("error: {msg}");
+                                    }
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                         "--checksum" => {
                             let dir = rest
@@ -6022,44 +6035,47 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                             let dir = rest.get(2).map(Path::new).context(
                                 "usage: test-tool read-midx --show-objects <object-dir>",
                             )?;
-                            let s = format_midx_show_objects(dir)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            print!("{s}");
+                            let checksum = rest.get(3).map(|s| s.as_str());
+                            match format_midx_show_objects_layer(dir, checksum) {
+                                Ok(s) => print!("{s}"),
+                                Err(e) => {
+                                    // git's test-read-midx prints `error: could not find
+                                    // MIDX with checksum <hash>` and exits non-zero.
+                                    eprintln!("error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                         "--bitmap" => {
+                            use grit_lib::midx::format_midx_bitmapped_packs;
                             let dir = rest
                                 .get(2)
                                 .map(Path::new)
                                 .context("usage: test-tool read-midx --bitmap <object-dir>")?;
-                            let pack_dir = dir.join("pack");
-                            let midx_d = pack_dir.join("multi-pack-index.d");
-                            let has_root = std::fs::read_dir(&pack_dir)
-                                .ok()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|e| e.ok())
-                                .any(|e| {
-                                    let n = e.file_name().to_string_lossy().to_string();
-                                    n.starts_with("multi-pack-index-") && n.ends_with(".bitmap")
-                                });
-                            let has_split = std::fs::read_dir(&midx_d)
-                                .ok()
-                                .into_iter()
-                                .flatten()
-                                .filter_map(|e| e.ok())
-                                .any(|e| {
-                                    let n = e.file_name().to_string_lossy().to_string();
-                                    n.starts_with("multi-pack-index-") && n.ends_with(".bitmap")
-                                });
-                            if !has_root && !has_split {
-                                bail!("no multi-pack bitmap in {}", pack_dir.display());
+                            match format_midx_bitmapped_packs(dir) {
+                                Ok(s) => print!("{s}"),
+                                Err(e) => {
+                                    // Print the bare message (the `Error::CorruptObject`
+                                    // Display adds a `corrupt object: ` prefix we don't want).
+                                    let msg = e.to_string();
+                                    let msg = msg.strip_prefix("corrupt object: ").unwrap_or(&msg);
+                                    eprintln!("error: {msg}");
+                                    std::process::exit(1);
+                                }
                             }
                         }
                         "" => bail!("usage: test-tool read-midx <object-dir>"),
                         dir => {
-                            let dump = format_midx_dump(Path::new(dir))
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            print!("{dump}");
+                            // `read-midx <object-dir> [<checksum>]`: an optional checksum
+                            // selects a specific incremental layer.
+                            let checksum = rest.get(2).map(|s| s.as_str());
+                            match format_midx_dump_layer(Path::new(dir), checksum) {
+                                Ok(dump) => print!("{dump}"),
+                                Err(e) => {
+                                    eprintln!("error: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
                         }
                     }
                     Ok(())

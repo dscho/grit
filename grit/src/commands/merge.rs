@@ -2843,6 +2843,9 @@ Aborting"
     if will_edit && msg.trim().is_empty() {
         bail!("Empty commit message.");
     }
+    merge_result
+        .index
+        .expand_sparse_directory_placeholders(&repo.odb)?;
     let tree_oid = write_tree_from_index(&repo.odb, &merge_result.index, "")?;
     let cache_tree = build_cache_tree_from_index(&repo.odb, &merge_result.index)?;
     merge_result.index.set_cache_tree(cache_tree);
@@ -5048,7 +5051,9 @@ fn merge_continue(message: Option<String>) -> Result<()> {
     let no_verify_merge_continue = std::env::args().any(|a| a == "--no-verify");
     run_pre_merge_commit_hook(&repo, no_verify_merge_continue, false, &mut index)?;
     repo.write_index(&mut index)?;
-    let tree_oid = write_tree_from_index(&repo.odb, &index, "")?;
+    let mut index_for_tree = index.clone();
+    index_for_tree.expand_sparse_directory_placeholders(&repo.odb)?;
+    let tree_oid = write_tree_from_index(&repo.odb, &index_for_tree, "")?;
     let config = ConfigSet::load(Some(git_dir), true)?;
     let now = OffsetDateTime::now_utc();
     let author = resolve_ident(&config, "author", now)?;

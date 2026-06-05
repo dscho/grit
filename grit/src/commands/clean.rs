@@ -244,7 +244,7 @@ pub fn run(args: Args) -> Result<()> {
             } else {
                 fs::remove_file(&abs).with_context(|| format!("failed to remove file '{path}'"))?;
                 if args.pathspec.is_empty() {
-                    remove_empty_parents(&abs, &work_tree);
+                    remove_empty_parents(&abs, &work_tree, &tracked);
                 }
             }
         }
@@ -1326,7 +1326,7 @@ fn remove_cleanable_untracked_under_dir(
             }
             let _ = fs::remove_file(&path);
             if args.pathspec.is_empty() {
-                remove_empty_parents(&path, work_tree);
+                remove_empty_parents(&path, work_tree, tracked);
             }
         }
     }
@@ -1352,12 +1352,29 @@ fn remove_dir_all_best_effort(path: &Path) -> Result<()> {
     }
 }
 
+fn dir_has_tracked_descendant(dir: &Path, work_tree: &Path, tracked: &BTreeSet<String>) -> bool {
+    let Ok(rel_path) = dir.strip_prefix(work_tree) else {
+        return false;
+    };
+    let rel = path_to_slash(rel_path);
+    if rel.is_empty() {
+        return false;
+    }
+    let prefix = format!("{}/", rel.trim_end_matches('/'));
+    tracked.contains(&rel)
+        || tracked.contains(&prefix)
+        || tracked.iter().any(|t| t.starts_with(&prefix))
+}
+
 /// Remove empty parent directories up to (but not including) the worktree root.
-fn remove_empty_parents(file: &Path, work_tree: &Path) {
+fn remove_empty_parents(file: &Path, work_tree: &Path, tracked: &BTreeSet<String>) {
     let cwd_rel = grit_lib::worktree_cwd::process_cwd_repo_relative(work_tree);
     let mut current = file.parent();
     while let Some(dir) = current {
         if dir == work_tree {
+            break;
+        }
+        if dir_has_tracked_descendant(dir, work_tree, tracked) {
             break;
         }
         if let Some(ref cr) = cwd_rel {

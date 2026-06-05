@@ -18,7 +18,9 @@ use grit_lib::index::Index;
 use grit_lib::objects::{parse_commit, parse_tree, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::repo::Repository;
-use grit_lib::sparse_checkout::{parse_sparse_checkout_file, path_in_sparse_checkout_patterns};
+use grit_lib::sparse_checkout::{
+    parse_sparse_checkout_file, path_in_cone_mode_sparse_checkout, path_in_sparse_checkout_patterns,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -189,6 +191,24 @@ pub fn run(mut args: Args) -> Result<()> {
         Vec::new()
     };
 
+    let raw_index = Index::load(&repo.index_path_for_env()?).unwrap_or_else(|_| Index::new());
+    let raw_sparse_placeholders: Vec<String> = raw_index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_directory_placeholder())
+        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .collect();
+    if rm_pathspec_needs_sparse_index_expansion(
+        &args.pathspec,
+        work_tree,
+        &raw_sparse_placeholders,
+        &sparse_patterns,
+        cone_cfg,
+        sparse_enabled,
+    )? {
+        emit_index_trace_region("ensure_full_index");
+    }
+
     let mut index = match repo.load_index() {
         Ok(idx) => idx,
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
@@ -200,6 +220,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Phase 1: collect all index paths to remove and check safety.
     let mut to_remove: Vec<String> = Vec::new();
+    let mut sparse_placeholder_outputs: BTreeSet<String> = BTreeSet::new();
     // Collect errors grouped by kind so we can emit batched messages.
     let mut errors_by_kind: Vec<(RmErrorKind, Vec<String>)> = Vec::new();
     let mut sparse_only_pathspecs: Vec<String> = Vec::new();
@@ -244,6 +265,13 @@ pub fn run(mut args: Args) -> Result<()> {
                 );
             }
         } else {
+            collect_sparse_placeholder_outputs_for_pathspec_list(
+                &raw_sparse_placeholders,
+                &full_specs,
+                args.sparse,
+                &mut sparse_placeholder_outputs,
+            );
+
             for path_str in &matches {
                 if symlink_leading_path_resolves(work_tree, Path::new(path_str)).is_some() {
                     bail!("'{path_str}' is beyond a symbolic link");
@@ -351,6 +379,13 @@ pub fn run(mut args: Args) -> Result<()> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+
+        collect_sparse_placeholder_outputs_for_single_pathspec(
+            &raw_sparse_placeholders,
+            &rel,
+            args.sparse,
+            &mut sparse_placeholder_outputs,
+        );
 
         if !exclude_specs.is_empty() {
             let mut resolved_excludes: Vec<String> = Vec::new();
@@ -577,8 +612,18 @@ pub fn run(mut args: Args) -> Result<()> {
 
         index.remove(path_str.as_bytes());
 
-        if !args.quiet {
+        if !args.quiet
+            && !sparse_placeholder_outputs
+                .iter()
+                .any(|prefix| path_is_under_sparse_placeholder(path_str, prefix))
+        {
             print_rm_line(&mut out, path_str)?;
+        }
+    }
+
+    if !args.quiet {
+        for path in compressed_sparse_placeholder_outputs(&to_remove, &sparse_placeholder_outputs) {
+            print_rm_line(&mut out, &path)?;
         }
     }
 
@@ -656,6 +701,124 @@ fn rm_entry_matches_sparse_worktree(
         path_in_sparse_checkout_lines(path, patterns, work_tree)
     };
     in_sparse
+}
+
+fn collect_sparse_placeholder_outputs_for_pathspec_list(
+    placeholders: &[String],
+    specs: &[String],
+    sparse_allowed: bool,
+    out: &mut BTreeSet<String>,
+) {
+    if !sparse_allowed {
+        return;
+    }
+    for placeholder in placeholders {
+        if grit_lib::pathspec::matches_pathspec_list(placeholder, specs) {
+            out.insert(placeholder.clone());
+        }
+    }
+}
+
+fn collect_sparse_placeholder_outputs_for_single_pathspec(
+    placeholders: &[String],
+    pathspec: &str,
+    sparse_allowed: bool,
+    out: &mut BTreeSet<String>,
+) {
+    if !sparse_allowed {
+        return;
+    }
+    for placeholder in placeholders {
+        if pathspec_matches(pathspec, placeholder) {
+            out.insert(placeholder.clone());
+        }
+    }
+}
+
+fn path_is_under_sparse_placeholder(path: &str, placeholder: &str) -> bool {
+    path.as_bytes().starts_with(placeholder.as_bytes()) && path.len() > placeholder.len()
+}
+
+fn compressed_sparse_placeholder_outputs(
+    removed_paths: &[String],
+    placeholders: &BTreeSet<String>,
+) -> Vec<String> {
+    placeholders
+        .iter()
+        .filter(|placeholder| {
+            removed_paths
+                .iter()
+                .any(|path| path_is_under_sparse_placeholder(path, placeholder))
+        })
+        .cloned()
+        .collect()
+}
+
+fn rm_pathspec_needs_sparse_index_expansion(
+    pathspecs: &[String],
+    work_tree: &Path,
+    sparse_placeholders: &[String],
+    sparse_patterns: &[String],
+    cone_cfg: bool,
+    sparse_enabled: bool,
+) -> Result<bool> {
+    if !sparse_enabled || sparse_placeholders.is_empty() {
+        return Ok(false);
+    }
+    if pathspecs.iter().any(|spec| spec.starts_with(':')) {
+        return Ok(true);
+    }
+
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let prefix = crate::pathspec::pathdiff(&cwd, work_tree);
+    for spec in pathspecs {
+        let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix.as_deref());
+        if rm_single_pathspec_needs_sparse_index_expansion(
+            &resolved,
+            sparse_placeholders,
+            sparse_patterns,
+            cone_cfg,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rm_single_pathspec_needs_sparse_index_expansion(
+    pathspec: &str,
+    sparse_placeholders: &[String],
+    sparse_patterns: &[String],
+    cone_cfg: bool,
+) -> bool {
+    if let Some(wildcard_at) = first_glob_char(pathspec) {
+        let wildcard_suffix = &pathspec[wildcard_at..];
+        if wildcard_suffix.bytes().all(|b| b == b'*')
+            && path_in_cone_mode_sparse_checkout(pathspec, sparse_patterns, cone_cfg)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    !path_in_cone_mode_sparse_checkout(pathspec, sparse_patterns, cone_cfg)
+        && !sparse_placeholders
+            .iter()
+            .any(|placeholder| pathspec_matches(pathspec, placeholder))
+}
+
+fn first_glob_char(pathspec: &str) -> Option<usize> {
+    pathspec
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '*' | '?' | '[').then_some(idx))
+}
+
+fn emit_index_trace_region(label: &str) {
+    if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
+        if !trace2_event.trim().is_empty() {
+            let _ = crate::trace2_region_json(&trace2_event, "index", label);
+        }
+    }
 }
 
 /// Generate error header and optional hint for a batch of failures.
