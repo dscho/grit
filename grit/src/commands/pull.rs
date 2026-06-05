@@ -85,6 +85,42 @@ pub struct Args {
     /// Do not recurse into submodules after pull.
     #[arg(long = "no-recurse-submodules")]
     pub no_recurse_submodules: bool,
+
+    /// Be more verbose (passed to the underlying fetch). May be repeated.
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Fetch from all remotes.
+    #[arg(long = "all")]
+    pub all: bool,
+
+    /// When fetching, force update of local refs (`fetch --force`).
+    #[arg(short = 'f', long = "force")]
+    pub force: bool,
+
+    /// Show what would be done, without making any changes.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
+
+    /// Allow merging histories that do not share a common ancestor.
+    #[arg(long = "allow-unrelated-histories")]
+    pub allow_unrelated_histories: bool,
+
+    /// Add a `Signed-off-by` trailer to the merge commit message.
+    #[arg(long = "signoff", overrides_with = "no_signoff")]
+    pub signoff: bool,
+
+    /// Do not add a `Signed-off-by` trailer (cancels an earlier `--signoff`).
+    #[arg(long = "no-signoff", overrides_with = "signoff")]
+    pub no_signoff: bool,
+
+    /// Skip the pre-merge-commit and commit-msg hooks when merging.
+    #[arg(long = "no-verify", overrides_with = "verify")]
+    pub no_verify: bool,
+
+    /// Run the pre-merge-commit and commit-msg hooks when merging (cancels `--no-verify`).
+    #[arg(long = "verify", overrides_with = "no_verify")]
+    pub verify: bool,
 }
 
 fn rebase_cli_value_is_valid(s: &str) -> bool {
@@ -225,13 +261,71 @@ fn normalize_pull_positionals(mut args: Args) -> Args {
     args
 }
 
+/// Compute the effective verbosity level from `-q`/`--quiet`/`-v`/`--verbose` in argv order,
+/// mirroring Git's `parse_opt_verbosity_cb` (a single signed counter, not two independent flags).
+///
+/// `-v` raises verbosity (or jumps from quiet to `+1`); `-q` lowers it (or jumps from verbose to
+/// `-1`); `--no-quiet`/`--no-verbose` reset to `0`. The asymmetry makes `pull -v -q` quiet but
+/// `pull -q -v` verbose (t5521 subtests 8 and 9).
+fn compute_pull_verbosity<I>(args: I) -> i32
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut target: i32 = 0;
+    let mut apply = |is_verbose: bool, unset: bool| {
+        if unset {
+            target = 0;
+        } else if is_verbose {
+            target = if target >= 0 { target + 1 } else { 1 };
+        } else {
+            target = if target <= 0 { target - 1 } else { -1 };
+        }
+    };
+    for tok in args {
+        match tok.as_str() {
+            "--quiet" => apply(false, false),
+            "--verbose" => apply(true, false),
+            "--no-quiet" => apply(false, true),
+            "--no-verbose" => apply(true, true),
+            "--" => break,
+            t if t.starts_with("--") => {}
+            t if t.starts_with('-') && t.len() > 1 => {
+                // Short bundle like `-qv`, `-vq`, `-q`, `-v`. Process each letter in order;
+                // a non-`q`/`v` short option ends the cluster scan (it may take a value).
+                for c in t[1..].chars() {
+                    match c {
+                        'q' => apply(false, false),
+                        'v' => apply(true, false),
+                        _ => break,
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    target
+}
+
 pub fn run(args: Args) -> Result<()> {
-    let args = normalize_pull_positionals(args);
+    let mut args = normalize_pull_positionals(args);
+    // Reconcile `-q`/`-v` into Git's single verbosity counter (clap parses them as independent
+    // flags and loses the argv ordering that Git's verbosity algorithm depends on).
+    let verbosity = compute_pull_verbosity(std::env::args());
+    args.quiet = verbosity < 0;
+    args.verbose = u8::try_from(verbosity.max(0)).unwrap_or(u8::MAX);
+    let args = args;
     let repo = Repository::discover(None).context("not a git repository")?;
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
 
     let head = resolve_head(&repo.git_dir)?;
     let current_branch = head.branch_name().map(|s| s.to_owned());
+
+    // `git pull --all` fetches from every configured remote (no single repository argument).
+    // Delegate to the real `git fetch --all` machinery — which writes FETCH_HEAD with the
+    // configured upstream branch marked for merge — then integrate exactly as a normal pull.
+    if args.all {
+        return run_pull_all(&args, &config, &repo, &head);
+    }
 
     let remote_name_owned: String = if let Some(ref r) = args.remote {
         r.clone()
@@ -279,6 +373,11 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     if let Some(remote_path) = local_remote_path {
+        // `--dry-run` reports what fetch would do and stops before any merge; the local-path
+        // shortcut must likewise touch nothing (no object copy, no FETCH_HEAD, no refs).
+        if args.dry_run {
+            return Ok(());
+        }
         // Local path remotes (`..`, `./upstream`): copy objects directly and write FETCH_HEAD
         // without updating `refs/tags/*`. Git keeps annotated tags only in FETCH_HEAD for
         // `git pull $path $tag` so throwaway-tag merges default to --no-ff (t7600).
@@ -333,6 +432,9 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     if is_local_dot {
+        if args.dry_run {
+            return Ok(());
+        }
         let lines = if args.refspecs.is_empty() {
             let remote_oid = resolve_revision(&repo, &merge_branch)
                 .with_context(|| format!("bad revision '{merge_branch}'"))?;
@@ -361,7 +463,7 @@ pub fn run(args: Args) -> Result<()> {
         refspecs: effective_refspecs.clone(),
         filter: None,
         no_filter: false,
-        all: false,
+        all: args.all,
         no_all: false,
         no_auto_gc: false,
         no_write_commit_graph: false,
@@ -370,11 +472,11 @@ pub fn run(args: Args) -> Result<()> {
         no_tags: false,
         prune: false,
         no_prune: false,
-        force: false,
+        force: args.force,
         prune_tags: false,
         atomic: false,
         append: false,
-        dry_run: false,
+        dry_run: args.dry_run,
         write_fetch_head: false,
         no_write_fetch_head: false,
         refmap: Vec::new(),
@@ -388,7 +490,7 @@ pub fn run(args: Args) -> Result<()> {
         keep: false,
         output: None,
         quiet: args.quiet,
-        verbose: 0,
+        verbose: args.verbose,
         jobs: None,
         server_options: Vec::new(),
         porcelain: false,
@@ -410,6 +512,10 @@ pub fn run(args: Args) -> Result<()> {
         no_ipv6: false,
     };
     super::fetch::run(fetch_args)?;
+    // `--dry-run` stops after reporting what fetch would do; never merge (git pull.c).
+    if args.dry_run {
+        return Ok(());
+    }
     // The in-process fetch (and its post-fetch maintenance repack/gc) added and
     // removed packs; drop the process-wide pack-index cache so the subsequent
     // merge sees the freshly-fetched (and lazily-fetched) objects rather than a
@@ -422,6 +528,98 @@ pub fn run(args: Args) -> Result<()> {
 
     let kind = do_merge_or_rebase_after_fetch(&args, &config, &repo, &head)?;
     maybe_update_submodules_after_pull(&args, &config, kind)?;
+    Ok(())
+}
+
+/// Handle `git pull --all`: fetch from every configured remote, then integrate the configured
+/// upstream branch (the one fetch marked for-merge in FETCH_HEAD) via merge or rebase.
+fn run_pull_all(
+    args: &Args,
+    config: &ConfigSet,
+    repo: &Repository,
+    head: &grit_lib::state::HeadState,
+) -> Result<()> {
+    let fetch_recurse = if args.no_recurse_submodules {
+        None
+    } else if config
+        .get("fetch.recursesubmodules")
+        .or_else(|| config.get("fetch.recurseSubmodules"))
+        .map(|v| {
+            let l = v.to_ascii_lowercase();
+            l == "true" || l == "yes" || l == "on" || l == "1"
+        })
+        .unwrap_or(false)
+    {
+        Some("true".to_owned())
+    } else {
+        None
+    };
+
+    let fetch_args = super::fetch::Args {
+        remote: None,
+        refspecs: Vec::new(),
+        filter: None,
+        no_filter: false,
+        all: true,
+        no_all: false,
+        no_auto_gc: false,
+        no_write_commit_graph: false,
+        multiple: false,
+        tags: false,
+        no_tags: false,
+        prune: false,
+        no_prune: false,
+        force: args.force,
+        prune_tags: false,
+        atomic: false,
+        append: false,
+        dry_run: args.dry_run,
+        write_fetch_head: false,
+        no_write_fetch_head: false,
+        refmap: Vec::new(),
+        deepen: None,
+        depth: None,
+        shallow_since: None,
+        shallow_exclude: None,
+        unshallow: false,
+        update_shallow: false,
+        refetch: false,
+        keep: false,
+        output: None,
+        quiet: args.quiet,
+        verbose: args.verbose,
+        jobs: None,
+        server_options: Vec::new(),
+        porcelain: false,
+        no_porcelain: false,
+        no_show_forced_updates: false,
+        show_forced_updates: false,
+        negotiate_only: false,
+        negotiation_tip: Vec::new(),
+        set_upstream: false,
+        update_head_ok: false,
+        prefetch: false,
+        update_refs: false,
+        upload_pack: None,
+        recurse_submodules: fetch_recurse,
+        no_recurse_submodules: args.no_recurse_submodules,
+        recurse_submodules_default: None,
+        submodule_prefix: None,
+        no_ipv4: false,
+        no_ipv6: false,
+    };
+    super::fetch::run(fetch_args)?;
+    // `--dry-run` reports what would be fetched and stops before integrating (git pull.c).
+    if args.dry_run {
+        return Ok(());
+    }
+    grit_lib::pack::clear_pack_cache();
+
+    // `fetch --all` already records exactly the configured upstream branch (the current branch's
+    // `branch.<name>.remote`) as for-merge in FETCH_HEAD and every other fetched branch as
+    // not-for-merge, so we integrate straight from FETCH_HEAD without re-normalizing.
+    let kind = do_merge_or_rebase_after_fetch(args, config, repo, head)?;
+    maybe_update_submodules_after_pull(args, config, kind)?;
     Ok(())
 }
 
@@ -911,7 +1109,7 @@ fn build_pull_merge_args(
         ff_only,
         no_ff,
         no_commit: false,
-        no_verify: false,
+        no_verify: args.no_verify,
         squash: false,
         abort: false,
         continue_merge: false,
@@ -922,8 +1120,8 @@ fn build_pull_merge_args(
         no_progress: false,
         no_edit: true,
         edit: false,
-        signoff: false,
-        no_signoff: false,
+        signoff: args.signoff,
+        no_signoff: args.no_signoff,
         gpg_sign: None,
         no_gpg_sign: false,
         stat: false,
@@ -944,7 +1142,7 @@ fn build_pull_merge_args(
         no_squash: false,
         quit: false,
         autostash: false,
-        allow_unrelated_histories: false,
+        allow_unrelated_histories: args.allow_unrelated_histories,
         cleanup: None,
         file: None,
         rerere_autoupdate: false,
