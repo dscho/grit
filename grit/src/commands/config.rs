@@ -182,19 +182,19 @@ pub struct Args {
 
     // ── Display flags ──
     /// Show origin file and scope for each entry.
-    #[arg(long = "show-origin")]
+    #[arg(long = "show-origin", global = true)]
     pub show_origin: bool,
 
     /// Show scope for each entry.
-    #[arg(long = "show-scope")]
+    #[arg(long = "show-scope", global = true)]
     pub show_scope: bool,
 
     /// Use NUL as delimiter.
-    #[arg(short = 'z', long = "null")]
+    #[arg(short = 'z', long = "null", global = true)]
     pub null_terminated: bool,
 
     /// Show key names for --get-regexp.
-    #[arg(long = "name-only")]
+    #[arg(long = "name-only", global = true)]
     pub name_only: bool,
 
     /// Includes support.
@@ -459,7 +459,7 @@ pub fn run(args: Args) -> Result<()> {
         bail!("unknown option `no-get'");
     }
     if args.get_key.is_some() && args.get_all_key.is_some() {
-        bail!("error: options '--get-all' and '--get' cannot be used together");
+        bail!("options '--get-all' and '--get' cannot be used together");
     }
 
     for dir in &args.change_dir {
