@@ -315,6 +315,12 @@ pub fn run(args: Args) -> Result<()> {
             for spec in &effective_refspecs {
                 let (oid, desc) = pull_fetch_head_line(&remote_repo, spec)?;
                 out.push(format!("{}\t\t{desc}\n", oid.to_hex()));
+                // Opportunistically update the configured remote-tracking ref, the
+                // same way `git fetch <remote> <branch>` does: an explicit refspec
+                // still refreshes `refs/remotes/<remote>/<branch>` when a
+                // `remote.<name>.fetch` rule maps it (t5510 "explicit pull should
+                // update tracking").
+                update_opportunistic_tracking_ref(&repo, &remote_repo, remote_name, spec, &config)?;
             }
             out
         };
@@ -489,6 +495,40 @@ fn parse_rebase_value(key: &str, value: &str) -> Result<RebaseTri> {
         "true" | "yes" | "on" | "1" | "merges" | "interactive" => Ok(RebaseTri::True),
         _ => bail!("invalid value for '{key}': '{value}'"),
     }
+}
+
+/// Opportunistically update the configured remote-tracking ref for `spec`.
+///
+/// When `git pull <remote> <branch>` (or `git fetch <remote> <branch>`) is run
+/// with an explicit refspec, git still refreshes the remote-tracking ref that a
+/// `remote.<name>.fetch` rule maps the fetched branch to. This mirrors that for
+/// the local-path pull shortcut: resolve `refs/heads/<spec>` on the remote, map
+/// it through the configured fetch refspecs, and write the destination ref.
+fn update_opportunistic_tracking_ref(
+    local: &Repository,
+    remote: &Repository,
+    remote_name: &str,
+    spec: &str,
+    config: &ConfigSet,
+) -> Result<()> {
+    // Only plain branch sources participate; tags and full refs are left alone.
+    if spec.starts_with("refs/") || spec == "HEAD" {
+        return Ok(());
+    }
+    let source_ref = format!("refs/heads/{spec}");
+    let Ok(oid) = refs::resolve_ref(&remote.git_dir, &source_ref) else {
+        return Ok(());
+    };
+    let refspecs = super::fetch::remote_fetch_refspecs(config, remote_name);
+    let Some(tracking_ref) = super::fetch::map_ref_through_refspecs(&source_ref, &refspecs) else {
+        return Ok(());
+    };
+    if !tracking_ref.starts_with("refs/remotes/") {
+        return Ok(());
+    }
+    refs::write_ref(&local.git_dir, &tracking_ref, &oid)
+        .with_context(|| format!("update remote-tracking ref {tracking_ref}"))?;
+    Ok(())
 }
 
 fn pull_fetch_head_line(remote: &Repository, spec: &str) -> Result<(ObjectId, String)> {
