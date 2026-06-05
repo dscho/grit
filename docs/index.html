@@ -17,6 +17,7 @@
     <meta property="og:url" content="https://grit-scm.com/" />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary" />
+    <script async src="https://u.gitbutler.com/script.js" data-website-id="2c6f680c-eaf5-4cd7-a419-1032ffab6bbc"></script>
     <meta name="twitter:title" content="grit - Git in Rust" />
     <meta
       name="twitter:description"
@@ -94,35 +95,42 @@
       .brand {
         display: flex;
         align-items: center;
-        gap: 0.75rem;
+        gap: 0.62rem;
         color: var(--accent-dark);
-        font-family:
-          ui-sans-serif,
-          system-ui,
-          -apple-system,
-          BlinkMacSystemFont,
-          "Segoe UI",
-          sans-serif;
-        font-size: 1.55rem;
-        font-weight: 950;
-        letter-spacing: -0.032em;
-        transform: translateY(0.55rem);
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-size: 1.22rem;
+        font-weight: 700;
+        letter-spacing: -0.018em;
+        transform: translateY(0.35rem);
       }
       .mark {
         display: block;
-        width: 5.25rem;
-        height: 5.25rem;
+        width: 3.7rem;
+        height: 3.7rem;
         object-fit: contain;
-        margin: -1rem 0 -1.85rem;
-        filter: drop-shadow(0 10px 18px rgba(63, 45, 24, 0.18));
+        margin: -0.45rem 0 -0.9rem;
+        filter: drop-shadow(0 8px 14px rgba(63, 45, 24, 0.14));
       }
       .brand-subtle {
-        color: #8b7e72;
-        font-weight: 760;
+        color: #746a61;
+        font-weight: 600;
       }
       .brand-grit {
         color: var(--accent-dark);
-        font-weight: 950;
+        font-weight: 760;
+      }
+      .brand-byline {
+        display: block;
+        width: fit-content;
+        margin: 0.16rem 0 0 calc(3.7rem + 0.62rem);
+        color: #9a8b7d;
+        font-size: 0.62rem;
+        font-weight: 550;
+        letter-spacing: 0.02em;
+        line-height: 1.1;
+      }
+      .brand-byline:hover {
+        color: var(--accent-dark);
       }
       .nav {
         display: flex;
@@ -154,13 +162,13 @@
         fill: currentColor;
       }
       .hero {
-        padding: 3.1rem 0 4rem;
+        padding: 1.55rem 0 4rem;
       }
       .hero-grid {
         display: grid;
         grid-template-columns: minmax(0, 1fr) minmax(300px, 0.95fr);
         gap: 3.2rem;
-        align-items: center;
+        align-items: start;
       }
       .eyebrow {
         display: inline-flex;
@@ -175,18 +183,12 @@
       }
       h1 {
         max-width: 12.5em;
-        margin: 1.15rem 0 1.1rem;
-        font-family:
-          ui-sans-serif,
-          system-ui,
-          -apple-system,
-          BlinkMacSystemFont,
-          "Segoe UI",
-          sans-serif;
-        font-size: clamp(1.58rem, 3.6vw, 2.78rem);
-        font-weight: 720;
-        line-height: 1.08;
-        letter-spacing: -0.036em;
+        margin: 0 0 1.1rem;
+        font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-size: clamp(1.58rem, 3.6vw, 2.72rem);
+        font-weight: 650;
+        line-height: 1.1;
+        letter-spacing: -0.026em;
       }
       .h-git {
         color: #bf3d17;
@@ -485,24 +487,27 @@
         inset: 0;
         z-index: 20;
         display: grid;
-        place-items: center;
-        padding: 1.25rem;
+        align-items: start;
+        justify-items: center;
+        padding: clamp(0.7rem, 2.5vh, 1.2rem) 1.25rem 1.25rem;
       }
       .example-modal-backdrop {
         position: absolute;
         inset: 0;
-        background: rgba(23, 18, 13, 0.58);
+        background: rgba(57, 44, 31, 0.22);
+        backdrop-filter: blur(2px);
       }
       .example-modal-panel {
         position: relative;
         z-index: 1;
-        width: min(860px, 100%);
-        max-height: min(760px, calc(100vh - 2.5rem));
+        width: min(1040px, 100%);
+        max-height: min(780px, calc(100vh - 1.5rem));
         overflow: hidden;
-        border: 1px solid rgba(207, 190, 168, 0.65);
-        border-radius: 0.2rem;
-        background: var(--code-bg);
-        box-shadow: 0 30px 80px rgba(23, 18, 13, 0.36);
+        border: 1px solid rgba(112, 92, 70, 0.2);
+        border-radius: 0.28rem;
+        background: #fffaf2;
+        box-shadow: 0 22px 65px rgba(63, 45, 24, 0.22);
+        color: #312820;
       }
       .example-modal-head {
         display: flex;
@@ -510,44 +515,165 @@
         justify-content: space-between;
         gap: 1rem;
         padding: 0.72rem 0.9rem;
-        border-bottom: 1px solid rgba(255, 250, 242, 0.12);
-        color: var(--code-fg);
+        border-bottom: 1px solid rgba(112, 92, 70, 0.16);
+        background: #fff6e9;
+        color: #312820;
       }
       .example-modal-title {
         margin: 0;
         font-size: 0.86rem;
       }
       .example-modal-close {
-        border: 1px solid rgba(255, 250, 242, 0.16);
-        border-radius: 0.16rem;
-        background: rgba(255, 250, 242, 0.08);
-        color: var(--code-fg);
+        border: 1px solid rgba(112, 92, 70, 0.22);
+        border-radius: 0.18rem;
+        background: rgba(255, 255, 255, 0.72);
+        color: #5c4735;
         cursor: pointer;
         font-size: 1.1rem;
         line-height: 1;
         padding: 0.32rem 0.5rem;
       }
+      .example-modal-close:hover {
+        border-color: rgba(191, 61, 23, 0.38);
+        color: var(--accent-dark);
+      }
+      .example-modal-body {
+        display: grid;
+        grid-template-columns: minmax(180px, 230px) 1fr;
+        min-height: 0;
+      }
+      .example-sidebar {
+        max-height: calc(min(780px, 100vh - 1.5rem) - 3.25rem);
+        overflow: auto;
+        padding: 0.85rem;
+        border-right: 1px solid rgba(112, 92, 70, 0.14);
+        background: rgba(249, 237, 219, 0.56);
+      }
+      .example-sidebar-title {
+        margin: 0 0 0.55rem;
+        color: #7b6755;
+        font-size: 0.68rem;
+        font-weight: 900;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+      .example-list {
+        display: grid;
+        gap: 0.18rem;
+      }
+      .example-list button {
+        width: 100%;
+        border: 1px solid transparent;
+        border-radius: 0.18rem;
+        background: transparent;
+        color: #5c4735;
+        cursor: pointer;
+        font: inherit;
+        font-size: 0.76rem;
+        line-height: 1.25;
+        padding: 0.4rem 0.45rem;
+        text-align: left;
+      }
+      .example-list button:hover {
+        background: rgba(191, 61, 23, 0.07);
+        color: var(--accent-dark);
+      }
+      .example-list button.active {
+        border-color: rgba(191, 61, 23, 0.24);
+        background: #fffaf2;
+        color: var(--accent-dark);
+        font-weight: 800;
+      }
       .example-code {
-        max-height: calc(min(760px, 100vh - 2.5rem) - 3.4rem);
+        max-height: calc(min(780px, 100vh - 1.5rem) - 3.25rem);
         margin: 0;
         overflow: auto;
-        padding: 1rem;
-        color: var(--code-fg);
-        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        font-size: 0.78rem;
-        line-height: 1.65;
+        padding: 0.85rem 0 1rem;
+        border: 0;
+        background: transparent;
+        color: #242830;
+        font-family:
+          "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+        font-size: 0.88rem;
+        line-height: 1.72;
+        white-space: pre;
+      }
+      .example-code code {
+        position: relative;
+        display: block;
+        min-width: max-content;
+        padding: 0;
+        border: 0;
+        border-radius: 0;
+        background: transparent;
+        color: inherit;
+        font: inherit;
+      }
+      .example-code code::before {
+        content: "";
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: 3.1rem;
+        border-left: 1px solid rgba(91, 102, 115, 0.16);
+      }
+      .code-line {
+        display: grid;
+        grid-template-columns: 3.1rem max-content;
+        min-width: 100%;
+        white-space: pre;
+      }
+      .line-num {
+        padding-right: 0.82rem;
+        color: #98a0aa;
+        text-align: right;
+        user-select: none;
+      }
+      .line-text {
+        padding: 0 1.2rem 0 1rem;
+        white-space: pre;
       }
       .example-code .kw {
-        color: #ff9b70;
+        color: #df1f2d;
+      }
+      .example-code .type {
+        color: #9b4200;
+      }
+      .example-code .fn-name {
+        color: #8457e5;
       }
       .example-code .str {
-        color: #f2c078;
+        color: #123d74;
       }
       .example-code .com {
-        color: #9b8a7b;
+        color: #7f8894;
       }
       .example-code .numlit {
-        color: #8fb7ff;
+        color: #0969da;
+      }
+      .example-code .punct {
+        color: #0f6ddf;
+      }
+      .example-code a {
+        color: #0969da;
+        text-decoration: underline;
+        text-underline-offset: 0.16em;
+      }
+      .example-code a:hover {
+        color: var(--accent-dark);
+      }
+      @media (max-width: 720px) {
+        .example-modal-body {
+          grid-template-columns: 1fr;
+        }
+        .example-sidebar {
+          max-height: 10rem;
+          border-right: 0;
+          border-bottom: 1px solid rgba(112, 92, 70, 0.14);
+        }
+        .example-code {
+          max-height: calc(100vh - 15rem);
+        }
       }
       .editor-letter-wrap {
         display: grid;
@@ -822,7 +948,7 @@
           grid-template-columns: repeat(2, minmax(0, 1fr));
         }
         .hero {
-          padding-top: 2rem;
+          padding-top: 1rem;
         }
       }
       .install-section {
@@ -923,14 +1049,17 @@
           padding: 0.75rem 0;
         }
         .brand {
-          gap: 0.55rem;
-          font-size: 1.4rem;
+          gap: 0.5rem;
+          font-size: 1.1rem;
           transform: none;
         }
         .mark {
-          width: 3.6rem;
-          height: 3.6rem;
-          margin: -0.5rem 0 -0.8rem;
+          width: 3rem;
+          height: 3rem;
+          margin: -0.25rem 0 -0.45rem;
+        }
+        .brand-byline {
+          margin-left: calc(3rem + 0.5rem);
         }
         .nav {
           justify-content: flex-start;
@@ -988,13 +1117,16 @@
   </head>
   <body>
     <header class="wrap topbar">
-      <a class="brand" href="/" aria-label="grit homepage"
-        ><img class="mark" src="grit-logo.svg" alt="" /><span
-          ><span class="brand-subtle">the</span>
-          <span class="brand-grit">Grit</span>
-          <span class="brand-subtle">project</span></span
-        ></a
-      >
+      <div>
+        <a class="brand" href="/" aria-label="grit homepage"
+          ><img class="mark" src="grit-logo.svg" alt="" /><span
+            ><span class="brand-subtle">the</span>
+            <span class="brand-grit">Grit</span>
+            <span class="brand-subtle">project</span></span
+          ></a
+        >
+        <a class="brand-byline" href="https://gitbutler.com">(by gitbutler)</a>
+      </div>
       <nav class="nav" aria-label="Primary">
         <a href="#use">Use it</a>
         <a href="#why">Why</a>
@@ -1038,9 +1170,7 @@
               >
             </p>
             <div class="cta">
-              <a class="button primary" href="#install"
-                >Try the CLI</a
-              >
+              <a class="button primary" href="#install">Try the CLI</a>
               <a class="button" href="https://docs.rs/grit-lib">Read docs</a>
               <a class="button" href="progress/">Track progress</a>
             </div>
@@ -1093,14 +1223,11 @@
               <pre><span class="comment"># install via shell script (macOS / Linux)</span>
 <span class="prompt">$</span> <span class="cmd">curl -fsSL https://grit-scm.com/install | sh</span>
 
-<span class="comment"># or via cargo</span>
-<span class="prompt">$</span> <span class="cmd">cargo install grit-cli</span>
 <span class="prompt">$</span> <span class="cmd">grit status --short</span>
 <span class="output"> M docs/index.html</span>
 
-<span class="prompt">$</span> <span class="cmd">grit log --oneline --decorate -3</span>
+<span class="prompt">$</span> <span class="cmd">grit log --oneline --decorate -2</span>
 <span class="output">cc96ca5 (HEAD, main) gc
-8f2d1a0 implement promisor hydrate
 5ac721e update index parsing</span>
 
 <span class="prompt">$</span> <span class="cmd">grit diff --stat HEAD~1..HEAD</span>
@@ -1113,7 +1240,7 @@
               aria-labelledby="tab-grit-lib"
             >
               <pre><span class="comment">// Cargo.toml</span>
-grit-lib = <span class="string">"0.1"</span>
+grit-lib = <span class="string">"0.3"</span>
 
 <span class="kw">use</span> grit_lib::repo::Repository;
 
@@ -1133,7 +1260,7 @@ grit-lib = <span class="string">"0.1"</span>
         <div class="split">
           <div>
             <span class="num">Current status</span>
-            <h2>Passing the Git Test Suite</h2>
+            <h2>Git Test Suite Progress</h2>
             <p class="section-intro">
               Grit is tracked against the upstream Git harness. The generated
               dashboard shows pass rate by family, skipped files, and per-file
@@ -1193,8 +1320,8 @@ grit-lib = <span class="string">"0.1"</span>
               <div class="suite-stat" style="--pct: 98.5%">
                 <span>t0 basics</span><strong>98.5%</strong>
               </div>
-              <div class="suite-stat" style="--pct: 99.4%">
-                <span>t1 database</span><strong>99.4%</strong>
+              <div class="suite-stat" style="--pct: 99.3%">
+                <span>t1 database</span><strong>99.3%</strong>
               </div>
               <div class="suite-stat" style="--pct: 98.6%">
                 <span>t2 worktree</span><strong>98.6%</strong>
@@ -1217,13 +1344,13 @@ grit-lib = <span class="string">"0.1"</span>
               <div class="suite-stat" style="--pct: 99.6%">
                 <span>t8 forensics</span><strong>99.6%</strong>
               </div>
-              <div class="suite-stat" style="--pct: 99.8%">
-                <span>t9 tools</span><strong>99.8%</strong>
+              <div class="suite-stat" style="--pct: 99.7%">
+                <span>t9 tools</span><strong>99.7%</strong>
               </div>
             </div>
             <p>
-              Latest generated harness pass rate: 40,308 of
-              42,479 in-scope tests. Open the dashboard for exact
+              Latest generated harness pass rate: 40,306 of
+              42,483 in-scope tests. Open the dashboard for exact
               counts.
             </p>
           </a>
@@ -1286,19 +1413,25 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/objects.rs" data-example="examples/objects.rs" data-example-title="Objects"
+                  href="examples/objects.rs"
+                  data-example="examples/objects.rs"
+                  data-example-title="Objects"
                   >Read and write loose objects</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/hash-objects.rs" data-example="examples/hash-objects.rs" data-example-title="Hash objects"
+                  href="examples/hash-objects.rs"
+                  data-example="examples/hash-objects.rs"
+                  data-example-title="Hash objects"
                   >Hash blobs, trees, commits, and tags</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/object-ids.rs" data-example="examples/object-ids.rs" data-example-title="Object IDs"
+                  href="examples/object-ids.rs"
+                  data-example="examples/object-ids.rs"
+                  data-example-title="Object IDs"
                   >Parse object IDs and payloads</a
                 >
               </li>
@@ -1315,19 +1448,25 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/index.rs" data-example="examples/index.rs" data-example-title="Index"
+                  href="examples/index.rs"
+                  data-example="examples/index.rs"
+                  data-example-title="Index"
                   >Load and write the staging area</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/index-add.rs" data-example="examples/index-add.rs" data-example-title="Index entries"
+                  href="examples/index-add.rs"
+                  data-example="examples/index-add.rs"
+                  data-example-title="Index entries"
                   >Add, replace, sort, and refresh entries</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/write-tree.rs" data-example="examples/write-tree.rs" data-example-title="Write tree"
+                  href="examples/write-tree.rs"
+                  data-example="examples/write-tree.rs"
+                  data-example-title="Write tree"
                   >Build trees from the index</a
                 >
               </li>
@@ -1347,19 +1486,25 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/refs.rs" data-example="examples/refs.rs" data-example-title="Refs"
+                  href="examples/refs.rs"
+                  data-example="examples/refs.rs"
+                  data-example-title="Refs"
                   >Read, write, delete, and list refs</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/head.rs" data-example="examples/head.rs" data-example-title="HEAD and symbolic refs"
+                  href="examples/head.rs"
+                  data-example="examples/head.rs"
+                  data-example-title="HEAD and symbolic refs"
                   >Resolve HEAD and symbolic refs</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/reflog.rs" data-example="examples/reflog.rs" data-example-title="Reflogs"
+                  href="examples/reflog.rs"
+                  data-example="examples/reflog.rs"
+                  data-example-title="Reflogs"
                   >Append and expire reflogs</a
                 >
               </li>
@@ -1377,19 +1522,25 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/rev-parse.rs" data-example="examples/rev-parse.rs" data-example-title="Rev parse"
+                  href="examples/rev-parse.rs"
+                  data-example="examples/rev-parse.rs"
+                  data-example-title="Rev parse"
                   >Parse names like <code>HEAD~3</code></a
                 >
               </li>
               <li>
                 <a
-                  href="examples/rev-list.rs" data-example="examples/rev-list.rs" data-example-title="Rev list"
+                  href="examples/rev-list.rs"
+                  data-example="examples/rev-list.rs"
+                  data-example-title="Rev list"
                   >Walk commit graphs</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/merge-base.rs" data-example="examples/merge-base.rs" data-example-title="Merge base"
+                  href="examples/merge-base.rs"
+                  data-example="examples/merge-base.rs"
+                  data-example-title="Merge base"
                   >Compute merge bases and ancestry</a
                 >
               </li>
@@ -1405,19 +1556,25 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/diff.rs" data-example="examples/diff.rs" data-example-title="Diffs"
+                  href="examples/diff.rs"
+                  data-example="examples/diff.rs"
+                  data-example-title="Diffs"
                   >Diff trees, index, and worktree</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/diff.rs" data-example="examples/diff.rs" data-example-title="Diffs"
+                  href="examples/diff.rs"
+                  data-example="examples/diff.rs"
+                  data-example-title="Diffs"
                   >Detect renames and copies</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/patch-id.rs" data-example="examples/patch-id.rs" data-example-title="Patch IDs"
+                  href="examples/patch-id.rs"
+                  data-example="examples/patch-id.rs"
+                  data-example-title="Patch IDs"
                   >Generate patches and patch IDs</a
                 >
               </li>
@@ -1437,19 +1594,25 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/merge-file.rs" data-example="examples/merge-file.rs" data-example-title="Merge file"
+                  href="examples/merge-file.rs"
+                  data-example="examples/merge-file.rs"
+                  data-example-title="Merge file"
                   >Three-way line merges</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/merge-message.rs" data-example="examples/merge-message.rs" data-example-title="Merge messages"
+                  href="examples/merge-message.rs"
+                  data-example="examples/merge-message.rs"
+                  data-example-title="Merge messages"
                   >Conflict styles and merge messages</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/cherry-pick.rs" data-example="examples/cherry-pick.rs" data-example-title="Cherry-pick"
+                  href="examples/cherry-pick.rs"
+                  data-example="examples/cherry-pick.rs"
+                  data-example-title="Cherry-pick"
                   >Cherry-pick detection helpers</a
                 >
               </li>
@@ -1467,72 +1630,104 @@ grit-lib = <span class="string">"0.1"</span>
             <ul>
               <li>
                 <a
-                  href="examples/config.rs" data-example="examples/config.rs" data-example-title="Config"
+                  href="examples/config.rs"
+                  data-example="examples/config.rs"
+                  data-example-title="Config"
                   >Load multi-scope Git config</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/config.rs" data-example="examples/config.rs" data-example-title="Config"
+                  href="examples/config.rs"
+                  data-example="examples/config.rs"
+                  data-example-title="Config"
                   >Parse typed values</a
                 >
               </li>
               <li>
                 <a
-                  href="examples/ignore.rs" data-example="examples/ignore.rs" data-example-title="Ignore rules"
+                  href="examples/ignore.rs"
+                  data-example="examples/ignore.rs"
+                  data-example-title="Ignore rules"
                   >Match ignore and sparse patterns</a
                 >
               </li>
             </ul>
           </article>
+          <!-- Remote APIs are still CLI-heavy; revisit this card when a first-class grit-lib fetch/push API exists.
           <article class="card capability-card">
             <div class="cap-head">
-              <span class="cap-icon cap-letter" aria-hidden="true">$</span>
-              <h3>CLI</h3>
+              <span class="cap-icon cap-letter" aria-hidden="true">↕</span>
+              <h3>Remotes</h3>
             </div>
             <ul>
               <li>
                 <a
-                  href="examples/cli.rs" data-example="examples/cli.rs" data-example-title="CLI commands"
-                  >140+ Git commands implemented</a
+                  href="examples/fetch.rs"
+                  data-example="examples/fetch.rs"
+                  data-example-title="Fetch"
+                  >Fetch refs from remotes</a
                 >
               </li>
               <li>
-                <a href="examples/status.rs" data-example="examples/status.rs" data-example-title="Status">Status</a>,
-                <a href="examples/log.rs" data-example="examples/log.rs" data-example-title="Log">log</a>,
-                <a href="examples/diff.rs" data-example="examples/diff.rs" data-example-title="Diff">diff</a>,
-                <a href="examples/add.rs" data-example="examples/add.rs" data-example-title="Add">add</a>,
-                <a href="examples/commit.rs" data-example="examples/commit.rs" data-example-title="Commit">commit</a>,
-                <a href="examples/fetch.rs" data-example="examples/fetch.rs" data-example-title="Fetch">fetch</a>,
-                <a href="examples/push.rs" data-example="examples/push.rs" data-example-title="Push">push</a>
+                <a
+                  href="examples/push.rs"
+                  data-example="examples/push.rs"
+                  data-example-title="Push"
+                  >Push branches and updates</a
+                >
               </li>
               <li>
                 <a
-                  href="examples/harness.rs" data-example="examples/harness.rs" data-example-title="Harness compatibility"
-                  >Harness-tested Git compatibility</a
+                  href="examples/harness.rs"
+                  data-example="examples/harness.rs"
+                  data-example-title="Harness compatibility"
+                  >Harness-tested remote behavior</a
                 >
               </li>
             </ul>
           </article>
+          -->
         </div>
       </section>
 
       <section class="wrap section install-section" id="install">
         <h2>Try it out.</h2>
         <p class="section-intro">
-          <span class="install-primary">Install the <code>grit</code> CLI and use it as a drop-in replacement for <code>git</code>.</span>
-          <span class="install-secondary">Pre-built binaries for macOS and Linux, or install via Cargo.</span>
+          <span class="install-primary"
+            >Install the <code>grit</code> CLI and use it as a drop-in
+            replacement for <code>git</code>.</span
+          >
+          <span class="install-secondary"
+            >Pre-built binaries for macOS and Linux, or install via Cargo.</span
+          >
         </p>
         <div class="install-block">
           <div class="install-cmd" data-install-cmd>
             <code>curl -fsSL https://grit-scm.com/install | sh</code>
-            <button class="copy-btn" aria-label="Copy to clipboard" data-copy="curl -fsSL https://grit-scm.com/install | sh">
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            <button
+              class="copy-btn"
+              aria-label="Copy to clipboard"
+              data-copy="curl -fsSL https://grit-scm.com/install | sh"
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              >
+                <rect x="9" y="9" width="13" height="13" rx="2" />
+                <path
+                  d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"
+                />
+              </svg>
             </button>
           </div>
-          <div class="install-alt">
-            or <code>cargo install grit-cli</code>
-          </div>
+          <div class="install-alt">or <code>cargo install grit-cli</code></div>
         </div>
       </section>
     </main>
@@ -1552,12 +1747,30 @@ grit-lib = <span class="string">"0.1"</span>
 
     <div class="example-modal" data-example-modal hidden>
       <div class="example-modal-backdrop" data-example-close></div>
-      <div class="example-modal-panel" role="dialog" aria-modal="true" aria-labelledby="example-modal-title">
+      <div
+        class="example-modal-panel"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="example-modal-title"
+      >
         <div class="example-modal-head">
           <h3 class="example-modal-title" id="example-modal-title">Example</h3>
-          <button class="example-modal-close" type="button" data-example-close aria-label="Close example">×</button>
+          <button
+            class="example-modal-close"
+            type="button"
+            data-example-close
+            aria-label="Close example"
+          >
+            ×
+          </button>
         </div>
-        <pre class="example-code"><code data-example-code></code></pre>
+        <div class="example-modal-body">
+          <aside class="example-sidebar" aria-label="Available examples">
+            <p class="example-sidebar-title">Examples</p>
+            <nav class="example-list" data-example-list></nav>
+          </aside>
+          <pre class="example-code"><code data-example-code></code></pre>
+        </div>
       </div>
     </div>
 
@@ -1584,6 +1797,36 @@ grit-lib = <span class="string">"0.1"</span>
         if (!modal) return;
         const title = modal.querySelector(".example-modal-title");
         const code = modal.querySelector("[data-example-code]");
+        const exampleList = modal.querySelector("[data-example-list]");
+        const inlineExamples = {
+          "examples/add.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/index/struct.Index.html\nuse grit_lib::index::{Index, IndexEntry, MODE_REGULAR};\nuse grit_lib::objects::ObjectId;\n\nfn main() -> grit_lib::error::Result<()> {\n    let mut index = Index::new();\n    let oid = ObjectId::from_hex(\"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\")?;\n\n    index.add_or_replace(IndexEntry {\n        ctime_sec: 0,\n        ctime_nsec: 0,\n        mtime_sec: 0,\n        mtime_nsec: 0,\n        dev: 0,\n        ino: 0,\n        mode: MODE_REGULAR,\n        uid: 0,\n        gid: 0,\n        size: 0,\n        oid,\n        flags: \"README.md\".len() as u16,\n        flags_extended: None,\n        path: b\"README.md\".to_vec(),\n        base_index_pos: 0,\n    });\n\n    println!(\"staged {} entry\", index.entries.len());\n    Ok(())\n}\n",
+          "examples/cherry-pick.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/patch_ids/index.html\nuse grit_lib::patch_ids::{compute_patch_ids_from_text, PatchIdMode};\n\nfn main() {\n    let patch = b\"diff --git a/a b/a\\nindex 0000000..1111111 100644\\n--- a/a\\n+++ b/a\\n@@ -0,0 +1 @@\\n+hello\\n\";\n    let ids = compute_patch_ids_from_text(patch, PatchIdMode::Stable);\n\n    for (commit_id, patch_id) in ids {\n        println!(\"{commit_id} has stable patch-id {patch_id}\");\n    }\n}\n",
+          "examples/cli.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/repo/struct.Repository.html\nuse std::process::Command;\n\nfn main() -> std::io::Result<()> {\n    let status = Command::new(\"grit\").arg(\"status\").status()?;\n    println!(\"grit status exited with {status}\");\n    Ok(())\n}\n",
+          "examples/commit.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/objects/struct.CommitData.html\nuse grit_lib::objects::{serialize_commit, CommitData, ObjectId};\n\nfn main() -> grit_lib::error::Result<()> {\n    let tree = ObjectId::from_hex(\"4b825dc642cb6eb9a060e54bf8d69288fbee4904\")?;\n    let commit = CommitData {\n        tree,\n        parents: Vec::new(),\n        author: \"A U Thor <author@example.com> 0 +0000\".into(),\n        committer: \"C O Mitter <committer@example.com> 0 +0000\".into(),\n        author_raw: Vec::new(),\n        committer_raw: Vec::new(),\n        encoding: None,\n        message: \"initial commit\\n\".into(),\n        raw_message: None,\n    };\n\n    let bytes = serialize_commit(&commit);\n    println!(\"{}\", String::from_utf8_lossy(&bytes));\n    Ok(())\n}\n",
+          "examples/config.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/config/struct.ConfigSet.html\nuse grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let file = ConfigFile::parse(\n        Path::new(\".git/config\"),\n        \"[user]\\n\\tname = Ada\\n[core]\\n\\tbare = false\\n\",\n        ConfigScope::Local,\n    )?;\n    let mut config = ConfigSet::new();\n    config.merge(&file);\n\n    println!(\"user.name = {}\", config.get(\"user.name\").unwrap_or_default());\n    println!(\"core.bare = {:?}\", config.get_bool(\"core.bare\"));\n    Ok(())\n}\n",
+          "examples/diff.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/diff/index.html\nuse grit_lib::diff::unified_diff;\n\nfn main() {\n    let patch = unified_diff(\"hello\\nold\\n\", \"hello\\nnew\\n\", \"file.txt\", \"file.txt\", 3, true, false);\n    println!(\"{patch}\");\n}\n",
+          "examples/fetch.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/ls_remote/fn.ls_remote.html\nuse grit_lib::ls_remote::{ls_remote, Options};\nuse grit_lib::objects::{parse_commit, parse_tree, tag_object_line_oid, ObjectId, ObjectKind};\nuse grit_lib::odb::Odb;\nuse grit_lib::refs::write_ref;\nuse std::collections::HashSet;\nuse std::env;\nuse std::path::PathBuf;\n\nfn main() -> grit_lib::error::Result<()> {\n    let local_git = arg_path(1, \".git\");\n    let remote_git = arg_path(2, \"../remote.git\");\n    let local_odb = Odb::new(&local_git.join(\"objects\"));\n    let remote_odb = Odb::new(&remote_git.join(\"objects\"));\n\n    let refs = ls_remote(\n        &remote_git,\n        &remote_odb,\n        &Options {\n            heads: true,\n            ..Options::default()\n        },\n    )?;\n\n    for remote_ref in refs {\n        copy_reachable(&remote_odb, &local_odb, remote_ref.oid)?;\n        if let Some(branch) = remote_ref.name.strip_prefix(\"refs/heads/\") {\n            let tracking_ref = format!(\"refs/remotes/origin/{branch}\");\n            write_ref(&local_git, &tracking_ref, &remote_ref.oid)?;\n            println!(\"fetched {} -> {}\", remote_ref.name, tracking_ref);\n        }\n    }\n\n    Ok(())\n}\n\nfn arg_path(index: usize, default: &str) -> PathBuf {\n    env::args_os()\n        .nth(index)\n        .map(PathBuf::from)\n        .unwrap_or_else(|| PathBuf::from(default))\n}\n\nfn copy_reachable(remote: &Odb, local: &Odb, root: ObjectId) -> grit_lib::error::Result<()> {\n    let mut seen = HashSet::new();\n    let mut stack = vec![root];\n\n    while let Some(oid) = stack.pop() {\n        if !seen.insert(oid) || local.exists(&oid) {\n            continue;\n        }\n\n        let object = remote.read(&oid)?;\n        local.write(object.kind, &object.data)?;\n\n        match object.kind {\n            ObjectKind::Commit => {\n                let commit = parse_commit(&object.data)?;\n                stack.push(commit.tree);\n                stack.extend(commit.parents);\n            }\n            ObjectKind::Tree => {\n                stack.extend(parse_tree(&object.data)?.into_iter().map(|entry| entry.oid));\n            }\n            ObjectKind::Tag => {\n                if let Some(target) = tag_object_line_oid(&object.data) {\n                    stack.push(target);\n                }\n            }\n            ObjectKind::Blob => {}\n        }\n    }\n\n    Ok(())\n}\n",
+          "examples/harness.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/repo/struct.Repository.html\nuse std::process::Command;\n\nfn main() -> std::io::Result<()> {\n    let output = Command::new(\"./scripts/run-tests.sh\")\n        .arg(\"t0000-basic.sh\")\n        .output()?;\n\n    println!(\"{}\", String::from_utf8_lossy(&output.stdout));\n    Ok(())\n}\n",
+          "examples/hash-objects.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/odb/struct.Odb.html\nuse grit_lib::objects::ObjectKind;\nuse grit_lib::odb::Odb;\n\nfn main() {\n    let oid = Odb::hash_object_data(ObjectKind::Blob, b\"content to hash\\n\");\n    println!(\"{oid}\");\n}\n",
+          "examples/head.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/state/fn.resolve_head.html\nuse grit_lib::state::{resolve_head, HeadState};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    match resolve_head(Path::new(\".git\"))? {\n        HeadState::Branch { refname, oid, .. } => println!(\"{refname} at {oid:?}\"),\n        HeadState::Detached { oid } => println!(\"detached at {oid}\"),\n        HeadState::Invalid => println!(\"HEAD is invalid\"),\n    }\n    Ok(())\n}\n",
+          "examples/ignore.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/ignore/index.html\nuse grit_lib::ignore::{parse_sparse_patterns_from_blob, path_matches_sparse_pattern_list};\n\nfn main() {\n    let patterns = parse_sparse_patterns_from_blob(\"/*\\n/docs/\\n!/target/\\n\");\n    let included = path_matches_sparse_pattern_list(\"docs/index.html\", &patterns).unwrap_or(false);\n\n    println!(\"docs/index.html included? {included}\");\n}\n",
+          "examples/index-add.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/index/struct.Index.html\nuse grit_lib::index::{Index, IndexEntry, MODE_REGULAR};\nuse grit_lib::objects::ObjectId;\n\nfn main() -> grit_lib::error::Result<()> {\n    let oid = ObjectId::from_hex(\"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\")?;\n    let mut index = Index::new();\n    let path = b\"src/main.rs\".to_vec();\n\n    index.add_or_replace(IndexEntry {\n        ctime_sec: 0,\n        ctime_nsec: 0,\n        mtime_sec: 0,\n        mtime_nsec: 0,\n        dev: 0,\n        ino: 0,\n        mode: MODE_REGULAR,\n        uid: 0,\n        gid: 0,\n        size: 0,\n        oid,\n        flags: path.len() as u16,\n        flags_extended: None,\n        path,\n        base_index_pos: 0,\n    });\n\n    index.sort();\n    println!(\"index version {}\", index.version);\n    Ok(())\n}\n",
+          "examples/index.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/index/struct.Index.html\nuse grit_lib::index::Index;\n\nfn main() {\n    let index = Index::new();\n    println!(\"empty index has {} entries\", index.entries.len());\n}\n",
+          "examples/log.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_list/index.html\nuse grit_lib::rev_list::{split_revision_token, RevListOptions};\n\nfn main() {\n    let (positive, negative) = split_revision_token(\"main..feature\");\n    let options = RevListOptions::default();\n\n    println!(\"include {positive:?}, exclude {negative:?}\");\n    println!(\"reverse output? {}\", options.reverse);\n}\n",
+          "examples/merge-base.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/merge_base/index.html\nuse grit_lib::merge_base::resolve_fork_point_reflog_ref;\nuse grit_lib::repo::Repository;\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let repo = Repository::discover(Some(Path::new(\".\")))?;\n    let reflog_ref = resolve_fork_point_reflog_ref(&repo, \"main\");\n\n    println!(\"look for fork-point entries in {reflog_ref}\");\n    Ok(())\n}\n",
+          "examples/merge-file.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/merge_file/index.html\nuse grit_lib::merge_file::{merge, ConflictStyle, MergeFavor, MergeInput};\n\nfn main() -> grit_lib::error::Result<()> {\n    let result = merge(&MergeInput {\n        base: b\"base\\n\",\n        ours: b\"ours\\n\",\n        theirs: b\"theirs\\n\",\n        label_ours: \"ours\",\n        label_base: \"base\",\n        label_theirs: \"theirs\",\n        favor: MergeFavor::None,\n        style: ConflictStyle::Merge,\n        marker_size: 7,\n        diff_algorithm: None,\n        ignore_all_space: false,\n        ignore_space_change: false,\n        ignore_space_at_eol: false,\n        ignore_cr_at_eol: false,\n    })?;\n\n    println!(\"{}\", String::from_utf8_lossy(&result.content));\n    Ok(())\n}\n",
+          "examples/merge-message.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/fmt_merge_msg/fn.fmt_merge_msg.html\nuse grit_lib::fmt_merge_msg::{fmt_merge_msg, FmtMergeMsgOptions};\n\nfn main() {\n    let input = \"0123456789012345678901234567890123456789\\t\\tbranch 'topic' of example\\n\";\n    let message = fmt_merge_msg(input, &FmtMergeMsgOptions::default());\n\n    println!(\"{message}\");\n}\n",
+          "examples/object-ids.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/objects/struct.ObjectId.html\nuse grit_lib::objects::ObjectId;\n\nfn main() -> grit_lib::error::Result<()> {\n    let id = ObjectId::from_hex(\"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\")?;\n\n    println!(\"full id: {id}\");\n    println!(\"loose path: {}/{}\", id.loose_prefix(), id.loose_suffix());\n    Ok(())\n}\n",
+          "examples/objects.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/objects/index.html\nuse grit_lib::objects::{Object, ObjectKind};\nuse grit_lib::odb::Odb;\n\nfn main() {\n    let object = Object::new(ObjectKind::Blob, b\"hello from grit\\n\".to_vec());\n    let oid = Odb::hash_object_data(object.kind, &object.data);\n\n    println!(\"{} {} bytes\", oid, object.data.len());\n}\n",
+          "examples/patch-id.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/patch_ids/fn.compute_patch_ids_from_text.html\nuse grit_lib::patch_ids::{compute_patch_ids_from_text, PatchIdMode};\n\nfn main() {\n    let patch = b\"diff --git a/file b/file\\n--- a/file\\n+++ b/file\\n@@ -1 +1 @@\\n-old\\n+new\\n\";\n    let ids = compute_patch_ids_from_text(patch, PatchIdMode::Stable);\n\n    println!(\"computed {} patch-id record(s)\", ids.len());\n}\n",
+          "examples/push.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/protocol/index.html\nuse grit_lib::protocol::{check_protocol_allowed_with, ProtocolPolicyInputs};\n\nfn main() -> Result<(), grit_lib::protocol::ProtocolError> {\n    check_protocol_allowed_with(\n        \"https\",\n        &ProtocolPolicyInputs {\n            git_allow_protocol: None,\n            git_protocol_from_user: Some(\"1\".into()),\n            specific_allow: None,\n            blanket_allow: None,\n        },\n    )?;\n\n    println!(\"https transport is allowed for a user-requested push\");\n    Ok(())\n}\n",
+          "examples/reflog.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/reflog/index.html\nuse grit_lib::reflog::{reflog_path, read_reflog};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let git_dir = Path::new(\".git\");\n    println!(\"HEAD reflog path: {}\", reflog_path(git_dir, \"HEAD\").display());\n\n    for entry in read_reflog(git_dir, \"HEAD\")?.iter().take(5) {\n        println!(\"{} -> {} {}\", entry.old_oid, entry.new_oid, entry.message);\n    }\n    Ok(())\n}\n",
+          "examples/refs.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/refs/index.html\nuse grit_lib::refs::{list_refs, read_head};\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let git_dir = Path::new(\".git\");\n    println!(\"HEAD = {:?}\", read_head(git_dir)?);\n    // cool\n\n    for (name, oid) in list_refs(git_dir, \"refs/heads\")? {\n        println!(\"{name} {oid}\");\n    }\n    Ok(())\n}\n",
+          "examples/rev-list.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_list/enum.ObjectFilter.html\nuse grit_lib::rev_list::ObjectFilter;\n\nfn main() -> Result<(), String> {\n    let filter = ObjectFilter::parse(\"blob:limit=1m\")?;\n\n    println!(\"small blob included? {}\", filter.includes_blob(512));\n    println!(\"large blob included? {}\", filter.includes_blob(2 * 1024 * 1024));\n    Ok(())\n}\n",
+          "examples/rev-parse.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_parse/index.html\nuse grit_lib::rev_parse::{abbreviate_ref_name, split_double_dot_range};\n\nfn main() {\n    let short = abbreviate_ref_name(\"refs/heads/main\");\n    let range = split_double_dot_range(\"main..feature\");\n\n    println!(\"short ref: {short}\");\n    println!(\"range: {range:?}\");\n}\n",
+          "examples/status.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/diff/enum.DiffStatus.html\nuse grit_lib::diff::DiffStatus;\n\nfn main() {\n    let statuses = [DiffStatus::Added, DiffStatus::Modified, DiffStatus::Deleted];\n\n    for status in statuses {\n        println!(\"{}\", status.letter());\n    }\n}\n",
+          "examples/write-tree.rs": "// API docs: https://docs.rs/grit-lib/latest/grit_lib/write_tree/fn.write_tree_from_index.html\nuse grit_lib::index::Index;\nuse grit_lib::odb::Odb;\nuse grit_lib::write_tree::write_tree_from_index;\nuse std::path::Path;\n\nfn main() -> grit_lib::error::Result<()> {\n    let odb = Odb::new(Path::new(\".git/objects\"));\n    let index = Index::new();\n    let tree_id = write_tree_from_index(&odb, &index, \"\")?;\n\n    println!(\"empty tree: {tree_id}\");\n    Ok(())\n}\n"
+};
         let lastFocus = null;
 
         function escapeHtml(value) {
@@ -1596,17 +1839,60 @@ grit-lib = <span class="string">"0.1"</span>
         function highlightRust(source) {
           let html = escapeHtml(source);
           const tokens = [];
-          html = html.replace(/\/\/.*$/gm, (match) => {
-            tokens.push('<span class="com">' + match + '</span>');
-            return "\u0000" + (tokens.length - 1) + "\u0000";
-          });
-          html = html.replace(/&quot;(?:\\.|[^&])*?&quot;|"(?:\\.|[^"\\])*"/g, (match) => {
-            tokens.push('<span class="str">' + match + '</span>');
-            return "\u0000" + (tokens.length - 1) + "\u0000";
-          });
-          html = html.replace(/\b(fn|let|mut|pub|use|struct|enum|impl|trait|for|in|if|else|match|return|Result|Ok|Err|Some|None|async|await|move|const|static|where|as)\b/g, '<span class="kw">$1</span>');
-          html = html.replace(/\b\d+(?:\.\d+)?\b/g, '<span class="numlit">$&</span>');
-          return html.replace(/\u0000(\d+)\u0000/g, (_, index) => tokens[Number(index)]);
+          const keep = (className, value) => {
+            const key = String.fromCharCode(0xe000 + tokens.length);
+            tokens.push('<span class="' + className + '">' + value + "</span>");
+            return key;
+          };
+          html = html.replace(/\/\/.*$/gm, (match) => keep("com", match));
+          html = html.replace(/"(?:\\.|[^"\\])*"/g, (match) =>
+            keep("str", match),
+          );
+          html = html.replace(
+            /\b(use|fn|let|mut|pub|struct|enum|impl|trait|for|in|if|else|match|return|async|await|move|const|static|where|as)\b/g,
+            '<span class="kw">$1</span>',
+          );
+          html = html.replace(
+            /\b(Result|Ok|Err|Some|None|Repository|ObjectId|CommitOptions|FetchOptions|PushOptions)\b/g,
+            '<span class="type">$1</span>',
+          );
+          html = html.replace(
+            /\b([a-z_][a-zA-Z0-9_]*)\s*(?=\()/g,
+            '<span class="fn-name">$1</span>',
+          );
+          html = html.replace(
+            /\b\d+(?:\.\d+)?\b/g,
+            '<span class="numlit">$&</span>',
+          );
+          return html.replace(
+            /[\ue000-\ue0ff]/g,
+            (key) => tokens[key.charCodeAt(0) - 0xe000],
+          );
+        }
+
+        function linkApiDocs(line) {
+          return line.replace(
+            /(https:\/\/docs\.rs\/grit-lib\/latest\/grit_lib\/[^\s<]+)/,
+            '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>',
+          );
+        }
+
+        function renderEditor(source) {
+          return source
+            .trimEnd()
+            .split("\n")
+            .map((rawLine, index) => {
+              const line = linkApiDocs(highlightRust(rawLine));
+              const text = line.length ? line : " ";
+              return (
+                '<span class="code-line"><span class="line-num">' +
+                (index + 1) +
+                '</span><span class="line-text">' +
+                text +
+                "</span></span>"
+              );
+            })
+            .join("");
         }
 
         function closeModal() {
@@ -1615,28 +1901,80 @@ grit-lib = <span class="string">"0.1"</span>
           if (lastFocus) lastFocus.focus();
         }
 
-        async function openModal(link) {
-          lastFocus = link;
+        function titleFromPath(path) {
+          return path
+            .replace(/^examples\//, "")
+            .replace(/\.rs$/, "")
+            .split("-")
+            .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+            .join(" ");
+        }
+
+        const examples = Array.from(
+          document.querySelectorAll("[data-example]"),
+        ).reduce((items, link) => {
           const path = link.getAttribute("data-example");
-          title.textContent = link.getAttribute("data-example-title") || link.textContent.trim();
+          if (!path || items.some((item) => item.path === path)) return items;
+          items.push({
+            path,
+            title:
+              link.getAttribute("data-example-title") ||
+              link.textContent.trim(),
+            link,
+          });
+          return items;
+        }, []);
+        Object.keys(inlineExamples).forEach((path) => {
+          if (examples.some((example) => example.path === path)) return;
+          examples.push({ path, title: titleFromPath(path), link: null });
+        });
+
+        function setActiveExample(path) {
+          exampleList.querySelectorAll("button").forEach((button) => {
+            button.classList.toggle(
+              "active",
+              button.getAttribute("data-example-path") === path,
+            );
+          });
+        }
+
+        async function openExample(example, focusSource) {
+          if (focusSource) lastFocus = focusSource;
+          const path = example.path;
+          title.textContent = example.title;
+          setActiveExample(path);
           code.textContent = "Loading " + path + "…";
           modal.hidden = false;
           document.body.style.overflow = "hidden";
           try {
+            if (Object.prototype.hasOwnProperty.call(inlineExamples, path)) {
+              code.innerHTML = renderEditor(inlineExamples[path]);
+              return;
+            }
             const response = await fetch(path);
             if (!response.ok) throw new Error("missing");
             const source = await response.text();
-            code.innerHTML = highlightRust(source.trimEnd());
+            code.innerHTML = renderEditor(source);
           } catch (error) {
-            code.textContent = "Add an example at docs/" + path + " to show it here.";
+            code.textContent =
+              "Add an example at docs/" + path + " to show it here.";
           }
         }
 
-        document.querySelectorAll("[data-example]").forEach((link) => {
-          link.addEventListener("click", (event) => {
-            event.preventDefault();
-            openModal(link);
-          });
+        examples.forEach((example) => {
+          const button = document.createElement("button");
+          button.type = "button";
+          button.textContent = example.title;
+          button.setAttribute("data-example-path", example.path);
+          button.addEventListener("click", () => openExample(example));
+          exampleList.appendChild(button);
+
+          if (example.link) {
+            example.link.addEventListener("click", (event) => {
+              event.preventDefault();
+              openExample(example, example.link);
+            });
+          }
         });
         modal.querySelectorAll("[data-example-close]").forEach((button) => {
           button.addEventListener("click", closeModal);

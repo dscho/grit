@@ -1,11 +1,10 @@
-use grit_lib::Repository;
+// API docs: https://docs.rs/grit-lib/latest/grit_lib/diff/enum.DiffStatus.html
+use grit_lib::diff::DiffStatus;
 
-fn main() -> anyhow::Result<()> {
-    let repo = Repository::open(".")?;
-    let status = repo.status()?;
+fn main() {
+    let statuses = [DiffStatus::Added, DiffStatus::Modified, DiffStatus::Deleted];
 
-    for entry in status.entries() {
-        println!("{} {}", entry.kind(), entry.path().display());
+    for status in statuses {
+        println!("{}", status.letter());
     }
-    Ok(())
 }

@@ -1,11 +1,13 @@
-use grit_lib::Repository;
+// API docs: https://docs.rs/grit-lib/latest/grit_lib/reflog/index.html
+use grit_lib::reflog::{reflog_path, read_reflog};
+use std::path::Path;
 
-fn main() -> anyhow::Result<()> {
-    let repo = Repository::open(".")?;
+fn main() -> grit_lib::error::Result<()> {
+    let git_dir = Path::new(".git");
+    println!("HEAD reflog path: {}", reflog_path(git_dir, "HEAD").display());
 
-    repo.reflogs().append("HEAD", "checkout: moving to main")?;
-    for entry in repo.reflogs().read("HEAD")? {
-        println!("{} {}", entry.new_oid(), entry.message());
+    for entry in read_reflog(git_dir, "HEAD")?.iter().take(5) {
+        println!("{} -> {} {}", entry.old_oid, entry.new_oid, entry.message);
     }
     Ok(())
 }

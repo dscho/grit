@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import json
 import subprocess
 import sys
 import urllib.parse
@@ -18,6 +19,7 @@ OUT_INDEX = REPO / "docs" / "progress" / "index.html"
 OUT_FILES = REPO / "docs" / "testfiles.html"
 OUT_SVG = REPO / "docs" / "test-progress.svg"
 OUT_HOME = REPO / "docs" / "index.html"
+DOC_EXAMPLES = REPO / "docs" / "examples"
 
 # Published site root (GitHub Pages) for absolute og/twitter image URLs on index.html.
 GITHUB_PAGES_SITE = "https://schacon.github.io/grit"
@@ -305,7 +307,7 @@ def generate_homepage_progress_section(rows: list[dict[str, str]]) -> str:
         <div class="split">
           <div>
             <span class="num">Current status</span>
-            <h2>Passing the Git Test Suite</h2>
+            <h2>Git Test Suite Progress</h2>
             <p class="section-intro">
               Grit is tracked against the upstream Git harness. The generated
               dashboard shows pass rate by family, skipped files, and per-file
@@ -373,8 +375,31 @@ def generate_homepage_progress_section(rows: list[dict[str, str]]) -> str:
       </section>"""
 
 
+def load_homepage_examples() -> dict[str, str]:
+    """Return docs/examples/*.rs content keyed by the browser-visible path."""
+    return {
+        f"examples/{path.name}": path.read_text(encoding="utf-8")
+        for path in sorted(DOC_EXAMPLES.glob("*.rs"))
+    }
+
+
+def refresh_homepage_inline_examples(text: str) -> str:
+    """Replace the inline example cache in docs/index.html from docs/examples."""
+    start_marker = "        const inlineExamples = "
+    end_marker = ";\n        let lastFocus"
+    start = text.find(start_marker)
+    if start == -1:
+        raise RuntimeError(f"Could not find inline example cache start in {OUT_HOME}")
+    value_start = start + len(start_marker)
+    end = text.find(end_marker, value_start)
+    if end == -1:
+        raise RuntimeError(f"Could not find inline example cache end in {OUT_HOME}")
+    examples_json = json.dumps(load_homepage_examples(), indent=10)
+    return text[:value_start] + examples_json + text[end:]
+
+
 def update_homepage_index(rows: list[dict[str, str]]) -> None:
-    """Replace the progress section in docs/index.html with generated metrics."""
+    """Replace homepage generated sections and inline examples from source files."""
     text = OUT_HOME.read_text(encoding="utf-8")
     start_marker = '      <section class="wrap section progress-section" id="progress">'
     end_marker = '\n\n      <section class="wrap section" id="why">'
@@ -389,6 +414,7 @@ def update_homepage_index(rows: list[dict[str, str]]) -> None:
         + generate_homepage_progress_section(rows)
         + text[end:]
     )
+    updated = refresh_homepage_inline_examples(updated)
     OUT_HOME.write_text(updated, encoding="utf-8")
 
 

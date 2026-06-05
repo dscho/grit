@@ -1,10 +1,10 @@
-use grit_lib::Repository;
+// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_list/index.html
+use grit_lib::rev_list::{split_revision_token, RevListOptions};
 
-fn main() -> anyhow::Result<()> {
-    let repo = Repository::open(".")?;
+fn main() {
+    let (positive, negative) = split_revision_token("main..feature");
+    let options = RevListOptions::default();
 
-    for commit in repo.log("HEAD")?.take(10) {
-        println!("{} {}", commit.id().short(12), commit.summary());
-    }
-    Ok(())
+    println!("include {positive:?}, exclude {negative:?}");
+    println!("reverse output? {}", options.reverse);
 }

@@ -1,10 +1,10 @@
-use grit_lib::Repository;
+// API docs: https://docs.rs/grit-lib/latest/grit_lib/rev_list/enum.ObjectFilter.html
+use grit_lib::rev_list::ObjectFilter;
 
-fn main() -> anyhow::Result<()> {
-    let repo = Repository::open(".")?;
+fn main() -> Result<(), String> {
+    let filter = ObjectFilter::parse("blob:limit=1m")?;
 
-    for commit in repo.rev_walk(["HEAD"])? {
-        println!("{} {}", commit.id(), commit.summary());
-    }
+    println!("small blob included? {}", filter.includes_blob(512));
+    println!("large blob included? {}", filter.includes_blob(2 * 1024 * 1024));
     Ok(())
 }

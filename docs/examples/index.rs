@@ -1,12 +1,7 @@
-use grit_lib::Repository;
+// API docs: https://docs.rs/grit-lib/latest/grit_lib/index/struct.Index.html
+use grit_lib::index::Index;
 
-fn main() -> anyhow::Result<()> {
-    let repo = Repository::open(".")?;
-    let mut index = repo.index().read()?;
-
-    for entry in index.entries() {
-        println!("{} {}", entry.mode(), entry.path().display());
-    }
-    index.write()?;
-    Ok(())
+fn main() {
+    let index = Index::new();
+    println!("empty index has {} entries", index.entries.len());
 }
