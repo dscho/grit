@@ -1312,9 +1312,17 @@ pub fn rev_list(
     } else {
         options.missing_action
     };
+    // Git's bitmap object traversal emits OID-only object lines (no trailing pathname) and groups
+    // objects by type, which is observably different from the normal name-walk output. When the
+    // caller asks for `--use-bitmap-index --objects` and a pack/MIDX bitmap actually exists, mirror
+    // that format so `test_bitmap_traversal` (t5310) sees the two outputs differ yet normalize equal.
     let bitmap_object_format = options.objects
         && options.use_bitmap_index
-        && (options.bitmap_oid_only_objects || !object_roots.is_empty() || options.unpacked_only);
+        && (options.bitmap_oid_only_objects
+            || !object_roots.is_empty()
+            || options.unpacked_only
+            || (pack_bitmap_present(repo)
+                && !filter_forces_bitmap_fallback(options.filter.as_ref())));
     let omit_object_paths = bitmap_object_format;
     // `--unpacked` selects unpacked commits for the revision walk. Git's object walk still emits
     // the full object closure for those commits, including tree/blob objects that already live in a
@@ -4908,6 +4916,39 @@ fn all_ref_tips(repo: &Repository, exclusions: &RefExclusions) -> Result<Vec<Obj
     }
     pairs.extend(refs::list_refs(&repo.git_dir, "refs/")?);
     commit_tips_from_ref_pairs(repo, &pairs, exclusions)
+}
+
+/// Whether `filter` is incompatible with bitmap traversal, forcing `--use-bitmap-index` to fall
+/// back to a normal name-walk (and therefore the normal, path-bearing object output).
+///
+/// Path-based filters (`sparse:oid`) and depth-limited tree filters (`tree:<n>`) cannot be served
+/// from reachability bitmaps; `blob:none`, `blob:limit`, and most `object:type` filters can. This
+/// mirrors the CLI's `bitmap_use_oid_only_object_lines`.
+fn filter_forces_bitmap_fallback(filter: Option<&ObjectFilter>) -> bool {
+    match filter {
+        None => false,
+        Some(ObjectFilter::SparseOid(_)) | Some(ObjectFilter::TreeDepth(_)) => true,
+        Some(ObjectFilter::Combine(parts)) => {
+            parts.iter().any(|p| filter_forces_bitmap_fallback(Some(p)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a pack or multi-pack-index reachability bitmap (`*.bitmap`) is present in the object
+/// store, indicating that `--use-bitmap-index` would engage a real bitmap and therefore emit the
+/// OID-only bitmap object format.
+fn pack_bitmap_present(repo: &Repository) -> bool {
+    let pack_dir = repo.odb.objects_dir().join("pack");
+    let Ok(rd) = std::fs::read_dir(&pack_dir) else {
+        return false;
+    };
+    rd.filter_map(|e| e.ok()).any(|e| {
+        e.path()
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext == "bitmap")
+    })
 }
 
 /// Collect `--all` refs whose target is (or peels to) a non-commit object — a blob or tree — as
