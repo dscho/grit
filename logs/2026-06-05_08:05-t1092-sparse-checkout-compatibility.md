@@ -72,3 +72,7 @@
   treats that as a failed checkout unless `-f` is provided, so the command now returns an error in
   that path while preserving the force behavior.
 - Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `85/106`.
+- Subtest 52 (`clean`) removed the empty sparse-present `folder1` directory after deleting its
+  ignored file. Empty-parent pruning now stops at directories that are tracked prefixes in the
+  index, including skip-worktree sparse entries.
+- Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `86/106`.
