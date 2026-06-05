@@ -3933,6 +3933,8 @@ fn do_rebase(
         true
     } else if args.no_fork_point {
         false
+    } else if args.keep_base > 0 {
+        false
     } else {
         let cfg_default = config
             .get_bool("rebase.forkPoint")
@@ -4067,10 +4069,12 @@ Use '--' to separate paths from revisions, like this:\n\
         && !args.autosquash
         && !date_options_force_replay;
 
-    // `rebase --keep-base` with fork-point uses a different upstream OID for the replay list than
-    // the branch tip; preemptive fast-forward detection wrongly treats the branch as up-to-date
-    // (t3431 `--fork-point --keep-base`).
-    let skip_preemptive_ff_for_keep_base_fork_point = upstream_tip_oid != upstream_oid;
+    // `rebase --fork-point --keep-base` can use different commits for the replay range and the
+    // new base. If the fork point is not the same as `onto`, preemptive fast-forward detection
+    // would incorrectly treat the branch as up-to-date and skip required replay (t3431). When
+    // `onto` is the fork point, the preemptive noop path is valid (t3432).
+    let skip_preemptive_ff_for_keep_base_fork_point =
+        args.keep_base > 0 && upstream_tip_oid != upstream_oid && onto_oid != upstream_oid;
 
     if allow_preemptive_ff
         && !root_rebase_no_onto
@@ -4378,6 +4382,7 @@ Use '--' to separate paths from revisions, like this:\n\
     fs::write(rb_dir.join("onto"), onto_oid.to_hex())?;
     if !args.root {
         fs::write(rb_dir.join("upstream"), upstream_oid.to_hex())?;
+        fs::write(rb_dir.join("upstream-tip"), upstream_tip_oid.to_hex())?;
     }
     fs::write(rb_dir.join("onto-name"), format!("{onto_name_for_state}\n"))?;
     fs::write(
@@ -5783,6 +5788,11 @@ fn rebase_upstream_oid(rb_dir: &Path) -> Option<ObjectId> {
     ObjectId::from_hex(s.trim()).ok()
 }
 
+fn rebase_upstream_tip_oid(rb_dir: &Path) -> Option<ObjectId> {
+    let s = fs::read_to_string(rb_dir.join("upstream-tip")).ok()?;
+    ObjectId::from_hex(s.trim()).ok()
+}
+
 fn rebase_onto_oid_from_state(rb_dir: &Path) -> Option<ObjectId> {
     let s = fs::read_to_string(rb_dir.join("onto")).ok()?;
     ObjectId::from_hex(s.trim()).ok()
@@ -6006,10 +6016,16 @@ fn cherry_pick_for_rebase(
                     (Some(u), Some(o)) => u == o,
                     _ => false,
                 };
+                let rebase_range_starts_at_upstream_tip =
+                    match (rebase_upstream_oid(rb_dir), rebase_upstream_tip_oid(rb_dir)) {
+                        (Some(u), Some(tip)) => u == tip,
+                        _ => true,
+                    };
                 let single_noop_same_tip = force_rewrite_commits
                     && !rebase_signoff(rb_dir)
                     && ws_fix_rule.is_none()
                     && upstream_matches_onto
+                    && rebase_range_starts_at_upstream_tip
                     && rebase_initial_todo_count(rb_dir) == Some(1)
                     && rebase_orig_head_oid(rb_dir).as_ref() == Some(commit_oid);
 
