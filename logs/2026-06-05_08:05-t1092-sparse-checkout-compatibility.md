@@ -35,3 +35,10 @@
   error. Narrowed the unmatched pathspec behavior accordingly.
 - Direct execution now passes through subtest 35 and stops at read-tree subtest 36. Canonical
   harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `74/106`.
+- The read-tree failure was `read-tree -m -u base HEAD update-folder2` rejecting sparse checkouts
+  because `require_uptodate` treated missing skip-worktree entries as local changes. Missing
+  skip-worktree paths are intentionally up to date in sparse checkouts, so `read-tree` now accepts
+  them while still checking present files.
+- Direct execution now passes through subtest 41 and stops at subtest 42
+  (`merge, cherry-pick, and rebase`). Canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `78/106`.
