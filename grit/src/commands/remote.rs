@@ -233,6 +233,17 @@ fn remote_section_exists(config: &ConfigSet, name: &str) -> bool {
     config.entries().iter().any(|e| e.key.starts_with(&prefix))
 }
 
+/// Whether a remote named `name` is configured in the **repository-level** config file (Git's
+/// `remote_is_configured(..., in_repo=1)`), ignoring global/system config.
+fn remote_configured_in_repo(git_dir: &Path, name: &str) -> Result<bool> {
+    let config_path = git_dir.join("config");
+    let Some(cfg) = ConfigFile::from_path(&config_path, ConfigScope::Local)? else {
+        return Ok(false);
+    };
+    let prefix = format!("remote.{name}.");
+    Ok(cfg.entries.iter().any(|e| e.key.starts_with(&prefix)))
+}
+
 fn check_remote_name_collision(config: &ConfigSet, name: &str) -> Result<()> {
     for other in collect_remote_names_from_config(config) {
         if other == name {
@@ -695,7 +706,9 @@ fn reverse_map_src(dst_pat: &str, src_pat: &str, local_ref: &str) -> Option<Stri
 
 fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     let mut i = 0usize;
+    let mut show_progress = false;
     while i < rest.len() && (rest[i] == "--progress" || rest[i] == "--no-progress") {
+        show_progress = rest[i] == "--progress";
         i += 1;
     }
     let rest = &rest[i..];
@@ -714,7 +727,9 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
             message: format!("error: No such remote: '{old}'"),
         }));
     }
-    if remote_section_exists(&config, &new) {
+    // Git's collision check uses `remote_is_configured(..., in_repo=1)`: a remote that exists only
+    // via global/system config (e.g. a stray `remote.<new>.prune`) does not block the rename.
+    if remote_configured_in_repo(&git_dir, &new)? {
         return Err(anyhow::Error::new(ExplicitExit {
             code: 3,
             message: format!("error: remote {new} already exists."),
@@ -726,32 +741,33 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
             message: format!("fatal: '{new}' is not a valid remote name"),
         }));
     }
-    check_remote_name_collision(&config, &new)?;
+    // Git's `mv` does NOT run the subset/superset collision check (that is only for `add`), so
+    // nesting a remote into itself (`parent` -> `parent/child`) is permitted.
 
-    let old_dir = git_dir.join("refs/remotes").join(&old);
-    let new_dir = git_dir.join("refs/remotes").join(&new);
-    if new_dir.exists() {
-        let mut conflict = false;
-        if old_dir.is_dir() {
-            for e in std::fs::read_dir(&old_dir)
-                .with_context(|| format!("read {}", old_dir.display()))?
-            {
-                let e = e?;
-                let name = e.file_name().to_string_lossy().to_string();
-                if new_dir.join(&name).exists() {
-                    conflict = true;
-                    break;
-                }
-            }
-        }
-        if conflict {
-            bail!(
-                "renaming remote references failed: The remote you are trying to rename has conflicting references in the\n\
-                 new target refspec. This is most likely caused by you trying to nest\n\
-                 one remote in another, which is not supported."
-            );
-        }
-    }
+    let old_prefix = format!("refs/remotes/{old}/");
+    let new_prefix = format!("refs/remotes/{new}/");
+
+    // Capture every loose tracking ref under the old remote (with its symref target, if any) before
+    // any mutation, so the move can be performed ref-by-ref. This handles nesting a remote into
+    // itself (`parent` -> `parent/child`) where a plain directory rename would be impossible, and
+    // captures broken/unborn symrefs (e.g. HEAD -> a nonexistent branch) that `list_refs` skips.
+    let old_remote_dir = git_dir.join("refs/remotes").join(&old);
+    let refs_to_move = collect_loose_remote_refs(&old_remote_dir, &git_dir);
+
+    // Detect a ref-namespace conflict (Git's transaction prepare failing with NAME_CONFLICT): a new
+    // ref name that collides with an existing ref as a prefix/suffix. Renaming into itself only
+    // conflicts when a sibling ref already occupies the nested path. Git renames the config section
+    // *before* this transaction, so on conflict the config rename is left in place (the failed
+    // `git remote rename` still leaves `remote.<new>` configured); compute the flag now but defer
+    // the error until after the config is written.
+    let has_ref_conflict = refs_to_move.iter().any(|(old_ref, _, _)| {
+        let Some(tail) = old_ref.strip_prefix(&old_prefix) else {
+            return false;
+        };
+        let new_ref = format!("{new_prefix}{tail}");
+        new_ref != *old_ref
+            && ref_name_conflicts(&git_dir, &new_ref, &refs_to_move, &old_prefix, &new_prefix)
+    });
 
     let config_path = git_dir.join("config");
     let mut config_file = load_or_create_config_file(&config_path)?;
@@ -761,8 +777,10 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
         bail!("No such remote: '{old}'");
     }
 
-    let old_refspec_target = format!("refs/remotes/{old}/*");
-    let new_fetch_default = format!("+refs/heads/*:refs/remotes/{new}/*");
+    // Git only rewrites refspecs (and renames refs) when at least one fetch refspec maps into the
+    // old remote's tracking namespace (`:refs/remotes/<old>/`). Each such refspec has `<old>`
+    // replaced with `<new>` just after `:refs/remotes/`; others are left alone with a warning.
+    let old_remote_context = format!(":refs/remotes/{old}/");
     let fetch_key = format!("remote.{new}.fetch");
     let current_fetch: Vec<String> = config_file
         .entries
@@ -770,10 +788,24 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
         .filter(|e| e.key == fetch_key)
         .filter_map(|e| e.value.clone())
         .collect();
-    for val in &current_fetch {
-        if val.contains(&old_refspec_target) {
-            config_file.set(&fetch_key, &new_fetch_default)?;
-            break;
+    let refspecs_need_update = current_fetch
+        .iter()
+        .any(|v| v.contains(&old_remote_context));
+
+    if !current_fetch.is_empty() {
+        config_file.unset(&fetch_key)?;
+        for raw in &current_fetch {
+            let new_val = if let Some(pos) = raw.find(&old_remote_context) {
+                let head = &raw[..pos + ":refs/remotes/".len()];
+                let tail = &raw[pos + old_remote_context.len()..];
+                format!("{head}{new}/{tail}")
+            } else {
+                eprintln!(
+                    "warning: Not updating non-default fetch refspec\n\t{raw}\n\tPlease update the configuration manually if necessary."
+                );
+                raw.clone()
+            };
+            config_file.add_value(&fetch_key, &new_val)?;
         }
     }
 
@@ -782,38 +814,159 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
 
     config_file.write().context("writing config")?;
 
-    let old_prefix = format!("refs/remotes/{old}/");
-    let refs_before = if old_dir.is_dir() {
-        refs::list_refs(&git_dir, &old_prefix)?
-    } else {
-        Vec::new()
-    };
+    // The config section is now renamed (matching Git). If the ref transaction would fail with a
+    // name conflict, stop here without moving any refs.
+    if has_ref_conflict {
+        bail!(
+            "renaming remote references failed: The remote you are trying to rename has conflicting references in the\n\
+             new target refspec. This is most likely caused by you trying to nest\n\
+             one remote in another, which is not supported."
+        );
+    }
 
-    if old_dir.is_dir() {
-        std::fs::create_dir_all(git_dir.join("refs/remotes"))?;
-        let _ = std::fs::rename(&old_dir, &new_dir);
+    // Only rewrite refs when at least one fetch refspec maps into the old tracking namespace.
+    if !refspecs_need_update {
+        return Ok(());
+    }
+
+    // Emit the trace2 progress region Git surrounds the ref renames with (t5505 `test_region`).
+    if show_progress {
+        if let Ok(trace) = std::env::var("GIT_TRACE2_EVENT") {
+            let _ = crate::trace2_region_json(&trace, "progress", "Renaming remote references");
+        }
     }
 
     let identity = git_identity_line()?;
-    let new_prefix = format!("refs/remotes/{new}/");
-    for (old_ref, oid) in refs_before {
+    // Delete every old ref first so nesting `parent` into `parent/child` does not leave a file
+    // blocking the new directory, then recreate at the renamed path.
+    for (old_ref, _, _) in &refs_to_move {
+        let _ = refs::delete_ref(&git_dir, old_ref);
+    }
+    for (old_ref, oid, sym) in &refs_to_move {
         let Some(tail) = old_ref.strip_prefix(&old_prefix) else {
             continue;
         };
         let new_ref = format!("{new_prefix}{tail}");
+        if let Some(target) = sym {
+            // Re-point the symref's target into the new namespace when it referenced the old one.
+            let new_target = target
+                .strip_prefix(&old_prefix)
+                .map(|t| format!("{new_prefix}{t}"))
+                .unwrap_or_else(|| target.clone());
+            refs::write_symbolic_ref(&git_dir, &new_ref, &new_target)?;
+            continue;
+        }
+        let Some(oid) = oid else {
+            continue;
+        };
+        refs::write_ref(&git_dir, &new_ref, oid)?;
+        // Move the existing reflog (if any) to the new ref, then append the rename entry with the
+        // ref's current OID for both old and new value (matching Git's reflog rename).
+        move_reflog_file(&git_dir, old_ref, &new_ref);
         let msg = format!("remote: renamed {old_ref} to {new_ref}");
-        refs::append_reflog(
-            &git_dir,
-            &new_ref,
-            &ObjectId::zero(),
-            &oid,
-            &identity,
-            &msg,
-            true,
-        )?;
+        refs::append_reflog(&git_dir, &new_ref, oid, oid, &identity, &msg, true)?;
     }
 
     Ok(())
+}
+
+/// Move the loose reflog file from `old_ref` to `new_ref` under `.git/logs/`, if it exists.
+fn move_reflog_file(git_dir: &Path, old_ref: &str, new_ref: &str) {
+    let old_log = git_dir.join("logs").join(old_ref);
+    let new_log = git_dir.join("logs").join(new_ref);
+    if !old_log.is_file() {
+        return;
+    }
+    if let Some(parent) = new_log.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::rename(&old_log, &new_log);
+}
+
+/// Whether creating `new_ref` would clash with an existing ref in the store as a name-prefix or
+/// name-suffix (Git's `REF_TRANSACTION_ERROR_NAME_CONFLICT`). Refs in `refs_to_move` are excluded
+/// because they are being deleted as part of the same rename; their *renamed* destinations are the
+/// only ones that could legitimately clash.
+fn ref_name_conflicts(
+    git_dir: &Path,
+    new_ref: &str,
+    refs_to_move: &[(String, Option<ObjectId>, Option<String>)],
+    old_prefix: &str,
+    new_prefix: &str,
+) -> bool {
+    // Destinations of all moved refs.
+    let dests: Vec<String> = refs_to_move
+        .iter()
+        .filter_map(|(r, _, _)| {
+            r.strip_prefix(old_prefix)
+                .map(|t| format!("{new_prefix}{t}"))
+        })
+        .collect();
+    let conflicts_with = |other: &str| -> bool {
+        other != new_ref
+            && (other.starts_with(&format!("{new_ref}/"))
+                || new_ref.starts_with(&format!("{other}/")))
+    };
+    // A moved ref's old name (which occupies its directory path until deleted) being a strict
+    // prefix of the destination is a D/F conflict Git rejects even within one transaction
+    // (e.g. delete `parent/child`, create `parent/child/child`).
+    if refs_to_move
+        .iter()
+        .any(|(old_name, _, _)| new_ref.starts_with(&format!("{old_name}/")))
+    {
+        return true;
+    }
+    // A moved ref's destination clashing with another destination.
+    if dests.iter().any(|o| conflicts_with(o)) {
+        return true;
+    }
+    // An existing ref (not being moved away) clashing with the destination.
+    let Ok(all) = refs::list_refs(git_dir, "refs/remotes/") else {
+        return false;
+    };
+    all.iter()
+        .map(|(r, _)| r.as_str())
+        .filter(|r| !refs_to_move.iter().any(|(m, _, _)| m == r))
+        .any(conflicts_with)
+}
+
+/// Walk a `refs/remotes/<old>/` directory and return every loose ref as `(full_name, oid, symref)`.
+///
+/// Symbolic refs yield `(name, None, Some(target))`; direct refs yield `(name, Some(oid), None)`.
+/// Broken/unborn symrefs (whose target does not exist) are still captured, unlike `list_refs`.
+fn collect_loose_remote_refs(
+    dir: &Path,
+    git_dir: &Path,
+) -> Vec<(String, Option<ObjectId>, Option<String>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(git_dir) else {
+                continue;
+            };
+            let refname = rel.to_string_lossy().replace('\\', "/");
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let content = content.trim();
+            if let Some(target) = content.strip_prefix("ref: ") {
+                out.push((refname, None, Some(target.trim().to_owned())));
+            } else if let Ok(oid) = ObjectId::from_hex(content) {
+                out.push((refname, Some(oid), None));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 fn git_identity_line() -> Result<String> {
@@ -858,7 +1011,8 @@ fn rename_branch_config_remote(config_file: &mut ConfigFile, old: &str, new: &st
             .and_then(|e| e.value.as_deref())
             == Some(old)
         {
-            config_file.set(&pkey, new)?;
+            // Write the canonical camelCase variable name Git uses (t5505 greps for `pushRemote`).
+            config_file.set(&format!("branch.{b}.pushRemote"), new)?;
         }
     }
     Ok(())
@@ -874,7 +1028,8 @@ fn update_push_default_if_local(config_file: &mut ConfigFile, old: &str, new: &s
         .and_then(|e| e.value.as_deref())
         == Some(old)
     {
-        config_file.set(key, new)?;
+        // Preserve Git's camelCase variable name `pushDefault` (t5505 greps for it).
+        config_file.set("remote.pushDefault", new)?;
     }
     Ok(())
 }
