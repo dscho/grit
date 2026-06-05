@@ -6951,7 +6951,6 @@ fn run_test_tool_dump_fsmonitor() -> Result<()> {
 
 /// `test-tool read-cache` — minimal helper for fsmonitor/read-cache tests.
 fn run_test_tool_read_cache(rest: &[String]) -> Result<()> {
-    use grit_lib::index::Index;
     use grit_lib::repo::Repository;
 
     let mut count: usize = 1;
@@ -6971,7 +6970,7 @@ fn run_test_tool_read_cache(rest: &[String]) -> Result<()> {
         let repo = Repository::discover(None).context("not a git repository")?;
         if let Some(path) = print_and_refresh.as_deref() {
             let _ = crate::commands::update_index::run_refresh_quiet(&repo);
-            let index = Index::load(&repo.index_path()).context("read index")?;
+            let index = repo.load_index().context("read index")?;
             let rel = path.as_bytes();
             let is_up_to_date = index
                 .get(rel, 0)

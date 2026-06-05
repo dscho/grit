@@ -167,9 +167,9 @@ impl IndexEntry {
     /// In-memory and on-disk compatibility bit for fsmonitor validity (`git ls-files -f`).
     const FLAG_EXT_FSMONITOR_VALID: u16 = 0x1000;
     /// Extended flags Git persists in index v3 (`CE_EXTENDED_FLAGS` in `read-cache-ll.h`).
-    const FLAG_EXT_ON_DISK: u16 = 0x2000 | 0x4000;
+    const FLAG_EXT_ON_DISK: u16 = Self::FLAG_EXT_FSMONITOR_VALID | 0x2000 | 0x4000;
 
-    /// Extended flag bits safe to write to a Git-compatible on-disk index (excludes fsmonitor).
+    /// Extended flag bits safe to write to a Git-compatible on-disk index.
     fn disk_flags_extended(fe: u16) -> u16 {
         fe & Self::FLAG_EXT_ON_DISK
     }

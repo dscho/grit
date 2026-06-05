@@ -118,8 +118,9 @@ pub(crate) fn entries_equal_for_split(a: &IndexEntry, b: &IndexEntry) -> bool {
     let mask: u16 = 0xF000 | 0x8000;
     let a_flags = a.flags & mask;
     let b_flags = b.flags & mask;
-    let a_ext = a.flags_extended.unwrap_or(0) & 0xFFF;
-    let b_ext = b.flags_extended.unwrap_or(0) & 0xFFF;
+    let ext_mask: u16 = 0x7000;
+    let a_ext = a.flags_extended.unwrap_or(0) & ext_mask;
+    let b_ext = b.flags_extended.unwrap_or(0) & ext_mask;
     a.ctime_sec == b.ctime_sec
         && a.ctime_nsec == b.ctime_nsec
         && a.mtime_sec == b.mtime_sec

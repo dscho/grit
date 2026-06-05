@@ -302,7 +302,7 @@ fn is_fsmonitor_disabled_in_cli(config: &ConfigSet) -> bool {
 /// Run the configured fsmonitor hook (`core.fsmonitor`) and return `(new_token, reported_paths)`.
 ///
 /// The hook is invoked with Git-compatible argv shape: `hook 2 <last_update_token>`.
-fn query_status_fsmonitor_paths(
+pub(crate) fn query_status_fsmonitor_paths(
     work_tree: &Path,
     config: &ConfigSet,
     last_update_token: Option<&str>,
@@ -343,7 +343,10 @@ fn query_status_fsmonitor_paths(
     parse_fsmonitor_payload(&output.stdout)
 }
 
-fn fsmonitor_reported_path_matches(path: &str, reported: &BTreeSet<Vec<u8>>) -> bool {
+pub(crate) fn fsmonitor_reported_path_matches(path: &str, reported: &BTreeSet<Vec<u8>>) -> bool {
+    if reported.contains(b"/".as_slice()) {
+        return true;
+    }
     let path_bytes = path.as_bytes();
     if reported.contains(path_bytes) {
         return true;
