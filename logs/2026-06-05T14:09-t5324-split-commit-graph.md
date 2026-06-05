@@ -52,7 +52,22 @@ Ticket: fba897. Subsystem: pack-storage (commit-graph machinery).
 - --split=replace with --stdin-commits must NOT import the old chain's commits
   (only the seeds' closure). Test 31. (Flaky in shared-binary runs but verified.)
 
-## Remaining failures (5): 13, 15, 25, 26, 40.
+## Fourth batch (38/42)
+- expire_commit_graphs unlinks ANY `*.graph` file (not just `graph-<hash>.graph`)
+  that is not in the new chain and is older than the expire time; keep_set keyed
+  by full filename. Fixed test 15 (to-delete.graph expiry).
+
+## Remaining failures (4): 13, 25, 26, 40.
+- 13, 25: split chain spanning an ALTERNATE object dir. CommitGraphChain::load
+  reads layer files only from the local objects dir, so a chain whose base
+  layers live in the alternate doesn't load (wrong layer count on write/verify).
+  Needs alternate-aware layer resolution in the lib chain loader.
+- 26: read-path (log) must bounds-check the BASE chunk size against the layer's
+  base-graph count, warn "commit-graph base graphs chunk is too small", and fall
+  back to the ODB. Needs the warning + fallback in the chain loader used by log.
+- 40: deep multi-clone chain; mixed-merge-gdat ends up cloning a flattened
+  [103,8] chain so the FIFTH-layer write sees new_only=0. Likely an upstream
+  clone/merge-state divergence in the 37-40 dependency chain.
 - 13, 25: alternates — chain spans an alternate object dir; CommitGraphChain::load
   only reads layer files from the local objects dir, so cross-alternate chains
   don't load/write the right number of layers.

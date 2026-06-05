@@ -904,7 +904,12 @@ fn cmd_write(
         // new chain (commit-graph.c:expire_commit_graphs). Only files older than
         // the expire time are removed; the just-written layer and kept base
         // layers are always retained.
-        let keep_set: HashSet<String> = chain_lines.iter().cloned().collect();
+        // The kept set holds the just-written layer + kept base layers, keyed by
+        // the `graph-<hash>.graph` filename (Git compares full filenames).
+        let keep_set: HashSet<String> = chain_lines
+            .iter()
+            .map(|h| format!("graph-{h}.graph"))
+            .collect();
         let expire_ts: Option<i64> = expire_time.and_then(parse_expire_time);
         if let Ok(read_dir) = fs::read_dir(&graphs_dir) {
             for entry in read_dir.flatten() {
@@ -912,13 +917,13 @@ fn cmd_write(
                 let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
                     continue;
                 };
-                let Some(h) = name
-                    .strip_prefix("graph-")
-                    .and_then(|s| s.strip_suffix(".graph"))
-                else {
+                // Git's expire_commit_graphs unlinks any `*.graph` file in the dir
+                // that is not part of the new chain and is older than the expire
+                // time (it matches the `.graph` suffix, not the `graph-` prefix).
+                if !name.ends_with(".graph") {
                     continue;
-                };
-                if keep_set.contains(h) {
+                }
+                if keep_set.contains(name) {
                     continue;
                 }
                 if let Some(ts) = expire_ts {
