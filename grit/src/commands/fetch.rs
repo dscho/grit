@@ -1318,6 +1318,28 @@ fn collect_wants_for_upload_pack(
         }
     }
 
+    // Explicit tag refspecs that map a `refs/tags/<name>` source to a `refs/tags/` destination —
+    // e.g. a `--single-branch --branch <tag>` clone's `+refs/tags/<tag>:refs/tags/<tag>` — must
+    // fetch the named tag's object even when tag auto-following is off (`tagOpt = --no-tags`). The
+    // heads loop above only covers `refs/heads/` sources. Restrict this to genuine `refs/tags/`
+    // sources whose destination is also under `refs/tags/` so we never request peeled `^{}`
+    // advertisement entries or other namespaces (t5515).
+    for rs in &effective_refspecs {
+        if rs.negative || !rs.src.starts_with("refs/tags/") || rs.src.contains('*') {
+            continue;
+        }
+        if !rs.dst.starts_with("refs/tags/") {
+            continue;
+        }
+        let Some(remote_oid) = refs::resolve_ref(remote_git_dir, &rs.src).ok() else {
+            continue;
+        };
+        if local_odb.exists(&remote_oid) {
+            continue;
+        }
+        crate::fetch_transport::push_want_unique(&mut wants, remote_oid);
+    }
+
     wants.dedup();
     Ok(wants)
 }
@@ -2936,6 +2958,13 @@ fn fetch_remote(
                     // opportunistic remote-tracking updates. Never synthesize `refs/remotes/<url>/*`,
                     // which would write malformed refs from the URL path (t5515 `main ../.git`).
                     Vec::new()
+                } else if config.get(&format!("remote.{remote_name}.url")).is_some()
+                    || config.get(&format!("remote.{remote_name}.pushurl")).is_some()
+                {
+                    // A configured remote with a url but no fetch refspec performs no opportunistic
+                    // remote-tracking updates (e.g. a `--single-branch` clone of a detached HEAD,
+                    // whose origin has only `url`). Match upstream's empty `remote->fetch`.
+                    Vec::new()
                 } else {
                     default_fetch_refspecs(remote_name)
                 };
@@ -3191,6 +3220,7 @@ fn fetch_remote(
     }
 
     if should_fetch_tags {
+        let cli_refspecs_parsed = parse_cli_fetch_refspecs(cli_refspecs);
         for (refname, remote_oid) in &remote_tags {
             let old_oid = read_ref_oid(git_dir, refname);
             if old_oid.as_ref() == Some(remote_oid) {
@@ -3198,22 +3228,37 @@ fn fetch_remote(
             }
 
             if let Some(old) = old_oid {
-                if old != *remote_oid && !should_force_tag_update(config, remote_name, args) {
-                    let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
-                    if !args.quiet {
-                        display.push(
-                            '!',
-                            "[rejected]",
-                            refname,
-                            refname,
-                            refname,
-                            old,
-                            *remote_oid,
-                            Some("would clobber existing tag"),
-                        );
+                if old != *remote_oid {
+                    // Distinguish an explicit tag refspec (force semantics, clobber rejection)
+                    // from opportunistic auto-follow (add-only: leave an existing local tag as is).
+                    let forced = match tag_update_kind(
+                        refname,
+                        args,
+                        &refspecs,
+                        &cli_refspecs_parsed,
+                    ) {
+                        TagUpdateKind::Opportunistic => continue,
+                        TagUpdateKind::Explicit { force } => {
+                            force || should_force_tag_update(config, remote_name, args)
+                        }
+                    };
+                    if !forced {
+                        let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
+                        if !args.quiet {
+                            display.push(
+                                '!',
+                                "[rejected]",
+                                refname,
+                                refname,
+                                refname,
+                                old,
+                                *remote_oid,
+                                Some("would clobber existing tag"),
+                            );
+                        }
+                        tag_clobber_failures.push(tag_name.to_owned());
+                        continue;
                     }
-                    tag_clobber_failures.push(tag_name.to_owned());
-                    continue;
                 }
             }
 
@@ -5724,6 +5769,49 @@ fn should_force_tag_update(config: &ConfigSet, remote_name: &str, args: &Args) -
         .unwrap_or(false)
 }
 
+/// How a tag should be updated during fetch.
+///
+/// Mirrors upstream Git's distinction between tags fetched through an *explicit* refspec
+/// (`--tags`, or a configured/CLI refspec whose destination lands under `refs/tags/`, e.g.
+/// `+refs/tags/two:refs/tags/two`) and tags that are merely *opportunistically auto-followed*
+/// because their target object was downloaded as part of a branch fetch.
+///
+/// Explicit tag updates honor force semantics: a non-fast-forward (a tag that moved) is rejected
+/// with `! [rejected] (would clobber existing tag)` unless the refspec is forced. Opportunistic
+/// auto-follow is strictly *add-only* — an existing local tag is left untouched (no update, no
+/// rejection, no error), matching `git fetch` against the default `+refs/heads/*:...` refspec.
+enum TagUpdateKind {
+    /// Tag is covered by an explicit tag refspec; `bool` is whether that refspec is forced.
+    Explicit { force: bool },
+    /// Tag is only opportunistically auto-followed (not covered by any explicit tag refspec).
+    Opportunistic,
+}
+
+/// Determine how `tag_refname` (a `refs/tags/...` ref) should be updated, given the active
+/// configured/CLI fetch refspecs and the `--tags` flag.
+fn tag_update_kind(
+    tag_refname: &str,
+    args: &Args,
+    configured_refspecs: &[FetchRefspec],
+    cli_refspecs: &[FetchRefspec],
+) -> TagUpdateKind {
+    // `--tags` behaves like an explicit `refs/tags/*:refs/tags/*` refspec (non-forced).
+    if args.tags {
+        return TagUpdateKind::Explicit { force: false };
+    }
+    for rs in cli_refspecs.iter().chain(configured_refspecs.iter()) {
+        if rs.negative {
+            continue;
+        }
+        if let Some(dst) = match_refspec_pattern(&rs.src, &rs.dst, tag_refname) {
+            if dst.starts_with("refs/tags/") {
+                return TagUpdateKind::Explicit { force: rs.force };
+            }
+        }
+    }
+    TagUpdateKind::Opportunistic
+}
+
 fn trace_ls_refs_head_prefix() {
     crate::trace_packet::trace_packet_line(b"fetch> ref-prefix HEAD");
 }
@@ -6173,12 +6261,22 @@ pub fn remote_fetch_refspecs(config: &ConfigSet, remote_name: &str) -> Vec<Fetch
     let specs = collect_refspecs(config, &key);
     let has_positive = specs.iter().any(|s| !s.negative);
     if has_positive {
-        specs
-    } else {
-        let mut out = default_fetch_refspecs(remote_name);
-        out.extend(specs);
-        out
+        return specs;
     }
+    // A configured remote that exists (has a `url`/`pushurl`) but carries no positive fetch
+    // refspec performs *no* opportunistic remote-tracking updates — matching upstream, where
+    // `remote->fetch` is left empty. (A `--single-branch` clone of a detached source HEAD writes
+    // exactly such a remote: only `url`, no `fetch`.) Only synthesize the default tracking spec
+    // for an otherwise-undefined remote name.
+    let url_key = format!("remote.{remote_name}.url");
+    let pushurl_key = format!("remote.{remote_name}.pushurl");
+    let remote_defined = config.get(&url_key).is_some() || config.get(&pushurl_key).is_some();
+    if remote_defined {
+        return specs;
+    }
+    let mut out = default_fetch_refspecs(remote_name);
+    out.extend(specs);
+    out
 }
 
 /// Returns true if a local (destination) ref is shielded from pruning by a negative refspec.
@@ -6955,25 +7053,16 @@ fn resolve_fetch_display_url(
 
 fn resolve_fetch_from_line_url(
     raw_url: &str,
-    url_override: Option<&str>,
-    remote_repo: Option<&Repository>,
-    default_display_url: &str,
+    _url_override: Option<&str>,
+    _remote_repo: Option<&Repository>,
+    _default_display_url: &str,
 ) -> String {
-    if url_override.is_none() && !crate::ssh_transport::is_configured_ssh_url(raw_url) {
-        if let Some(remote_repo) = remote_repo {
-            if let Ok(canon_remote) = canonical_repo_path(&remote_repo.git_dir) {
-                let mut s = canon_remote.to_string_lossy().to_string();
-                if let Some(prefix) = s.strip_suffix("/.git") {
-                    s = prefix.to_owned();
-                }
-                if !s.ends_with("/.") {
-                    s.push_str("/.");
-                }
-                return s;
-            }
-        }
-    }
-    default_display_url.to_owned()
+    // Git's `From <url>` header is the configured remote URL verbatim, only trimmed of trailing
+    // slashes and a `.git` suffix (builtin/fetch.c `display_state_init` -> `transport_anonymize_url`).
+    // It is NOT canonicalized and no `/.` is synthesized: `git clone .` stores the URL as `<cwd>/.`
+    // (see `absolute_clone_source_url` in clone.rs), so a superproject shows `From <cwd>/.` while a
+    // submodule whose URL is `<cwd>/submodule` shows `From <cwd>/submodule` with no trailing `/.`.
+    normalize_fetch_url_display(raw_url)
 }
 
 fn remotes_match_same_repository(git_dir: &Path, remote_repo: &Repository, url_str: &str) -> bool {

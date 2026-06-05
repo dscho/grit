@@ -2891,6 +2891,11 @@ fn run_add(args: &AddArgs) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    // Track whether we clone the submodule. Git only runs `checkout -f` (which detaches/repopulates
+    // the worktree) on the clone path; the "Adding existing repo" path leaves the existing worktree
+    // and its HEAD untouched (builtin/submodule--helper.c:add_submodule).
+    let mut did_clone = false;
+
     if sub_path.exists() {
         // If the path already exists and is a valid git repo, treat it like
         // "Adding existing repo" (same as C git).
@@ -3063,6 +3068,7 @@ fn run_add(args: &AddArgs) -> Result<()> {
             bail!("failed to clone submodule from '{}'", args.url);
         }
         set_separate_gitdir_worktree(&grit_bin, &modules_dir, &sub_path);
+        did_clone = true;
     }
 
     if let Some(ref branch) = args.branch {
@@ -3147,15 +3153,19 @@ fn run_add(args: &AddArgs) -> Result<()> {
 
     // `clone --no-checkout` leaves an empty work tree; populate it from the staged gitlink
     // (HEAD’s tree may not include the new submodule until after commit — read the index).
-    if let Some(oid) = read_gitlink_oid_from_index(&repo, &path)? {
-        checkout_submodule_worktree(
-            &grit_bin, &repo, work_tree, &name, &path, &name, &oid, args.quiet,
-        )?;
-        // With `-b <branch>`, git checks out `origin/<branch>` and leaves the submodule on a
-        // local branch of that name (not detached / default branch). Attach HEAD accordingly.
-        if let Some(ref branch) = args.branch {
-            let modules_dir = submodule_separate_git_dir(&repo, work_tree, &name, &path)?;
-            let _ = attach_submodule_head_to_named_branch(&modules_dir, branch);
+    // Only do this on the clone path: git's "Adding existing repo" path leaves the existing
+    // worktree and its (branch) HEAD untouched and never runs `checkout -f`.
+    if did_clone {
+        if let Some(oid) = read_gitlink_oid_from_index(&repo, &path)? {
+            checkout_submodule_worktree(
+                &grit_bin, &repo, work_tree, &name, &path, &name, &oid, args.quiet,
+            )?;
+            // With `-b <branch>`, git checks out `origin/<branch>` and leaves the submodule on a
+            // local branch of that name (not detached / default branch). Attach HEAD accordingly.
+            if let Some(ref branch) = args.branch {
+                let modules_dir = submodule_separate_git_dir(&repo, work_tree, &name, &path)?;
+                let _ = attach_submodule_head_to_named_branch(&modules_dir, branch);
+            }
         }
     }
 

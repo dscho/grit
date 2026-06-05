@@ -5469,10 +5469,7 @@ fn setup_origin_remote(
         None => ConfigFile::parse(&config_path, "", ConfigScope::Local)?,
     };
 
-    let abs_source = source_path
-        .canonicalize()
-        .unwrap_or_else(|_| source_path.to_path_buf());
-    let url = abs_source.to_string_lossy().to_string();
+    let url = absolute_clone_source_url(source_path);
 
     config.set(&format!("remote.{remote_name}.url"), &url)?;
     config.set(&format!("remote.{remote_name}.fetch"), refspec)?;
@@ -5489,10 +5486,7 @@ fn setup_origin_remote_bare(git_dir: &Path, source_path: &Path, remote_name: &st
         None => ConfigFile::parse(&config_path, "", ConfigScope::Local)?,
     };
 
-    let abs_source = source_path
-        .canonicalize()
-        .unwrap_or_else(|_| source_path.to_path_buf());
-    let url = abs_source.to_string_lossy().to_string();
+    let url = absolute_clone_source_url(source_path);
 
     config.set(&format!("remote.{remote_name}.url"), &url)?;
     config.write().context("writing config")?;
@@ -5513,11 +5507,7 @@ fn absolute_clone_source_url(source_path: &Path) -> String {
         Ok(c) => c.canonicalize().unwrap_or(c),
         Err(_) => return source_path.to_string_lossy().to_string(),
     };
-    let r = cwd.join(source_path).to_string_lossy().to_string();
-    if std::env::var("GRIT_DBG_FROM").is_ok() {
-        eprintln!("DBG absolute_clone_source_url sp={source_path:?} -> {r:?}");
-    }
-    r
+    cwd.join(source_path).to_string_lossy().to_string()
 }
 
 fn setup_origin_remote_bare_url(git_dir: &Path, remote_url: &str, remote_name: &str) -> Result<()> {
