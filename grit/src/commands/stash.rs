@@ -2567,7 +2567,7 @@ fn show_stash_stat_git_diffstat(
 ) -> Result<()> {
     let obj = repo.odb.read(stash_oid)?;
     let stash_commit = parse_commit(&obj.data)?;
-    let old_tree = stash_index_tree_oid(repo, &stash_commit)?;
+    let old_tree = stash_head_parent_tree_oid(repo, &stash_commit)?;
     let entries = diff_trees(&repo.odb, Some(&old_tree), Some(&stash_commit.tree), "")?;
     if entries.is_empty() {
         return Ok(());
@@ -4647,15 +4647,6 @@ fn flatten_tree_full(odb: &Odb, tree_oid: &ObjectId, prefix: &str) -> Result<Vec
     Ok(result)
 }
 
-fn git_index_mode_tag(mode: u32) -> String {
-    match mode {
-        MODE_REGULAR => "100644".to_owned(),
-        MODE_EXECUTABLE => "100755".to_owned(),
-        MODE_SYMLINK => "120000".to_owned(),
-        _ => format!("{mode:o}"),
-    }
-}
-
 /// Show diff between two flattened trees.
 fn show_tree_diff(
     odb: &Odb,
@@ -4725,62 +4716,62 @@ fn show_tree_diff(
             (None, Some(n)) => {
                 println!("diff --git a/{path} b/{path}");
                 println!("new file mode {}", format_mode(n.mode));
-                let nm = git_index_mode_tag(n.mode);
                 println!(
-                    "index {}..{} {}",
+                    "index {}..{}",
                     &ObjectId::zero().to_hex()[..7],
-                    &n.oid.to_hex()[..7],
-                    nm
+                    &n.oid.to_hex()[..7]
                 );
                 let blob = odb.read(&n.oid)?;
-                let new_text = String::from_utf8_lossy(&blob.data);
-                let patch = unified_diff_with_prefix_and_funcname_and_algorithm(
-                    "",
-                    new_text.as_ref(),
-                    "/dev/null",
-                    path,
-                    0,
-                    0,
-                    "a/",
-                    "b/",
-                    None,
-                    algorithm,
-                    false,
-                    false,
-                    false,
-                    false,
-                );
-                print!("{patch}");
+                if !blob.data.is_empty() {
+                    let new_text = String::from_utf8_lossy(&blob.data);
+                    let patch = unified_diff_with_prefix_and_funcname_and_algorithm(
+                        "",
+                        new_text.as_ref(),
+                        "/dev/null",
+                        path,
+                        0,
+                        0,
+                        "a/",
+                        "b/",
+                        None,
+                        algorithm,
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
+                    print!("{patch}");
+                }
             }
             (Some(o), None) => {
                 println!("diff --git a/{path} b/{path}");
                 println!("deleted file mode {}", format_mode(o.mode));
-                let om = git_index_mode_tag(o.mode);
                 println!(
-                    "index {}..{} {}",
+                    "index {}..{}",
                     &o.oid.to_hex()[..7],
-                    &ObjectId::zero().to_hex()[..7],
-                    om
+                    &ObjectId::zero().to_hex()[..7]
                 );
                 let blob = odb.read(&o.oid)?;
-                let old_text = String::from_utf8_lossy(&blob.data);
-                let patch = unified_diff_with_prefix_and_funcname_and_algorithm(
-                    old_text.as_ref(),
-                    "",
-                    path,
-                    "/dev/null",
-                    0,
-                    0,
-                    "a/",
-                    "b/",
-                    None,
-                    algorithm,
-                    false,
-                    false,
-                    false,
-                    false,
-                );
-                print!("{patch}");
+                if !blob.data.is_empty() {
+                    let old_text = String::from_utf8_lossy(&blob.data);
+                    let patch = unified_diff_with_prefix_and_funcname_and_algorithm(
+                        old_text.as_ref(),
+                        "",
+                        path,
+                        "/dev/null",
+                        0,
+                        0,
+                        "a/",
+                        "b/",
+                        None,
+                        algorithm,
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
+                    print!("{patch}");
+                }
             }
             (None, None) => unreachable!(),
         }
