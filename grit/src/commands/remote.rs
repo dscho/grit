@@ -272,12 +272,27 @@ struct RemoteUrls {
     push: Vec<String>,
 }
 
+/// Collect a remote's URL list applying Git's `add_url` semantics: an empty value clears the
+/// accumulated list (so later non-empty values start a fresh list), matching
+/// `git -c remote.<n>.url= -c remote.<n>.url=real`.
+fn collect_url_list(config: &ConfigSet, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in config.get_all(key) {
+        if v.is_empty() {
+            out.clear();
+        } else {
+            out.push(v);
+        }
+    }
+    out
+}
+
 fn remote_urls_effective(config: &ConfigSet, name: &str) -> Option<RemoteUrls> {
-    let fetch = config.get_all(&format!("remote.{name}.url"));
+    let fetch = collect_url_list(config, &format!("remote.{name}.url"));
     if fetch.is_empty() {
         return None;
     }
-    let push = config.get_all(&format!("remote.{name}.pushurl"));
+    let push = collect_url_list(config, &format!("remote.{name}.pushurl"));
     Some(RemoteUrls { fetch, push })
 }
 
@@ -1776,19 +1791,23 @@ fn show_one_remote(
         listed.sort_by(|a, b| a.0.cmp(&b.0));
         merge_remote_branch_status(&mut listed);
     } else {
-        for (lr, _) in refs::list_refs(git_dir, &format!("refs/remotes/{name}/"))? {
-            if lr.ends_with("/HEAD") {
-                continue;
-            }
+        // No-query mode (Git's `append_ref_to_tracked_list`): for every non-symbolic local ref,
+        // reverse-map it through the remote's fetch refspecs and list the abbreviated remote source
+        // name. This surfaces e.g. `refs/heads/main` for a `refs/heads/main:refs/heads/upstream`
+        // fetch line, not just `refs/remotes/<name>/*` tracking refs.
+        for (lr, _) in refs::list_refs(git_dir, "refs/")? {
             if let Ok(Some(_)) = grit_lib::refs::read_symbolic_ref(git_dir, &lr) {
                 continue;
             }
-            let branch = lr
-                .strip_prefix(&format!("refs/remotes/{name}/"))
-                .unwrap_or(&lr);
-            listed.push((branch.to_owned(), String::new()));
+            let mut src: Option<String> = None;
+            if remote_find_tracking_src(&remote_stub, &lr, &mut src).is_ok() {
+                if let Some(s) = src {
+                    listed.push((abbrev_branch(&s).to_owned(), String::new()));
+                }
+            }
         }
         listed.sort_by(|a, b| a.0.cmp(&b.0));
+        listed.dedup();
     }
 
     if !listed.is_empty() {
@@ -1861,29 +1880,35 @@ fn show_one_remote(
             }
         }
     } else {
+        // No-query push display (Git's `get_push_ref_states_noquery` + `show_push_info_item`).
         let specs = config.get_all(&format!("remote.{name}.push"));
+        // Build (src, dest, forced) triples matching Git's spec interpretation.
+        let mut rows: Vec<(String, String, bool)> = Vec::new();
         if specs.is_empty() {
-            println!("  Local refs configured for 'git push' (status not queried):");
-            println!("    (matching)           pushes to (matching)");
-        } else {
-            println!("  Local refs configured for 'git push' (status not queried):");
-            for s in specs {
-                let (forced, rest) = if let Some(r) = s.strip_prefix('+') {
-                    (true, r)
-                } else {
-                    (false, s.as_str())
-                };
-                if rest == ":" {
-                    println!("    (matching)           pushes to (matching)");
-                    continue;
-                }
-                if let Some((a, b)) = rest.split_once(':') {
-                    let verb = if forced { "forces to" } else { "pushes to" };
-                    println!("    {a:24} {verb} {b}");
-                } else {
-                    println!("    {rest}");
-                }
+            rows.push(("(matching)".to_owned(), "(matching)".to_owned(), false));
+        }
+        for s in &specs {
+            let (forced, rest) = if let Some(r) = s.strip_prefix('+') {
+                (true, r)
+            } else {
+                (false, s.as_str())
+            };
+            if rest == ":" {
+                rows.push(("(matching)".to_owned(), "(matching)".to_owned(), false));
+                continue;
             }
+            let (src, dst) = match rest.split_once(':') {
+                Some((a, b)) => (a.to_owned(), b.to_owned()),
+                // Source-only spec (e.g. `+refs/tags/lastbackup`): dest mirrors the source.
+                None => (rest.to_owned(), rest.to_owned()),
+            };
+            rows.push((src, dst, forced));
+        }
+        println!("  Local refs configured for 'git push' (status not queried):");
+        let width = rows.iter().map(|(s, _, _)| s.len()).max().unwrap_or(0);
+        for (src, dst, forced) in rows {
+            let verb = if forced { "forces to" } else { "pushes to" };
+            println!("    {src:width$} {verb} {dst}");
         }
     }
 
