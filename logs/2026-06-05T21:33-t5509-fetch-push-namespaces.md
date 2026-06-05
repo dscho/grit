@@ -33,4 +33,18 @@ Ticket 203816. Upstream test: fetch/push involving ref namespaces.
 - Added advertisement tracing to `read_receive_pack_advertisement`.
 
 ## Result
-(to be filled in after final run)
+15/15 passing (was 4/15). Commits on grit-t5-progress:
+- 7d6d9f98a: advertisement/hideRefs/push-tags/empty-namespace fixes
+  (upload_pack.rs, serve_v2.rs, push.rs, fetch_transport.rs, http_push_smart.rs, TOML, log)
+- 25c069863: local clone namespaced-HEAD resolution (clone.rs)
+
+## Regression checks (all unchanged vs baseline adbef8c49)
+- t5510-fetch 215/215, t5701-git-serve 25/25, t5512-ls-remote 40/40,
+  t5400-send-pack 17/17 (all fully passing)
+- t5505-remote 121/130, t5601-clone 54/115, t5703-ref-in-want 18/26,
+  t5548-push-porcelain 5/25, t5516-fetch-push 6/124 — all identical to baseline
+
+## Note for other agents
+clone.rs also carried an unrelated in-flight `branch_is_tag`/`absolute_clone_source_url`
+refactor (another agent's work) that was already in the working tree; it compiled and
+all tests passed, so it was committed together with the namespaced-HEAD fix in 25c069863.
