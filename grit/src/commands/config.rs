@@ -356,12 +356,6 @@ pub fn run(args: Args) -> Result<()> {
 
     // Resolve which file to operate on
     let git_dir = resolve_git_dir();
-    // Validate repository format if we found a git dir
-    if let Some(ref dir) = git_dir {
-        if let Err(e) = grit_lib::repo::validate_repo_format(dir) {
-            bail!("{}", e);
-        }
-    }
     let (scope, file_path) = resolve_config_file(&args, git_dir.as_deref())?;
 
     // Handle subcommands first
@@ -1547,6 +1541,11 @@ fn resolve_git_dir() -> Option<PathBuf> {
     grit_lib::repo::Repository::discover(None)
         .ok()
         .map(|r| r.git_dir)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(grit_lib::precompose_config::locate_git_dir_from_cwd)
+        })
 }
 
 /// Target file for `git config --worktree` (matches Git `builtin/config.c`).
