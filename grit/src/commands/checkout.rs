@@ -1885,6 +1885,7 @@ fn merge_branch_working_tree(
         work_tree_oid,
         MergeFavor::None,
         WhitespaceMergeOptions::default(),
+        None,
         presentation,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;

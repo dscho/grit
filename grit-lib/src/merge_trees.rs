@@ -78,6 +78,7 @@ impl Default for TreeMergeConflictPresentation<'_> {
 /// - `ours_tree` — current branch tree (HEAD during pick/revert).
 /// - `theirs_tree` — tree being applied (picked commit for cherry-pick, parent of reverted commit for revert).
 /// - `favor` / `ws` — merge strategy favour and whitespace options for textual merges.
+/// - `diff_algorithm` — optional line diff algorithm name used for textual merges.
 /// - `presentation` — conflict marker labels and style (`label_base` is the diff3 "base" name).
 ///
 /// # Errors
@@ -90,6 +91,7 @@ pub fn merge_trees_three_way(
     theirs_tree: ObjectId,
     favor: MergeFavor,
     ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<TreeMergeOutput> {
     let odb = &repo.odb;
@@ -140,6 +142,7 @@ pub fn merge_trees_three_way(
         &theirs_old_to_new,
         favor,
         ws,
+        diff_algorithm,
         presentation,
     )
 }
@@ -177,6 +180,7 @@ fn three_way_on_aligned_paths(
     theirs_old_to_new: &HashMap<Vec<u8>, Vec<u8>>,
     favor: MergeFavor,
     ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<TreeMergeOutput> {
     let mut out = Index::new();
@@ -232,6 +236,7 @@ fn three_way_on_aligned_paths(
             t,
             favor,
             ws,
+            diff_algorithm,
             presentation,
         )?;
     }
@@ -260,6 +265,7 @@ fn three_way_on_aligned_paths(
             t,
             favor,
             ws,
+            diff_algorithm,
             presentation,
         )?;
     }
@@ -281,6 +287,7 @@ fn three_way_on_aligned_paths(
             t,
             favor,
             ws,
+            diff_algorithm,
             presentation,
         )?;
     }
@@ -308,6 +315,7 @@ fn merge_one_path(
     t: Option<&IndexEntry>,
     favor: MergeFavor,
     ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<()> {
     match (b, o, t) {
@@ -364,6 +372,7 @@ fn merge_one_path(
                 te,
                 favor,
                 ws,
+                diff_algorithm,
                 presentation,
             )?;
         }
@@ -400,6 +409,7 @@ fn merge_one_path(
                 te,
                 favor,
                 ws,
+                diff_algorithm,
                 presentation,
             )?;
         }
@@ -444,6 +454,7 @@ fn content_merge_or_conflict(
     theirs: &IndexEntry,
     favor: MergeFavor,
     ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<()> {
     if base.mode == 0o160000 || ours.mode == 0o160000 || theirs.mode == 0o160000 {
@@ -505,7 +516,7 @@ fn content_merge_or_conflict(
         favor,
         style: presentation.style,
         marker_size: 7,
-        diff_algorithm: None,
+        diff_algorithm: diff_algorithm.map(str::to_owned),
         ignore_all_space: ws.ignore_all_space,
         ignore_space_change: ws.ignore_space_change,
         ignore_space_at_eol: ws.ignore_space_at_eol,
@@ -552,6 +563,7 @@ fn add_add_content_conflict(
     theirs: &IndexEntry,
     favor: MergeFavor,
     ws: WhitespaceMergeOptions,
+    diff_algorithm: Option<&str>,
     presentation: TreeMergeConflictPresentation<'_>,
 ) -> crate::error::Result<()> {
     // Gitlink add/add: no textual merge is possible; leave unmerged stages.
@@ -604,7 +616,7 @@ fn add_add_content_conflict(
         favor,
         style: presentation.style,
         marker_size: 7,
-        diff_algorithm: None,
+        diff_algorithm: diff_algorithm.map(str::to_owned),
         ignore_all_space: ws.ignore_all_space,
         ignore_space_change: ws.ignore_space_change,
         ignore_space_at_eol: ws.ignore_space_at_eol,
