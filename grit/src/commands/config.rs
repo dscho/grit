@@ -4,7 +4,7 @@
 //! and the new subcommand interface (`git config get`, `git config set`).
 
 use anyhow::{bail, Context, Result};
-use clap::{Args as ClapArgs, Subcommand};
+use clap::{ArgAction, Args as ClapArgs, Subcommand};
 use grit_lib::config::{
     parse_bool, parse_color, parse_i64, ConfigFile, ConfigIncludeOrigin, ConfigScope, ConfigSet,
     IncludeContext, LoadConfigOptions,
@@ -16,12 +16,33 @@ use grit_lib::rev_parse::resolve_revision;
 use grit_lib::worktree::registered_worktree_count;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigValueType {
+    Bool,
+    Int,
+    BoolOrInt,
+    Path,
+    ExpiryDate,
+    Color,
+}
+
+impl ConfigValueType {
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "bool" => Some(Self::Bool),
+            "int" => Some(Self::Int),
+            "bool-or-int" => Some(Self::BoolOrInt),
+            "path" => Some(Self::Path),
+            "expiry-date" => Some(Self::ExpiryDate),
+            "color" => Some(Self::Color),
+            _ => None,
+        }
+    }
+}
+
 /// True when `--bool`, `--bool-or-int`, or `--type=bool|bool-or-int` requests explicit boolean output.
 fn regexp_type_requests_bool_output(args: &Args) -> bool {
-    args.type_bool
-        || args.type_bool_or_int
-        || args.type_name.as_deref() == Some("bool")
-        || args.type_name.as_deref() == Some("bool-or-int")
+    type_is(args, ConfigValueType::Bool) || type_is(args, ConfigValueType::BoolOrInt)
 }
 
 /// Arguments for `grit config`.
@@ -128,28 +149,32 @@ pub struct Args {
 
     // ── Type flags ──
     /// Ensure the value is a valid boolean and canonicalize.
-    #[arg(long = "bool", global = true)]
-    pub type_bool: bool,
+    #[arg(long = "bool", global = true, action = ArgAction::Count)]
+    pub type_bool: u8,
 
     /// Ensure the value is a valid integer and canonicalize.
-    #[arg(long = "int", global = true)]
-    pub type_int: bool,
+    #[arg(long = "int", global = true, action = ArgAction::Count)]
+    pub type_int: u8,
 
     /// Ensure the value is a valid bool-or-int and canonicalize.
-    #[arg(long = "bool-or-int", global = true)]
-    pub type_bool_or_int: bool,
+    #[arg(long = "bool-or-int", global = true, action = ArgAction::Count)]
+    pub type_bool_or_int: u8,
 
     /// Expand `~/` in the value.
-    #[arg(long = "path", global = true)]
-    pub type_path: bool,
+    #[arg(long = "path", global = true, action = ArgAction::Count)]
+    pub type_path: u8,
 
     /// Interpret the value as an expiry date and print its timestamp.
-    #[arg(long = "expiry-date", global = true)]
-    pub type_expiry_date: bool,
+    #[arg(long = "expiry-date", global = true, action = ArgAction::Count)]
+    pub type_expiry_date: u8,
 
     /// Type selector (alternative to individual flags).
-    #[arg(long = "type", value_name = "TYPE", global = true)]
-    pub type_name: Option<String>,
+    #[arg(long = "type", value_name = "TYPE", global = true, action = ArgAction::Append)]
+    pub type_name: Vec<String>,
+
+    /// Clear any previously selected type.
+    #[arg(long = "no-type", global = true, action = ArgAction::Count)]
+    pub no_type: u8,
 
     // ── Display flags ──
     /// Show origin file and scope for each entry.
@@ -200,6 +225,72 @@ pub struct Args {
     /// a default color (Git synonym for `normal`), not as a clap flag.
     #[arg(trailing_var_arg = true, allow_negative_numbers = true)]
     pub positional: Vec<String>,
+}
+
+fn legacy_type_specs(args: &Args) -> Vec<ConfigValueType> {
+    let mut specs = Vec::new();
+    if args.type_bool > 0 {
+        specs.push(ConfigValueType::Bool);
+    }
+    if args.type_int > 0 {
+        specs.push(ConfigValueType::Int);
+    }
+    if args.type_bool_or_int > 0 {
+        specs.push(ConfigValueType::BoolOrInt);
+    }
+    if args.type_path > 0 {
+        specs.push(ConfigValueType::Path);
+    }
+    if args.type_expiry_date > 0 {
+        specs.push(ConfigValueType::ExpiryDate);
+    }
+    specs
+}
+
+fn type_name_specs(args: &Args) -> Result<Vec<ConfigValueType>> {
+    args.type_name
+        .iter()
+        .map(|name| {
+            ConfigValueType::parse(name).ok_or_else(|| {
+                fatal_config_parse(format!("fatal: unrecognized --type argument, {name}"))
+            })
+        })
+        .collect()
+}
+
+fn validate_type_specifiers(args: &Args) -> Result<()> {
+    let mut specs = legacy_type_specs(args);
+    specs.extend(type_name_specs(args)?);
+    specs.dedup();
+    if args.no_type == 0 && specs.len() > 1 {
+        return Err(fatal_config_parse("fatal: only one type at a time"));
+    }
+    Ok(())
+}
+
+fn effective_type(args: &Args) -> Option<ConfigValueType> {
+    if args.no_type > 0 {
+        if args.type_name.len() > 1 {
+            return args
+                .type_name
+                .last()
+                .and_then(|name| ConfigValueType::parse(name));
+        }
+        return None;
+    }
+
+    type_name_specs(args)
+        .ok()
+        .and_then(|specs| specs.last().copied())
+        .or_else(|| legacy_type_specs(args).last().copied())
+}
+
+fn type_is(args: &Args, expected: ConfigValueType) -> bool {
+    effective_type(args) == Some(expected)
+}
+
+fn has_type(args: &Args) -> bool {
+    effective_type(args).is_some()
 }
 
 /// Modern subcommand interface for `grit config`.
@@ -327,6 +418,8 @@ pub struct EditArgs {}
 
 /// Run the `config` command.
 pub fn run(args: Args) -> Result<()> {
+    validate_type_specifiers(&args)?;
+
     for dir in &args.change_dir {
         std::env::set_current_dir(dir)
             .with_context(|| format!("cannot change to '{}'", dir.display()))?;
@@ -783,7 +876,7 @@ fn cmd_get(
 
     // For --path with :(optional) values, we need to check all values
     // and find the last non-optional-missing one.
-    let has_path_type = args.type_path || args.type_name.as_deref() == Some("path");
+    let has_path_type = type_is(args, ConfigValueType::Path);
     if has_path_type {
         if let Ok(canon) = grit_lib::config::canonical_key(&get_args.key) {
             if let Some(entry) = config
@@ -1069,21 +1162,12 @@ fn cmd_list(args: &Args, git_dir: Option<&Path>) -> Result<()> {
     for entry in config.entries() {
         let prefix = config_entry_prefix_for_list(args, entry, cwd.as_deref());
         let raw_val = entry.value.as_deref().unwrap_or("true");
-        let formatted = if args.type_int
-            || args.type_bool
-            || args.type_bool_or_int
-            || args.type_path
-            || args.type_expiry_date
-            || args.type_name.is_some()
-        {
+        let formatted = if has_type(args) {
             if is_optional_missing_path(args, raw_val) {
                 continue;
             }
             match format_typed_value(args, Some(&entry.key), raw_val) {
-                Ok(v)
-                    if (args.type_path || args.type_name.as_deref() == Some("path"))
-                        && v.is_empty() =>
-                {
+                Ok(v) if type_is(args, ConfigValueType::Path) && v.is_empty() => {
                     continue;
                 }
                 Ok(v) => v,
@@ -1252,9 +1336,9 @@ fn cmd_get_urlmatch(args: &Args, key: &str, url: &str, git_dir: Option<&Path>) -
                 String::new()
             };
             if val.is_empty()
-                && !args.type_bool
-                && !args.type_bool_or_int
-                && args.type_name.is_none()
+                && !type_is(args, ConfigValueType::Bool)
+                && !type_is(args, ConfigValueType::BoolOrInt)
+                && !has_type(args)
             {
                 print!("{prefix}{var_key}{terminator}");
             } else {
@@ -1863,7 +1947,7 @@ fn default_supported(args: &Args) -> bool {
 /// Formats a default value and adds Git-compatible context on failure.
 fn format_default_value(args: &Args, val: &str) -> Result<String> {
     format_typed_value(args, None, val).map_err(|err| {
-        if args.type_int || args.type_name.as_deref() == Some("int") {
+        if type_is(args, ConfigValueType::Int) {
             fatal_config_parse(format!("fatal: bad numeric config value '{val}'"))
         } else {
             err.context("failed to format default config value")
@@ -1872,7 +1956,7 @@ fn format_default_value(args: &Args, val: &str) -> Result<String> {
 }
 
 fn print_default_value(args: &Args, val: &str, terminator: char) {
-    if args.type_name.as_deref() == Some("color") {
+    if type_is(args, ConfigValueType::Color) {
         print!("{val}");
     } else {
         print!("{val}{terminator}");
@@ -1890,8 +1974,6 @@ fn is_pack_allow_pack_reuse_key(config_key: &str) -> bool {
 }
 
 fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Result<String> {
-    let type_name = args.type_name.as_deref();
-
     if is_pack_allow_pack_reuse_key(config_key) {
         let t = val.trim();
         let lower = t.to_ascii_lowercase();
@@ -1908,7 +1990,7 @@ fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Resul
         }
     }
 
-    if !is_pack_allow_pack_reuse_key(config_key) && (args.type_bool || type_name == Some("bool")) {
+    if !is_pack_allow_pack_reuse_key(config_key) && type_is(args, ConfigValueType::Bool) {
         match parse_bool(val) {
             Ok(b) => return Ok(if b { "true" } else { "false" }.to_owned()),
             Err(_) => {
@@ -1919,7 +2001,7 @@ fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Resul
         }
     }
 
-    if args.type_int || type_name == Some("int") {
+    if type_is(args, ConfigValueType::Int) {
         match parse_i64(val) {
             Ok(n) => return Ok(n.to_string()),
             Err(_) => {
@@ -1930,7 +2012,7 @@ fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Resul
         }
     }
 
-    if args.type_bool_or_int || type_name == Some("bool-or-int") {
+    if type_is(args, ConfigValueType::BoolOrInt) {
         // Try named booleans first (not numbers — those go to int)
         match val.to_lowercase().as_str() {
             "true" | "yes" | "on" => return Ok("true".to_owned()),
@@ -1946,7 +2028,7 @@ fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Resul
         )));
     }
 
-    if type_name == Some("color") {
+    if type_is(args, ConfigValueType::Color) {
         match parse_color(val) {
             Ok(_) => return Ok(val.to_owned()),
             Err(e) => bail!("cannot parse color: {}", e),
@@ -1959,23 +2041,20 @@ fn canonicalize_value_for_set(args: &Args, config_key: &str, val: &str) -> Resul
 /// Check if a value with --path type is an optional path that doesn't exist.
 /// Returns true if the value should be skipped.
 fn is_optional_missing_path(args: &Args, val: &str) -> bool {
-    let type_name = args.type_name.as_deref();
-    if (args.type_path || type_name == Some("path")) && val.starts_with(":(optional)") {
+    if type_is(args, ConfigValueType::Path) && val.starts_with(":(optional)") {
         return grit_lib::config::parse_path_optional(val).is_none();
     }
     false
 }
 
 fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Result<String> {
-    let type_name = args.type_name.as_deref();
-
     if let Some(key) = config_key {
         if is_pack_allow_pack_reuse_key(key) {
             return Ok(val.trim().to_string());
         }
     }
 
-    if args.type_bool || type_name == Some("bool") {
+    if type_is(args, ConfigValueType::Bool) {
         match parse_bool(val) {
             Ok(b) => {
                 return Ok(if b {
@@ -1995,7 +2074,7 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
         }
     }
 
-    if args.type_int || type_name == Some("int") {
+    if type_is(args, ConfigValueType::Int) {
         match parse_i64(val) {
             Ok(n) => return Ok(n.to_string()),
             Err(err) => {
@@ -2009,7 +2088,7 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
         }
     }
 
-    if args.type_path || type_name == Some("path") {
+    if type_is(args, ConfigValueType::Path) {
         if val.starts_with("~/") && std::env::var_os("HOME").is_none() {
             return Err(fatal_config_parse(format!(
                 "fatal: failed to expand user dir in: {val}"
@@ -2021,7 +2100,7 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
         };
     }
 
-    if args.type_bool_or_int || type_name == Some("bool-or-int") {
+    if type_is(args, ConfigValueType::BoolOrInt) {
         // Try as named bool first
         match val.to_lowercase().as_str() {
             "true" | "yes" | "on" => return Ok("true".to_owned()),
@@ -2043,14 +2122,14 @@ fn format_typed_value(args: &Args, config_key: Option<&str>, val: &str) -> Resul
         }
     }
 
-    if type_name == Some("color") {
+    if type_is(args, ConfigValueType::Color) {
         match parse_color(val) {
             Ok(ansi) => return Ok(ansi),
             Err(e) => bail!("{}", e),
         }
     }
 
-    if args.type_expiry_date || type_name == Some("expiry-date") {
+    if type_is(args, ConfigValueType::ExpiryDate) {
         return format_expiry_date(val);
     }
 
