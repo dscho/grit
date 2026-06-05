@@ -76,3 +76,7 @@
   ignored file. Empty-parent pruning now stops at directories that are tracked prefixes in the
   index, including skip-worktree sparse entries.
 - Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `86/106`.
+- Subtest 56 (`git apply functionality`) had correct behavior but mismatched sparse stderr because
+  the missing outside-cone worktree file error included absolute paths with the repo directory
+  name. The apply preimage stat check now reports the adjusted repo-relative path.
+- Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `87/106`.
