@@ -106,6 +106,10 @@ pub struct Args {
     #[arg(long = "no-reuse-delta")]
     pub no_reuse_delta: bool,
 
+    /// Restrict cross-island deltas (Git `--delta-islands`; driven by `pack.island` config).
+    #[arg(long = "delta-islands")]
+    pub delta_islands: bool,
+
     /// Suppress progress output (accepted for compat).
     #[arg(short = 'q', long = "quiet")]
     pub quiet: bool,
@@ -491,8 +495,13 @@ fn compute_midx_reused_entries(
                             if base_entry.oid.len() != 20 {
                                 false
                             } else if let Ok(b_oid) = ObjectId::from_bytes(&base_entry.oid) {
-                                global_bitmap_bit_for_oid(&tables, &b_oid)
-                                    .is_some_and(|bb| reuse_bits.contains(&bb))
+                                // Cross-pack delta rejection (Git `try_partial_reuse`): the base must
+                                // be the MIDX's canonical copy in *this* pack. If the MIDX deduped
+                                // the base to a different pack, reuse would emit a delta whose base
+                                // is not in our reuse chunk, so punt to the normal path.
+                                tables.canonical_pack(&b_oid) == Some(pack_id)
+                                    && global_bitmap_bit_for_oid(&tables, &b_oid)
+                                        .is_some_and(|bb| reuse_bits.contains(&bb))
                             } else {
                                 false
                             }
@@ -514,7 +523,10 @@ fn compute_midx_reused_entries(
                                     Err(_) => false,
                                 }
                             } else {
-                                reuse_bits.contains(&bb)
+                                // Cross-pack delta rejection (see OFS case): the REF_DELTA base must
+                                // resolve to the MIDX's canonical copy in this same pack.
+                                tables.canonical_pack(&base_oid) == Some(pack_id)
+                                    && reuse_bits.contains(&bb)
                             }
                         }
                         None => false,
@@ -769,6 +781,17 @@ pub fn run(mut args: Args) -> Result<()> {
         return Ok(());
     }
 
+    // Delta islands (`--delta-islands`): compute island marks for the objects being packed so
+    // delta selection can restrict cross-island deltas and bias base preference. Inactive unless
+    // `pack.island` config matched at least one ref.
+    let delta_islands = if args.delta_islands {
+        let packed_oids: HashSet<ObjectId> = entries.iter().map(|e| e.oid).collect();
+        let icfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        grit_lib::delta_islands::load_delta_islands(&repo, &icfg, &packed_oids)
+    } else {
+        grit_lib::delta_islands::DeltaIslands::default()
+    };
+
     // OID-sorted `--all` order breaks REF_DELTA chains (base must appear earlier in the pack).
     // Order blobs by increasing size so strict-prefix chains (t5316) serialize correctly.
     // Incremental repack (`--unpacked --incremental`) uses the rev-list object order as-is.
@@ -782,7 +805,19 @@ pub fn run(mut args: Args) -> Result<()> {
                 non_blobs.push(e);
             }
         }
+        // `pack.islandcore` layering: core-island objects are written first (layer 0). We keep the
+        // existing size order within each layer, matching Git's per-layer `type_size_sort`.
+        let core_active = delta_islands.has_core();
         blobs.sort_by(|a, b| {
+            if core_active {
+                let a_core = delta_islands.is_core_object(&a.oid);
+                let b_core = delta_islands.is_core_object(&b.oid);
+                // Core objects first (true sorts before false).
+                match b_core.cmp(&a_core) {
+                    std::cmp::Ordering::Equal => {}
+                    ord => return ord,
+                }
+            }
             a.data
                 .len()
                 .cmp(&b.data.len())
@@ -790,6 +825,10 @@ pub fn run(mut args: Args) -> Result<()> {
         });
         non_blobs.extend(blobs);
         entries = non_blobs;
+        // Git's `compute_write_order` writes commits newest-tip-first (recency order), not in OID
+        // order. The OID-based collection above loses that ordering, so re-derive it from the
+        // first-parent chain. t5332 "middle gap" asserts F precedes E precedes D in the pack.
+        order_all_commits_first_parent_chain(&repo, &mut entries)?;
     }
 
     let max_delta_depth = pack_delta_depth_limit(&args);
@@ -850,6 +889,7 @@ pub fn run(mut args: Args) -> Result<()> {
         window_reuse_only,
         &pack_list.thin_blob_deltas,
         pack_hash_bytes,
+        &delta_islands,
     )?;
     let cruft_mtimes = if args.cruft && !args.incremental {
         Some(collect_cruft_mtime_map(&repo, &pack_list.oids)?)
@@ -3505,6 +3545,61 @@ fn collect_all_loose_in_dir(objects_dir: &Path, oids: &mut HashSet<ObjectId>) ->
     Ok(())
 }
 
+/// Order commits to the front of `entries` in `rev-list --all` recency order (newest tip first),
+/// preserving the relative order of trees and blobs after them. This mirrors Git's
+/// `compute_write_order`, which writes commits before trees/blobs and visits commits in the
+/// reverse-chronological order produced by the revision walk. Without this, the OID-sorted `--all`
+/// collection writes commits in hash order and fails t5332's "middle gap" position assertions.
+fn order_all_commits_first_parent_chain(
+    repo: &Repository,
+    entries: &mut Vec<PackEntry>,
+) -> Result<()> {
+    let commit_count = entries
+        .iter()
+        .filter(|e| e.kind == ObjectKind::Commit)
+        .count();
+    if commit_count < 2 {
+        return Ok(());
+    }
+
+    // Recency rank from the revision walk: index 0 is the newest tip.
+    let opts = RevListOptions {
+        all_refs: true,
+        missing_action: MissingAction::Allow,
+        ..Default::default()
+    };
+    let walk = match rev_list(repo, &[] as &[String], &[] as &[String], &opts) {
+        Ok(r) => r,
+        Err(_) => return Ok(()),
+    };
+    let mut rank: HashMap<ObjectId, usize> = HashMap::new();
+    for (i, c) in walk.commits.iter().enumerate() {
+        rank.entry(*c).or_insert(i);
+    }
+
+    let mut commits: Vec<PackEntry> = Vec::with_capacity(commit_count);
+    let mut others: Vec<PackEntry> = Vec::with_capacity(entries.len() - commit_count);
+    for e in entries.drain(..) {
+        if e.kind == ObjectKind::Commit {
+            commits.push(e);
+        } else {
+            others.push(e);
+        }
+    }
+    // Any commit missing from the walk (should not happen for a `--all` pack) sorts last but keeps
+    // a stable order via the OID tiebreak.
+    let missing_rank = walk.commits.len();
+    commits.sort_by(|a, b| {
+        let ra = rank.get(&a.oid).copied().unwrap_or(missing_rank);
+        let rb = rank.get(&b.oid).copied().unwrap_or(missing_rank);
+        ra.cmp(&rb).then_with(|| a.oid.cmp(&b.oid))
+    });
+
+    commits.extend(others);
+    *entries = commits;
+    Ok(())
+}
+
 /// For incremental `pack-objects --all --unpacked` with `--window=0`, order commit objects so the
 /// newest tip appears first and the first-parent chain follows (t5332 pack index order).
 fn order_incremental_commits_first_parent_chain(
@@ -3882,6 +3977,7 @@ fn optimize_blob_deltas(
     window_reuse_only: bool,
     thin_blob_deltas: &[(ObjectId, ObjectId)],
     pack_hash_bytes: usize,
+    islands: &grit_lib::delta_islands::DeltaIslands,
 ) -> Result<(Vec<PackWriteEntry>, usize, usize)> {
     if pack_hash_bytes == 32 {
         let out = entries.into_iter().map(PackWriteEntry::Full).collect();
@@ -3912,7 +4008,10 @@ fn optimize_blob_deltas(
     if max_delta_depth != Some(0) {
         if window_reuse_only {
             for (oid, (base, _)) in &reuse_candidates {
-                delta_target_to_base.insert(*oid, *base);
+                // Island rules forbid basing a delta on an object in a non-superset island.
+                if islands.in_same_island(oid, base) {
+                    delta_target_to_base.insert(*oid, *base);
+                }
             }
         }
         // t5316: successive `file` blobs are not strict prefixes (`…\\n8` vs `…\\n9`); the long
@@ -3923,7 +4022,10 @@ fn optimize_blob_deltas(
                 continue;
             }
             if let Ok(Some(base)) = grit_lib::pack::packed_delta_base_oid(objects_dir, &t.oid) {
-                if packed_set.contains(&base) && base != t.oid {
+                if packed_set.contains(&base)
+                    && base != t.oid
+                    && islands.in_same_island(&t.oid, &base)
+                {
                     delta_target_to_base.insert(t.oid, base);
                 }
             }
@@ -3942,13 +4044,22 @@ fn optimize_blob_deltas(
                     if b.data.is_empty() {
                         continue;
                     }
+                    // Delta islands: never base `t` on `b` if `t`'s island set is not a subset of
+                    // `b`'s (matches `in_same_island` in Git's `try_delta`).
+                    if islands.is_active() && !islands.in_same_island(&t.oid, &b.oid) {
+                        continue;
+                    }
                     if blobs.len() > 3
-                        && t.data.starts_with(&b.data)
-                        && t.data.len() > b.data.len()
-                        && best_base.is_none_or(|bb| b.data.len() > bb.data.len())
+                        && b.data.starts_with(&t.data)
+                        && b.data.len() > t.data.len()
+                        && best_base.is_none_or(|bb| b.data.len() < bb.data.len())
                     {
+                        // Match Git's `type_size_sort` + `find_deltas` direction: the smaller
+                        // blob deltas against a larger blob that has it as a prefix (the target
+                        // is the delta, the base is larger). Pick the smallest qualifying base
+                        // (closest in size) for the smallest delta, mirroring window proximity.
                         best_base = Some(b);
-                        best_common = b.data.len();
+                        best_common = t.data.len();
                         continue;
                     }
                     if blobs.len() <= 3 {
@@ -3959,6 +4070,19 @@ fn optimize_blob_deltas(
                             && (common > best_common
                                 || (common == best_common
                                     && best_base.is_none_or(|bb| b.data.len() < bb.data.len())))
+                        {
+                            best_base = Some(b);
+                            best_common = common;
+                        } else if islands.is_active()
+                            && common > 64
+                            && common.saturating_mul(2) >= t.data.len()
+                            && islands.delta_cmp(&b.oid, &t.oid) < 0
+                            && best_base.is_none_or(|bb| {
+                                // Prefer a base whose island set strictly dominates the current
+                                // pick (superset islands win regardless of size), matching Git's
+                                // `island_delta_cmp` bias in `type_size_sort`.
+                                islands.delta_cmp(&b.oid, &bb.oid) < 0 || common > best_common
+                            })
                         {
                             best_base = Some(b);
                             best_common = common;
