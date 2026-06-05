@@ -533,6 +533,48 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
+    // When `core.multiPackIndex` is enabled, verify each object source's MIDX by
+    // spawning `multi-pack-index verify`, mirroring git/builtin/fsck.c.
+    // `core.multiPackIndex` defaults to true (matching grit's odb and upstream Git).
+    if config
+        .get_bool("core.multiPackIndex")
+        .map(|r| r.unwrap_or(true))
+        .unwrap_or(true)
+    {
+        let show_progress = args.progress
+            || (!args.no_progress && std::io::IsTerminal::is_terminal(&std::io::stderr()));
+        let mut midx_dirs: Vec<std::path::PathBuf> = vec![objects_dir.clone()];
+        if let Ok(alts) = grit_lib::pack::read_alternates_recursive(&objects_dir) {
+            midx_dirs.extend(alts);
+        }
+        for dir in midx_dirs {
+            if !dir.join("pack").join("multi-pack-index").exists()
+                && !dir
+                    .join("pack")
+                    .join("multi-pack-index.d")
+                    .join("multi-pack-index-chain")
+                    .exists()
+            {
+                continue;
+            }
+            let mut cmd = std::process::Command::new(crate::grit_exe::grit_executable());
+            cmd.arg("multi-pack-index")
+                .arg("verify")
+                .arg("--object-dir")
+                .arg(&dir);
+            cmd.arg(if show_progress {
+                "--progress"
+            } else {
+                "--no-progress"
+            });
+            if let Ok(status) = cmd.status() {
+                if !status.success() {
+                    has_errors = true;
+                }
+            }
+        }
+    }
+
     if has_errors {
         // Match Git: repository problems yield exit code 2 (not 1). Use `ExplicitExit` so POSIX
         // shells running `git fsck` under `set -e` do not treat exit 2 as a hard failure mid-pipeline.
