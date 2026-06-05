@@ -24,7 +24,8 @@
 //! # Include directives
 //!
 //! `[include] path = <path>` and `[includeIf "<condition>"] path = <path>`
-//! are supported. Conditions: `gitdir:`, `gitdir/i:`, `onbranch:`.
+//! are supported. Conditions: `gitdir:`, `gitdir/i:`, `onbranch:`,
+//! and `hasconfig:remote.*.url:`.
 
 use std::fmt;
 use std::fs;
@@ -116,7 +117,7 @@ pub struct ConfigSet {
     entries: Vec<ConfigEntry>,
 }
 
-/// Context for evaluating `[includeIf]` conditions (`gitdir:`, `onbranch:`).
+/// Context for evaluating `[includeIf]` conditions (`gitdir:`, `onbranch:`, `hasconfig:`).
 #[derive(Debug, Clone, Default)]
 pub struct IncludeContext {
     /// Git directory path used for `gitdir:` matching (may contain unresolved symlinks).
@@ -2087,8 +2088,10 @@ impl ConfigSet {
             let Some((inc_path, condition)) = include_directive_for_entry(entry) else {
                 continue;
             };
-            if let Some(ref cond) = condition {
-                if !evaluate_include_condition(cond, file, ctx) {
+            let included_by_hasconfig = condition.as_deref().is_some_and(is_hasconfig_remote_url);
+            if condition.is_some() && !included_by_hasconfig {
+                let cond = condition.as_deref().unwrap_or_default();
+                if !evaluate_include_condition(cond, set, file, ctx) {
                     continue;
                 }
             }
@@ -2101,9 +2104,19 @@ impl ConfigSet {
             // Git's `git_config_from_file` surfaces parse errors in an included file as a
             // fatal error (t0001 #102 `re-init reads matching includeIf.onbranch`). A missing
             // include target is silently skipped (`from_path` -> `Ok(None)`).
-            if let Some(inc_file) = ConfigFile::from_path(&resolved, file.scope)? {
-                Self::merge_with_includes(set, &inc_file, process_includes, depth + 1, ctx)?;
+            let Some(inc_file) = ConfigFile::from_path(&resolved, file.scope)? else {
+                continue;
+            };
+
+            if included_by_hasconfig {
+                validate_hasconfig_remote_url_include(&inc_file, process_includes, depth + 1, ctx)?;
+                let cond = condition.as_deref().unwrap_or_default();
+                if !evaluate_include_condition(cond, set, file, ctx) {
+                    continue;
+                }
             }
+
+            Self::merge_with_includes(set, &inc_file, process_includes, depth + 1, ctx)?;
         }
 
         Ok(())
@@ -3253,10 +3266,83 @@ fn include_by_onbranch(condition: &str, ctx: &IncludeContext) -> bool {
     wildmatch(pattern.as_bytes(), short.as_bytes(), WM_PATHNAME)
 }
 
+fn is_remote_url_entry(entry: &ConfigEntry) -> bool {
+    let Ok((section, subsection, variable)) = split_key(&entry.key) else {
+        return false;
+    };
+    section == "remote" && subsection.is_some() && variable == "url"
+}
+
+fn is_hasconfig_remote_url(condition: &str) -> bool {
+    condition
+        .strip_prefix("hasconfig:")
+        .is_some_and(|rest| rest.starts_with("remote.*.url:"))
+}
+
+fn include_by_hasconfig_remote_url(condition: &str, set: &ConfigSet, file: &ConfigFile) -> bool {
+    let Some(pattern) = condition.strip_prefix("remote.*.url:") else {
+        return false;
+    };
+    set.entries
+        .iter()
+        .chain(file.entries.iter())
+        .filter(|entry| is_remote_url_entry(entry))
+        .filter_map(|entry| entry.value.as_deref())
+        .any(|value| wildmatch(pattern.as_bytes(), value.as_bytes(), WM_PATHNAME))
+}
+
+fn validate_hasconfig_remote_url_include(
+    file: &ConfigFile,
+    process_includes: bool,
+    depth: usize,
+    ctx: &IncludeContext,
+) -> Result<()> {
+    const MAX_INCLUDE_DEPTH: usize = 10;
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(Error::ConfigError(
+            "exceeded maximum include depth".to_owned(),
+        ));
+    }
+    if file.entries.iter().any(is_remote_url_entry) {
+        return Err(Error::Message(
+            "fatal: remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
+                .to_owned(),
+        ));
+    }
+    if !process_includes {
+        return Ok(());
+    }
+    for entry in &file.entries {
+        let Some((inc_path, condition)) = include_directive_for_entry(entry) else {
+            continue;
+        };
+        if let Some(ref cond) = condition {
+            if !evaluate_include_condition(cond, &ConfigSet::new(), file, ctx) {
+                continue;
+            }
+        }
+        let resolved = match resolve_include_file_path(&inc_path, file, ctx) {
+            Ok(p) => p,
+            Err(Error::ConfigError(msg)) if msg.is_empty() => continue,
+            Err(e) => return Err(e),
+        };
+        if let Some(inc_file) = ConfigFile::from_path(&resolved, file.scope)? {
+            validate_hasconfig_remote_url_include(&inc_file, process_includes, depth + 1, ctx)?;
+        }
+    }
+    Ok(())
+}
+
 /// Evaluate an `[includeIf]` condition.
 ///
-/// Supports `gitdir:`, `gitdir/i:`, and `onbranch:` like Git. Unknown prefixes are false.
-fn evaluate_include_condition(condition: &str, file: &ConfigFile, ctx: &IncludeContext) -> bool {
+/// Supports `gitdir:`, `gitdir/i:`, `onbranch:`, and `hasconfig:remote.*.url:` like Git.
+/// Unknown prefixes are false.
+fn evaluate_include_condition(
+    condition: &str,
+    set: &ConfigSet,
+    file: &ConfigFile,
+    ctx: &IncludeContext,
+) -> bool {
     if let Some(rest) = condition.strip_prefix("gitdir/i:") {
         return include_by_gitdir(rest, file, ctx, true);
     }
@@ -3265,6 +3351,9 @@ fn evaluate_include_condition(condition: &str, file: &ConfigFile, ctx: &IncludeC
     }
     if let Some(rest) = condition.strip_prefix("onbranch:") {
         return include_by_onbranch(rest, ctx);
+    }
+    if let Some(rest) = condition.strip_prefix("hasconfig:") {
+        return include_by_hasconfig_remote_url(rest, set, file);
     }
     false
 }
