@@ -2068,13 +2068,27 @@ pub fn write_multi_pack_index_with_options(
     } else {
         // A non-incremental write replaces any prior split layout entirely; Git
         // leaves no `multi-pack-index.d/` directory behind for a single-file MIDX.
+        let dest = pack_dir.join("multi-pack-index");
+
+        // Git's `midx_needs_update`: if the new MIDX is byte-identical to the one
+        // already on disk and we are not (re)writing a bitmap, leave the file
+        // untouched so its mtime is preserved (t5319 `test_midx_is_retained`).
+        let bitmap_path = pack_dir.join(format!("multi-pack-index-{hash_hex}.bitmap"));
+        let bitmap_ok = !opts.write_bitmap_placeholders || bitmap_path.exists();
+        if bitmap_ok && !midx_d_dir(pack_dir).exists() {
+            if let Ok(existing) = fs::read(&dest) {
+                if existing == out {
+                    return Ok(());
+                }
+            }
+        }
+
         let midx_d = midx_d_dir(pack_dir);
         if midx_d.exists() {
             let _ = fs::remove_dir_all(&midx_d);
         }
         let _ = fs::remove_file(chain_file_path(pack_dir));
 
-        let dest = pack_dir.join("multi-pack-index");
         fs::write(&dest, &out).map_err(Error::Io)?;
 
         scrub_root_midx_sidecars_except(pack_dir, Some(&hash_hex))?;
