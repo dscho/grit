@@ -221,5 +221,6 @@ The Git-compatible engine should live in a **library crate** (`grit-lib`); the *
 - **No external services**: Grit is a pure CLI tool with no databases, containers, or network services. Build and test entirely via Cargo and the Bash test runner.
 - **Unit tests**: Run `cargo test -p grit-lib --lib`. The `grit-cli` crate has no lib target; use `cargo test --workspace` to run everything.
 - **Integration tests**: Use `./scripts/run-tests.sh <test-file>` (see TESTING.md). Many tests are expected to fail — Grit is a work-in-progress.
-- **Lint**: `cargo check -p grit-cli 2>&1 | grep warning` — there are 2 pre-existing unused-variable warnings in `grit/src/commands/add.rs`.
+- **Lint**: `cargo check -p grit-cli 2>&1 | grep warning` — there are 2 pre-existing warnings in `grit/src/commands/diff.rs` and `grit/src/commands/reset.rs`. Avoid `cargo clippy --all-targets` on the full workspace unless fixing test-target errors; `cargo check -p grit-cli` is the quick smoke lint.
+- **Known unit test failures**: 2 pre-existing failures in `ignore::gitignore_glob_tests` (`dir_star_extension_*`); the rest of `cargo test -p grit-lib --lib` should pass.
 - **Binary location**: After `cargo build --release`, the binary is at `target/release/grit`. The test harness expects this path.
