@@ -30,5 +30,27 @@ Ticket: fba897. Subsystem: pack-storage (commit-graph machinery).
 
 ## After first commit: 26/42 passing.
 
-## Remaining failures (to diagnose)
-13, 15, 17, 18, 19, 22, 25, 26, 31, 33, 34, 37, 38, 39, 40, 42.
+## Second batch (33/42)
+- Layer identity for chain BASE-chunk match = file TRAILER (Git g->oid), not the
+  filename. A corrupted trailer breaks the chain match and surfaces as
+  "incorrect checksum" / "chain does not match". Fixed tests 17, 18, 19, 22.
+- Local clone of split commit-graph layer files must use writable (0644) perms,
+  not the source 0444 (tests corrupt them in place).
+- resolve_layer_path is case-SENSITIVE even on case-insensitive FS (macOS APFS):
+  a chain line whose hex case is corrupted must be "file not found". Test 22.
+- read-graph (test-read-graph.c) prints a FIXED set of known chunks in a fixed
+  order, never BASE or "unknown". Fixed parse_graph_file. Tests 37, 38, 39.
+- generationVersion=1 forces no GDA2 chunk; a split write atop a non-GDA2 base
+  also drops GDA2 (only ever *removes* generation data). Tests 37, 38, 39.
+
+## Remaining failures (9): 13, 15, 25, 26, 31, 33, 34, 40, 42.
+- 13, 25: alternates — chain spans an alternate object dir; CommitGraphChain::load
+  only reads layer files from the local objects dir, so cross-alternate chains
+  don't load/write the right number of layers.
+- 31: --split=replace + graph_read_expect (read-graph base count off / chain not
+  reduced to 1 as expected).
+- 33, 34: core.sharedrepository modebits on the split layer + chain file.
+- 40: deep multi-clone dependency; mixed-merge-gdat ends up cloning a flattened
+  chain ([103,8]) so the FIFTH-layer write sees new_only=0.
+- 42: temporary graph layer must be discarded on write failure (missing parent
+  object) and $graphdir left empty.

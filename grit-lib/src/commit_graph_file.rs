@@ -948,23 +948,29 @@ pub fn parse_graph_file(path: &Path) -> Option<ParsedGraphDump> {
     }
     let header_word = u32::from_be_bytes(body[0..4].try_into().ok()?);
     let num_chunks = body[6] as usize;
-    let mut chunk_names = Vec::new();
     let toc_start = 8;
+    let mut present: std::collections::HashSet<u32> = std::collections::HashSet::new();
     for i in 0..num_chunks {
         let e = toc_start + i * 12;
         let id = u32::from_be_bytes(body[e..e + 4].try_into().ok()?);
-        let name = match id {
-            CHUNK_OID_FANOUT => "oid_fanout",
-            CHUNK_OID_LOOKUP => "oid_lookup",
-            CHUNK_COMMIT_DATA => "commit_metadata",
-            CHUNK_GENERATION_DATA => "generation_data",
-            CHUNK_GENERATION_DATA_OVERFLOW => "generation_data_overflow",
-            CHUNK_EXTRA_EDGES => "extra_edges",
-            CHUNK_BLOOM_INDEXES => "bloom_indexes",
-            CHUNK_BLOOM_DATA => "bloom_data",
-            _ => "unknown",
-        };
-        chunk_names.push(name.to_string());
+        present.insert(id);
+    }
+    // `git/t/helper/test-read-graph.c` prints a fixed set of recognized chunks in
+    // a fixed order, omitting the BASE chunk and any unknown chunk.
+    let mut chunk_names: Vec<String> = Vec::new();
+    for (id, label) in [
+        (CHUNK_OID_FANOUT, "oid_fanout"),
+        (CHUNK_OID_LOOKUP, "oid_lookup"),
+        (CHUNK_COMMIT_DATA, "commit_metadata"),
+        (CHUNK_GENERATION_DATA, "generation_data"),
+        (CHUNK_GENERATION_DATA_OVERFLOW, "generation_data_overflow"),
+        (CHUNK_EXTRA_EDGES, "extra_edges"),
+        (CHUNK_BLOOM_INDEXES, "bloom_indexes"),
+        (CHUNK_BLOOM_DATA, "bloom_data"),
+    ] {
+        if present.contains(&id) {
+            chunk_names.push(label.to_string());
+        }
     }
     let layer = CommitGraphLayer::parse(path.to_path_buf(), raw.clone())?;
     let bloom_opt = layer.bloom_settings.map(|s| {

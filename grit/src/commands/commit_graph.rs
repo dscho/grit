@@ -704,25 +704,21 @@ fn cmd_write(
         .get("commitgraph.generationversion")
         .and_then(|s| s.parse::<i32>().ok())
         .unwrap_or(2);
+    // gen_version 1 (or anything != 2) never writes the generation-data chunk.
     let mut write_generation_data = gen_version == 2;
-    if split_enabled && !replace && keep_base > 0 {
+    // When a split write keeps base layers, the result follows the topmost kept
+    // base layer's generation-data presence: if that layer lacks GDA2, the new
+    // layer must also omit it (a chain cannot have a GDA2 layer atop a non-GDA2
+    // one). This only *removes* generation data — gen_version 1 already forced it
+    // off, and a gen_version 2 write atop a non-GDA2 base must drop it too.
+    if write_generation_data && split_enabled && !replace && keep_base > 0 {
         if let Some(ref chain) = existing_chain {
+            let has_gdat = chain.layer_has_generation_data_tip_first();
             // The topmost kept base layer is at tip-first index `num_merged`.
-            let has_gdat = chain.layer_has_generation_data_tip_first();
             if let Some(&topmost_has) = has_gdat.get(num_merged) {
-                write_generation_data = topmost_has;
-            }
-        }
-    }
-    // validate_mixed_generation_chain: if any kept base layer lacks generation
-    // data, the whole result is treated as untrusted and we drop generation data.
-    if split_enabled && !replace && keep_base > 0 {
-        if let Some(ref chain) = existing_chain {
-            let has_gdat = chain.layer_has_generation_data_tip_first();
-            let all_kept_have =
-                (num_merged..num_before).all(|i| *has_gdat.get(i).unwrap_or(&false));
-            if !all_kept_have {
-                write_generation_data = false;
+                if !topmost_has {
+                    write_generation_data = false;
+                }
             }
         }
     }
@@ -955,6 +951,10 @@ struct VerifyLayer {
     has_generation_data: bool,
     /// Number of commits in all layers below this one.
     num_commits_in_base: u32,
+    /// The layer's identity hash, read from the file's trailer (last 20 bytes).
+    /// Git derives `g->oid` from the trailer, so a corrupted trailer changes the
+    /// layer's identity and is detected by the chain BASE-chunk match.
+    trailer_oid: [u8; 20],
 }
 
 /// Parse a single commit-graph layer's chunk table. Returns an error string on
@@ -1051,6 +1051,11 @@ fn parse_verify_layer(path: &Path, data: Vec<u8>) -> std::result::Result<VerifyL
         }
     }
 
+    let mut trailer_oid = [0u8; 20];
+    if data.len() >= HASH_LEN {
+        trailer_oid.copy_from_slice(&data[data.len() - HASH_LEN..]);
+    }
+
     Ok(VerifyLayer {
         path: path.to_path_buf(),
         data,
@@ -1060,6 +1065,7 @@ fn parse_verify_layer(path: &Path, data: Vec<u8>) -> std::result::Result<VerifyL
         base_graphs,
         has_generation_data: gdat_off.is_some(),
         num_commits_in_base: 0,
+        trailer_oid,
     })
 }
 
@@ -1080,19 +1086,39 @@ impl VerifyLayer {
 
 /// Resolve a split-graph layer file `graph-<hash>.graph` across the local object
 /// dir and any alternates.
+///
+/// The match is case-SENSITIVE on the filename even when the underlying
+/// filesystem is case-insensitive (macOS APFS): Git looks up the layer file by
+/// the exact hex string from the chain file, so a chain line whose hex case has
+/// been corrupted must be treated as "file not found" (the verify tests rely on
+/// this). We therefore confirm a directory entry exists with the exact name.
 fn resolve_layer_path(objects_dir: &Path, alt_dirs: &[PathBuf], hash: &str) -> Option<PathBuf> {
     let name = format!("graph-{hash}.graph");
-    let local = objects_dir.join("info").join("commit-graphs").join(&name);
-    if local.is_file() {
-        return Some(local);
+    let dir = objects_dir.join("info").join("commit-graphs");
+    if dir_has_exact_entry(&dir, &name) {
+        return Some(dir.join(&name));
     }
     for alt in alt_dirs {
-        let p = alt.join("info").join("commit-graphs").join(&name);
-        if p.is_file() {
-            return Some(p);
+        let altdir = alt.join("info").join("commit-graphs");
+        if dir_has_exact_entry(&altdir, &name) {
+            return Some(altdir.join(&name));
         }
     }
     None
+}
+
+/// Whether `dir` contains a file whose name matches `name` byte-for-byte (case
+/// sensitive), regardless of the filesystem's case sensitivity.
+fn dir_has_exact_entry(dir: &Path, name: &str) -> bool {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in rd.flatten() {
+        if entry.file_name().to_string_lossy() == name {
+            return entry.path().is_file();
+        }
+    }
+    false
 }
 
 fn read_alternates(objects_dir: &Path) -> Vec<PathBuf> {
@@ -1211,11 +1237,10 @@ fn cmd_verify(
             }
             // num_commits_in_base = sum of commits below.
             layer.num_commits_in_base = chain_layers.iter().map(|l| l.num_commits).sum::<u32>();
-            let mut layer_hash = [0u8; 20];
-            if let Some(hh) = hex_to_hash20(h) {
-                layer_hash = hh;
-            }
-            prev_hashes.push(layer_hash);
+            // The layer's identity for the next layer's BASE-chunk match is its
+            // trailer (Git's g->oid), not its filename. A corrupted trailer thus
+            // breaks the chain match and is surfaced as "chain does not match".
+            prev_hashes.push(layer.trailer_oid);
             chain_layers.push(layer);
         }
         if !valid {
