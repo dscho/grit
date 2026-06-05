@@ -449,10 +449,16 @@ pub fn run(mut args: Args) -> Result<()> {
     // emits no blank line between them, like `--format=%s`.
     let oneline_compact = (args.oneline || args.format.as_deref() == Some("oneline"))
         && (args.quiet || args.no_patch);
-    let compact_multi_subject = ((args.quiet || args.no_patch)
-        && args.format.as_deref() == Some("%s"))
-        || user_format_name_listing
-        || oneline_compact;
+    let custom_format_compact = args.format.as_deref().is_some_and(|f| {
+        f.starts_with("format:")
+            || f.starts_with("tformat:")
+            || !matches!(
+                f,
+                "medium" | "short" | "full" | "fuller" | "reference" | "oneline" | "raw" | "email"
+            )
+    });
+    let compact_multi_subject =
+        custom_format_compact || user_format_name_listing || oneline_compact;
 
     let notes_map = load_notes_map(&repo);
 
@@ -1078,11 +1084,11 @@ fn show_commit(
         } else {
             String::new()
         };
-        let first_line = commit.message.lines().next().unwrap_or("");
+        let first_line = grit_lib::commit_pretty::message_subject(&commit.message);
         let first_line = if expand_tabs_in_log > 0 {
-            grit_lib::tab_expand::expand_tabs_in_line(first_line, expand_tabs_in_log)
+            grit_lib::tab_expand::expand_tabs_in_line(&first_line, expand_tabs_in_log)
         } else {
-            first_line.to_owned()
+            first_line
         };
         if args.remerge_diff && !(args.quiet || args.no_patch) && commit.parents.len() == 2 {
             use crate::commands::remerge_diff::{write_remerge_diff, RemergeDiffOptions};
@@ -1284,9 +1290,9 @@ fn show_commit(
             writeln!(out)?;
         }
         Some("reference") => {
-            let subject = commit.message.lines().next().unwrap_or("");
+            let subject = grit_lib::commit_pretty::message_subject(&commit.message);
             let line =
-                grit_lib::commit_pretty::format_reference_line(oid, subject, &commit.committer, 7);
+                grit_lib::commit_pretty::format_reference_line(oid, &subject, &commit.committer, 7);
             writeln!(out, "{line}")?;
         }
         Some("medium") | None => {
@@ -1340,11 +1346,11 @@ fn show_commit(
             writeln!(out, "From {} Mon Sep 17 00:00:00 2001", hex)?;
             writeln!(out, "From: {}", format_ident_display(&commit.author))?;
             writeln!(out, "Date: {}", format_date(&commit.author))?;
-            let subject = commit.message.lines().next().unwrap_or("");
+            let subject = grit_lib::commit_pretty::message_subject(&commit.message);
             let subject = if expand_tabs_in_log > 0 {
-                grit_lib::tab_expand::expand_tabs_in_line(subject, expand_tabs_in_log)
+                grit_lib::tab_expand::expand_tabs_in_line(&subject, expand_tabs_in_log)
             } else {
-                subject.to_owned()
+                subject
             };
             writeln!(out, "Subject: [PATCH] {}", subject)?;
             writeln!(out)?;
@@ -1383,7 +1389,7 @@ fn show_commit(
             let note_bytes = notes_map.get(oid).map(|v| v.as_slice());
             let formatted =
                 apply_format_string(other, oid, &commit, note_bytes, expand_tabs_in_log);
-            write_formatted_line(out, &formatted)?;
+            writeln!(out, "{formatted}")?;
         }
     }
 
@@ -1735,7 +1741,7 @@ fn show_commit(
 
         if args.diff_merges {
             let subject_isolated = args.format.as_deref() == Some("%s");
-            let subject = commit.message.lines().next().unwrap_or("");
+            let subject = grit_lib::commit_pretty::message_subject(&commit.message);
             for (pi, ptree) in parent_trees.iter().enumerate() {
                 for entry in &diff_entries {
                     if let Some(patch) = format_parent_patch(
@@ -2434,7 +2440,7 @@ pub(crate) fn apply_format_string(
                 }
                 Some('s') => {
                     chars.next();
-                    let subj = pretty_subject(info.message);
+                    let subj = grit_lib::commit_pretty::message_subject(info.message);
                     if expand_tabs_in_log > 0 {
                         result.push_str(&grit_lib::tab_expand::expand_tabs_in_line(
                             &subj,
@@ -2463,14 +2469,14 @@ pub(crate) fn apply_format_string(
                 }
                 Some('b') => {
                     chars.next();
-                    let raw_body = extract_body(info.message);
+                    let raw_body = grit_lib::commit_pretty::message_body(info.message);
                     let body = if expand_tabs_in_log > 0 {
                         grit_lib::tab_expand::expand_tabs_in_multiline_message(
-                            &raw_body,
+                            raw_body,
                             expand_tabs_in_log,
                         )
                     } else {
-                        raw_body
+                        raw_body.to_owned()
                     };
                     if !body.is_empty() {
                         result.push_str(&body);
@@ -2568,35 +2574,6 @@ pub(crate) fn apply_format_string(
     }
 
     result
-}
-
-fn pretty_subject(message: &str) -> String {
-    message
-        .trim_end_matches('\n')
-        .lines()
-        .take_while(|line| !line.is_empty())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn extract_body(message: &str) -> String {
-    let msg = message.trim_end_matches('\n');
-    let mut seen_separator = false;
-    let mut body = Vec::new();
-    for line in msg.lines() {
-        if seen_separator {
-            body.push(line);
-        } else if line.is_empty() {
-            seen_separator = true;
-        }
-    }
-    if !seen_separator || body.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", body.join("\n"))
-    }
 }
 
 /// Extract the name portion from a Git ident string (e.g. "Name <email> ts offset").

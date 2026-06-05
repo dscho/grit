@@ -3764,7 +3764,7 @@ fn collect_branches(dir: &Path, prefix: &str, out: &mut Vec<(String, ObjectId)>)
 fn commit_subject(odb: &grit_lib::odb::Odb, oid: &ObjectId) -> Option<String> {
     let obj = odb.read(oid).ok()?;
     let commit = parse_commit(&obj.data).ok()?;
-    commit.message.lines().next().map(String::from)
+    Some(grit_lib::commit_pretty::message_subject(&commit.message))
 }
 
 /// Extract committer timestamp from a commit for sorting.
