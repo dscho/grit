@@ -1809,50 +1809,58 @@ pub fn write_multi_pack_index_with_options(
     // incremental-repack test, for instance), so include any `*.idx` whose
     // companion `.pack` exists.
     let mut idx_names: Vec<String> = fs::read_dir(pack_dir)
-        .map_err(Error::Io)?
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            let stem = name.strip_suffix(".idx")?;
-            if pack_dir.join(format!("{stem}.pack")).exists() {
-                Some(name)
-            } else {
-                None
-            }
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let stem = name.strip_suffix(".idx")?;
+                    if pack_dir.join(format!("{stem}.pack")).exists() {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     idx_names.sort();
-
-    if idx_names.is_empty() {
-        return Err(Error::CorruptObject(
-            "no pack-*.idx files found in pack directory".to_owned(),
-        ));
-    }
 
     let idx_names: Vec<String> = if let Some(sub) = &opts.pack_names_subset_ordered {
         let mut out = Vec::new();
         for line in sub {
             let want = normalize_pack_idx_basename(line)?;
-            let found = idx_names
-                .iter()
-                .find(|n| **n == want)
-                .cloned()
-                .ok_or_else(|| {
-                    Error::CorruptObject(format!("pack index not in repository: {want}"))
-                })?;
-            if !out.contains(&found) {
-                out.push(found);
+            if let Some(found) = idx_names.iter().find(|n| **n == want).cloned() {
+                if !out.contains(&found) {
+                    out.push(found);
+                }
             }
-        }
-        if out.is_empty() {
-            return Err(Error::CorruptObject(
-                "stdin-packs list produced empty pack set".to_owned(),
-            ));
+            // Unknown names on stdin are silently ignored (Git skips packs it
+            // cannot find rather than failing the whole write).
         }
         out
     } else {
         idx_names
     };
+
+    // Resolve / validate the preferred pack against the working pack set. Git emits a
+    // (non-fatal) `warning: unknown preferred pack: '<name>'` when it cannot be matched.
+    let mut preferred_warned = false;
+    if let Some(raw) = opts.preferred_pack_name.as_deref() {
+        if opts.preferred_pack_idx.is_none()
+            && !idx_names
+                .iter()
+                .any(|n| cmp_idx_or_pack_name(raw, n).is_eq())
+        {
+            eprintln!("warning: unknown preferred pack: '{raw}'");
+            preferred_warned = true;
+        }
+    }
+
+    if idx_names.is_empty() {
+        // Git `write_midx_internal`: `error("no pack files to index.")` then fail.
+        eprintln!("error: no pack files to index.");
+        return Err(Error::CorruptObject("no pack files to index.".to_owned()));
+    }
 
     let (base_oids, base_pack_names) = if opts.incremental {
         collect_incremental_base(pack_dir)?
@@ -1885,17 +1893,12 @@ pub fn write_multi_pack_index_with_options(
     };
 
     let mut preferred_idx = opts.preferred_pack_idx.map(|p| p as usize);
-    if preferred_idx.is_none() {
+    if preferred_idx.is_none() && !preferred_warned {
         if let Some(raw) = opts.preferred_pack_name.as_deref() {
-            let pos = work_names
+            // Already validated against `idx_names`; resolve against the working set.
+            preferred_idx = work_names
                 .iter()
-                .position(|n| cmp_idx_or_pack_name(raw, n).is_eq())
-                .ok_or_else(|| {
-                    Error::CorruptObject(format!(
-                        "preferred pack '{raw}' not found in multi-pack-index input"
-                    ))
-                })?;
-            preferred_idx = Some(pos);
+                .position(|n| cmp_idx_or_pack_name(raw, n).is_eq());
         }
     }
     if preferred_idx.is_none() && opts.write_bitmap_placeholders && !work_names.is_empty() {
@@ -1913,6 +1916,18 @@ pub fn write_multi_pack_index_with_options(
     for name in work_names {
         let path = pack_dir.join(name);
         indexes.push(read_pack_index(&path)?);
+    }
+
+    // Git refuses an explicitly preferred pack that has no objects.
+    if let Some(p) = preferred_idx {
+        if indexes.get(p).map(|i| i.entries.len()).unwrap_or(0) == 0 {
+            let name = work_names.get(p).cloned().unwrap_or_default();
+            let pack_name = name.strip_suffix(".idx").unwrap_or(&name);
+            eprintln!("error: cannot select preferred pack {pack_name}.pack with no objects");
+            return Err(Error::CorruptObject(
+                "cannot select preferred pack with no objects".to_owned(),
+            ));
+        }
     }
 
     let pack_mtimes_layer: Vec<std::time::SystemTime> =

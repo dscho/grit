@@ -302,7 +302,7 @@ fn cmd_write(repo: &Repository, args: &WriteArgs) -> Result<()> {
     };
     let write_bitmaps = args.bitmap && !args.no_bitmap;
     let force_progress = args.progress && !args.no_progress;
-    write_multi_pack_index_with_options(
+    if let Err(e) = write_multi_pack_index_with_options(
         &pack_dir(repo),
         &WriteMultiPackIndexOptions {
             preferred_pack_idx: None,
@@ -312,8 +312,17 @@ fn cmd_write(repo: &Repository, args: &WriteArgs) -> Result<()> {
             incremental: args.incremental,
             write_rev_placeholder: write_rev && write_bitmaps,
         },
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    ) {
+        let msg = e.to_string();
+        // These conditions print a user-facing error to stderr from inside the
+        // library; exit non-zero without the CLI re-printing the message.
+        if msg.contains("no pack files to index.")
+            || msg.contains("cannot select preferred pack with no objects")
+        {
+            return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
+        }
+        return Err(anyhow::anyhow!("{msg}"));
+    }
     emit_forced_progress(force_progress, "Writing chunks to multi-pack-index", 1);
     Ok(())
 }
