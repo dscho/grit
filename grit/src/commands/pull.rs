@@ -806,20 +806,32 @@ fn update_opportunistic_tracking_ref(
     Ok(())
 }
 
+/// Split a pull refspec `<src>[:<dst>]` into its source and optional destination, mirroring
+/// git-fetch: only the source side is fetched into FETCH_HEAD; the destination, if any, names a
+/// local ref to fast-forward (e.g. `git pull . second:third`).
+fn split_pull_refspec(spec: &str) -> (&str, Option<&str>) {
+    let spec = spec.strip_prefix('+').unwrap_or(spec);
+    match spec.split_once(':') {
+        Some((src, dst)) => (src, Some(dst)),
+        None => (spec, None),
+    }
+}
+
 fn pull_fetch_head_line(remote: &Repository, spec: &str) -> Result<(ObjectId, String)> {
     use grit_lib::objects::ObjectKind;
     use grit_lib::refs::resolve_ref;
 
-    let tag_ref = format!("refs/tags/{spec}");
+    let (src, _dst) = split_pull_refspec(spec);
+    let tag_ref = format!("refs/tags/{src}");
     if let Ok(tag_oid) = resolve_ref(&remote.git_dir, &tag_ref) {
         if remote.odb.read(&tag_oid)?.kind == ObjectKind::Tag {
-            return Ok((tag_oid, format!("tag '{spec}' of .")));
+            return Ok((tag_oid, format!("tag '{src}' of .")));
         }
     }
-    let oid = resolve_revision(remote, spec).with_context(|| format!("bad revision '{spec}'"))?;
+    let oid = resolve_revision(remote, src).with_context(|| format!("bad revision '{src}'"))?;
     // Match git's FETCH_HEAD format: the short branch name (e.g. `branch 'side' of .`),
     // not the full `refs/heads/...` ref. fmt-merge-msg reads this verbatim.
-    let short = spec.strip_prefix("refs/heads/").unwrap_or(spec);
+    let short = src.strip_prefix("refs/heads/").unwrap_or(src);
     Ok((oid, format!("branch '{short}' of .")))
 }
 

@@ -1331,12 +1331,36 @@ fn try_merge_strategies(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("merge failed")))
 }
 
-/// Handle merge when HEAD is unborn — just set HEAD to merge target.
+/// Handle merge when HEAD is unborn — "pull into void".
+///
+/// Git treats this as a two-way fast-forward from the empty tree to the merge target
+/// (builtin/pull.c `pull_into_void`): index/worktree changes the user already staged or left
+/// untracked on the unborn branch must survive (or abort the merge), exactly like a normal
+/// fast-forward. We therefore compose the target tree with unrelated staged additions and run
+/// the same overwrite checks before touching HEAD or the working tree.
 fn merge_unborn(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> {
     if args.commits.len() != 1 {
         bail!("Can merge only exactly one commit into empty head");
     }
     let merge_oid = resolve_merge_target(repo, &args.commits[0])?;
+    let commit_obj = repo.odb.read(&merge_oid)?;
+    let commit = parse_commit(&commit_obj.data)?;
+
+    // Two-way merge with an empty base tree: keeps unrelated staged additions and surfaces
+    // collisions with untracked / staged files before we mutate anything.
+    let empty_tree = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904")?;
+    let current_index = repo.load_index()?;
+    let mut index = compose_fast_forward_index(repo, commit.tree, empty_tree, &current_index)?;
+    let empty_old: HashMap<Vec<u8>, IndexEntry> = HashMap::new();
+    bail_if_merge_would_overwrite_local_changes(repo, &empty_old, &index, &[], false)?;
+
+    apply_sparse_checkout_skip_worktree(
+        &repo.git_dir,
+        repo.work_tree.as_deref(),
+        &mut index,
+        false,
+    );
+
     merge_update_head_with_reflog(
         repo,
         head,
@@ -1344,19 +1368,6 @@ fn merge_unborn(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
         merge_oid,
         Some("initial pull"),
     )?;
-    // Update index and working tree
-    let commit_obj = repo.odb.read(&merge_oid)?;
-    let commit = parse_commit(&commit_obj.data)?;
-    let entries = tree_to_index_entries(repo, &commit.tree, "")?;
-    let mut index = Index::new();
-    index.entries = entries;
-    index.sort();
-    apply_sparse_checkout_skip_worktree(
-        &repo.git_dir,
-        repo.work_tree.as_deref(),
-        &mut index,
-        false,
-    );
 
     if let Some(ref wt) = repo.work_tree {
         checkout_entries(
