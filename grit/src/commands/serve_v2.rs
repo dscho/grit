@@ -491,17 +491,31 @@ fn cmd_fetch(
 
     let want_set: HashSet<ObjectId> = wants.iter().copied().collect();
     let mut have_commits: Vec<ObjectId> = Vec::new();
+    // `acknowledgments` ACKs every `have` the server already has, de-duplicated and in first-seen
+    // order (matching `upload-pack.c` `do_got_oid`: each object's `THEY_HAVE` flag is set once, so a
+    // repeated `have` for the same object is ACKed only once). Non-commit `have` objects (trees,
+    // blobs) are ACKed too — they just do not contribute ancestor history.
+    let mut acks: Vec<ObjectId> = Vec::new();
+    let mut acked: HashSet<ObjectId> = HashSet::new();
     for h in &have_oids {
         if let Ok(obj) = repo.odb.read(h) {
             if obj.kind == ObjectKind::Commit {
                 have_commits.push(*h);
+            }
+            if acked.insert(*h) {
+                acks.push(*h);
             }
         }
     }
 
     if !have_oids.is_empty() && !seen_done {
         pkt_line::write_line(out, "acknowledgments")?;
-        pkt_line::write_line(out, "NAK")?;
+        if acks.is_empty() {
+            pkt_line::write_line(out, "NAK")?;
+        }
+        for oid in &acks {
+            pkt_line::write_line(out, &format!("ACK {}", oid.to_hex()))?;
+        }
         if ok_to_give_up_v2(&repo, &want_set, &have_commits) {
             pkt_line::write_line(out, "ready")?;
             pkt_line::write_delim(out)?;
