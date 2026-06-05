@@ -4109,10 +4109,10 @@ Use '--' to separate paths from revisions, like this:\n\
     // still uses the upstream *tip* for the replay list (t3431.4); explicit `--fork-point
     // --keep-base` uses the fork-point commit (t3431.12).
     let commits_upstream = if args.keep_base > 0 {
-        if reapply_cherry_picks {
-            onto_oid
-        } else if fork_point_effective && args.fork_point {
+        if fork_point_effective && args.fork_point {
             upstream_oid
+        } else if reapply_cherry_picks {
+            onto_oid
         } else {
             upstream_tip_oid
         }
