@@ -18,7 +18,9 @@ use grit_lib::index::Index;
 use grit_lib::objects::{parse_commit, parse_tree, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::repo::Repository;
-use grit_lib::sparse_checkout::{parse_sparse_checkout_file, path_in_sparse_checkout_patterns};
+use grit_lib::sparse_checkout::{
+    parse_sparse_checkout_file, path_in_cone_mode_sparse_checkout, path_in_sparse_checkout_patterns,
+};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -196,6 +198,16 @@ pub fn run(mut args: Args) -> Result<()> {
         .filter(|entry| entry.is_sparse_directory_placeholder())
         .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
         .collect();
+    if rm_pathspec_needs_sparse_index_expansion(
+        &args.pathspec,
+        work_tree,
+        &raw_sparse_placeholders,
+        &sparse_patterns,
+        cone_cfg,
+        sparse_enabled,
+    )? {
+        emit_index_trace_region("ensure_full_index");
+    }
 
     let mut index = match repo.load_index() {
         Ok(idx) => idx,
@@ -740,6 +752,73 @@ fn compressed_sparse_placeholder_outputs(
         })
         .cloned()
         .collect()
+}
+
+fn rm_pathspec_needs_sparse_index_expansion(
+    pathspecs: &[String],
+    work_tree: &Path,
+    sparse_placeholders: &[String],
+    sparse_patterns: &[String],
+    cone_cfg: bool,
+    sparse_enabled: bool,
+) -> Result<bool> {
+    if !sparse_enabled || sparse_placeholders.is_empty() {
+        return Ok(false);
+    }
+    if pathspecs.iter().any(|spec| spec.starts_with(':')) {
+        return Ok(true);
+    }
+
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    let prefix = crate::pathspec::pathdiff(&cwd, work_tree);
+    for spec in pathspecs {
+        let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix.as_deref());
+        if rm_single_pathspec_needs_sparse_index_expansion(
+            &resolved,
+            sparse_placeholders,
+            sparse_patterns,
+            cone_cfg,
+        ) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn rm_single_pathspec_needs_sparse_index_expansion(
+    pathspec: &str,
+    sparse_placeholders: &[String],
+    sparse_patterns: &[String],
+    cone_cfg: bool,
+) -> bool {
+    if let Some(wildcard_at) = first_glob_char(pathspec) {
+        let wildcard_suffix = &pathspec[wildcard_at..];
+        if wildcard_suffix.bytes().all(|b| b == b'*')
+            && path_in_cone_mode_sparse_checkout(pathspec, sparse_patterns, cone_cfg)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    !path_in_cone_mode_sparse_checkout(pathspec, sparse_patterns, cone_cfg)
+        && !sparse_placeholders
+            .iter()
+            .any(|placeholder| pathspec_matches(pathspec, placeholder))
+}
+
+fn first_glob_char(pathspec: &str) -> Option<usize> {
+    pathspec
+        .char_indices()
+        .find_map(|(idx, ch)| matches!(ch, '*' | '?' | '[').then_some(idx))
+}
+
+fn emit_index_trace_region(label: &str) {
+    if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
+        if !trace2_event.trim().is_empty() {
+            let _ = crate::trace2_region_json(&trace2_event, "index", label);
+        }
+    }
 }
 
 /// Generate error header and optional hint for a batch of failures.

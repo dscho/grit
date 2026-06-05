@@ -122,3 +122,9 @@
   them, while still removing expanded children from the index.
 - Direct `--run=1,79` passes, and canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `94/106`.
+- Subtests 80 and 81 check sparse-index expansion trace behavior for `rm`. `rm` now mirrors Git's
+  pathspec expansion decision for trace2: in-cone literal/wildcard removals stay quiet, while
+  pathspecs that may need to inspect partial contents of sparse-directory placeholders emit
+  `index/ensure_full_index`.
+- Direct `--run=1,80,81` passes, and canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `95/106`.
