@@ -42,3 +42,13 @@
 - Direct execution now passes through subtest 41 and stops at subtest 42
   (`merge, cherry-pick, and rebase`). Canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `78/106`.
+- The subtest 42 merge failure was caused by sparse-index placeholders being collapsed before the
+  merge commit tree was written; expanding the index for tree writing preserves out-of-cone files.
+- The next subtest 42 failure was sparse-index cherry-pick. Cherry-pick applied sparse rules to all
+  out-of-cone paths and then tried to write sparse-directory placeholders during checkout. Changed
+  cherry-pick to clear skip-worktree for paths changed by the replay, expand placeholders before
+  commit-tree writing, and skip sparse stage-0 entries/placeholders during worktree checkout.
+- Focused sparse-index cherry-pick of `update-folder1` now succeeds and materializes `folder1/a`
+  while keeping unchanged out-of-cone entries sparse.
+- Canonical harness: `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `80/106`.
+  Direct execution now passes subtest 42 and exposes later conflict-resolution failures.
