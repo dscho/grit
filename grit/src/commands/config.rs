@@ -100,6 +100,10 @@ pub struct Args {
     #[arg(long = "get-all", value_name = "KEY", num_args = 0..=1, default_missing_value = "")]
     pub get_all_key: Option<String>,
 
+    /// Unsupported negated legacy get mode.
+    #[arg(long = "no-get", hide = true)]
+    pub no_get: bool,
+
     /// Get values matching a regex (legacy).
     #[arg(long = "get-regexp", value_name = "PATTERN", num_args = 0..=1, default_missing_value = "")]
     pub get_regexp: Option<String>,
@@ -451,6 +455,12 @@ pub struct EditArgs {}
 /// Run the `config` command.
 pub fn run(args: Args) -> Result<()> {
     validate_type_specifiers(&args)?;
+    if args.no_get {
+        bail!("unknown option `no-get'");
+    }
+    if args.get_key.is_some() && args.get_all_key.is_some() {
+        bail!("error: options '--get-all' and '--get' cannot be used together");
+    }
 
     for dir in &args.change_dir {
         std::env::set_current_dir(dir)
