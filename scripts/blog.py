@@ -196,7 +196,6 @@ def load_posts() -> list[Post]:
 def page_shell(title: str, description: str, body: str, base: str, blog_href: str, rss_href: str, atom_href: str, extra_head: str = "") -> str:
     home_href = f"{base}/" if base != "." else "./"
     logo_href = f"{base}/grit-logo.svg"
-    spec_href = f"{base}/v1-scope.md"
     return f"""<!doctype html>
 <html lang=\"en\">
 <head>
@@ -212,7 +211,7 @@ def page_shell(title: str, description: str, body: str, base: str, blog_href: st
 <body>
 <header class=\"site-header\">
   <a class=\"brand\" href=\"{home_href}\"><img src=\"{logo_href}\" alt=\"\" /> <span><span>the</span> <strong>Grit</strong> <span>project</span></span></a>
-  <nav aria-label=\"Primary\"><a href=\"{blog_href}\">Blog</a><a href=\"{rss_href}\">RSS</a><a href=\"{spec_href}\">Spec →</a></nav>
+  <nav aria-label=\"Primary\"><a href=\"{blog_href}\">Blog</a><a href=\"{rss_href}\">RSS</a></nav>
 </header>
 {body}
 </body>
