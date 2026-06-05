@@ -709,7 +709,23 @@ pub fn run(mut args: Args) -> Result<()> {
                 return Ok(());
             }
         }
-        if !args.stdout && !args.quiet {
+        if args.stdout {
+            // Git's `write_pack_file()` is always called (unless `--non-empty`), so an
+            // empty enumeration still streams a valid 32-byte empty pack to stdout. The
+            // protocol-v2 `fetch` "want-ref with ref we already have commit for" case
+            // (t5703) relies on this: the client already has every wanted object, so the
+            // pack is empty but `index-pack` must still accept it.
+            if !args.quiet {
+                eprintln!("Total 0 (delta 0), reused 0 (delta 0)");
+            }
+            let pack_bytes = build_pack(&[], false, pack_hash_bytes, Compression::default())?;
+            let stdout = io::stdout();
+            let mut out = stdout.lock();
+            out.write_all(&pack_bytes)?;
+            out.flush()?;
+            return Ok(());
+        }
+        if !args.quiet {
             eprintln!("Total 0 (delta 0), reused 0 (delta 0)");
         }
         // `--unpack-unreachable` (repack -A) must still run the loosen pass and
@@ -3341,6 +3357,16 @@ fn collect_incremental_repack_oids(repo: &Repository, args: &Args) -> Result<Pac
             let promisor = promisor_pack_object_ids(&repo.git_dir.join("objects"));
             ordered.retain(|o| !promisor.contains(o));
         }
+    }
+
+    // `pack-objects --local` packs only objects in the local object store, never objects that
+    // live in an alternate ODB (git/pack-objects.c `want_object_in_pack` honors `local`). The
+    // `--unpacked` walk treats alternate-packed objects as "unpacked" (they are not in a *local*
+    // pack), so without this filter `git repack --local` would copy the alternate's objects into
+    // a new local pack (t5319 "multi-pack-index in an alternate").
+    if args.local {
+        let alt_oids = alternate_object_ids(repo)?;
+        ordered.retain(|o| !alt_oids.contains(o));
     }
 
     Ok(PackObjectList {
