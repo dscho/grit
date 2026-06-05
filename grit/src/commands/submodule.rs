@@ -3445,8 +3445,12 @@ pub(crate) fn resolve_submodule_super_url(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| work_tree.to_path_buf());
 
-    let base = default_remote_url_raw(repo_git_dir)
-        .unwrap_or_else(|| outer_wt.to_string_lossy().into_owned());
+    let base = if superproject_git_dir_for_nested_modules(repo_git_dir).is_some() {
+        work_tree.to_string_lossy().into_owned()
+    } else {
+        default_remote_url_raw(repo_git_dir)
+            .unwrap_or_else(|| outer_wt.to_string_lossy().into_owned())
+    };
     git_relative_url(&base, raw_url, None)
 }
 
@@ -4022,6 +4026,17 @@ pub(crate) fn absorb_submodule_dot_git_dir_into_modules(
     let relative_gitdir = pathdiff_relative(&sub_path, &modules_dir);
     fs::write(&dot_git, format!("gitdir: {relative_gitdir}\n"))?;
     Ok(())
+}
+
+/// Absorb a submodule's embedded gitdir before `git rm` removes its work tree.
+pub(crate) fn absorb_submodule_git_dir_for_rm(
+    repo: &Repository,
+    submodule_rel: &str,
+    quiet: bool,
+) -> Result<()> {
+    let work_tree = repo.work_tree.as_ref().context("bare repository")?;
+    let modules_cfg = parse_gitmodules_with_repo(work_tree, Some(repo))?;
+    absorb_git_dir_into_superproject(repo, work_tree, submodule_rel, None, quiet, &modules_cfg)
 }
 
 fn run_absorbgitdirs(args: &AbsorbgitdirsArgs, quiet: bool) -> Result<()> {

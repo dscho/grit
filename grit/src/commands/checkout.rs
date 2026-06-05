@@ -6741,7 +6741,13 @@ fn checkout_index_to_worktree_inner(
                     }
                     let abs = work_tree.join(&rel);
                     if submodule_dir_has_non_dotgit_content(&abs) {
-                        remove_gitlink_dir_or_warn(&abs, &rel);
+                        match std::fs::remove_dir(&abs) {
+                            Ok(()) => remove_empty_parent_dirs(work_tree, &abs),
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                eprintln!("warning: unable to rmdir '{rel}': {e}");
+                            }
+                        }
                         continue;
                     }
                 }
