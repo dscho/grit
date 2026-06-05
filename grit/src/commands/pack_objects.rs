@@ -2429,8 +2429,15 @@ fn add_children_by_path_for_sparse(
     uninteresting: &mut HashSet<ObjectId>,
     map: &mut HashMap<Vec<u8>, HashSet<ObjectId>>,
 ) -> Result<()> {
-    let obj = read_object_from_repo(repo, tree_oid)
-        .map_err(|_| anyhow::anyhow!("bad tree object {}", tree_oid.to_hex()))?;
+    // Git's `mark_tree_uninteresting` reads boundary trees gently: a missing tree on the
+    // uninteresting (boundary) side is tolerated, because its children cannot be in the
+    // interesting set anyway. A genuinely-missing interesting tree is still caught later by the
+    // positive-side walk (`walk_reachable_commits_first`). This lets `pack with missing tree`
+    // (t5310) succeed when an excluded object is absent.
+    let obj = match read_object_from_repo(repo, tree_oid) {
+        Ok(obj) => obj,
+        Err(_) => return Ok(()),
+    };
     if obj.kind != ObjectKind::Tree {
         return Ok(());
     }
@@ -2565,7 +2572,11 @@ fn collect_revs_pack_objects_sparse(
                 continue;
             }
             commit_uninteresting.insert(cid);
-            let obj = read_object_from_repo(repo, &cid)?;
+            // A missing commit on the uninteresting side is tolerated (its ancestors cannot be in
+            // the interesting set): lets `pack with missing parent` (t5310) succeed.
+            let Ok(obj) = read_object_from_repo(repo, &cid) else {
+                continue;
+            };
             if obj.kind != ObjectKind::Commit {
                 continue;
             }
@@ -2598,7 +2609,11 @@ fn collect_revs_pack_objects_sparse(
             uninteresting.insert(c.tree);
         }
         for p in &c.parents {
-            let pobj = read_object_from_repo(repo, p)?;
+            // A missing parent commit (e.g. an excluded boundary whose ancestor was pruned) is
+            // tolerated: its root tree simply does not join the edge set.
+            let Ok(pobj) = read_object_from_repo(repo, p) else {
+                continue;
+            };
             if pobj.kind != ObjectKind::Commit {
                 continue;
             }
@@ -2873,7 +2888,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
         if !skip_full_exclude_subtract {
             let mut exclude = BTreeSet::new();
             for root in &exclude_roots {
-                walk_reachable(repo, root, &mut exclude, &shallow_grafts)?;
+                walk_reachable_lenient(repo, root, &mut exclude, &shallow_grafts)?;
             }
             for oid in &exclude {
                 oids.remove(oid);
@@ -2914,7 +2929,7 @@ fn collect_pack_objects_from_rev_stdin_lines(
     for neg in &negative {
         let oid =
             resolve_revision(repo, neg).with_context(|| format!("cannot resolve ref '{neg}'"))?;
-        walk_reachable(repo, &oid, &mut exclude, &shallow_grafts)?;
+        walk_reachable_lenient(repo, &oid, &mut exclude, &shallow_grafts)?;
     }
     for pos in &positive {
         let oid =
@@ -3869,11 +3884,41 @@ fn walk_reachable(
     oids: &mut BTreeSet<ObjectId>,
     shallow_grafts: &HashSet<ObjectId>,
 ) -> Result<()> {
+    walk_reachable_inner(repo, oid, oids, shallow_grafts, false)
+}
+
+/// Walk reachability from `oid` like [`walk_reachable`], but silently skip objects whose content
+/// cannot be read instead of failing.
+///
+/// Git's `pack-objects --revs` boundary (exclude) traversal does not require the *content* of the
+/// uninteresting closure to be present: with bitmaps the closure comes from the bitmap, and without
+/// them missing objects in the uninteresting set are simply ignored (they cannot also be in the
+/// interesting set). Using this for the negative side lets `pack with missing blob/tree/parent`
+/// (t5310) succeed when an excluded object is absent.
+fn walk_reachable_lenient(
+    repo: &Repository,
+    oid: &ObjectId,
+    oids: &mut BTreeSet<ObjectId>,
+    shallow_grafts: &HashSet<ObjectId>,
+) -> Result<()> {
+    walk_reachable_inner(repo, oid, oids, shallow_grafts, true)
+}
+
+fn walk_reachable_inner(
+    repo: &Repository,
+    oid: &ObjectId,
+    oids: &mut BTreeSet<ObjectId>,
+    shallow_grafts: &HashSet<ObjectId>,
+    lenient: bool,
+) -> Result<()> {
     if !oids.insert(*oid) {
         return Ok(()); // already visited
     }
-    let obj = read_object_from_repo(repo, oid)
-        .map_err(|_| anyhow::anyhow!("bad tree object {}", oid.to_hex()))?;
+    let obj = match read_object_from_repo(repo, oid) {
+        Ok(obj) => obj,
+        Err(_) if lenient => return Ok(()),
+        Err(_) => return Err(anyhow::anyhow!("bad tree object {}", oid.to_hex())),
+    };
     match obj.kind {
         ObjectKind::Commit => {
             // Parse tree and parent lines.
@@ -3881,12 +3926,18 @@ fn walk_reachable(
                 for line in text.lines() {
                     if let Some(tree_hex) = line.strip_prefix("tree ") {
                         if let Ok(tree_oid) = ObjectId::from_hex(tree_hex.trim()) {
-                            walk_reachable(repo, &tree_oid, oids, shallow_grafts)?;
+                            walk_reachable_inner(repo, &tree_oid, oids, shallow_grafts, lenient)?;
                         }
                     } else if let Some(parent_hex) = line.strip_prefix("parent ") {
                         if !shallow_grafts.contains(oid) {
                             if let Ok(parent_oid) = ObjectId::from_hex(parent_hex.trim()) {
-                                walk_reachable(repo, &parent_oid, oids, shallow_grafts)?;
+                                walk_reachable_inner(
+                                    repo,
+                                    &parent_oid,
+                                    oids,
+                                    shallow_grafts,
+                                    lenient,
+                                )?;
                             }
                         }
                     } else if line.is_empty() {
@@ -3903,7 +3954,7 @@ fn walk_reachable(
                 if entry.mode == MODE_GITLINK {
                     continue;
                 }
-                walk_reachable(repo, &entry.oid, oids, shallow_grafts)?;
+                walk_reachable_inner(repo, &entry.oid, oids, shallow_grafts, lenient)?;
             }
         }
         ObjectKind::Tag => {
@@ -3912,7 +3963,7 @@ fn walk_reachable(
                 if let Some(first_line) = text.lines().next() {
                     if let Some(obj_hex) = first_line.strip_prefix("object ") {
                         if let Ok(target_oid) = ObjectId::from_hex(obj_hex.trim()) {
-                            walk_reachable(repo, &target_oid, oids, shallow_grafts)?;
+                            walk_reachable_inner(repo, &target_oid, oids, shallow_grafts, lenient)?;
                         }
                     }
                 }
