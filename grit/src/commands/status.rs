@@ -377,6 +377,70 @@ fn sparse_reported_paths_require_full_index(
     })
 }
 
+fn sparse_index_expanded_advice_enabled(config: &ConfigSet) -> bool {
+    !config
+        .get("advice.sparseIndexExpanded")
+        .map(|v| {
+            matches!(
+                v.to_ascii_lowercase().as_str(),
+                "false" | "no" | "off" | "0"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn status_path_outside_sparse_checkout(
+    repo: &Repository,
+    config: &ConfigSet,
+    work_tree: &Path,
+    path: &str,
+) -> bool {
+    let sparse_enabled = config
+        .get("core.sparseCheckout")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let sparse_index_enabled = config
+        .get("index.sparse")
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    if !sparse_enabled || !sparse_index_enabled {
+        return false;
+    }
+    let cone_enabled = config
+        .get("core.sparseCheckoutCone")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true);
+    let (cone_ok, cone, non_cone) =
+        grit_lib::sparse_checkout::load_sparse_checkout(&repo.git_dir, cone_enabled);
+    let normalized = path.trim_end_matches('/');
+    !grit_lib::sparse_checkout::path_in_sparse_checkout(
+        normalized,
+        cone_ok,
+        cone.as_ref(),
+        &non_cone,
+        Some(work_tree),
+    )
+}
+
+fn should_advise_sparse_index_expanded(
+    repo: &Repository,
+    config: &ConfigSet,
+    work_tree: &Path,
+    index_sparse_on_disk: bool,
+    unstaged: &[grit_lib::diff::DiffEntry],
+    untracked: &[String],
+    ignored_files: &[String],
+) -> bool {
+    if !index_sparse_on_disk || !sparse_index_expanded_advice_enabled(config) {
+        return false;
+    }
+    unstaged
+        .iter()
+        .any(|entry| status_path_outside_sparse_checkout(repo, config, work_tree, entry.path()))
+        || untracked
+            .iter()
+            .chain(ignored_files.iter())
+            .any(|path| status_path_outside_sparse_checkout(repo, config, work_tree, path))
+}
+
 /// Run the `status` command.
 pub fn run(mut args: Args) -> Result<()> {
     if !git_optional_locks_enabled() {
@@ -797,6 +861,24 @@ pub fn run(mut args: Args) -> Result<()> {
         .into_iter()
         .filter(|p| status_path_matches_worktree(&repo, &index, work_tree, p, &pathspecs))
         .collect();
+
+    if should_advise_sparse_index_expanded(
+        &repo,
+        &config,
+        work_tree,
+        index_sparse_on_disk,
+        &unstaged,
+        &untracked,
+        &ignored_files,
+    ) {
+        eprintln!(
+            "The sparse index is expanding to a full index, a slow operation.\n\
+Your working directory likely has contents that are outside of\n\
+your sparse-checkout patterns. Use 'git sparse-checkout list' to\n\
+see your sparse-checkout definition and compare it to your working\n\
+directory contents. Running 'git clean' may assist in this cleanup."
+        );
+    }
 
     let staged_long = remap_diff_paths(&staged, &relativize);
     let unstaged_long = remap_diff_paths(&unstaged, &relativize);

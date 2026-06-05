@@ -152,3 +152,9 @@
 - Direct `--run=1,101` passes. Canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
   `101/106`.
+- 2026-06-05 15:39 CEST: Subtest 102 now passes. `status` emits the
+  `advice.sparseIndexExpanded` warning when a sparse index reports outside-cone worktree paths, and
+  still respects the advice config plus sparse-checkout/index.sparse state.
+- Direct `--run=1,102` passes. Canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
+  `102/106`.
