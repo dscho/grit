@@ -170,3 +170,9 @@
 - Direct `--run=1,104` passes. Canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
   `104/106`.
+- 2026-06-05 16:00 CEST: Subtest 105 now passes. `merge -s ours` computes the commit tree after
+  merge commit-message hooks and expands sparse-directory placeholders before writing the tree, so
+  sparse-index merges preserve the same HEAD tree as full checkouts.
+- Direct `--run=1,105` passes. Canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
+  `105/106`.

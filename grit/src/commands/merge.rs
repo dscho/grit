@@ -4511,8 +4511,6 @@ fn do_strategy_ours(
     run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut idx)?;
     repo.write_index(&mut idx)?;
 
-    let tree_oid = write_tree_from_index(&repo.odb, &idx, "")?;
-
     let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
     let msg = run_merge_commit_msg_hooks(
         repo,
@@ -4522,6 +4520,8 @@ fn do_strategy_ours(
         &mut idx,
         hook_cleanup,
     )?;
+    idx.expand_sparse_directory_placeholders(&repo.odb)?;
+    let tree_oid = write_tree_from_index(&repo.odb, &idx, "")?;
 
     let commit_data = CommitData {
         tree: tree_oid,
