@@ -324,7 +324,7 @@ pub fn run(args: Args) -> Result<()> {
     } else {
         grit_lib::midx::read_midx_pack_idx_names(repo.odb.objects_dir()).unwrap_or_default()
     };
-    let loosen_unreachable = args.repack_all_unpack && !args.cruft;
+    let loosen_unreachable = args.repack_all_unpack && args.delete_old && !args.cruft;
 
     let pack_line_hex_len = if cfg
         .get("extensions.objectformat")
@@ -726,9 +726,11 @@ pub fn run(args: Args) -> Result<()> {
         }
     } else if args.repack_all_unpack {
         trace_argv.push("-A".to_string());
-        match args.unpack_unreachable.as_deref() {
-            Some(u) if !u.is_empty() => trace_argv.push(format!("--unpack-unreachable={u}")),
-            _ => trace_argv.push("--unpack-unreachable".to_string()),
+        if args.delete_old {
+            match args.unpack_unreachable.as_deref() {
+                Some(u) if !u.is_empty() => trace_argv.push(format!("--unpack-unreachable={u}")),
+                _ => trace_argv.push("--unpack-unreachable".to_string()),
+            }
         }
     } else if args.all {
         trace_argv.push("-a".to_string());
@@ -817,9 +819,8 @@ pub fn run(args: Args) -> Result<()> {
                     .read_dir()
                     .map(|mut rd| rd.next().is_some())
                     .unwrap_or(false);
-            let simple_full_repack = args.all
+            let simple_full_repack = (args.all || args.repack_all_unpack)
                 && !args.cruft
-                && !args.repack_all_unpack
                 && !grafts_or_replace_in_effect
                 && args
                     .filter
