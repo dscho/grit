@@ -527,7 +527,7 @@ dependencies = [
 
 [[package]]
 name = "grit-simple"
-version = "0.3.94"
+version = "0.3.94-1"
 dependencies = [
  "anyhow",
  "clap",
