@@ -4033,7 +4033,7 @@ fn prepare_commit_message(
         let commit = grit_lib::objects::parse_commit(&obj.data)?;
         if args.reedit_message.is_some() {
             let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
-            let mut file_body = build_initial_commit_buffer(args, repo, fixup, template_path)?;
+            let mut file_body = ensure_trailing_newline(&commit.message);
             if !args.no_status {
                 commit_template_status_append(args, repo, head, config, &mut file_body)?;
             }
