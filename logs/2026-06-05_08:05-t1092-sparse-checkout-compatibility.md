@@ -116,3 +116,9 @@
   path updates for non-sparse-index cases, while preserving sparse-index's quiet output.
 - Direct `--run=1,75,76` passes, and canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `93/106`.
+- Subtest 79 (`rm pathspec outside sparse definition`) exposed that `git rm --sparse folder1/*`
+  on a sparse index expanded the `folder1/` placeholder and printed each child removal. `rm` now
+  preserves raw sparse-directory placeholders as the porcelain removal unit when pathspecs select
+  them, while still removing expanded children from the index.
+- Direct `--run=1,79` passes, and canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `94/106`.

@@ -189,6 +189,14 @@ pub fn run(mut args: Args) -> Result<()> {
         Vec::new()
     };
 
+    let raw_index = Index::load(&repo.index_path_for_env()?).unwrap_or_else(|_| Index::new());
+    let raw_sparse_placeholders: Vec<String> = raw_index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_directory_placeholder())
+        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .collect();
+
     let mut index = match repo.load_index() {
         Ok(idx) => idx,
         Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
@@ -200,6 +208,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Phase 1: collect all index paths to remove and check safety.
     let mut to_remove: Vec<String> = Vec::new();
+    let mut sparse_placeholder_outputs: BTreeSet<String> = BTreeSet::new();
     // Collect errors grouped by kind so we can emit batched messages.
     let mut errors_by_kind: Vec<(RmErrorKind, Vec<String>)> = Vec::new();
     let mut sparse_only_pathspecs: Vec<String> = Vec::new();
@@ -244,6 +253,13 @@ pub fn run(mut args: Args) -> Result<()> {
                 );
             }
         } else {
+            collect_sparse_placeholder_outputs_for_pathspec_list(
+                &raw_sparse_placeholders,
+                &full_specs,
+                args.sparse,
+                &mut sparse_placeholder_outputs,
+            );
+
             for path_str in &matches {
                 if symlink_leading_path_resolves(work_tree, Path::new(path_str)).is_some() {
                     bail!("'{path_str}' is beyond a symbolic link");
@@ -351,6 +367,13 @@ pub fn run(mut args: Args) -> Result<()> {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
+
+        collect_sparse_placeholder_outputs_for_single_pathspec(
+            &raw_sparse_placeholders,
+            &rel,
+            args.sparse,
+            &mut sparse_placeholder_outputs,
+        );
 
         if !exclude_specs.is_empty() {
             let mut resolved_excludes: Vec<String> = Vec::new();
@@ -577,8 +600,18 @@ pub fn run(mut args: Args) -> Result<()> {
 
         index.remove(path_str.as_bytes());
 
-        if !args.quiet {
+        if !args.quiet
+            && !sparse_placeholder_outputs
+                .iter()
+                .any(|prefix| path_is_under_sparse_placeholder(path_str, prefix))
+        {
             print_rm_line(&mut out, path_str)?;
+        }
+    }
+
+    if !args.quiet {
+        for path in compressed_sparse_placeholder_outputs(&to_remove, &sparse_placeholder_outputs) {
+            print_rm_line(&mut out, &path)?;
         }
     }
 
@@ -656,6 +689,57 @@ fn rm_entry_matches_sparse_worktree(
         path_in_sparse_checkout_lines(path, patterns, work_tree)
     };
     in_sparse
+}
+
+fn collect_sparse_placeholder_outputs_for_pathspec_list(
+    placeholders: &[String],
+    specs: &[String],
+    sparse_allowed: bool,
+    out: &mut BTreeSet<String>,
+) {
+    if !sparse_allowed {
+        return;
+    }
+    for placeholder in placeholders {
+        if grit_lib::pathspec::matches_pathspec_list(placeholder, specs) {
+            out.insert(placeholder.clone());
+        }
+    }
+}
+
+fn collect_sparse_placeholder_outputs_for_single_pathspec(
+    placeholders: &[String],
+    pathspec: &str,
+    sparse_allowed: bool,
+    out: &mut BTreeSet<String>,
+) {
+    if !sparse_allowed {
+        return;
+    }
+    for placeholder in placeholders {
+        if pathspec_matches(pathspec, placeholder) {
+            out.insert(placeholder.clone());
+        }
+    }
+}
+
+fn path_is_under_sparse_placeholder(path: &str, placeholder: &str) -> bool {
+    path.as_bytes().starts_with(placeholder.as_bytes()) && path.len() > placeholder.len()
+}
+
+fn compressed_sparse_placeholder_outputs(
+    removed_paths: &[String],
+    placeholders: &BTreeSet<String>,
+) -> Vec<String> {
+    placeholders
+        .iter()
+        .filter(|placeholder| {
+            removed_paths
+                .iter()
+                .any(|path| path_is_under_sparse_placeholder(path, placeholder))
+        })
+        .cloned()
+        .collect()
 }
 
 /// Generate error header and optional hint for a batch of failures.
