@@ -673,48 +673,66 @@ pub fn run(args: Args) -> Result<()> {
         // without updating `refs/tags/*`. Git keeps annotated tags only in FETCH_HEAD for
         // `git pull $path $tag` so throwaway-tag merges default to --no-ff (t7600).
         let remote_repo = open_repository_at_path(&remote_path)?;
-        super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
 
-        let lines = if args.refspecs.is_empty() {
-            let remote_oid = if let Ok(oid) =
-                refs::resolve_ref(&remote_repo.git_dir, &format!("refs/heads/{merge_branch}"))
-            {
-                oid
-            } else if let Ok(oid) = refs::resolve_ref(&remote_repo.git_dir, "HEAD") {
-                oid
-            } else {
-                bail!("bad revision '{merge_branch}': could not resolve in remote");
-            };
-            let tracking_ref = format!("refs/remotes/{remote_name}/{merge_branch}");
-            refs::write_ref(&repo.git_dir, &tracking_ref, &remote_oid)
-                .with_context(|| format!("update remote-tracking ref {tracking_ref}"))?;
-            if let Ok(Some(sym)) = refs::read_symbolic_ref(&remote_repo.git_dir, "HEAD") {
-                let short = sym.strip_prefix("refs/heads/").unwrap_or(&sym);
-                if short == merge_branch.as_str() {
-                    let remote_head_ref = format!("refs/remotes/{remote_name}/HEAD");
-                    let _ =
-                        refs::write_symbolic_ref(&repo.git_dir, &remote_head_ref, &tracking_ref);
+        // `fetch.recurseSubmodules` (or `--recurse-submodules`) makes the *fetch* phase descend into
+        // submodules. The non-local path gets this from `super::fetch::run`; the direct-copy
+        // shortcut must reproduce it, recording superproject ref tips around the copy so on-demand
+        // recursion can detect changed submodule pointers.
+        let fetch_recurse_mode = pull_fetch_recurse_mode(&args, &config)?;
+        recurse_fetch_submodules_for_local_pull(&config, fetch_recurse_mode, || {
+            super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
+
+            let lines = if args.refspecs.is_empty() {
+                let remote_oid = if let Ok(oid) =
+                    refs::resolve_ref(&remote_repo.git_dir, &format!("refs/heads/{merge_branch}"))
+                {
+                    oid
+                } else if let Ok(oid) = refs::resolve_ref(&remote_repo.git_dir, "HEAD") {
+                    oid
+                } else {
+                    bail!("bad revision '{merge_branch}': could not resolve in remote");
+                };
+                let tracking_ref = format!("refs/remotes/{remote_name}/{merge_branch}");
+                refs::write_ref(&repo.git_dir, &tracking_ref, &remote_oid)
+                    .with_context(|| format!("update remote-tracking ref {tracking_ref}"))?;
+                if let Ok(Some(sym)) = refs::read_symbolic_ref(&remote_repo.git_dir, "HEAD") {
+                    let short = sym.strip_prefix("refs/heads/").unwrap_or(&sym);
+                    if short == merge_branch.as_str() {
+                        let remote_head_ref = format!("refs/remotes/{remote_name}/HEAD");
+                        let _ = refs::write_symbolic_ref(
+                            &repo.git_dir,
+                            &remote_head_ref,
+                            &tracking_ref,
+                        );
+                    }
                 }
-            }
-            vec![format!(
-                "{}\t\tbranch 'refs/heads/{merge_branch}' of .\n",
-                remote_oid.to_hex()
-            )]
-        } else {
-            let mut out = Vec::new();
-            for spec in &effective_refspecs {
-                let (oid, desc) = pull_fetch_head_line(&remote_repo, spec)?;
-                out.push(format!("{}\t\t{desc}\n", oid.to_hex()));
-                // Opportunistically update the configured remote-tracking ref, the
-                // same way `git fetch <remote> <branch>` does: an explicit refspec
-                // still refreshes `refs/remotes/<remote>/<branch>` when a
-                // `remote.<name>.fetch` rule maps it (t5510 "explicit pull should
-                // update tracking").
-                update_opportunistic_tracking_ref(&repo, &remote_repo, remote_name, spec, &config)?;
-            }
-            out
-        };
-        fs::write(repo.git_dir.join("FETCH_HEAD"), lines.concat())?;
+                vec![format!(
+                    "{}\t\tbranch 'refs/heads/{merge_branch}' of .\n",
+                    remote_oid.to_hex()
+                )]
+            } else {
+                let mut out = Vec::new();
+                for spec in &effective_refspecs {
+                    let (oid, desc) = pull_fetch_head_line(&remote_repo, spec)?;
+                    out.push(format!("{}\t\t{desc}\n", oid.to_hex()));
+                    // Opportunistically update the configured remote-tracking ref, the
+                    // same way `git fetch <remote> <branch>` does: an explicit refspec
+                    // still refreshes `refs/remotes/<remote>/<branch>` when a
+                    // `remote.<name>.fetch` rule maps it (t5510 "explicit pull should
+                    // update tracking").
+                    update_opportunistic_tracking_ref(
+                        &repo,
+                        &remote_repo,
+                        remote_name,
+                        spec,
+                        &config,
+                    )?;
+                }
+                out
+            };
+            fs::write(repo.git_dir.join("FETCH_HEAD"), lines.concat())?;
+            Ok(())
+        })?;
 
         grit_lib::pack::clear_pack_cache();
         let kind = do_merge_or_rebase_after_fetch(&args, &config, &repo, &head)?;
@@ -1010,6 +1028,123 @@ fn submodule_update_after_pull_will_run(args: &Args, config: &ConfigSet) -> bool
         return false;
     }
     config_recurse
+}
+
+/// Run the recursive submodule **fetch** for the local-path pull shortcut.
+///
+/// The non-local fetch path delegates to `super::fetch::run`, which recurses into submodules itself
+/// (Git `cmd_pull` always shells out to `git fetch`). The local-path shortcut copies objects
+/// directly and bypasses that machinery, so when `fetch.recurseSubmodules` (or
+/// `--recurse-submodules`) requests submodule recursion we must reproduce it here: record the
+/// superproject ref tips around the object copy, then fetch each populated/changed submodule from
+/// its own remote (Git `fetch_submodules`). This is the *fetch* phase only — the submodule working
+/// tree is left untouched (that update happens separately when submodule recursion is enabled for
+/// the merge).
+fn recurse_fetch_submodules_for_local_pull(
+    config: &ConfigSet,
+    recurse: grit_lib::fetch_submodules::FetchRecurseSubmodules,
+    copy_and_record: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    use grit_lib::fetch_submodules::FetchRecurseSubmodules;
+    if recurse == FetchRecurseSubmodules::Off {
+        return copy_and_record();
+    }
+    let cwd = std::env::current_dir().context("cwd")?;
+    let repo = Repository::discover(Some(cwd.as_path())).context("open repository")?;
+    crate::fetch_submodule_record::begin_fetch_submodule_record(&repo.git_dir);
+    copy_and_record()?;
+    crate::fetch_submodule_record::finish_record_tips_after(&repo.git_dir);
+    let fetch_args = fetch_args_for_recurse(config);
+    crate::fetch_submodule_recurse::recursive_fetch_submodules_after_fetch(
+        &repo.git_dir,
+        config,
+        &fetch_args,
+        recurse,
+    )
+}
+
+/// Build a minimal `fetch::Args` carrying only the fields the recursive submodule fetch reads
+/// (parallelism, dry-run/quiet propagation, prefix). All other fields take their defaults.
+fn fetch_args_for_recurse(_config: &ConfigSet) -> super::fetch::Args {
+    super::fetch::Args {
+        remote: None,
+        refspecs: Vec::new(),
+        filter: None,
+        no_filter: false,
+        all: false,
+        no_all: false,
+        no_auto_gc: false,
+        no_write_commit_graph: false,
+        multiple: false,
+        tags: false,
+        no_tags: false,
+        prune: false,
+        no_prune: false,
+        force: false,
+        prune_tags: false,
+        atomic: false,
+        append: false,
+        dry_run: false,
+        write_fetch_head: false,
+        no_write_fetch_head: false,
+        refmap: Vec::new(),
+        deepen: None,
+        depth: None,
+        shallow_since: None,
+        shallow_exclude: None,
+        unshallow: false,
+        update_shallow: false,
+        refetch: false,
+        keep: false,
+        output: None,
+        quiet: false,
+        verbose: 0,
+        jobs: None,
+        server_options: Vec::new(),
+        porcelain: false,
+        no_porcelain: false,
+        no_show_forced_updates: false,
+        show_forced_updates: false,
+        negotiate_only: false,
+        negotiation_tip: Vec::new(),
+        set_upstream: false,
+        update_head_ok: false,
+        prefetch: false,
+        update_refs: false,
+        upload_pack: None,
+        recurse_submodules: None,
+        no_recurse_submodules: false,
+        recurse_submodules_default: None,
+        submodule_prefix: None,
+        no_ipv4: false,
+        no_ipv6: false,
+    }
+}
+
+/// Resolve the submodule **fetch** recursion mode for a pull, matching
+/// `fetch_recurse_submodules_mode`: `--no-recurse-submodules` forces off, an explicit
+/// `--recurse-submodules[=val]` wins next, then `fetch.recurseSubmodules`; otherwise `Default`
+/// (on-demand) so only changed submodules recurse.
+fn pull_fetch_recurse_mode(
+    args: &Args,
+    config: &ConfigSet,
+) -> Result<grit_lib::fetch_submodules::FetchRecurseSubmodules> {
+    use grit_lib::fetch_submodules::{parse_fetch_recurse_submodules_arg, FetchRecurseSubmodules};
+    if args.no_recurse_submodules {
+        return Ok(FetchRecurseSubmodules::Off);
+    }
+    if let Some(raw) = args.recurse_submodules.as_deref() {
+        return parse_fetch_recurse_submodules_arg("--recurse-submodules", raw)
+            .map_err(|e| anyhow::anyhow!(e));
+    }
+    if let Some(raw) = config
+        .get("fetch.recursesubmodules")
+        .or_else(|| config.get("fetch.recurseSubmodules"))
+    {
+        return parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", raw.trim())
+            .map_err(|e| anyhow::anyhow!(e));
+    }
+    Ok(FetchRecurseSubmodules::Default)
 }
 
 fn maybe_update_submodules_after_pull(
