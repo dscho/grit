@@ -14,7 +14,7 @@ use grit_lib::rev_list::{self, ObjectFilter};
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 
-use grit_lib::index::MODE_SYMLINK;
+use grit_lib::index::{Index, MODE_SYMLINK};
 use grit_lib::objects::{parse_commit, parse_tree, Object, ObjectId, ObjectKind};
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse;
@@ -209,6 +209,7 @@ pub fn run(args: Args) -> Result<()> {
     };
 
     let transform_mode = args.textconv || args.filters;
+    maybe_emit_index_path_sparse_expansion_trace(&repo, obj_str);
     let (oid, blob_mode_for_transform) = match if transform_mode {
         resolve_object_with_mode_lib(&repo, obj_str)
     } else {
@@ -1851,6 +1852,59 @@ fn resolve_object(repo: &Repository, obj_str: &str) -> Result<ObjectId> {
 
 fn resolve_object_lib(repo: &Repository, obj_str: &str) -> LibResult<ObjectId> {
     rev_parse::resolve_revision(repo, obj_str)
+}
+
+fn maybe_emit_index_path_sparse_expansion_trace(repo: &Repository, obj_str: &str) {
+    let Some(path) = index_path_from_cat_file_spec(obj_str) else {
+        return;
+    };
+    let index_path = if let Ok(raw) = std::env::var("GIT_INDEX_FILE") {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() {
+            p
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(p)
+        } else {
+            p
+        }
+    } else {
+        repo.index_path()
+    };
+    let Ok(index) = Index::load(&index_path) else {
+        return;
+    };
+    if !path_under_sparse_index_dir(&index, path) {
+        return;
+    }
+    if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
+        if !trace2_event.trim().is_empty() {
+            let _ = crate::trace2_region_json(&trace2_event, "index", "ensure_full_index");
+        }
+    }
+}
+
+fn index_path_from_cat_file_spec(spec: &str) -> Option<&str> {
+    let rest = spec.strip_prefix(':')?;
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_digit() && bytes[1] == b':' {
+        Some(&rest[2..])
+    } else {
+        Some(rest)
+    }
+}
+
+fn path_under_sparse_index_dir(index: &Index, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.is_sparse_directory_placeholder())
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok())
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .any(|prefix| {
+            let prefix_slash = format!("{prefix}/");
+            path == prefix || path.starts_with(&prefix_slash)
+        })
 }
 
 /// Emit `--textconv` / `--filters` output for a single object (non-batch).

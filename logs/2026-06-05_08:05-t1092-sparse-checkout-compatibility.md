@@ -158,3 +158,9 @@
 - Direct `--run=1,102` passes. Canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
   `102/106`.
+- 2026-06-05 15:44 CEST: Subtest 103 now passes. `cat-file` emits an
+  `index/ensure_full_index` trace for `:path` lookups beneath sparse-directory placeholders while
+  keeping in-cone index-path lookups quiet.
+- Direct `--run=1,103` passes. Canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
+  `103/106`.
