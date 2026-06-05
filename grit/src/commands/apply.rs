@@ -18,7 +18,7 @@ use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::crlf::{self, FileAttrs, MergeAttr};
 use grit_lib::index::{
-    Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK,
+    Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK, MODE_TREE,
 };
 use grit_lib::merge_file::{merge, ConflictStyle, MergeFavor, MergeInput};
 use grit_lib::objects::ObjectId;
@@ -27,6 +27,10 @@ use grit_lib::quote_path::quote_c_style;
 use grit_lib::repo::Repository;
 use grit_lib::rerere::{repo_rerere, rerere_enabled, RerereAutoupdate};
 use grit_lib::rev_parse::resolve_revision_for_patch_old_blob;
+use grit_lib::sparse_checkout::{
+    effective_cone_mode_for_sparse_file, parse_sparse_checkout_file,
+    path_in_sparse_checkout_patterns,
+};
 use grit_lib::ws::{self, WhitespaceGitAttr, WS_BLANK_AT_EOF, WS_DEFAULT_RULE, WS_INCOMPLETE_LINE};
 use regex::Regex;
 use std::borrow::Cow;
@@ -4276,6 +4280,8 @@ pub fn run(mut args: Args) -> Result<()> {
     if args.three_way && Repository::discover(None).is_err() {
         bail!("'--3way' outside a repository");
     }
+    let pre_expanded_sparse_paths = sparse_index_patch_paths(&patches, &args);
+    maybe_emit_apply_sparse_index_trace(&patches, &args);
     prepare_patch_modes_for_apply(&mut patches, &args)?;
 
     // For --cached, we need a repository and index.
@@ -4306,11 +4312,17 @@ pub fn run(mut args: Args) -> Result<()> {
                     verify_worktree_matches_index_for_patch(fp, &args)?;
                 }
             }
-            apply_to_worktree(&patches, &args, ws_mode, &patch_input_display)?;
+            apply_to_worktree(
+                &patches,
+                &args,
+                ws_mode,
+                &patch_input_display,
+                &pre_expanded_sparse_paths,
+            )?;
             apply_to_index(&patches, &args, ws_mode, &patch_input_display)?;
             ensure_gitlink_placeholder_dirs(&patches, &args)?;
         } else {
-            apply_to_worktree(&patches, &args, ws_mode, &patch_input_display)?;
+            apply_to_worktree(&patches, &args, ws_mode, &patch_input_display, &[])?;
             if args.intent_to_add {
                 apply_intent_to_add_entries(&patches, &args)?;
             }
@@ -4893,10 +4905,15 @@ fn can_apply_with_empty_preimage(fp: &FilePatch) -> bool {
 /// This catches invalid sequences (e.g. later patches reading a path that was
 /// moved away by an earlier rename) and prevents partially-applied worktree
 /// state when such sequences are detected.
-fn precheck_worktree_patch_sequence(patches: &[FilePatch], args: &Args) -> Result<()> {
+fn precheck_worktree_patch_sequence(
+    patches: &[FilePatch],
+    args: &Args,
+    pre_expanded_sparse_paths: &[String],
+) -> Result<()> {
     let work_tree = apply_work_tree_root();
     let work_tree_ref = work_tree.as_deref();
     let setup_prefix = apply_setup_prefix();
+    let repo = Repository::discover(None).ok();
     let mut current_exists: HashMap<String, bool> = HashMap::new();
     let mut initial_exists: HashMap<String, bool> = HashMap::new();
 
@@ -4972,6 +4989,14 @@ fn precheck_worktree_patch_sequence(patches: &[FilePatch], args: &Args) -> Resul
         if !source_exists_now {
             let can_use_initial_snapshot =
                 source_op != target_op && (fp.is_copy || fp.is_rename) && source_existed_initially;
+            let source_was_sparse = args.index
+                && (path_matches_sparse_patch_paths(&source_op, pre_expanded_sparse_paths)
+                    || repo
+                        .as_ref()
+                        .is_some_and(|repo| path_outside_sparse_checkout(repo, &source_op)));
+            if source_was_sparse {
+                continue;
+            }
             if !can_use_initial_snapshot && !can_apply_with_empty_preimage(fp) {
                 bail!(
                     "failed to read {}: No such file or directory (os error 2)",
@@ -5011,10 +5036,14 @@ fn apply_to_worktree(
     args: &Args,
     ws_mode: ApplyWhitespaceMode,
     patch_input_display: &str,
+    pre_expanded_sparse_paths: &[String],
 ) -> Result<()> {
     let work_tree = apply_work_tree_root();
     let work_tree_ref = work_tree.as_deref();
     let setup_prefix = apply_setup_prefix();
+    let raw_index = Repository::discover(None)
+        .ok()
+        .and_then(|repo| load_raw_index_for_sparse_detection(&repo).ok());
     let crlf_ctx = ApplyCrlfContext::load();
     let mut had_rejects = false;
     let mut apply_nonzero = false;
@@ -5050,7 +5079,7 @@ fn apply_to_worktree(
             source_snapshots.insert(source_op, content);
         }
     }
-    precheck_worktree_patch_sequence(patches, args)?;
+    precheck_worktree_patch_sequence(patches, args, pre_expanded_sparse_paths)?;
 
     for fp in patches {
         let path_str = fp
@@ -5183,6 +5212,18 @@ fn apply_to_worktree(
         let read_path = apply_fs_path(&source_operational, work_tree_ref);
         let source_contains_target =
             fp.is_rename && read_path != path && target_is_inside_source(&path, &read_path);
+        let source_was_sparse =
+            path_is_sparse_in_indexes(
+                crlf_ctx.as_ref().map(|ctx| &ctx.index),
+                raw_index.as_ref(),
+                &source_operational,
+            ) || path_matches_sparse_patch_paths(&source_operational, pre_expanded_sparse_paths)
+                || crlf_ctx.as_ref().is_some_and(|ctx| {
+                    path_outside_sparse_checkout(&ctx.repo, &source_operational)
+                });
+        if args.index && !read_path.exists() && source_was_sparse {
+            continue;
+        }
 
         if fp.binary_patch.is_some() {
             let old_bytes: Vec<u8> = if source_adjusted != path_adjusted {
@@ -6116,6 +6157,165 @@ fn preimage_st_mode_for_apply(
     Ok(patch_old_declared.unwrap_or(MODE_REGULAR))
 }
 
+fn maybe_emit_apply_sparse_index_trace(patches: &[FilePatch], args: &Args) {
+    if !(args.index || args.cached) {
+        return;
+    }
+    let Ok(repo) = Repository::discover(None) else {
+        return;
+    };
+    let Ok(index) = load_raw_index_for_sparse_detection(&repo) else {
+        return;
+    };
+    if !patches
+        .iter()
+        .any(|fp| patch_touches_sparse_dir(fp, args, &index))
+    {
+        return;
+    }
+    if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
+        if !trace2_event.trim().is_empty() {
+            let _ = crate::trace2_region_json(&trace2_event, "index", "ensure_full_index");
+        }
+    }
+}
+
+fn load_raw_index_for_sparse_detection(repo: &Repository) -> Result<Index> {
+    let index_path = repo.index_path_for_env()?;
+    Index::load(&index_path).map_err(Into::into)
+}
+
+fn sparse_index_patch_paths(patches: &[FilePatch], args: &Args) -> Vec<String> {
+    if !(args.index || args.cached) {
+        return Vec::new();
+    }
+    let Ok(repo) = Repository::discover(None) else {
+        return Vec::new();
+    };
+    let Ok(index) = load_raw_index_for_sparse_detection(&repo) else {
+        return Vec::new();
+    };
+    let setup_prefix = apply_setup_prefix();
+    let mut sparse_paths = Vec::new();
+    for fp in patches {
+        for path in fp.source_path().into_iter().chain(fp.target_path()) {
+            if path == "/dev/null" {
+                continue;
+            }
+            let adjusted = adjust_path(path, args.directory.as_deref());
+            let operational = fp.worktree_rel_operational(&adjusted, &setup_prefix);
+            if index_path_is_sparse(&index, &operational) {
+                sparse_paths.push(operational);
+            }
+        }
+    }
+    sparse_paths
+}
+
+fn patch_touches_sparse_dir(fp: &FilePatch, args: &Args, index: &Index) -> bool {
+    fp.source_path()
+        .into_iter()
+        .chain(fp.target_path())
+        .filter(|path| *path != "/dev/null")
+        .map(|path| adjust_path(path, args.directory.as_deref()))
+        .any(|path| index_path_is_under_sparse_dir(index, &path))
+}
+
+fn index_path_is_under_sparse_dir(index: &Index, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let candidates = [
+        path,
+        path.strip_prefix("a/").unwrap_or(path),
+        path.strip_prefix("b/").unwrap_or(path),
+    ];
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == 0 && entry.mode == MODE_TREE)
+        .filter_map(|entry| std::str::from_utf8(&entry.path).ok())
+        .map(|prefix| prefix.trim_end_matches('/'))
+        .any(|prefix| {
+            let prefix_slash = format!("{prefix}/");
+            candidates
+                .iter()
+                .any(|candidate| *candidate == prefix || candidate.starts_with(&prefix_slash))
+        })
+}
+
+fn index_path_is_sparse(index: &Index, path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    let candidates = [
+        path,
+        path.strip_prefix("a/").unwrap_or(path),
+        path.strip_prefix("b/").unwrap_or(path),
+    ];
+    candidates.iter().any(|candidate| {
+        index
+            .get(candidate.as_bytes(), 0)
+            .is_some_and(|entry| entry.skip_worktree())
+            || index_path_is_under_sparse_dir(index, candidate)
+    })
+}
+
+fn path_is_sparse_in_indexes(index: Option<&Index>, raw_index: Option<&Index>, path: &str) -> bool {
+    index.is_some_and(|ix| index_path_is_sparse(ix, path))
+        || raw_index.is_some_and(|ix| index_path_is_sparse(ix, path))
+}
+
+fn path_matches_sparse_patch_paths(path: &str, sparse_paths: &[String]) -> bool {
+    sparse_paths
+        .iter()
+        .any(|sparse_path| path_variants_match(path, sparse_path))
+}
+
+fn path_variants_match(left: &str, right: &str) -> bool {
+    let left = left.trim_end_matches('/');
+    let right = right.trim_end_matches('/');
+    let left_variants = [
+        left,
+        left.strip_prefix("a/").unwrap_or(left),
+        left.strip_prefix("b/").unwrap_or(left),
+    ];
+    let right_variants = [
+        right,
+        right.strip_prefix("a/").unwrap_or(right),
+        right.strip_prefix("b/").unwrap_or(right),
+    ];
+    left_variants
+        .iter()
+        .any(|left| right_variants.iter().any(|right| left == right))
+}
+
+fn path_outside_sparse_checkout(repo: &Repository, path: &str) -> bool {
+    let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let sparse_enabled = config
+        .get("core.sparseCheckout")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !sparse_enabled {
+        return false;
+    }
+    let sparse_file = repo.git_dir.join("info").join("sparse-checkout");
+    let Ok(contents) = fs::read_to_string(sparse_file) else {
+        return false;
+    };
+    let patterns = parse_sparse_checkout_file(&contents);
+    if patterns.is_empty() {
+        return false;
+    }
+    let cone_config = config
+        .get("core.sparseCheckoutCone")
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    let path = path.trim_end_matches('/');
+    let included = if effective_cone_mode_for_sparse_file(cone_config, &patterns) {
+        path_in_sparse_checkout_patterns(path, &patterns, true)
+    } else {
+        grit_lib::ignore::path_in_sparse_checkout(path, &patterns, repo.work_tree.as_deref())
+    };
+    !included
+}
+
 /// Reconcile patch extended modes with index/stat like Git `check_preimage`.
 fn reconcile_filepatch_preimage_modes(
     fp: &mut FilePatch,
@@ -6166,6 +6366,9 @@ fn reconcile_filepatch_preimage_modes(
 /// Fill in missing `old_mode` / `new_mode` and emit mode mismatch warnings (Git `check_preimage`).
 fn prepare_patch_modes_for_apply(patches: &mut [FilePatch], args: &Args) -> Result<()> {
     let repo_ok = Repository::discover(None).ok();
+    let raw_index = repo_ok
+        .as_ref()
+        .and_then(|r| load_raw_index_for_sparse_detection(r).ok());
     let index = repo_ok.as_ref().and_then(|r| r.load_index().ok());
     let work_tree = repo_ok.as_ref().and_then(|r| r.work_tree.clone());
     let work_tree_ref = work_tree.as_deref();
@@ -6193,10 +6396,10 @@ fn prepare_patch_modes_for_apply(patches: &mut [FilePatch], args: &Args) -> Resu
         }
         let adjusted = adjust_path(source, args.directory.as_deref());
         let operational = fp.worktree_rel_operational(&adjusted, &setup_prefix);
-        let ce_mode = index
+        let ce_entry = index
             .as_ref()
-            .and_then(|ix| ix.get(operational.as_bytes(), 0))
-            .map(|e| e.mode);
+            .and_then(|ix| ix.get(operational.as_bytes(), 0));
+        let ce_mode = ce_entry.map(|e| e.mode);
 
         if args.cached {
             reconcile_filepatch_preimage_modes(
@@ -6218,7 +6421,15 @@ fn prepare_patch_modes_for_apply(patches: &mut [FilePatch], args: &Args) -> Resu
             let st_stat = match fs::symlink_metadata(&path) {
                 Ok(meta) => Some(meta.permissions().mode()),
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    if can_apply_with_empty_preimage(fp) {
+                    if args.index
+                        && path_is_sparse_in_indexes(
+                            index.as_ref(),
+                            raw_index.as_ref(),
+                            &operational,
+                        )
+                    {
+                        None
+                    } else if can_apply_with_empty_preimage(fp) {
                         None
                     } else {
                         return Err(err).with_context(|| format!("failed to stat {adjusted}"));

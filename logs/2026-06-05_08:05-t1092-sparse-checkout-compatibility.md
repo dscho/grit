@@ -134,3 +134,14 @@
   to recurse and find sparse-directory matches without emitting an index expansion trace.
 - Direct `--run=1,84` and `--run=1,85` pass, and canonical harness:
   `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh` -> `96/106`.
+- 2026-06-05 15:01 CEST: Subtests 93, 97, 99, and 100 were advanced. Worktree add/remove now
+  reports user-supplied relative paths, cached diff checks load missing sparse `.gitattributes`
+  rules from the index, apply skips worktree preimage reads for missing outside-cone files while
+  still emitting sparse-index expansion traces, reset preserves a partially expanded sparse-index
+  shape across `reset --hard`, and interactive add emits expansion traces for outside-cone patch
+  selections.
+- Direct `--run=1,99` and `--run=1,100` pass. Direct `--run=1,101,102,103,104,105,106` now
+  reaches subtest 101 and fails at `git add .` sparse-path advice before the checkout/reset patch
+  trace assertions. Canonical harness:
+  `./scripts/run-tests.sh t1092-sparse-checkout-compatibility.sh --verbose --timeout 180` ->
+  `99/106`.

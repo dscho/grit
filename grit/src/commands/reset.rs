@@ -185,6 +185,27 @@ pub(crate) fn preserve_index_cache_flags_from(old: &Index, new: &mut Index) {
     }
 }
 
+fn sparse_index_was_partially_expanded(index: &Index) -> bool {
+    let sparse_roots: HashSet<Vec<u8>> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.is_sparse_directory_placeholder())
+        .filter_map(|entry| first_path_component(&entry.path))
+        .collect();
+    !sparse_roots.is_empty()
+        && index.entries.iter().any(|entry| {
+            entry.stage() == 0
+                && !entry.is_sparse_directory_placeholder()
+                && first_path_component(&entry.path)
+                    .is_some_and(|root| sparse_roots.contains(root.as_slice()))
+        })
+}
+
+fn first_path_component(path: &[u8]) -> Option<Vec<u8>> {
+    let slash = path.iter().position(|b| *b == b'/')?;
+    Some(path[..slash].to_vec())
+}
+
 /// The reset mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ResetMode {
@@ -1522,6 +1543,7 @@ Use '--' to separate paths from revisions, like this:\n\
     // Git updates the index before moving HEAD for mixed/hard/keep/merge (`reset_index` runs
     // before `reset_refs` in builtin/reset.c).
     let index_path = repo.index_path();
+    let old_index_raw = Index::load(&index_path).unwrap_or_else(|_| Index::new());
     let old_index = repo
         .load_index_at(&index_path)
         .context("loading old index")?;
@@ -1580,6 +1602,8 @@ Use '--' to separate paths from revisions, like this:\n\
 
     let needs_worktree_checkout =
         mode == ResetMode::Hard || mode == ResetMode::Keep || mode == ResetMode::Merge;
+    let preserve_partial_sparse_index =
+        needs_worktree_checkout && sparse_index_was_partially_expanded(&old_index_raw);
 
     if mode == ResetMode::Mixed && extra.intent_to_add {
         let new_paths: HashSet<Vec<u8>> =
@@ -1755,8 +1779,12 @@ Use '--' to separate paths from revisions, like this:\n\
         let cache_tree = build_cache_tree_from_index(&repo.odb, &new_index)?;
         new_index.set_cache_tree(cache_tree);
     }
-    repo.write_index_at(&index_path, &mut new_index)
-        .context("writing index")?;
+    if preserve_partial_sparse_index {
+        new_index.write(&index_path).context("writing index")?;
+    } else {
+        repo.write_index_at(&index_path, &mut new_index)
+            .context("writing index")?;
+    }
     // For MIXED (and SOFT) resets, do NOT re-apply sparse-checkout. Git's `reset`
     // only copies the existing entry's skip-worktree bit and never deletes
     // worktree files or re-runs sparse application (git/builtin/reset.c).
@@ -1768,7 +1796,7 @@ Use '--' to separate paths from revisions, like this:\n\
     // into the worktree without honoring skip-worktree, so they still need the
     // sparse re-apply to prune excluded paths back out (t1091 "cone mode: match
     // patterns").
-    if needs_worktree_checkout {
+    if needs_worktree_checkout && !preserve_partial_sparse_index {
         crate::commands::sparse_checkout::reapply_sparse_checkout_if_configured(repo)?;
     }
 
