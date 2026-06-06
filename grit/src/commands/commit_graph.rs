@@ -16,7 +16,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufWriter, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use grit_lib::bloom::BloomFilterSettings;
@@ -411,6 +411,40 @@ fn commit_graph_layer_id_hash(path: &Path) -> Option<[u8; 20]> {
     Some(h.finalize().into())
 }
 
+/// Write `contents` to `path` atomically by writing a uniquely-named temporary file in the
+/// same directory and renaming it over `path`.
+///
+/// This matches Git's commit-graph machinery, which always renames its lockfile into place
+/// rather than truncating an existing file. The rename creates a fresh inode, so if `path` was
+/// previously **hardlinked** (as happens for `info/commit-graphs/commit-graph-chain` after a
+/// local `git clone` that hardlinks the objects tree), the source repository's file is left
+/// untouched. A plain `fs::write` would instead truncate the shared inode and corrupt the
+/// clone source's commit-graph chain.
+///
+/// # Parameters
+/// - `path`: destination file path (overwritten atomically).
+/// - `contents`: bytes to write.
+///
+/// # Errors
+/// Returns an error if the temporary file cannot be created/written or the rename fails.
+fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("path {:?} has no parent directory", path))?;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("path {:?} has no file name", path))?;
+    let tmp = dir.join(format!(".{file_name}.tmp.{}", std::process::id()));
+    fs::write(&tmp, contents).with_context(|| format!("writing {:?}", tmp))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("renaming {:?} to {:?}", tmp, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_write(
     object_dir: Option<PathBuf>,
@@ -569,8 +603,7 @@ fn cmd_write(
             }
             fs::rename(&graph_path, &dest)
                 .with_context(|| format!("migrating {:?} to {:?}", graph_path, dest))?;
-            fs::write(&chain_path, format!("{hex}\n"))
-                .with_context(|| format!("writing {:?}", chain_path))?;
+            write_file_atomic(&chain_path, format!("{hex}\n").as_bytes())?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -858,7 +891,9 @@ fn cmd_write(
             fs::create_dir_all(&graphs_dir)?;
         }
         let layer_path = graphs_dir.join(format!("graph-{hex_hash}.graph"));
-        fs::write(&layer_path, &bytes).with_context(|| format!("writing {:?}", layer_path))?;
+        // Atomic write (temp + rename) avoids mutating a hardlinked layer file shared with a
+        // clone source when the same layer hash already exists on disk.
+        write_file_atomic(&layer_path, &bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -878,8 +913,13 @@ fn cmd_write(
             }
         }
         chain_lines.push(hex_hash.clone());
-        fs::write(&chain_path, format!("{}\n", chain_lines.join("\n")))
-            .with_context(|| format!("writing {:?}", chain_path))?;
+        // Write the chain file atomically (temp + rename) so a hardlinked clone source
+        // — local `git clone` hardlinks `info/commit-graphs/commit-graph-chain` — is not
+        // corrupted by truncating the shared inode in place.
+        write_file_atomic(
+            &chain_path,
+            format!("{}\n", chain_lines.join("\n")).as_bytes(),
+        )?;
         let _ = fs::remove_file(&graph_path);
 
         // Apply core.sharedRepository permissions to the new layer file and the
@@ -956,16 +996,9 @@ fn cmd_write(
             // which requires the directory to still exist.
         }
         let _ = fs::remove_file(&chain_path);
-        #[cfg(unix)]
-        if graph_path.is_file() {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&graph_path, fs::Permissions::from_mode(0o644));
-        }
-        let file =
-            fs::File::create(&graph_path).with_context(|| format!("creating {:?}", graph_path))?;
-        let mut w = BufWriter::new(file);
-        w.write_all(&bytes)?;
-        w.flush()?;
+        // Atomic write (temp + rename) so a hardlinked single `info/commit-graph` shared with a
+        // local-clone source is replaced with a fresh inode rather than truncated in place.
+        write_file_atomic(&graph_path, &bytes)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
