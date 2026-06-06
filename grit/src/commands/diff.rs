@@ -6903,12 +6903,24 @@ fn write_diff_header_with_prefix(
                 quote_c_style(new_path, quote_path_fully)
             )?;
             if entry.old_oid != entry.new_oid {
-                writeln!(
-                    out,
-                    "{b}index {}..{}{r}",
-                    abbr(&entry.old_oid),
-                    abbr(&entry.new_oid)
-                )?;
+                // Git appends the (shared) mode to the rename's `index` line when both
+                // sides have the same mode, exactly like a modify (t4015 #99).
+                if entry.old_mode == entry.new_mode {
+                    writeln!(
+                        out,
+                        "{b}index {}..{} {}{r}",
+                        abbr(&entry.old_oid),
+                        abbr(&entry.new_oid),
+                        entry.old_mode
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "{b}index {}..{}{r}",
+                        abbr(&entry.old_oid),
+                        abbr(&entry.new_oid)
+                    )?;
+                }
             }
         }
         DiffStatus::Copied => {
@@ -6925,12 +6937,22 @@ fn write_diff_header_with_prefix(
                 quote_c_style(new_path, quote_path_fully)
             )?;
             if entry.old_oid != entry.new_oid {
-                writeln!(
-                    out,
-                    "{b}index {}..{}{r}",
-                    abbr(&entry.old_oid),
-                    abbr(&entry.new_oid)
-                )?;
+                if entry.old_mode == entry.new_mode {
+                    writeln!(
+                        out,
+                        "{b}index {}..{} {}{r}",
+                        abbr(&entry.old_oid),
+                        abbr(&entry.new_oid),
+                        entry.old_mode
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "{b}index {}..{}{r}",
+                        abbr(&entry.old_oid),
+                        abbr(&entry.new_oid)
+                    )?;
+                }
             }
         }
         DiffStatus::TypeChanged => {
@@ -8121,6 +8143,22 @@ fn write_patch_with_prefix(
         // `-I` / `--ignore-blank-lines`: the diff is computed on the *full* content (so line
         // numbers are preserved) and then ignorable hunks are dropped from the rendered patch
         // below — never by pre-deleting lines here.
+
+        // Pure rename/copy with no textual change to show: emit only the rename/copy header
+        // (similarity + rename/copy from/to + index), not the `---`/`+++`/hunk body. Git's
+        // `builtin_diff` skips the textual section when `found_changes` is false, which also
+        // covers `-w`/`-b` renames whose content is identical once whitespace is normalised
+        // (t4015 #99, #100). Added/Deleted/Modified always go through the body path.
+        if matches!(entry.status, DiffStatus::Renamed | DiffStatus::Copied) {
+            let bodies_equal = if ws_mode.any() {
+                ws_mode.normalize(&old_content) == ws_mode.normalize(&new_content)
+            } else {
+                old_content == new_content
+            };
+            if bodies_equal {
+                continue;
+            }
+        }
 
         // Intent-to-add empty file: header + `index 0000000..e69de29` only (t2203).
         if !cached
