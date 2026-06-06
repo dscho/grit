@@ -116,6 +116,12 @@ Still failing in this cluster: 79, 80 (`--root` when root has an UNTRACKED FILE 
 different halt path; the untracked-overwrite obstruction during a root pick needs the same sentinel
 HEAD treatment).
 
+## Fix 7: edit-stop "You can amend" hint with -S<key> (gpg-sign)
+
+When `edit` stops, grit now prints the git hint `You can amend the commit now, with\n\n  git commit
+--amend <gpg_opt>\n\n...` echoing the shell-quoted `-S<key>` option (new `gpg_sign_opt_quoted`,
+mirroring git's `sq_quotef("-S%s", key)`). Fixed t3404 113/114. Full run 87 -> 89.
+
 ## KEY: full-run vs isolation divergence
 Many tests pass with `--run=1,N` but fail in the full sequential run because an EARLIER
 failing test leaves a rebase-in-progress / wrong branch. `/tmp/run3404.sh` replicates the

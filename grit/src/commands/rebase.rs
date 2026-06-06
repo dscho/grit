@@ -3555,6 +3555,23 @@ fn rebase_gpg_sign_opt(rb_dir: &Path) -> Option<String> {
     fs::read_to_string(rb_dir.join("gpg-sign-opt")).ok()
 }
 
+/// Render the `-S<key>` signing option for user-facing hints, shell-quoted like Git's
+/// `gpg_sign_opt_quoted` (`sq_quotef("-S%s", key)`); empty when this rebase is not signing.
+fn gpg_sign_opt_quoted(rb_dir: &Path) -> String {
+    let Some(key) = rebase_gpg_sign_opt(rb_dir) else {
+        return String::new();
+    };
+    let raw = format!("-S{key}");
+    // Git's `sq_quote` only wraps the value when it contains shell-special characters.
+    if raw.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | ',' | '+' | '=')
+    }) {
+        raw
+    } else {
+        shell_single_quote_author_script(&raw)
+    }
+}
+
 /// Write a replayed commit object, signing it first when this rebase has signing
 /// enabled. Mirrors `git commit`/sequencer signing for rebase.
 fn write_replayed_commit(
@@ -6537,6 +6554,12 @@ fn replay_remaining(
                             let _ = write_rebase_patch_file(&repo, &rb_dir, &commit_oid);
                             let _ = fs::write(rb_dir.join("rebase-amend-continue"), "1\n");
                             let _ = fs::write(rb_dir.join("rebase-edit-continue"), "1\n");
+                            // Git's `do_pick_commit` prints the amend hint when stopping for `edit`,
+                            // echoing the `-S<key>` signing option (t3404 "rebase -i --gpg-sign").
+                            let gpg_opt = gpg_sign_opt_quoted(&rb_dir);
+                            eprintln!(
+                                "You can amend the commit now, with\n\n  git commit --amend {gpg_opt}\n\nOnce you are satisfied with your changes, run\n\n  git rebase --continue"
+                            );
                             std::process::exit(0);
                         }
                         Err(_e) => {

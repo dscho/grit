@@ -5247,6 +5247,20 @@ pub fn run(mut args: Args) -> Result<()> {
             stdin_merged_all_refs = true;
             start_oids.extend(collect_all_ref_oids(&repo.git_dir)?);
         }
+        if args.bisect {
+            // `--bisect` adds `refs/bisect/bad*` as positive tips and `refs/bisect/good*` as
+            // negative tips (Git's `handle_revision_pseudo_opt`). For `%S`, each commit is labeled
+            // with the nearest bad ref that reaches it.
+            let (bad_tips, good_oids) = collect_bisect_ref_tips(&repo.git_dir)?;
+            if format_uses_percent_s {
+                let bisect_src = build_named_source_map(&repo.odb, &bad_tips, args.first_parent);
+                for (oid, label) in bisect_src {
+                    percent_s_source_map.entry(oid).or_insert(label);
+                }
+            }
+            start_oids.extend(bad_tips.into_iter().map(|(oid, _)| oid));
+            exclude_oids.extend(good_oids);
+        }
 
         start_oids = dedupe_oid_order(start_oids);
         exclude_oids = dedupe_oid_order(exclude_oids);
@@ -5258,6 +5272,7 @@ pub fn run(mut args: Args) -> Result<()> {
             || !neg_s.is_empty()
             || args.all
             || args.reflog
+            || args.bisect
             || args.branches.is_some()
             || stdin_all_refs
             || (args.read_stdin && args.ignore_missing)
@@ -13245,6 +13260,34 @@ fn follow_filter(
 /// wins. We mirror that with a date-ordered priority queue: pop the
 /// highest-dated pending commit, fix its label, then enqueue its parents with
 /// the same label (an already-labeled commit keeps its first label).
+/// Collect bisect ref tips for `git log --bisect`: positive `refs/bisect/bad*` tips (with their
+/// ref names, for `%S`) and negative `refs/bisect/good*` OIDs. Mirrors `rev-list`'s
+/// `append_bisect_ref_specs` (a "bad"/"good" prefix is matched whole or followed by `-`).
+fn collect_bisect_ref_tips(git_dir: &Path) -> Result<(Vec<(ObjectId, String)>, Vec<ObjectId>)> {
+    let refs =
+        grit_lib::refs::list_refs(git_dir, "refs/bisect/").context("failed to list bisect refs")?;
+    let mut bad_tips = Vec::new();
+    let mut good_oids = Vec::new();
+    for (name, oid) in refs {
+        if name.starts_with("refs/bisect/bad")
+            && name
+                .as_bytes()
+                .get("refs/bisect/bad".len())
+                .is_none_or(|b| *b == b'-')
+        {
+            bad_tips.push((oid, name));
+        } else if name.starts_with("refs/bisect/good")
+            && name
+                .as_bytes()
+                .get("refs/bisect/good".len())
+                .is_none_or(|b| *b == b'-')
+        {
+            good_oids.push(oid);
+        }
+    }
+    Ok((bad_tips, good_oids))
+}
+
 fn build_named_source_map(
     odb: &Odb,
     tips: &[(ObjectId, String)],
