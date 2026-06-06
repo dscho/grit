@@ -1913,10 +1913,13 @@ fn write_graph_interleaved_commit_msg(
 
     for chunk in lines {
         let text = chunk.strip_suffix(b"\n").unwrap_or(chunk);
-        if !graph.is_commit_finished() {
-            let (gline, _) = graph.next_line();
-            write!(out, "{line_prefix}{gline}")?;
-        }
+        // Mirror Git's `graph_show_strbuf` -> `graph_show_oneline`: a graph prefix is emitted
+        // before *every* body line after the first. `graph_next_line` produces a structural
+        // line while the graph is still rendering its own rows, and a *padding* line (the
+        // vertical rails, e.g. `| | `) once the commit's graph output is finished — so body
+        // lines past the structural ones still get the correct rail prefix.
+        let (gline, _) = graph.next_line();
+        write!(out, "{line_prefix}{gline}")?;
         out.write_all(text)?;
         if chunk.ends_with(b"\n") {
             writeln!(out)?;
@@ -3126,14 +3129,27 @@ fn run_graph_log(
         None
     };
 
-    for node in nodes {
+    let is_oneline = args.oneline || args.format.as_deref() == Some("oneline");
+    // Builtin human-readable formats (short/medium/full/…) separate entries with a blank line;
+    // `--format=`/`tformat:`/oneline terminate each entry instead (Git `rev->use_terminator`).
+    let wants_separator = log_wants_blank_line_between_commits(args);
+    for (node_idx, node) in nodes.into_iter().enumerate() {
         let info = load_commit_info(repo, node.oid)?;
+        // Inter-commit separator (Git log-tree.c `show_log`: `shown_one && !use_terminator`).
+        // Between human-readable entries Git emits one *padding* graph line (the vertical rails)
+        // followed by a newline; the very first commit gets none, and there is no separator after
+        // the last commit. This is the single `| | ` blank row visible between commits under
+        // `--graph`. Terminator-style formats (`--format=`, `tformat:`, oneline) get no blank.
+        if node_idx > 0 && wants_separator {
+            let (pad, _) = graph.next_line();
+            writeln!(out, "{line_prefix}{pad}")?;
+        }
         graph.update(node.clone());
 
         loop {
             let (line, shown_commit_line) = graph.next_line();
             if shown_commit_line {
-                if args.oneline || args.format.as_deref() == Some("oneline") {
+                if is_oneline {
                     let rendered = render_graph_commit_text(
                         &node,
                         &info,
@@ -3179,6 +3195,19 @@ fn run_graph_log(
                     );
                     GRAPH_PREFIX_WIDTH.with(|c| c.set(0));
                     fmt_result?;
+                    // For builtin formats `format_commit` appends the inter-entry trailing blank
+                    // line that Git instead adds via the separator above. Strip that single
+                    // trailing blank so it is not double-emitted (and not rail-prefixed after the
+                    // final commit). When a diff body follows (`show_commit_body`), the trailing
+                    // blank is part of the diff output, not the message, so leave it intact.
+                    if wants_separator && !show_commit_body {
+                        while body_buf.last() == Some(&b'\n')
+                            && body_buf.len() >= 2
+                            && body_buf[body_buf.len() - 2] == b'\n'
+                        {
+                            body_buf.pop();
+                        }
+                    }
                     write_graph_interleaved_commit_msg(
                         &mut out,
                         line_prefix,
@@ -5011,6 +5040,18 @@ pub fn run(mut args: Args) -> Result<()> {
     // The `--author`/`--committer` identity filters, by contrast, match case-INSENSITIVELY by
     // default (see `ident_pattern_ignore_case`), so a pattern like `--author=ALICE` finds "Alice".
     let grep_ptype = resolve_grep_pattern_type(&args, &cfg);
+    // Grit is not linked against libpcre2 (the harness leaves USE_LIBPCRE2 unset), so a request
+    // for Perl-compatible regexes must die exactly as upstream Git does when compiled without
+    // PCRE (grep.c: `die(_("cannot use Perl-compatible regexes when not compiled with
+    // USE_LIBPCRE"))`). Only fire when there is actually a pattern to compile, matching Git.
+    if grep_ptype == GrepPatternType::Perl
+        && !(args.grep_patterns.is_empty()
+            && args.authors.is_empty()
+            && args.committers.is_empty()
+            && args.grep_reflog_patterns.is_empty())
+    {
+        anyhow::bail!("cannot use Perl-compatible regexes when not compiled with USE_LIBPCRE");
+    }
     let grep_ignore_case = args.regexp_ignore_case;
     let ident_ignore_case = ident_pattern_ignore_case(args.regexp_ignore_case);
 
