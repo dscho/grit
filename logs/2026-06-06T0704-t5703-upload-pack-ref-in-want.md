@@ -85,12 +85,37 @@ gitignore code).
 
 Regression re-check (unchanged): t5510 215, t5601 112, t5616 46.
 
-## Remaining 3 (23, 25, 26) — smart-HTTP want-ref
+## smart-HTTP want-ref — now 24/26 (26 fixed)
 
-All have `uploadpack.allowRefInWant true` and need grit's **smart-HTTP** v2 client
-(http_smart.rs `http_fetch_pack`) to send `want-ref <name>` and consume the
-`wanted-refs` section, so the ref re-resolves against the (changed) server state
-mid-negotiation (23, 25) and an `unknown ref refs/heads/rain` is surfaced (26).
-The HTTP client currently only sends `want <oid>` from its own ls-refs snapshot.
-Adding want-ref there is the same shape as the `file://` fix already landed but in
-the stateless-RPC HTTP path; not yet done.
+http_smart.rs `http_fetch_pack`: when the server advertises `ref-in-want`, send
+`want-ref <name>` for named/wildcard-matched advertised refs (helper
+`http_want_refs_and_plain_wants`), emit recognized fetch features as standalone
+arg lines when no plain `want` carries them, and consume the `wanted-refs` section
+(`apply_wanted_refs_section`) to override head/tag OIDs with the server's current
+resolution. This fixes test 26 (`unknown ref refs/heads/rain` now surfaced).
+
+Regression re-check (unchanged): t5551 29, t5601 112, t5616 46, t5701 25.
+
+## FULLY PASSING — 26/26 (23, 25 fixed)
+
+Root-caused 23/25 with packet tracing: the `wanted-refs` override WAS reaching the
+returned `heads` (correct OID), but the fetch caller builds its ref-update map from
+the *advertised* ref list (`fetch.rs` `refs_for_mapping` uses `remote_advertised`
+when non-empty), which still held the stale/fake OID from the rewritten ls-refs
+response. `fetch.rs` is another agent's in-flight file, so the fix lives entirely
+on my side: `apply_wanted_refs_section` now also overrides the matching entry in
+`all_advertised` (made mutable), so the OID the caller maps from is the server's
+authoritative `want-ref` resolution.
+
+Final regression sweep (all == baseline): t5510 215, t5551 29, t5601 112, t5616
+46, t5701 25, t5552 6, t5516 108, t5615 9, t5604 34, t5705 17, t5500 47.
+grit-lib lib: only the 2 pre-existing `ignore::gitignore_glob_tests` failures
+(another agent's `ignore.rs`; untouched here). No new clippy warnings in my files.
+
+Files changed (this ticket): grit-lib/src/unpack_objects.rs and
+grit/src/commands/unpack_objects.rs + grit/src/commands/upload_pack.rs +
+grit/src/receive_ingest.rs (build-unblocking conflict resolution);
+grit/src/file_upload_pack_v2.rs, grit/src/fetch_transport.rs (file:// want-ref +
+multi-round); grit/src/commands/serve_v2.rs (server want validation);
+grit/src/http_smart.rs (HTTP want-ref + wanted-refs + ERR). `fetch.rs` NOT touched
+(reverted an exploratory edit to respect the concurrent agent).
