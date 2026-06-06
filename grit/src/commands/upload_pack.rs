@@ -127,6 +127,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut requested_depth: Option<usize> = None;
     let mut filter_spec: Option<String> = None;
     let mut multi_ack_detailed = false;
+    let mut no_done = false;
     let mut no_progress = false;
     loop {
         match pkt_line::read_packet(&mut stdin)? {
@@ -138,6 +139,13 @@ pub fn run(args: Args) -> Result<()> {
                     let features = rest.strip_prefix(hex).unwrap_or("").trim();
                     if wants.is_empty() && features.contains("multi_ack_detailed") {
                         multi_ack_detailed = true;
+                    }
+                    // `no-done` (only honored with `multi_ack_detailed`) lets the server skip the
+                    // client's final `done`: when it sends `ACK <oid> ready` at a flush it follows
+                    // with `ACK <oid>` and streams the pack in the same stateless RPC, so the client
+                    // never has to send `done` (upload-pack.c get_common_commits, t5539 test 3).
+                    if wants.is_empty() && features.split_whitespace().any(|f| f == "no-done") {
+                        no_done = true;
                     }
                     if wants.is_empty() && features.split_whitespace().any(|f| f == "no-progress") {
                         no_progress = true;
@@ -264,21 +272,32 @@ pub fn run(args: Args) -> Result<()> {
         match pkt_line::read_packet(&mut stdin)? {
             None => break,
             Some(pkt_line::Packet::Flush) => {
+                let mut sent_ready = false;
                 if multi_ack_detailed
                     && got_common
                     && !got_other
                     && ok_to_give_up(&repo, &want_set, &client_known)
                 {
                     pkt_line::write_line(&mut out, &format!("ACK {last_hex} ready"))?;
+                    sent_ready = true;
                 }
                 if args.stateless_rpc {
                     // Stateless negotiation ends at a flush: mirror `get_common_commits` —
-                    // write NAK only when no server-known `have` was received (or multi-ack), then
-                    // exit without generating a pack. The client re-sends its haves in a later RPC
-                    // (t5530 ACKs repeated non-commit objects; EOF after stateless wants).
+                    // write NAK only when no server-known `have` was received (or multi-ack).
                     if have_obj_count == 0 || multi_ack_detailed {
                         pkt_line::write_line(&mut out, "NAK")?;
                     }
+                    // `no-done` short-circuit: once `ACK <oid> ready` has been sent, the server
+                    // does not wait for the client's `done`. It sends a final `ACK <oid>` and
+                    // streams the pack in this same RPC (upload-pack.c: `no_done && sent_ready`),
+                    // so the client never sends `done` (t5539 "no shallow lines after ACK ready").
+                    if no_done && sent_ready {
+                        pkt_line::write_line(&mut out, &format!("ACK {last_hex}"))?;
+                        out.flush()?;
+                        break;
+                    }
+                    // Otherwise the client re-sends its haves in a later RPC (t5530 ACKs repeated
+                    // non-commit objects; EOF after stateless wants).
                     out.flush()?;
                     return Ok(());
                 }
