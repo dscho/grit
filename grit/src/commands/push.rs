@@ -1905,7 +1905,28 @@ fn push_to_url(
     // (matching `git push` with multiple refspecs).
     let force_if_includes = effective_force_if_includes(args, config);
     let mut pre_reject: Vec<Option<String>> = vec![None; updates.len()];
+
+    // Pre-reject updates/deletes to refs hidden by transfer/receive.hideRefs *before* any objects
+    // are sent, so a rejected hidden-ref push leaves the remote's object store untouched
+    // (t5516 'refuse to push a hidden ref, and make sure do not pollute the repository').
+    {
+        let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+        hidden.load_hidden_refs_from_config(&receive_remote_config, "receive");
+        for (i, update) in updates.iter().enumerate() {
+            if hidden.ref_excluded(Some(&update.remote_ref), &update.remote_ref) {
+                pre_reject[i] = Some(if update.new_oid.is_none() {
+                    "deny deleting a hidden ref".to_owned()
+                } else {
+                    "deny updating a hidden ref".to_owned()
+                });
+            }
+        }
+    }
+
     for (i, update) in updates.iter().enumerate() {
+        if pre_reject[i].is_some() {
+            continue;
+        }
         let mut includes_override_for_lease = false;
         if !cli_force_enabled && !update.refspec_force {
             match force_with_lease_expectation_for_remote_ref(
@@ -2574,9 +2595,12 @@ fn push_to_url(
     for &i in &apply_order {
         let update = &updates[i];
         if let Some(msg) = &pre_reject[i] {
-            // The shallow-update rejection is reported by receive-pack only via the per-ref
-            // `! [remote rejected] ... (shallow update not allowed)` line, with no extra prose line.
-            if msg == "shallow update not allowed" {
+            // Rejections reported by receive-pack only via the per-ref
+            // `! [remote rejected] ... (<reason>)` line, with no extra prose line: a shallow
+            // update, or an update/delete of a ref hidden by transfer/receive.hideRefs (the
+            // latter is pre-rejected before any objects are transferred so the repo is not
+            // polluted — t5516 test 120).
+            if msg == "shallow update not allowed" || msg.starts_with("deny ") {
                 report_ref_rejection(update, "remote rejected", msg, args);
                 ref_results[i] = Some(make_push_ref_result(
                     update,
