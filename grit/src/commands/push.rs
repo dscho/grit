@@ -598,7 +598,7 @@ fn sort_collateral_indices(
     js
 }
 
-pub fn run(args: Args) -> Result<()> {
+pub fn run(mut args: Args) -> Result<()> {
     if args.no_ipv4 {
         bail!("unknown option `no-ipv4'");
     }
@@ -679,6 +679,13 @@ pub fn run(args: Args) -> Result<()> {
 
     if push_all && effective_mirror {
         bail!("--all and --mirror cannot be used together");
+    }
+
+    // Apply `remote.<name>.push` (or `push.default = upstream`) as a refmap to colon-less
+    // command-line refspecs, mirroring Git's `set_refspecs`/`refspec_append_mapped`.
+    if !args.refspecs.is_empty() && !args.delete && remote_is_configured_name {
+        let mapped = map_cli_refspecs_via_refmap(&repo, &config, remote_name, &args.refspecs);
+        args.refspecs = mapped;
     }
 
     // Collect push refspecs from config if no CLI refspecs
@@ -5272,6 +5279,117 @@ fn reject_empty_branch_subsection(config: &ConfigSet) -> Result<()> {
         std::process::exit(128);
     }
     Ok(())
+}
+
+/// Apply the remote's configured push refmap to bare command-line refspecs.
+///
+/// Mirrors Git's `set_refspecs`/`refspec_append_mapped` (`builtin/push.c`): a
+/// colon-less command-line ref (e.g. `main`) that uniquely names a local head is
+/// rewritten using, in priority order, the remote's `push` refspecs as a refmap,
+/// or — when `push.default = upstream` — the branch's single `merge` ref. Specs
+/// that already contain a `:`, the `tag <name>` shorthand, exclude patterns, or
+/// refs that do not uniquely match a local head are left untouched.
+fn map_cli_refspecs_via_refmap(
+    repo: &Repository,
+    config: &ConfigSet,
+    remote_name: &str,
+    refspecs: &[String],
+) -> Vec<String> {
+    let local_heads = match refs::list_refs(&repo.git_dir, "refs/heads/") {
+        Ok(h) => h,
+        Err(_) => return refspecs.to_vec(),
+    };
+    let push_refspecs = config.get_all(&format!("remote.{remote_name}.push"));
+    let upstream_default = push_default_mode(config) == "upstream";
+
+    let mut out = Vec::with_capacity(refspecs.len());
+    let mut i = 0usize;
+    while i < refspecs.len() {
+        let spec = &refspecs[i];
+        // Preserve `tag <name>` shorthand (consumes the following token).
+        if spec == "tag" {
+            out.push(spec.clone());
+            if let Some(next) = refspecs.get(i + 1) {
+                out.push(next.clone());
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if spec.starts_with('^') || spec.contains(':') || spec.is_empty() {
+            out.push(spec.clone());
+            i += 1;
+            continue;
+        }
+        // Does `spec` uniquely name a local head? (`count_refspec_match` semantics.)
+        let (matched, ambiguous) = count_refspec_match_push(spec, &local_heads);
+        let Some(full_src) = matched.filter(|_| !ambiguous) else {
+            out.push(spec.clone());
+            i += 1;
+            continue;
+        };
+
+        if let Some((dst, force)) = query_push_refmap_dst(&push_refspecs, &full_src) {
+            out.push(format!(
+                "{}{}:{}",
+                if force { "+" } else { "" },
+                full_src,
+                dst
+            ));
+            i += 1;
+            continue;
+        }
+
+        if upstream_default {
+            if let Some(branch) = full_src.strip_prefix("refs/heads/") {
+                let merges = config.get_all(&format!("branch.{branch}.merge"));
+                if merges.len() == 1 {
+                    out.push(format!("{}:{}", spec, merges[0]));
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        out.push(spec.clone());
+        i += 1;
+    }
+    out
+}
+
+/// Query a list of `remote.<name>.push` refspecs for the destination matching `src`.
+///
+/// Mirrors `refspec_find_match` for the push direction: returns the mapped `dst`
+/// and force flag for the first refspec whose source (pattern or exact) matches
+/// the fully-qualified source ref `src`. Negative (`^`) and dst-less entries are
+/// skipped.
+fn query_push_refmap_dst(push_refspecs: &[String], src: &str) -> Option<(String, bool)> {
+    for raw in push_refspecs {
+        if raw.starts_with('^') {
+            continue;
+        }
+        let (force, clean) = match raw.strip_prefix('+') {
+            Some(s) => (true, s),
+            None => (false, raw.as_str()),
+        };
+        let Some(colon) = clean.find(':') else {
+            continue;
+        };
+        let key = &clean[..colon];
+        let value = &clean[colon + 1..];
+        if value.is_empty() {
+            continue;
+        }
+        if key.contains('*') {
+            if let Some(matched) = match_glob(key, src) {
+                return Some((value.replacen('*', matched, 1), force));
+            }
+        } else if key == src {
+            return Some((value.to_owned(), force));
+        }
+    }
+    None
 }
 
 fn resolve_remote_urls(config: &ConfigSet, remote_name: &str) -> Result<(Vec<String>, bool)> {
