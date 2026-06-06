@@ -434,6 +434,14 @@ pub(crate) fn read_advertisement(
                 if refname == "capabilities^{}" {
                     continue;
                 }
+                // A protocol v0/v1 ref advertisement emits a `<peeled-oid> <refname>^{}` line after
+                // each annotated tag (the peeled object). These `^{}` lines are not refs and must
+                // never be recorded as fetchable/trackable refs — otherwise a v0 fetch would write
+                // bogus `refs/tags/<name>^{}` refs and FETCH_HEAD lines (t5515 with
+                // GIT_TEST_PROTOCOL_VERSION=0). The real ref already preceded this peeled line.
+                if refname.ends_with("^{}") {
+                    continue;
+                }
                 out.push((refname, oid));
             }
             _ => {}
