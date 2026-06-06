@@ -3072,6 +3072,21 @@ fn worktree_clean_for_update_instead(
         .as_ref()
         .ok_or_else(|| "denyCurrentBranch = updateInstead needs a worktree".to_owned())?;
     let grit_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("grit"));
+
+    // git push_to_deploy starts with `update-index -q --refresh` so a file that is merely
+    // stat-dirty (e.g. an mtime bump from `test-tool chmtime` with unchanged content) does not
+    // count as an unstaged change in the following `diff-files`.
+    let mut ui = Command::new(&grit_bin);
+    ui.current_dir(wt)
+        .args(["update-index", "-q", "--ignore-submodules", "--refresh"])
+        .env("GIT_DIR", &remote_repo.git_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if !ui.status().map_err(|e| e.to_string())?.success() {
+        return Err("Up-to-date check failed".to_owned());
+    }
+
     let mut df = Command::new(&grit_bin);
     df.current_dir(wt)
         .args(["diff-files", "--quiet", "--ignore-submodules"])
@@ -3190,14 +3205,20 @@ fn update_worktree_after_push_update_instead_checkout(
         }
     }
     let grit_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("grit"));
-    // The current branch ref has already been written; reset hard updates the remote index and
-    // worktree to that branch tip without detaching HEAD.
+    // git's push_to_deploy finishes with a single-tree `read-tree -u -m <new>`, NOT `reset --hard`:
+    // the two-way merge updates the index and work tree to the new commit while *refusing* to
+    // overwrite an untracked or locally-modified file that the update would clobber (t5516
+    // updateInstead cases (3)/(4)). The branch ref is already written, so the index still reflects
+    // the old state, which `read-tree -m` needs.
+    let new_hex = _new_oid.to_hex();
     let mut cmd = Command::new(&grit_bin);
     cmd.current_dir(wt)
-        .args(["reset", "--hard", "--quiet"])
+        .args(["read-tree", "-u", "-m", new_hex.as_str()])
         .env("GIT_DIR", &remote_repo.git_dir)
         .env("GIT_WORK_TREE", wt)
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     if !cmd.status().map_err(|e| e.to_string())?.success() {
         return Err("Could not update working tree to new HEAD".to_owned());
     }
@@ -3509,8 +3530,10 @@ fn apply_ref_update(
     match (&update.new_oid, &update.old_oid) {
         (Some(new_oid), old_oid_opt) => {
             if !args.dry_run {
-                refs::write_ref(&remote_repo.git_dir, &update.remote_ref, new_oid)
-                    .with_context(|| format!("updating remote ref {}", update.remote_ref))?;
+                // For `denyCurrentBranch = updateInstead`, update the work tree *before* writing
+                // the ref (git calls `update_worktree` first; a failed push_to_deploy leaves the
+                // branch untouched). Otherwise a refused push would leave the ref advanced, which
+                // corrupts the next push's "old value" check (t5516 updateInstead case (4)).
                 if update_instead_after_ref {
                     match update_worktree_after_push_update_instead(
                         remote_repo,
@@ -3530,6 +3553,8 @@ fn apply_ref_update(
                         }
                     }
                 }
+                refs::write_ref(&remote_repo.git_dir, &update.remote_ref, new_oid)
+                    .with_context(|| format!("updating remote ref {}", update.remote_ref))?;
                 update_remote_tracking_ref(repo, remote_name, &update.remote_ref, Some(*new_oid))?;
             }
 
