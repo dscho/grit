@@ -33,6 +33,24 @@ wrong "only skipped commits left" lists.
    before the "was both good and bad" path (Git keeps TREESAME commits in revs.commits).
 
 ## Status
-94/96 after fix. Remaining: 56 (restricting bisection on one dir and a file) and
-69 (demonstrate identification of damage boundary) — both depend on correct pathspec+merge
-rev-list candidate generation, which is the rev_list regression noted above.
+95/96 in the honest harness run. 96/96 when `SHELL_PATH=/bin/sh` is exported.
+
+## Final follow-up fixes (second commit)
+- Reworked `find_bisection` to run over the full interesting DAG (`bad ^good`, no pathspec)
+  with `TREESAME` marking instead of only the path-filtered candidate set. Git's
+  `count_interesting_parents` counts parents that are not UNINTERESTING (including TREESAME
+  ones), so the merge/single-parent classification and weight propagation now match Git;
+  `nr` still counts only candidates. This fixed test 56 (pathspec bisection through merges).
+- Order the DAG list by committer date (newest-first, rev-list order as tiebreak) before the
+  oldest-first reversal so `best_bisection`'s tie-break matches Git's date-ordered limited
+  walk. Needed because the candidate rev-list is topo-ordered (the path-limited date-order
+  walk in grit-lib is currently broken for pathspec+merge ranges — a rev_list regression
+  another agent owns); sorting by date locally restores the correct selection.
+
+## Remaining (not a grit bug)
+Test 69 ("demonstrate identification of damage boundary") uses `git bisect run "$SHELL_PATH"
+-c '...'`. The grit harness does not generate/source `GIT-BUILD-OPTIONS`, so `$SHELL_PATH`
+is empty and `git bisect run` execs an empty command (exit 127). With `SHELL_PATH=/bin/sh`
+exported the test passes and the whole file is 96/96. Fixing this requires the harness to
+export `SHELL_PATH` (test-lib.sh / run-tests.sh), which is out of scope for this ticket and
+must not be edited per the rules. Left as the single honest-run failure.

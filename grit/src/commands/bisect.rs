@@ -671,6 +671,24 @@ fn commit_parents(repo: &Repository, oid: ObjectId, first_parent: bool) -> Resul
     }
 }
 
+/// Committer timestamp (seconds since epoch) of `oid`, used to order the bisection candidate list
+/// like Git's date-ordered limited revision walk. Returns 0 when unavailable.
+fn commit_committer_time(repo: &Repository, oid: ObjectId) -> i64 {
+    let Ok(object) = repo.odb.read(&oid) else {
+        return 0;
+    };
+    let Ok(commit) = parse_commit(&object.data) else {
+        return 0;
+    };
+    // `committer` is "Name <email> <secs> <tz>"; take the next-to-last whitespace token.
+    let parts: Vec<&str> = commit.committer.split_whitespace().collect();
+    if parts.len() >= 2 {
+        parts[parts.len() - 2].parse::<i64>().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
 /// Number of candidates reachable from `oid` (the commit's bisection weight), walking the full
 /// ancestry and counting only commits in `candidate_set` (Git's `count_distance`). Intermediate
 /// commits that are `TREESAME` to a parent are walked through but absent from the set and so not
@@ -720,32 +738,56 @@ struct Bisection {
 
 /// Port of Git's `find_bisection` + `do_find_bisection` (`bisect.c`).
 ///
-/// `candidates` is the testable commit set in rev-list (newest-first) order. Weights are computed
-/// over the full ancestry. The non-`ALL` best is found via the same ordered `approx_halfway`
-/// early-out and `best_bisection` fallback that Git uses, so the chosen midpoint matches
-/// `git rev-list --bisect`. The returned `ranks` are sorted like `--bisect-all` for skip handling.
+/// `dag` is the full interesting commit set (`bad ^good`, no pathspec) in rev-list newest-first
+/// order; `candidate_set` is the path-matched (non-`TREESAME`) subset that contributes to weights.
+/// Weights are computed over the full ancestry, counting only candidates. The non-`ALL` best is
+/// found via the same ordered `approx_halfway` early-out and `best_bisection` fallback that Git
+/// uses (a `TREESAME` commit is never selected), so the chosen midpoint matches
+/// `git rev-list --bisect`. The returned `ranks` (candidates only) are sorted like `--bisect-all`
+/// for skip handling.
 fn find_bisection(
     repo: &Repository,
-    candidates: &[ObjectId],
+    dag: &[ObjectId],
+    candidate_set: &HashSet<ObjectId>,
     first_parent: bool,
 ) -> Result<Bisection> {
-    let nr = candidates.len();
-    let candidate_set: HashSet<ObjectId> = candidates.iter().copied().collect();
+    // `nr` (Git's `all`) counts only non-`TREESAME` commits = path-matched candidates.
+    let nr = candidate_set.len();
+    let dag_set: HashSet<ObjectId> = dag.iter().copied().collect();
+    let treesame = |oid: ObjectId| !candidate_set.contains(&oid);
 
-    // Git reverses the (newest-first) rev-list into oldest-first before the weight walk.
-    let list: Vec<ObjectId> = candidates.iter().rev().copied().collect();
+    // Git's limited revision walk yields commits newest-first by committer date (topo/insertion
+    // order as tiebreak); `find_bisection` then reverses that to oldest-first before the weight
+    // walk and `best_bisection` scan. The candidate rev-list may be topo-ordered here, so re-sort by
+    // committer date (newest-first), preserving the rev-list order for equal dates, then reverse.
+    let mut by_date: Vec<(usize, ObjectId)> = dag.iter().copied().enumerate().collect();
+    let times: std::collections::HashMap<ObjectId, i64> = dag
+        .iter()
+        .map(|&oid| (oid, commit_committer_time(repo, oid)))
+        .collect();
+    by_date.sort_by(|a, b| times[&b.1].cmp(&times[&a.1]).then_with(|| a.0.cmp(&b.0)));
+    let list: Vec<ObjectId> = by_date.into_iter().rev().map(|(_, oid)| oid).collect();
 
     // weight: 0+ known, -1 single-parent unknown, -2 merge unknown.
     let mut weight: std::collections::HashMap<ObjectId, i64> = std::collections::HashMap::new();
     let mut interesting_parents: std::collections::HashMap<ObjectId, Vec<ObjectId>> =
         std::collections::HashMap::new();
     for &oid in &list {
+        // Git's count_interesting_parents counts parents that are not UNINTERESTING (i.e. in the
+        // bad-not-good DAG), including TREESAME ones.
         let parents: Vec<ObjectId> = commit_parents(repo, oid, first_parent)?
             .into_iter()
-            .filter(|p| candidate_set.contains(p))
+            .filter(|p| dag_set.contains(p))
             .collect();
-        let w = match parents.len() {
-            0 => 1,
+        let n_interesting = parents.len();
+        let w = match n_interesting {
+            0 => {
+                if treesame(oid) {
+                    0
+                } else {
+                    1
+                }
+            }
             1 => -1,
             _ => -2,
         };
@@ -754,22 +796,26 @@ fn find_bisection(
     }
 
     let mut best: Option<ObjectId> = None;
+    let halfway_ok =
+        |oid: ObjectId, w: i64| !treesame(oid) && approx_halfway(w.max(0) as usize, nr);
 
     // Resolve merge (-2) weights via count_distance, with the non-ALL halfway early-out.
     for &oid in &list {
         if weight[&oid] != -2 {
             continue;
         }
-        let w = count_reaches(repo, oid, &candidate_set, first_parent)? as i64;
+        let w = count_reaches(repo, oid, candidate_set, first_parent)? as i64;
         weight.insert(oid, w);
-        if best.is_none() && approx_halfway(w as usize, nr) {
+        if best.is_none() && halfway_ok(oid, w) {
             best = Some(oid);
         }
     }
 
-    // Propagate single-parent (-1) weights, again with the halfway early-out.
-    let mut counted = list.iter().filter(|o| weight[o] >= 0).count();
-    while counted < nr {
+    // Propagate single-parent (-1) weights, again with the halfway early-out. A TREESAME commit
+    // inherits its parent's weight; a counted commit adds one.
+    let total = list.len();
+    let mut counted = list.iter().filter(|o| weight[*o] >= 0).count();
+    while counted < total {
         let mut progressed = false;
         for &oid in &list {
             if weight[&oid] >= 0 {
@@ -783,10 +829,11 @@ fn find_bisection(
                 continue;
             };
             let pw = weight[&parent];
-            weight.insert(oid, pw + 1);
+            let w = if treesame(oid) { pw } else { pw + 1 };
+            weight.insert(oid, w);
             counted += 1;
             progressed = true;
-            if best.is_none() && approx_halfway((pw + 1) as usize, nr) {
+            if best.is_none() && halfway_ok(oid, w) {
                 best = Some(oid);
             }
         }
@@ -795,9 +842,10 @@ fn find_bisection(
         }
     }
 
-    // Build ranks (distance desc, oid asc) for skip handling.
+    // Build ranks (candidates only; distance desc, oid asc) for skip handling.
     let mut ranks: Vec<BisectRank> = list
         .iter()
+        .filter(|oid| candidate_set.contains(oid))
         .map(|&oid| {
             let reaches = weight[&oid].max(0) as usize;
             BisectRank {
@@ -809,11 +857,14 @@ fn find_bisection(
         .collect();
     ranks.sort_by(|a, b| b.distance.cmp(&a.distance).then_with(|| a.oid.cmp(&b.oid)));
 
-    // No early-out: Git's `best_bisection` keeps the first list (oldest-first) commit with strictly
-    // greater distance.
+    // No early-out: Git's `best_bisection` keeps the first list (oldest-first) non-TREESAME commit
+    // with strictly greater distance.
     if best.is_none() {
         let mut best_distance: i64 = -1;
         for &oid in &list {
+            if treesame(oid) {
+                continue;
+            }
             let reaches = weight[&oid].max(0) as usize;
             let distance = reaches.min(nr.saturating_sub(reaches)) as i64;
             if distance > best_distance {
@@ -1038,13 +1089,21 @@ fn bisect_next_all(repo: &Repository, git_dir: &Path, terms: &BisectTerms) -> Re
     let pathspecs = read_bisect_pathspecs(git_dir)?;
     let (candidates, _) =
         rev_list_bisect_candidates(repo, git_dir, bad, &goods, &pathspecs, first_parent)?;
+    // The full interesting DAG (`bad ^good`, no pathspec) is the weight graph; path-matched
+    // candidates are the non-`TREESAME` commits. Without pathspecs they coincide.
+    let dag = if pathspecs.is_empty() {
+        candidates.clone()
+    } else {
+        rev_list_bisect_candidates(repo, git_dir, bad, &goods, &[], first_parent)?.0
+    };
+    let candidate_set: HashSet<ObjectId> = candidates.iter().copied().collect();
     let skip_oids = read_bisect_skip_refs(git_dir)?;
 
     // Git's find_bisection: `all` counts the testable commits and ranks them by bisection distance.
     // Without skips it returns a single best (non-`ALL` `best_bisection`); with skips it returns the
     // full `best_bisection_sorted` list (distance desc, oid asc) so `managed_skipped` can pick a
     // commit away from skipped ones. `reaches` is the weight of that best candidate.
-    let bisection = find_bisection(repo, &candidates, first_parent)?;
+    let bisection = find_bisection(repo, &dag, &candidate_set, first_parent)?;
     let all = candidates.len();
     let sorted: Vec<ObjectId> = bisection.ranks.iter().map(|e| e.oid).collect();
 
