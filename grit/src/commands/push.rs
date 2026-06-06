@@ -3375,6 +3375,37 @@ fn apply_ref_update(
     remote_config: &ConfigSet,
 ) -> Result<ApplyRefResult> {
     let cli_force_enabled = args.force && !args.no_force;
+
+    // A branch (`refs/heads/*`) must point at a commit. Pushing a tag/tree/blob OID to a branch
+    // is rejected by receive-pack with `(invalid new value provided)` plus a `trying to write
+    // non-commit object ...` message (git refs.c `ref_update_check_old_target` / `refs_verify`).
+    if let Some(new_oid) = update.new_oid {
+        if update.remote_ref.starts_with("refs/heads/") {
+            let kind = remote_repo
+                .odb
+                .read(&new_oid)
+                .ok()
+                .map(|o| o.kind)
+                .or_else(|| repo.odb.read(&new_oid).ok().map(|o| o.kind));
+            if let Some(k) = kind {
+                if k != grit_lib::objects::ObjectKind::Commit {
+                    let style = RemoteMessageColorStyle::from_config(pushing_config);
+                    colorize_remote_output(
+                        &format!(
+                            "error: trying to write non-commit object {} to branch '{}'",
+                            new_oid.to_hex(),
+                            update.remote_ref
+                        ),
+                        &style,
+                    );
+                    return Ok(ApplyRefResult::RemoteRejected(
+                        "invalid new value provided".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+
     if let Err(reason) =
         check_receive_pack_policy(remote_repo, remote_config, pushing_config, update)
     {
