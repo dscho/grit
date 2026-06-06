@@ -3680,24 +3680,6 @@ fn branch_display_name(head: &HeadState) -> String {
     }
 }
 
-fn git_binary_for_status() -> PathBuf {
-    if let Ok(exec) = std::env::var("GIT_EXEC_PATH") {
-        let candidate = Path::new(&exec).join("git");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    // Tests prepend a `git` wrapper that runs grit; invoking `git diff` from commit
-    // would recurse. Prefer the real host binary when available.
-    for path in ["/usr/bin/git", "/bin/git"] {
-        let p = PathBuf::from(path);
-        if p.is_file() {
-            return p;
-        }
-    }
-    PathBuf::from("git")
-}
-
 /// Full `core.commentChar` / `core.commentString` prefix (Git may use multi-character prefixes).
 pub(crate) fn comment_line_prefix_full(config: &ConfigSet) -> Cow<'_, str> {
     let raw = config
@@ -3986,7 +3968,7 @@ fn append_commit_verbose_diffs(
         Cow::Borrowed("HEAD")
     };
 
-    let out1 = Command::new(git_binary_for_status())
+    let out1 = Command::new(crate::grit_exe::grit_executable())
         .current_dir(wt)
         .env("GIT_DIR", &repo.git_dir)
         .env("GIT_INDEX_FILE", &index_file)
@@ -3997,16 +3979,16 @@ fn append_commit_verbose_diffs(
             "diff.mnemonicprefix=false",
             "diff",
             "--cached",
-            cached_base.as_ref(),
             "-p",
-            "--no-color",
+            "--color=never",
             "--src-prefix",
             a1,
             "--dst-prefix",
             b1,
+            cached_base.as_ref(),
         ])
         .output()
-        .context("run git diff --cached for commit template")?;
+        .context("run grit diff --cached for commit template")?;
     if out1.status.success() {
         let patch = String::from_utf8_lossy(&out1.stdout);
         buf.push_str(&patch);
@@ -4020,7 +4002,7 @@ fn append_commit_verbose_diffs(
             "--------------------------------------------------",
         );
         append_commented_line(buf, &comment, "Changes not staged for commit:");
-        let out2 = Command::new(git_binary_for_status())
+        let out2 = Command::new(crate::grit_exe::grit_executable())
             .current_dir(wt)
             .env("GIT_DIR", &repo.git_dir)
             .env("GIT_INDEX_FILE", &index_file)
@@ -4031,14 +4013,14 @@ fn append_commit_verbose_diffs(
                 "diff.mnemonicprefix=false",
                 "diff",
                 "-p",
-                "--no-color",
+                "--color=never",
                 "--src-prefix",
                 "i/",
                 "--dst-prefix",
                 "w/",
             ])
             .output()
-            .context("run git diff for commit template")?;
+            .context("run grit diff for commit template")?;
         if out2.status.success() {
             let patch = String::from_utf8_lossy(&out2.stdout);
             buf.push_str(&patch);
@@ -4123,7 +4105,7 @@ fn commit_template_status_append_with_prefix(
 
     if let Some(wt) = repo.work_tree.as_deref() {
         let index_file = resolved_index_path(repo);
-        let output = Command::new(git_binary_for_status())
+        let output = Command::new(crate::grit_exe::grit_executable())
             .current_dir(wt)
             .env("GIT_DIR", &repo.git_dir)
             .env("GIT_INDEX_FILE", &index_file)

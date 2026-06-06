@@ -1016,9 +1016,10 @@ fn submodule_uses_gitfile(sub_dir: &Path) -> bool {
 }
 
 /// Whether a populated submodule has local modifications or untracked content
-/// (Git's `bad_to_remove_submodule` runs `git status --porcelain` inside it).
+/// (Git's `bad_to_remove_submodule` runs `git status --porcelain` inside it;
+/// we run our own binary so no system git is needed).
 fn submodule_status_dirty(sub_dir: &Path) -> bool {
-    let out = std::process::Command::new("git")
+    let out = std::process::Command::new(crate::grit_exe::grit_executable())
         .args(["status", "--porcelain", "--ignore-submodules=none", "-uall"])
         .current_dir(sub_dir)
         .env_remove("GIT_DIR")
