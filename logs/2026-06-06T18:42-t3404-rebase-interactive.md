@@ -122,6 +122,20 @@ When `edit` stops, grit now prints the git hint `You can amend the commit now, w
 --amend <gpg_opt>\n\n...` echoing the shell-quoted `-S<key>` option (new `gpg_sign_opt_quoted`,
 mirroring git's `sq_quotef("-S%s", key)`). Fixed t3404 113/114. Full run 87 -> 89.
 
+## Fix 8: multiple --exec support
+
+`Args.exec` changed `Option<String>` -> `Vec<String>` (clap collects repeated `-x`/`--exec`). All
+bool checks updated (`is_some`->`!is_empty`, `is_none`->`is_empty`); pull.rs `exec: None` ->
+`Vec::new()`. The `rebase-merge/exec` file now stores one command per line and the global-exec
+runner loops over them (running each after each pick, rescheduling the failed one + the rest on
+failure). Fixed t3404 69. Full run 89 -> 90.
+
+Still failing 70 (`-ix --autosquash`): the global-exec-after-pick approach runs the exec BEFORE the
+following fixup is applied, so `git show HEAD` shows the pre-fixup commit. Git inserts `exec` lines
+into the todo AFTER autosquash (`todo_list_add_exec_commands`), so the exec lands after the fixup.
+FIX NEEDED: switch from the `exec`-file global runner to inserting `exec <cmd>` todo lines after each
+pick post-autosquash (would also align 107 abbreviateCommands+exec).
+
 ## KEY: full-run vs isolation divergence
 Many tests pass with `--run=1,N` but fail in the full sequential run because an EARLIER
 failing test leaves a rebase-in-progress / wrong branch. `/tmp/run3404.sh` replicates the

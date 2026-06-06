@@ -150,9 +150,10 @@ pub struct Args {
     #[arg(long = "skip")]
     pub skip: bool,
 
-    /// Run a shell command after each commit is applied.
+    /// Run a shell command after each commit is applied. May be given multiple times; each `--exec`
+    /// adds an `exec` line after every pick, in order.
     #[arg(short = 'x', long = "exec")]
-    pub exec: Option<String>,
+    pub exec: Vec<String>,
 
     /// Use the merge backend for rebasing (default, accepted for compatibility).
     #[arg(long = "merge", short = 'm', conflicts_with = "apply")]
@@ -737,7 +738,7 @@ fn validate_compat_syntax(args: &Args) -> Result<()> {
             );
         }
     }
-    if let Some(ref exec_cmd) = args.exec {
+    for exec_cmd in &args.exec {
         if exec_cmd.is_empty() || exec_cmd.trim().is_empty() {
             bail!("empty exec command");
         }
@@ -760,7 +761,7 @@ fn merge_backend_requested_by_flags(
     if effective_rebase_merges_settings(args, config).0 {
         return true;
     }
-    if args.merge || args.interactive || args.exec.is_some() || args.keep_empty {
+    if args.merge || args.interactive || !args.exec.is_empty() || args.keep_empty {
         return true;
     }
     if args.empty.is_some() {
@@ -4861,7 +4862,7 @@ Use '--' to separate paths from revisions, like this:\n\
     let date_options_force_replay = args.committer_date_is_author_date || args.reset_author_date;
     let allow_preemptive_ff = !args.interactive
         && !rebase_merges_on
-        && args.exec.is_none()
+        && args.exec.is_empty()
         && !whitespace_forces_replay
         && !args.autosquash
         && !date_options_force_replay;
@@ -5099,7 +5100,7 @@ Use '--' to separate paths from revisions, like this:\n\
             && !want_autosquash
             && !force_rewrite_requested
             && args.onto.is_none()
-            && args.exec.is_none()
+            && args.exec.is_empty()
             && !rebase_merges_on
             && commits.is_empty()
             && is_ancestor(&repo, upstream_oid, head_oid)?
@@ -5315,7 +5316,7 @@ Use '--' to separate paths from revisions, like this:\n\
     if args.reschedule_failed_exec {
         fs::write(rb_dir.join("reschedule-failed-exec"), "")?;
     } else if !args.no_reschedule_failed_exec
-        && args.exec.is_some()
+        && !args.exec.is_empty()
         && config
             .get_bool("rebase.rescheduleFailedExec")
             .and_then(|r| r.ok())
@@ -5333,8 +5334,10 @@ Use '--' to separate paths from revisions, like this:\n\
         fs::write(rb_dir.join("ignore_date"), "")?;
     }
 
-    if let Some(ref exec_cmd) = args.exec {
-        fs::write(rb_dir.join("exec"), exec_cmd)?;
+    if !args.exec.is_empty() {
+        // Persist every `--exec` command (one per line, in order); the replay runs each after each
+        // pick (t3404 "rebase -ix with several instances of --exec").
+        fs::write(rb_dir.join("exec"), args.exec.join("\n"))?;
     }
     if let Some(ref strategy) = args.strategy {
         fs::write(rb_dir.join("strategy"), format!("{strategy}\n"))?;
@@ -6647,9 +6650,17 @@ fn replay_remaining(
                                 git_dir, "HEAD", &old_head, &new_oid, &ident, &msg, false,
                             );
 
-                            if let Ok(global_exec) = fs::read_to_string(rb_dir.join("exec")) {
-                                let global_exec = global_exec.trim();
-                                if !global_exec.is_empty() {
+                            if let Ok(global_exec_raw) = fs::read_to_string(rb_dir.join("exec")) {
+                                // Each `--exec` is stored on its own line; run them all, in order,
+                                // after this pick (t3404 "rebase -ix with several instances of
+                                // --exec").
+                                let exec_cmds: Vec<String> = global_exec_raw
+                                    .lines()
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty())
+                                    .map(ToOwned::to_owned)
+                                    .collect();
+                                for (exec_idx, global_exec) in exec_cmds.iter().enumerate() {
                                     if !rebase_quiet(rb_dir) {
                                         eprintln!("Executing: {}", global_exec);
                                     }
@@ -6678,8 +6689,12 @@ fn replay_remaining(
                                          hint:   grit rebase --continue",
                                             global_exec
                                         );
-                                        let mut remaining: Vec<String> =
-                                            vec![format!("exec {global_exec}")];
+                                        // The failed exec (and any later ones for this pick) plus the
+                                        // remaining todo are re-scheduled so `--continue` resumes them.
+                                        let mut remaining: Vec<String> = exec_cmds[exec_idx..]
+                                            .iter()
+                                            .map(|c| format!("exec {c}"))
+                                            .collect();
                                         if reschedule {
                                             eprintln!(
                                                 "hint: '{}' has been rescheduled",
@@ -6823,7 +6838,7 @@ fn resolve_become_empty_mode(args: &Args) -> BecomeEmptyMode {
     }
     if args.interactive {
         BecomeEmptyMode::Stop
-    } else if args.exec.is_some() {
+    } else if !args.exec.is_empty() {
         BecomeEmptyMode::Keep
     } else {
         BecomeEmptyMode::Drop
