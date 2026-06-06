@@ -8627,6 +8627,10 @@ fn recolor_sgr(line: &str, color: &str, reset: &str) -> String {
             // Reset sequences are `\x1b[m` or `\x1b[0m`.
             if seq == "\x1b[m" || seq == "\x1b[0m" {
                 out.push_str(reset);
+            } else if seq == BG_RED {
+                // Whitespace-error highlight (`\x1b[41m`) is layered on top of the
+                // diff color; Git keeps it on moved lines too, so preserve it.
+                out.push_str(BG_RED);
             } else {
                 out.push_str(color);
             }
