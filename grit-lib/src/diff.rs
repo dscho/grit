@@ -1976,6 +1976,26 @@ pub fn diff_index_to_worktree_with_options(
         if ie.mode == 0o160000 {
             let sub_dir = work_tree.join(path_str_ref);
             let sub_head_oid = read_submodule_head_oid(&sub_dir);
+            // A gitlink whose worktree directory is entirely absent is a deleted submodule. Git's
+            // `check_removed` (diff-lib.c) `lstat`s the path first: a missing directory is reported
+            // as a removal (`D`, new mode 000000), *before* the submodule "not checked out" special
+            // case (which only applies when the directory exists). An empty directory that exists is
+            // a placeholder and stays unchanged. Skipped when `simplify_gitlinks` so callers that
+            // only compare recorded HEADs keep their behaviour. (t4060 #50/#51.)
+            if !simplify_gitlinks && sub_head_oid.is_none() && !sub_dir.exists() {
+                let path_owned = path_str_ref.to_owned();
+                result.push(DiffEntry {
+                    status: DiffStatus::Deleted,
+                    old_path: Some(path_owned.clone()),
+                    new_path: Some(path_owned),
+                    old_mode: format_mode(ie.mode),
+                    new_mode: "000000".to_owned(),
+                    old_oid: ie.oid,
+                    new_oid: zero_oid(),
+                    score: None,
+                });
+                continue;
+            }
             let ref_matches = if let Some(oid) = sub_head_oid {
                 oid == ie.oid
             } else {
