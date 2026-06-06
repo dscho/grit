@@ -2673,34 +2673,70 @@ pub fn diff_tree_to_worktree(
                 .get(path.as_bytes())
                 .is_some_and(|ie| ie.mode == 0o160000);
         if is_gitlink {
-            if let Some(te) = tree_entry {
-                let sub_dir = work_tree.join(path);
-                let sub_head = read_submodule_head_oid(&sub_dir);
-                let index_oid = index_entries
-                    .get(path.as_bytes())
-                    .filter(|ie| ie.mode == 0o160000)
-                    .map(|ie| ie.oid);
-                let index_matches_tree = index_oid.is_some_and(|oid| oid == te.oid);
-                let head_differs = sub_head.as_ref() != Some(&te.oid);
-                let dirty_while_aligned = index_matches_tree
-                    && !head_differs
-                    && submodule_has_dirty_worktree_for_super_diff(work_tree, path, &te.oid);
-                if head_differs || dirty_while_aligned {
-                    // Raw `git diff <tree>` lines use a null OID on the worktree side when the
-                    // checked-out submodule HEAD differs from the tree's gitlink; patch output still
-                    // resolves the real commit from the submodule directory.
-                    let new_oid = if head_differs { zero_oid() } else { te.oid };
+            let sub_dir = work_tree.join(path);
+            let index_gitlink_oid = index_entries
+                .get(path.as_bytes())
+                .filter(|ie| ie.mode == 0o160000)
+                .map(|ie| ie.oid);
+            match (tree_entry, index_gitlink_oid) {
+                (Some(te), _) => {
+                    let sub_head = read_submodule_head_oid(&sub_dir);
+                    // A gitlink whose worktree directory no longer exists is a deleted submodule:
+                    // Git's `diff-lib.c` reports it as a deletion (status `D`, new mode 000000) and
+                    // `--submodule` renders the `(submodule deleted)` summary (t4041 #46).
+                    if sub_head.is_none() && !sub_dir.exists() {
+                        result.push(DiffEntry {
+                            status: DiffStatus::Deleted,
+                            old_path: Some(path.clone()),
+                            new_path: Some(path.clone()),
+                            old_mode: format_mode(te.mode),
+                            new_mode: "000000".to_string(),
+                            old_oid: te.oid,
+                            new_oid: zero_oid(),
+                            score: None,
+                        });
+                        continue;
+                    }
+                    let index_matches_tree = index_gitlink_oid.is_some_and(|oid| oid == te.oid);
+                    let head_differs = sub_head.as_ref() != Some(&te.oid);
+                    let dirty_while_aligned = index_matches_tree
+                        && !head_differs
+                        && submodule_has_dirty_worktree_for_super_diff(work_tree, path, &te.oid);
+                    if head_differs || dirty_while_aligned {
+                        // Raw `git diff <tree>` lines use a null OID on the worktree side when the
+                        // checked-out submodule HEAD differs from the tree's gitlink; patch output
+                        // still resolves the real commit from the submodule directory.
+                        let new_oid = if head_differs { zero_oid() } else { te.oid };
+                        result.push(DiffEntry {
+                            status: DiffStatus::Modified,
+                            old_path: Some(path.clone()),
+                            new_path: Some(path.clone()),
+                            old_mode: format_mode(te.mode),
+                            new_mode: format_mode(te.mode),
+                            old_oid: te.oid,
+                            new_oid,
+                            score: None,
+                        });
+                    }
+                }
+                (None, Some(idx_oid)) => {
+                    // Gitlink staged in the index but absent from the tree: a new submodule. Git
+                    // reports it as an addition (status `A`) with the index gitlink on the new side,
+                    // so `--submodule` renders `(new submodule)` (t4041 #46). The patch renderer
+                    // resolves the real commit from the index OID / submodule HEAD.
+                    let new_oid = read_submodule_head_oid(&sub_dir).unwrap_or(idx_oid);
                     result.push(DiffEntry {
-                        status: DiffStatus::Modified,
+                        status: DiffStatus::Added,
                         old_path: Some(path.clone()),
                         new_path: Some(path.clone()),
-                        old_mode: format_mode(te.mode),
-                        new_mode: format_mode(te.mode),
-                        old_oid: te.oid,
+                        old_mode: "000000".to_string(),
+                        new_mode: format_mode(0o160000),
+                        old_oid: zero_oid(),
                         new_oid,
                         score: None,
                     });
                 }
+                (None, None) => {}
             }
             continue;
         }
