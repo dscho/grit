@@ -4687,7 +4687,23 @@ fn run_no_index(args: Args) -> Result<()> {
         } else {
             for line in diff_body.lines() {
                 if line.starts_with("@@") {
-                    let _ = writeln!(colored, "{CYAN}{line}{RESET}");
+                    // Split a trailing funcname out of the cyan range (Git format).
+                    if let Some(close) = line.get(2..).and_then(|s| s.find("@@")).map(|i| i + 2) {
+                        let range = &line[..close + 2];
+                        let rest = &line[close + 2..];
+                        if let Some(func) = rest.strip_prefix(' ') {
+                            if func.is_empty() {
+                                let _ = writeln!(colored, "{CYAN}{range}{RESET} ");
+                            } else {
+                                let _ =
+                                    writeln!(colored, "{CYAN}{range}{RESET} {RESET}{func}{RESET}");
+                            }
+                        } else {
+                            let _ = writeln!(colored, "{CYAN}{range}{rest}{RESET}");
+                        }
+                    } else {
+                        let _ = writeln!(colored, "{CYAN}{line}{RESET}");
+                    }
                 } else if let Some(body) =
                     line.strip_prefix('+').filter(|_| !line.starts_with("+++"))
                 {
@@ -8637,7 +8653,8 @@ fn resolve_color_moved(
 ) -> Option<(grit_lib::diff_moved::ColorMovedMode, u32, MovedColors)> {
     use grit_lib::diff_moved::{parse_color_moved_ws, ColorMovedMode, MOVED_WS_ERROR};
 
-    // --- mode ---
+    // --- mode --- (Git validates `--color-moved` / `diff.colorMoved` whenever
+    // present, independently of whether color is on.)
     let (mode_str, mode_from_cmdline_cfg) = if let Some(m) = args.color_moved.as_deref() {
         (Some(m.to_owned()), false)
     } else if let Some(entry) = config.get_last_entry("diff.colormoved") {
@@ -8649,25 +8666,31 @@ fn resolve_color_moved(
         (None, false)
     };
 
-    let Some(mode_str) = mode_str else {
-        return None;
-    };
-
-    let mode = match ColorMovedMode::parse(&mode_str) {
-        Some(m) => m,
-        None => {
-            if mode_from_cmdline_cfg {
-                eprintln!("fatal: unable to parse 'diff.colormoved' from command-line config");
-            } else {
+    let mode = match &mode_str {
+        Some(s) => match ColorMovedMode::parse(s) {
+            Some(m) => m,
+            None => {
+                // Git prints the detailed `error:` line in all cases (t4015 #132).
                 eprintln!(
-                    "fatal: color moved setting must be one of 'no', 'default', 'blocks', 'zebra', 'dimmed-zebra', 'plain'"
+                    "error: color moved setting must be one of 'no', 'default', 'blocks', 'zebra', 'dimmed-zebra', 'plain'"
                 );
+                if mode_from_cmdline_cfg {
+                    // From `git -c diff.colorMoved=...`: a fatal config-parse error (exit 128).
+                    eprintln!("fatal: unable to parse 'diff.colormoved' from command-line config");
+                    std::process::exit(128);
+                } else {
+                    // From the `--color-moved=<arg>` flag: a usage error (exit 129).
+                    eprintln!("error: bad --color-moved argument: {s}");
+                    std::process::exit(129);
+                }
             }
-            std::process::exit(128);
-        }
+        },
+        // No mode requested → move detection is off, but `--color-moved-ws` is
+        // still validated below (Git errors on a bogus ws value regardless).
+        None => ColorMovedMode::No,
     };
 
-    // --- ws handling ---
+    // --- ws handling --- (validated whenever present, independent of mode)
     let (ws_str, ws_from_cmdline_cfg) = if let Some(w) = args.color_moved_ws.as_deref() {
         (Some(w.to_owned()), false)
     } else if let Some(entry) = config.get_last_entry("diff.colormovedws") {
@@ -8686,8 +8709,9 @@ fn resolve_color_moved(
         } else {
             ws_flags = parse_color_moved_ws(&ws_str);
             if ws_flags & MOVED_WS_ERROR != 0 {
-                // Determine the specific message: the allow-indentation-change
-                // incompatibility vs an unknown mode token.
+                // Detailed `error:` line first (always), mirroring Git's
+                // parse_color_moved_ws: the allow-indentation-change
+                // incompatibility takes precedence over an unknown-mode token.
                 let has_allow = ws_str
                     .split(',')
                     .any(|t| t.trim() == "allow-indentation-change");
@@ -8699,11 +8723,7 @@ fn resolve_color_moved(
                 });
                 if has_allow && has_other_ws {
                     eprintln!(
-                        "fatal: color-moved-ws: allow-indentation-change cannot be combined with other whitespace modes"
-                    );
-                } else if ws_from_cmdline_cfg {
-                    eprintln!(
-                        "fatal: unable to parse 'diff.colormovedws' from command-line config"
+                        "error: color-moved-ws: allow-indentation-change cannot be combined with other whitespace modes"
                     );
                 } else {
                     let bad = ws_str
@@ -8721,10 +8741,18 @@ fn resolve_color_moved(
                         })
                         .unwrap_or("");
                     eprintln!(
-                        "fatal: unknown color-moved-ws mode '{bad}', possible values are 'ignore-space-change', 'ignore-space-at-eol', 'ignore-all-space', 'allow-indentation-change'"
+                        "error: unknown color-moved-ws mode '{bad}', possible values are 'ignore-space-change', 'ignore-space-at-eol', 'ignore-all-space', 'allow-indentation-change'"
                     );
                 }
-                std::process::exit(128);
+                if ws_from_cmdline_cfg {
+                    eprintln!(
+                        "fatal: unable to parse 'diff.colormovedws' from command-line config"
+                    );
+                    std::process::exit(128);
+                } else {
+                    eprintln!("error: invalid mode '{ws_str}' in --color-moved-ws");
+                    std::process::exit(129);
+                }
             }
         }
     }
@@ -8738,6 +8766,33 @@ fn resolve_color_moved(
     let _ = ws_mode;
 
     Some((mode, ws_flags, MovedColors::load(config)))
+}
+
+/// Emit a colored `@@ ... @@[ funcname]` hunk header the way Git does: the
+/// `@@ -a,b +c,d @@` range is painted with the fraginfo (cyan) color, and a
+/// trailing function-context name is painted separately with `ctx_color`
+/// (Git's context color, empty by default → `<RESET>name<RESET>`).
+fn write_colored_hunk_header(out: &mut impl Write, line: &str, ctx_color: &str) -> Result<()> {
+    // Find the closing `@@` of the range. The header is `@@ <ranges> @@`,
+    // optionally followed by ` <funcname>`.
+    if let Some(close) = line.get(2..).and_then(|s| s.find("@@")).map(|i| i + 2) {
+        let range_end = close + 2; // index just past the second `@@`
+        let range = &line[..range_end];
+        let rest = &line[range_end..]; // may be "" or " funcname"
+        if let Some(func) = rest.strip_prefix(' ') {
+            if func.is_empty() {
+                writeln!(out, "{CYAN}{range}{RESET} ")?;
+            } else {
+                writeln!(out, "{CYAN}{range}{RESET} {ctx_color}{func}{RESET}")?;
+            }
+        } else {
+            // No funcname (rest should be empty).
+            writeln!(out, "{CYAN}{range}{rest}{RESET}")?;
+        }
+    } else {
+        writeln!(out, "{CYAN}{line}{RESET}")?;
+    }
+    Ok(())
 }
 
 fn write_colored_patch(
@@ -8794,7 +8849,10 @@ fn write_colored_patch_ws(
         } else if line.starts_with("@@") {
             last_was_plus_hunk_line = false;
             last_line_kind = 0;
-            writeln!(out, "{CYAN}{line_no_nl}{RESET}")?;
+            // Git colors only the `@@ ... @@` range with FRAGINFO (cyan); a
+            // trailing funcname is emitted separately with the (empty) context
+            // color: `<CYAN>@@ ... @@<RESET> <RESET>func<RESET>`.
+            write_colored_hunk_header(out, line_no_nl, "")?;
         } else if let Some(ctx) = ws {
             // ws-aware content line emission.
             let mut buf = String::new();

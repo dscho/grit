@@ -406,7 +406,16 @@ pub fn detect_moved_lines(patch: &str, mode: ColorMovedMode, ws_flags: u32) -> V
     let mut moved_symbol: Option<bool> = None;
 
     let mut nn = 0usize;
+    // Safety cap: the rewind logic strictly shrinks the re-examined block each
+    // time, so this terminates, but guard against any pathological input causing
+    // an unbounded loop (rewinds re-visit lines, so bound generously).
+    let max_iters = n.saturating_mul(n).saturating_add(n).saturating_add(16);
+    let mut iters = 0usize;
     while nn < n {
+        iters += 1;
+        if iters > max_iters {
+            break;
+        }
         // match for this line: a plus matches dels, a minus matches adds.
         let mut match_idx: Option<usize> = if syms[nn].is_plus {
             del_head[syms[nn].id]
