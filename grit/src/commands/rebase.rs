@@ -4001,9 +4001,257 @@ fn worktree_matches_head(repo: &Repository, git_dir: &Path) -> Result<bool> {
     Ok(staged.is_empty() && unstaged.is_empty())
 }
 
+/// `rebase.missingCommitsCheck` level (Git's `get_missing_commit_check_level`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MissingCommitCheck {
+    Ignore,
+    Warn,
+    Error,
+}
+
+/// Reads `rebase.missingCommitsCheck`; unknown values warn and behave as `ignore`.
+fn missing_commit_check_level(config: &ConfigSet) -> MissingCommitCheck {
+    match config.get("rebase.missingCommitsCheck") {
+        None => MissingCommitCheck::Ignore,
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "ignore" => MissingCommitCheck::Ignore,
+            "warn" => MissingCommitCheck::Warn,
+            "error" => MissingCommitCheck::Error,
+            other => {
+                eprintln!(
+                    "warning: unrecognized setting {other} for option rebase.missingCommitsCheck. Ignoring."
+                );
+                MissingCommitCheck::Ignore
+            }
+        },
+    }
+}
+
+/// Lower-cased first whitespace-delimited token (the todo command keyword) of a non-comment line.
+fn todo_command_word(line: &str) -> Option<String> {
+    let t = line.trim();
+    if t.is_empty() || rebase_todo_line_is_comment(t) {
+        return None;
+    }
+    t.split_whitespace().next().map(|w| w.to_ascii_lowercase())
+}
+
+/// True if the keyword is a recognized interactive-rebase command (Git's `parse_insn_line`).
+fn is_known_todo_command(word: &str) -> bool {
+    matches!(
+        word,
+        "pick"
+            | "p"
+            | "reword"
+            | "r"
+            | "edit"
+            | "e"
+            | "squash"
+            | "s"
+            | "fixup"
+            | "f"
+            | "drop"
+            | "d"
+            | "exec"
+            | "x"
+            | "break"
+            | "b"
+            | "label"
+            | "l"
+            | "reset"
+            | "t"
+            | "merge"
+            | "m"
+            | "update-ref"
+            | "u"
+            | "noop"
+    )
+}
+
+/// True if the command operates on a commit object (and so participates in the missing-commit check).
+fn todo_command_is_pick_like(word: &str) -> bool {
+    matches!(
+        word,
+        "pick"
+            | "p"
+            | "reword"
+            | "r"
+            | "edit"
+            | "e"
+            | "squash"
+            | "s"
+            | "fixup"
+            | "f"
+            | "drop"
+            | "d"
+    )
+}
+
+/// True if the command is a fixup/squash (which may not be the first actionable command).
+fn todo_command_is_fixup(word: &str) -> bool {
+    matches!(word, "squash" | "s" | "fixup" | "f")
+}
+
+/// Validates the edited interactive-rebase todo before execution (Git's `todo_list_parse_insn_buffer`
+/// + `todo_list_check`).
+///
+/// On any structural problem (unknown command, bad SHA-1, leading fixup, or — with
+/// `rebase.missingCommitsCheck = error` — a dropped commit) this writes the `git-rebase-todo.backup`
+/// and returns an error carrying the same advice Git prints. With `missingCommitsCheck = warn` it
+/// prints the warning but allows the rebase to proceed.
+fn validate_edited_interactive_todo(
+    repo: &Repository,
+    rb_merge: &Path,
+    original_todo: &str,
+    edited: &str,
+    config: &ConfigSet,
+) -> Result<()> {
+    const ADVICE: &str = "You can fix this with 'git rebase --edit-todo' and then run 'git rebase --continue'.\nOr you can abort the rebase with 'git rebase --abort'.";
+
+    // Backup the original todo (with help) so `--edit-todo` recovery and tests can restore it.
+    let _ = fs::create_dir_all(rb_merge);
+    let _ = fs::write(
+        rb_merge.join("git-rebase-todo.backup"),
+        original_todo.as_bytes(),
+    );
+
+    // Structural validation: unknown commands, bad SHAs, and a leading fixup all abort with advice.
+    let mut fixup_okay = false;
+    for (idx, raw) in edited.lines().enumerate() {
+        let t = raw.trim();
+        if t.is_empty() || rebase_todo_line_is_comment(t) {
+            continue;
+        }
+        let Some(word) = todo_command_word(t) else {
+            continue;
+        };
+        if !is_known_todo_command(&word) {
+            eprintln!("error: invalid line {}: {t}", idx + 1);
+            eprintln!("{ADVICE}");
+            return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
+        }
+        // Validate that pick-like commands carry a resolvable commit.
+        if todo_command_is_pick_like(&word) {
+            if let Err(_e) = parse_interactive_rebase_todo_line(repo, t) {
+                eprintln!("error: invalid line {}: {t}", idx + 1);
+                eprintln!("{ADVICE}");
+                return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
+            }
+        }
+        let is_noop = word == "noop";
+        if !fixup_okay && todo_command_is_fixup(&word) {
+            eprintln!("error: cannot '{word}' without a previous commit");
+            eprintln!("{ADVICE}");
+            return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
+        }
+        if !is_noop && !todo_command_is_fixup(&word) {
+            fixup_okay = true;
+        }
+    }
+
+    // Missing-commit check (`rebase.missingCommitsCheck`).
+    let level = missing_commit_check_level(config);
+    if level == MissingCommitCheck::Ignore {
+        return Ok(());
+    }
+
+    // Collect the OIDs that survive into the edited todo. An explicit `drop` still counts the commit
+    // as "seen" (Git marks dropped commits in `commit_seen`), so only commits removed entirely from
+    // the list are reported as accidentally dropped.
+    let mut kept: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    for line in rebase_todo_actionable_lines(edited) {
+        let Some(word) = todo_command_word(line) else {
+            continue;
+        };
+        if !todo_command_is_pick_like(&word) {
+            continue;
+        }
+        if let Some(oid) = todo_line_commit_oid(repo, line) {
+            kept.insert(oid);
+        }
+    }
+
+    // Walk the original todo newest-to-oldest; report commits dropped (not present, not `drop`ped).
+    let mut missing = String::new();
+    let mut reported: std::collections::HashSet<ObjectId> = std::collections::HashSet::new();
+    let original_lines: Vec<&str> = rebase_todo_actionable_lines(original_todo);
+    for line in original_lines.iter().rev() {
+        let Some(word) = todo_command_word(line) else {
+            continue;
+        };
+        if !todo_command_is_pick_like(&word) || word == "drop" || word == "d" {
+            continue;
+        }
+        let Some(oid) = todo_line_commit_oid(repo, line) else {
+            continue;
+        };
+        if kept.contains(&oid) || reported.contains(&oid) {
+            continue;
+        }
+        reported.insert(oid);
+        let abbrev = abbreviate_object_id(repo, oid, 7).unwrap_or_else(|_| oid.to_hex());
+        let subject = commit_subject_for_oid(repo, oid);
+        missing.push_str(&format!(" - {abbrev} # {subject}\n"));
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    eprintln!("Warning: some commits may have been dropped accidentally.");
+    eprintln!("Dropped commits (newer to older):");
+    eprint!("{missing}");
+    eprintln!("To avoid this message, use \"drop\" to explicitly remove a commit.");
+    if level == MissingCommitCheck::Error {
+        eprintln!();
+        eprintln!("Use 'git config rebase.missingCommitsCheck' to change the level of warnings.");
+        eprintln!("The possible behaviours are: ignore, warn, error.");
+        eprintln!();
+        eprintln!("{ADVICE}");
+        return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
+    }
+    Ok(())
+}
+
+/// Extracts the commit OID a pick-like todo line refers to (`pick`/`reword`/`edit`/`squash`/`fixup`/
+/// `drop` <commit> ...), resolving short SHAs and the `-C`/`-c` fixup flag form.
+fn todo_line_commit_oid(repo: &Repository, line: &str) -> Option<ObjectId> {
+    let t = line.trim();
+    let mut parts = t.split_whitespace();
+    let word = parts.next()?.to_ascii_lowercase();
+    if !todo_command_is_pick_like(&word) {
+        return None;
+    }
+    let mut next = parts.next()?;
+    // Skip a leading `-C`/`-c[ ]<commit>` flag on fixup lines.
+    if todo_command_is_fixup(&word) {
+        if next.eq_ignore_ascii_case("-C") || next.eq_ignore_ascii_case("-c") {
+            next = parts.next()?;
+        } else if next.len() > 2 && (next.starts_with("-C") || next.starts_with("-c")) {
+            next = &next[2..];
+        }
+    }
+    if next.len() == 40 && next.bytes().all(|b| b.is_ascii_hexdigit()) {
+        ObjectId::from_hex(next).ok()
+    } else {
+        resolve_revision(repo, next).ok()
+    }
+}
+
+/// Single-line subject for a commit OID (empty string if it cannot be read).
+fn commit_subject_for_oid(repo: &Repository, oid: ObjectId) -> String {
+    repo.odb
+        .read(&oid)
+        .ok()
+        .and_then(|obj| parse_commit(&obj.data).ok())
+        .map(|c| commit_subject_single_line(&c.message))
+        .unwrap_or_default()
+}
+
 /// Returns trimmed non-comment todo lines as edited (for replay), and pick/fixup/squash entries for
-/// empty-list / up-to-date checks.
-#[allow(clippy::too_many_arguments)]
+/// empty-list / up-to-date checks, plus the original (with-help) and raw-edited todo bodies for the
+/// post-state static check.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_interactive_rebase(
     repo: &Repository,
     git_dir: &Path,
@@ -4013,7 +4261,13 @@ fn run_interactive_rebase(
     autosquash: bool,
     update_refs: bool,
     revs_onto: Option<(&str, &str)>,
-) -> Result<(Vec<String>, Vec<(ObjectId, RebaseTodoCmd)>, bool)> {
+) -> Result<(
+    Vec<String>,
+    Vec<(ObjectId, RebaseTodoCmd)>,
+    bool,
+    String,
+    String,
+)> {
     if autosquash {
         validate_rebase_instruction_format(config)?;
     }
@@ -4091,7 +4345,7 @@ fn run_interactive_rebase(
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     let changed = lines != original_lines;
-    Ok((lines, pick_like, changed))
+    Ok((lines, pick_like, changed, todo, edited))
 }
 
 fn flush_rebase_stdout() {
@@ -4320,6 +4574,13 @@ fn do_edit_todo() -> Result<()> {
     let edited = fs::read_to_string(&path)
         .with_context(|| format!("read rebase todo after edit {}", path.display()))?;
     write_rebase_todo_file(&repo, &rb_dir, &edited)?;
+    // Re-run the static check (Git's `edit_todo_list` with `initial=false`): unknown commands, bad
+    // SHAs, a leading fixup, and — comparing against `git-rebase-todo.backup` — dropped commits all
+    // re-fail here so the user must fix the list before `--continue` (t3404 missingCommitsCheck +
+    // "first command cannot be a fixup" tests).
+    let original_for_check = fs::read_to_string(rb_dir.join("git-rebase-todo.backup"))
+        .unwrap_or_else(|_| content.clone());
+    validate_edited_interactive_todo(&repo, &rb_dir, &original_for_check, &edited, &config)?;
     Ok(())
 }
 
@@ -4702,6 +4963,9 @@ Use '--' to separate paths from revisions, like this:\n\
 
     let commits_for_update_refs = commits.clone();
     let mut generated_merge_script: Option<String> = None;
+    // For a plain `rebase -i`, captures (original todo with help, raw edited todo) so the static
+    // todo check (`todo_list_check`) can run after the rebase state dir is established.
+    let mut interactive_validation: Option<(String, String)> = None;
     let (rebase_todo_lines, rebase_interactive) = if rebase_merges_on {
         // Do not use `collect_rebase_todo_commits` emptiness here: it walks first-parent chains only
         // and misses merge topology, which would incorrectly report "up to date" for `main` over `A`.
@@ -4782,16 +5046,18 @@ Use '--' to separate paths from revisions, like this:\n\
                 abbreviate_object_id(&repo, head_oid, 7).unwrap_or_else(|_| head_oid.to_hex());
             format!("{short_upstream}..{short_head}")
         };
-        let (edited_lines, _, todo_changed) = run_interactive_rebase(
-            &repo,
-            git_dir,
-            &commits,
-            &config,
-            autostash_oid.as_ref(),
-            want_autosquash,
-            rebase_update_refs_enabled(&args, &config),
-            Some((help_revs.as_str(), short_onto.as_str())),
-        )?;
+        let (edited_lines, _, todo_changed, original_todo_with_help, raw_edited_todo) =
+            run_interactive_rebase(
+                &repo,
+                git_dir,
+                &commits,
+                &config,
+                autostash_oid.as_ref(),
+                want_autosquash,
+                rebase_update_refs_enabled(&args, &config),
+                Some((help_revs.as_str(), short_onto.as_str())),
+            )?;
+        interactive_validation = Some((original_todo_with_help, raw_edited_todo));
         if !todo_changed
             && !want_autosquash
             && !force_rewrite_requested
@@ -5149,6 +5415,20 @@ Use '--' to separate paths from revisions, like this:\n\
         &start_msg,
         false,
     );
+
+    // Static check of the edited todo, mirroring Git: the rebase is already set up and HEAD has been
+    // rewound onto the new base, so on failure the in-progress rebase (incl. `git-rebase-todo.backup`)
+    // is left in place for `git rebase --edit-todo` + `--continue` recovery (t3404 static-check +
+    // missingCommitsCheck=error tests).
+    if let Some((ref original_todo_with_help, ref raw_edited_todo)) = interactive_validation {
+        validate_edited_interactive_todo(
+            &repo,
+            &rb_dir,
+            original_todo_with_help,
+            raw_edited_todo,
+            &config,
+        )?;
+    }
 
     replay_remaining(
         &repo,
