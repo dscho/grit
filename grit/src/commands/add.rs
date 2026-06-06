@@ -16,7 +16,7 @@ use grit_lib::ignore::{path_in_sparse_checkout as path_in_sparse_checkout_lines,
 use grit_lib::index::{entry_from_metadata, normalize_mode, Index, IndexEntry, MODE_TREE};
 #[allow(unused_imports)]
 use grit_lib::objects::ObjectId;
-use grit_lib::objects::ObjectKind;
+use grit_lib::objects::{parse_commit, parse_tree, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::refs;
 use grit_lib::repo::Repository;
@@ -1340,6 +1340,23 @@ pub(crate) fn stage_pathspecs_for_commit(
     let ctx = StageFileContext::for_commit();
 
     let mut matched_paths = HashSet::new();
+    let head_paths = commit_head_tree_paths(repo)?;
+
+    let is_known_to_index = |idx: &Index, path: &[u8]| -> bool {
+        if path.is_empty() || path == b"." {
+            return !idx.entries.is_empty() || !head_paths.is_empty();
+        }
+        idx.get(path, 0).is_some()
+            || head_paths.contains(path)
+            || idx.entries.iter().any(|entry| {
+                entry.stage() == 0
+                    && entry.path.starts_with(path)
+                    && entry.path.get(path.len()) == Some(&b'/')
+            })
+            || head_paths
+                .iter()
+                .any(|known| known.starts_with(path) && known.get(path.len()) == Some(&b'/'))
+    };
 
     let remove_path_and_descendants = |idx: &mut Index, path: &[u8]| -> Vec<Vec<u8>> {
         let removed: Vec<Vec<u8>> = idx
@@ -1416,18 +1433,13 @@ pub(crate) fn stage_pathspecs_for_commit(
     }
 
     for spec in pathspecs {
-        let resolved = match crate::pathspec::resolve_pathspec_in_worktree(
-            spec,
-            spec,
-            work_tree,
-            prefix.as_deref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => bail!("{e}"),
-        };
+        let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix.as_deref());
 
         if !grit_lib::pathspec::has_glob_chars(&resolved) {
             reject_skip_worktree(&index, resolved.as_bytes())?;
+            if !is_known_to_index(&index, resolved.as_bytes()) {
+                bail!("pathspec '{spec}' did not match any file(s) known to git");
+            }
             let abs_path = work_tree.join(&resolved);
             let meta = match fs::symlink_metadata(&abs_path) {
                 Ok(m) => m,
@@ -1460,6 +1472,11 @@ pub(crate) fn stage_pathspecs_for_commit(
                     add_cfg.precompose_unicode,
                 )?;
                 for (rel, file_abs) in rels {
+                    if index.get(rel.as_bytes(), 0).is_none()
+                        && !head_paths.contains(rel.as_bytes())
+                    {
+                        continue;
+                    }
                     reject_skip_worktree(&index, rel.as_bytes())?;
                     stage_file(
                         odb, &mut index, work_tree, &rel, &file_abs, repo, &ctx, add_cfg,
@@ -1525,6 +1542,9 @@ pub(crate) fn stage_pathspecs_for_commit(
         }
 
         for rel in matched_rels {
+            if index.get(rel.as_bytes(), 0).is_none() && !head_paths.contains(rel.as_bytes()) {
+                continue;
+            }
             reject_skip_worktree(&index, rel.as_bytes())?;
             let abs_path = work_tree.join(&rel);
             if fs::symlink_metadata(&abs_path).is_ok() {
@@ -1543,6 +1563,41 @@ pub(crate) fn stage_pathspecs_for_commit(
 
     repo.write_index_at(&index_path, &mut index)?;
     Ok(matched_paths)
+}
+
+fn commit_head_tree_paths(repo: &Repository) -> Result<HashSet<Vec<u8>>> {
+    let head = resolve_head(&repo.git_dir)?;
+    let Some(head_oid) = head.oid() else {
+        return Ok(HashSet::new());
+    };
+    let obj = repo.odb.read(head_oid)?;
+    let commit = parse_commit(&obj.data)?;
+    let mut paths = HashSet::new();
+    collect_tree_paths_for_commit(repo, commit.tree, "", &mut paths)?;
+    Ok(paths)
+}
+
+fn collect_tree_paths_for_commit(
+    repo: &Repository,
+    tree_oid: ObjectId,
+    prefix: &str,
+    out: &mut HashSet<Vec<u8>>,
+) -> Result<()> {
+    let obj = repo.odb.read(&tree_oid)?;
+    for entry in parse_tree(&obj.data)? {
+        let name = String::from_utf8_lossy(&entry.name);
+        let path = if prefix.is_empty() {
+            name.into_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if entry.mode == MODE_TREE {
+            collect_tree_paths_for_commit(repo, entry.oid, &path, out)?;
+        } else {
+            out.insert(path.into_bytes());
+        }
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
