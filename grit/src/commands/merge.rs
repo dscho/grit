@@ -1349,6 +1349,21 @@ fn merge_unborn(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
     let empty_tree = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904")?;
     let current_index = repo.load_index()?;
     let mut index = compose_fast_forward_index(repo, commit.tree, empty_tree, &current_index)?;
+
+    // Git implements the unborn merge with `read-tree -m -u <empty> <target>` (builtin/merge.c
+    // `read_empty`/`pull_into_void`). That two-way unpack refuses to clobber an untracked working
+    // tree file with the singular `read-tree` diagnostic and dies with `read-tree failed`, which is
+    // a different message from the regular `git merge` overwrite report. Reproduce it here: report
+    // the first colliding path in index order and exit 128.
+    if let Some(rel) = first_unborn_untracked_collision(repo, &index, &current_index)? {
+        return Err(anyhow::Error::new(ExplicitExit {
+            code: 128,
+            message: format!(
+                "error: Untracked working tree file '{rel}' would be overwritten by merge.\n\
+                 fatal: read-tree failed"
+            ),
+        }));
+    }
     let empty_old: HashMap<Vec<u8>, IndexEntry> = HashMap::new();
     bail_if_merge_would_overwrite_local_changes(repo, &empty_old, &index, &[], false)?;
 
@@ -1383,6 +1398,66 @@ fn merge_unborn(repo: &Repository, head: &HeadState, args: &Args) -> Result<()> 
         eprintln!("Updating to {}", &merge_oid.to_hex()[..7]);
     }
     Ok(())
+}
+
+/// First merge-result path (in index order) that would clobber an untracked working tree file when
+/// merging into an unborn branch. `read-tree -m -u` stops at the first such collision, so we report
+/// only one. A path whose leading component is itself an untracked file (so the new path cannot be
+/// created without removing it) reports that ancestor component instead.
+fn first_unborn_untracked_collision(
+    repo: &Repository,
+    target_index: &Index,
+    current_index: &Index,
+) -> Result<Option<String>> {
+    let Some(work_tree) = repo.work_tree.as_deref() else {
+        return Ok(None);
+    };
+    let tracked: BTreeSet<&[u8]> = current_index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0)
+        .map(|e| e.path.as_slice())
+        .collect();
+
+    for entry in target_index.entries.iter().filter(|e| e.stage() == 0) {
+        if tracked.contains(entry.path.as_slice()) {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(&entry.path).to_string();
+
+        // A leading path component that exists as an untracked non-directory blocks creation of the
+        // full path; report that ancestor (matches `read-tree` ENOTDIR handling).
+        let mut prefix = String::new();
+        let mut blocked_ancestor: Option<String> = None;
+        for component in rel.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if prefix.len() >= rel.len() {
+                break;
+            }
+            if tracked.contains(prefix.as_bytes()) {
+                continue;
+            }
+            if let Ok(meta) = fs::symlink_metadata(work_tree.join(&prefix)) {
+                if !meta.file_type().is_dir() {
+                    blocked_ancestor = Some(prefix.clone());
+                    break;
+                }
+            }
+        }
+        if let Some(anc) = blocked_ancestor {
+            return Ok(Some(anc));
+        }
+
+        if let Ok(meta) = fs::symlink_metadata(work_tree.join(&rel)) {
+            if !meta.file_type().is_dir() {
+                return Ok(Some(rel));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Lazily fetch any index blobs that are missing locally (best-effort).
@@ -3237,6 +3312,43 @@ fn bail_if_merge_would_overwrite_local_changes(
     }
 
     let mut overwrite_untracked: BTreeSet<String> = BTreeSet::new();
+
+    // A merge result path like `sub/f` requires `sub` to be a directory. If a leading path
+    // component already exists in the working tree as an untracked *non-directory* (a plain file
+    // or a symlink), git's tree-merge refuses to clobber it and reports that leading component
+    // (e.g. untracked file `sub` blocking the creation of `sub/f`). `symlink_metadata` on the full
+    // path would fail with ENOTDIR before we ever notice, so detect the colliding ancestor here.
+    for new_entry in new_index.entries.iter().filter(|e| e.stage() == 0) {
+        if is_tracked_path(&new_entry.path) {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(&new_entry.path).to_string();
+        if !rel.contains('/') {
+            continue;
+        }
+        let mut prefix = String::new();
+        for component in rel.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(component);
+            if prefix.len() >= rel.len() {
+                break;
+            }
+            if is_tracked_path(prefix.as_bytes()) || is_test_harness_meta_path(&prefix) {
+                continue;
+            }
+            let Ok(meta) = fs::symlink_metadata(work_tree.join(&prefix)) else {
+                continue;
+            };
+            if !meta.file_type().is_dir() {
+                // Untracked file/symlink occupying a directory slot in the merge result.
+                overwrite_untracked.insert(prefix.clone());
+                break;
+            }
+        }
+    }
+
     for new_entry in new_index.entries.iter().filter(|e| e.stage() == 0) {
         if is_tracked_path(&new_entry.path) {
             continue;
