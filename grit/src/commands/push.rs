@@ -3187,6 +3187,20 @@ fn check_receive_pack_policy(
     pushing_config: &ConfigSet,
     update: &RefUpdate,
 ) -> std::result::Result<(), String> {
+    // A ref hidden by `transfer.hideRefs` / `receive.hideRefs` is not advertised by receive-pack,
+    // so any attempt to update or delete it is rejected (git/builtin/receive-pack.c
+    // `check_aliased_updates` → `reject_updates_to_hidden_refs`).
+    let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+    hidden.load_hidden_refs_from_config(remote_config, "receive");
+    // Without a namespace the stripped name equals the full storage path (matching
+    // receive-pack's `ref_is_hidden(cmd->ref_name, refname_full.buf, ...)`).
+    if hidden.ref_excluded(Some(&update.remote_ref), &update.remote_ref) {
+        if update.new_oid.is_none() {
+            return Err("deny deleting a hidden ref".to_owned());
+        }
+        return Err("deny updating a hidden ref".to_owned());
+    }
+
     if remote_repo.is_bare() {
         return Ok(());
     }
