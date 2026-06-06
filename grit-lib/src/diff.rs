@@ -156,11 +156,16 @@ fn histogram_unified_body_raw(
 /// distance rules so the line numbers and surviving context match Git exactly.
 ///
 /// Returns the body only; an empty string means no substantive change survives.
-pub(crate) fn histogram_unified_body_ignore<F>(
+/// Optional `--function-context` (`-W`) hunk expansion is applied *after*
+/// ignorable change-record pruning so the boundaries/funcname header match Git.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn histogram_unified_body_ignore_fc<F>(
     old_content: &str,
     new_content: &str,
     context_lines: usize,
     inter_hunk_context: usize,
+    function_context: bool,
+    funcname_matcher: Option<&FuncnameMatcher>,
     is_ignorable_change: F,
 ) -> String
 where
@@ -308,14 +313,57 @@ where
         let xche = &changes[xche_idx];
 
         // pre-context
-        let s1 = (xch.i1 - ctxlen).max(0);
-        let s2 = (xch.i2 - ctxlen).max(0);
+        let mut s1 = (xch.i1 - ctxlen).max(0);
+        let mut s2 = (xch.i2 - ctxlen).max(0);
         // post-context (clamped so it does not run past either side's EOF).
         let mut lctx = ctxlen;
         lctx = lctx.min(before_len - (xche.i1 + xche.chg1));
         lctx = lctx.min(after_len - (xche.i2 + xche.chg2));
-        let e1 = xche.i1 + xche.chg1 + lctx;
-        let e2 = xche.i2 + xche.chg2 + lctx;
+        let mut e1 = xche.i1 + xche.chg1 + lctx;
+        let mut e2 = xche.i2 + xche.chg2 + lctx;
+
+        // `--function-context`: expand the hunk up to the enclosing function's
+        // header and down to the line before the next function (Git's
+        // XDL_EMIT_FUNCCONTEXT in xemit.c), using the already ignore-pruned
+        // change boundaries.
+        if function_context {
+            // Upward: find the function line at or before xch.i1, then climb to
+            // the start of that function (past non-empty non-func lines).
+            let mut fs1 = xch.i1;
+            while fs1 >= 0 && !is_func_line(before_line(fs1), funcname_matcher) {
+                fs1 -= 1;
+            }
+            while fs1 > 0
+                && before_line(fs1 - 1).trim().is_empty() == false
+                && !is_func_line(before_line(fs1 - 1), funcname_matcher)
+            {
+                fs1 -= 1;
+            }
+            if fs1 < 0 {
+                fs1 = 0;
+            }
+            if fs1 < s1 {
+                s2 = (s2 - (s1 - fs1)).max(0);
+                s1 = fs1;
+            }
+            // Downward: find the next function line after the hunk end, climb up
+            // past trailing empty lines, and extend e1/e2 to it.
+            let end1 = xche.i1 + xche.chg1;
+            let mut fe1 = end1;
+            while fe1 < before_len && !is_func_line(before_line(fe1), funcname_matcher) {
+                fe1 += 1;
+            }
+            while fe1 > 0 && before_line(fe1 - 1).trim().is_empty() {
+                fe1 -= 1;
+            }
+            if fe1 > before_len {
+                fe1 = before_len;
+            }
+            if fe1 > e1 {
+                e2 = (e2 + (fe1 - e1)).min(after_len);
+                e1 = fe1;
+            }
+        }
 
         let _ = writeln!(
             out,
@@ -483,6 +531,7 @@ pub fn unified_diff_histogram_ignore_with_prefix_and_funcname<F>(
     dst_prefix: &str,
     funcname_matcher: Option<&FuncnameMatcher>,
     quote_path_fully: bool,
+    function_context: bool,
     is_ignorable_change: F,
 ) -> String
 where
@@ -490,11 +539,13 @@ where
 {
     use crate::quote_path::format_diff_path_with_prefix;
 
-    let body = histogram_unified_body_ignore(
+    let body = histogram_unified_body_ignore_fc(
         old_content,
         new_content,
         context_lines,
         inter_hunk_context,
+        function_context,
+        funcname_matcher,
         is_ignorable_change,
     );
     if body.is_empty() {

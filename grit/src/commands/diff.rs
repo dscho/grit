@@ -8421,6 +8421,7 @@ fn write_patch_with_prefix(
                     dst_prefix,
                     func_matcher.as_ref(),
                     quote_path_fully,
+                    function_context,
                     is_ignorable,
                 )
             } else if ws_aware {
