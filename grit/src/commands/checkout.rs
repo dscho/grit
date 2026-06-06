@@ -2965,7 +2965,9 @@ fn detach_head_inner(
         HeadState::Detached { oid } => oid.to_hex()[..7].to_string(),
         HeadState::Invalid => "unknown".to_string(),
     };
-    let to_desc = oid.to_hex()[..7].to_string();
+    let to_desc = label
+        .map(str::to_owned)
+        .unwrap_or_else(|| oid.to_hex()[..7].to_string());
     let msg = format!("checkout: moving from {} to {}", from_desc, to_desc);
     write_checkout_reflog(repo, &head, &old_oid, oid, &msg);
 

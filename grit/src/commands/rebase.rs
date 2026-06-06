@@ -5207,6 +5207,9 @@ fn replay_remaining(
                     let _ = fs::remove_file(rb_dir.join("current"));
                     let _ = fs::remove_file(rb_dir.join("current-cmd"));
                     let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
+                    if rebase_interactive {
+                        append_interactive_rebase_done_line(rb_dir, todo[i])?;
+                    }
                     let remaining: Vec<&str> = todo[i + 1..].to_vec();
                     write_rebase_todo_slice(rb_dir, &remaining)?;
                     std::process::exit(0);
@@ -5276,6 +5279,9 @@ fn replay_remaining(
                     let _ = fs::remove_file(rb_dir.join("current"));
                     let _ = fs::remove_file(rb_dir.join("current-cmd"));
                     let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
+                    if rebase_interactive {
+                        append_interactive_rebase_done_line(rb_dir, todo[i])?;
+                    }
                     let remaining_before: Vec<&str> = todo[i + 1..].to_vec();
                     let rem_body = if remaining_before.is_empty() {
                         String::new()

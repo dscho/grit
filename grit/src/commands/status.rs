@@ -2656,8 +2656,7 @@ fn long_status_print_rebase_information(
             cpw(out, cp, &format!("   {line}"))?;
         }
         if n > NR_SHOW && show_hints {
-            let path = git_dir.join("rebase-merge/done");
-            cpw(out, cp, &format!("  (see more in file {})", path.display()))?;
+            cpw(out, cp, "  (see more in file .git/rebase-merge/done)")?;
         }
     }
     if yet_to_do.is_empty() {
@@ -2685,6 +2684,17 @@ fn long_status_print_rebase_information(
         }
     }
     Ok(())
+}
+
+fn long_status_rebase_has_started(git_dir: &Path) -> bool {
+    fs::read_to_string(git_dir.join("rebase-merge/done"))
+        .ok()
+        .is_some_and(|content| {
+            content.lines().any(|line| {
+                let t = line.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+        })
 }
 
 pub(crate) fn parse_submodule_summary_limit(config: &ConfigSet) -> Option<i32> {
@@ -2986,6 +2996,9 @@ fn format_long(
         .ok()
         .and_then(|v| parse_bool_str(&v))
         .unwrap_or(config_hints);
+    let git_dir = &repo.git_dir;
+    let interactive_rebase_started =
+        state.rebase_interactive_in_progress && long_status_rebase_has_started(git_dir);
 
     match head {
         HeadState::Branch {
@@ -2993,22 +3006,33 @@ fn format_long(
             oid: Some(_),
             ..
         } => {
-            cpw(out, cp, &format!("On branch {short_name}"))?;
-            let tracking = format_tracking_info(
-                repo,
-                short_name,
-                if effective_no_ahead_behind {
-                    AheadBehindMode::Quick
-                } else {
-                    AheadBehindMode::Full
-                },
-                show_hints,
-            )?;
-            if !tracking.is_empty() {
-                for line in tracking.trim_end_matches('\n').lines() {
-                    cpw(out, cp, line)?;
+            if interactive_rebase_started
+                && state.rebase_branch.as_deref() == Some(short_name.as_str())
+            {
+                let onto = state.rebase_onto.as_deref().unwrap_or("");
+                cpw(
+                    out,
+                    cp,
+                    &format!("interactive rebase in progress; onto {onto}"),
+                )?;
+            } else {
+                cpw(out, cp, &format!("On branch {short_name}"))?;
+                let tracking = format_tracking_info(
+                    repo,
+                    short_name,
+                    if effective_no_ahead_behind {
+                        AheadBehindMode::Quick
+                    } else {
+                        AheadBehindMode::Full
+                    },
+                    show_hints,
+                )?;
+                if !tracking.is_empty() {
+                    for line in tracking.trim_end_matches('\n').lines() {
+                        cpw(out, cp, line)?;
+                    }
+                    cpw(out, cp, "")?;
                 }
-                cpw(out, cp, "")?;
             }
         }
         HeadState::Branch {
@@ -3048,7 +3072,6 @@ fn format_long(
         }
     }
 
-    let git_dir = &repo.git_dir;
     let merge_msg_exists = git_dir.join("MERGE_MSG").exists();
 
     if state.merge_in_progress {
@@ -3099,10 +3122,12 @@ fn format_long(
         }
         cpw(out, cp, "")?;
     } else if state.rebase_in_progress || state.rebase_interactive_in_progress {
-        long_status_print_rebase_information(out, cp, show_hints, repo, git_dir)?;
+        if state.rebase_interactive_in_progress {
+            long_status_print_rebase_information(out, cp, show_hints, repo, git_dir)?;
+        }
         let has_um = long_status_has_unmerged(expanded_index);
         if has_um {
-            long_status_print_rebase_state(out, cp, state)?;
+            long_status_print_rebase_state(out, cp, repo, git_dir, head, state)?;
             if show_hints {
                 cpw(
                     out,
@@ -3118,7 +3143,7 @@ fn format_long(
             }
             cpw(out, cp, "")?;
         } else if state.rebase_in_progress || merge_msg_exists {
-            long_status_print_rebase_state(out, cp, state)?;
+            long_status_print_rebase_state(out, cp, repo, git_dir, head, state)?;
             if show_hints {
                 cpw(
                     out,
@@ -3127,10 +3152,12 @@ fn format_long(
                 )?;
             }
             cpw(out, cp, "")?;
-        } else if split_commit_in_progress(git_dir, head) {
-            long_status_print_splitting(out, cp, show_hints, state)?;
+        } else if split_commit_in_progress(git_dir, head)
+            || long_status_split_commit_in_progress(git_dir, head, unstaged)
+        {
+            long_status_print_splitting(out, cp, show_hints, repo, git_dir, head, state)?;
         } else {
-            long_status_print_editing(out, cp, show_hints, state)?;
+            long_status_print_editing(out, cp, show_hints, repo, git_dir, head, state)?;
         }
     } else if state.cherry_pick_in_progress {
         if let Some(oid) = state.cherry_pick_head_oid {
@@ -3650,10 +3677,12 @@ fn long_status_has_unmerged(index: &Index) -> bool {
 fn long_status_print_rebase_state(
     out: &mut impl Write,
     cp: &str,
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
     state: &WtStatusState,
 ) -> Result<()> {
-    let branch = state.rebase_branch.as_deref().unwrap_or("");
-    let onto = state.rebase_onto.as_deref().unwrap_or("");
+    let (branch, onto) = long_status_rebase_display(repo, git_dir, head, state)?;
     cpw(
         out,
         cp,
@@ -3661,14 +3690,95 @@ fn long_status_print_rebase_state(
     )
 }
 
+fn long_status_rebase_display(
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
+    state: &WtStatusState,
+) -> Result<(String, String)> {
+    let branch = state
+        .rebase_branch
+        .clone()
+        .or_else(|| head.branch_name().map(str::to_owned))
+        .unwrap_or_default();
+    let onto = state
+        .rebase_onto
+        .clone()
+        .or_else(|| long_status_infer_onto_from_todo(repo, git_dir))
+        .unwrap_or_default();
+    Ok((branch, onto))
+}
+
+fn long_status_infer_onto_from_todo(repo: &Repository, git_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(git_dir.join("rebase-merge/git-rebase-todo")).ok()?;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let mut parts = t.split_whitespace();
+        let cmd = parts.next()?;
+        if !matches!(
+            cmd,
+            "pick" | "p" | "edit" | "e" | "reword" | "r" | "squash" | "s" | "fixup" | "f"
+        ) {
+            continue;
+        }
+        let oid = long_status_resolve_todo_oid(repo, parts.next()?)?;
+        let obj = repo.odb.read(&oid).ok()?;
+        let commit = parse_commit(&obj.data).ok()?;
+        let parent = commit.parents.first()?;
+        return Some(status_unique_abbrev(repo, *parent));
+    }
+    None
+}
+
+fn long_status_resolve_todo_oid(repo: &Repository, token: &str) -> Option<ObjectId> {
+    if let Ok(oid) = ObjectId::from_hex(token) {
+        return Some(oid);
+    }
+    if token.len() < 4 || token.len() > 40 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (dir, file_prefix) = token.split_at(2);
+    let object_dir = repo.git_dir.join("objects").join(dir);
+    let mut found = None;
+    for entry in fs::read_dir(object_dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(file_prefix) {
+            continue;
+        }
+        let hex = format!("{dir}{name}");
+        let oid = ObjectId::from_hex(&hex).ok()?;
+        if found.replace(oid).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+fn long_status_split_commit_in_progress(
+    git_dir: &Path,
+    head: &HeadState,
+    unstaged: &[grit_lib::diff::DiffEntry],
+) -> bool {
+    matches!(head, HeadState::Detached { .. })
+        && git_dir.join("rebase-merge").is_dir()
+        && !unstaged.is_empty()
+}
+
 fn long_status_print_splitting(
     out: &mut impl Write,
     cp: &str,
     show_hints: bool,
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
     state: &WtStatusState,
 ) -> Result<()> {
-    let branch = state.rebase_branch.as_deref().unwrap_or("");
-    let onto = state.rebase_onto.as_deref().unwrap_or("");
+    let (branch, onto) = long_status_rebase_display(repo, git_dir, head, state)?;
     cpw(
         out,
         cp,
@@ -3691,10 +3801,12 @@ fn long_status_print_editing(
     out: &mut impl Write,
     cp: &str,
     show_hints: bool,
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
     state: &WtStatusState,
 ) -> Result<()> {
-    let branch = state.rebase_branch.as_deref().unwrap_or("");
-    let onto = state.rebase_onto.as_deref().unwrap_or("");
+    let (branch, onto) = long_status_rebase_display(repo, git_dir, head, state)?;
     cpw(
         out,
         cp,
