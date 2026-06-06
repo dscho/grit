@@ -4892,6 +4892,9 @@ fn append_fetch_reflog(
     branch: &str,
 ) -> anyhow::Result<()> {
     let old = old_oid.cloned().unwrap_or_else(zero_oid);
+    // Strip URL userinfo so credentials never reach the reflog (t5541 "clone/fetch scrubs
+    // password from reflogs"); a named remote passes through unchanged.
+    let remote_url = crate::http_client::scrub_url_credentials(remote_url);
     let message = if branch.is_empty() {
         format!("fetch --append --prune {remote_url}")
     } else {
@@ -4914,7 +4917,10 @@ fn fetch_reflog_action_prefix(args: &Args) -> String {
     let mut prefix = String::from("fetch");
     if let Some(remote) = &args.remote {
         prefix.push(' ');
-        prefix.push_str(remote);
+        // Scrub any userinfo (`user:pass@`) from a URL remote so credentials never land in the
+        // reflog, matching Git's `transport_anonymize_url` (t5541 "clone/fetch scrubs password
+        // from reflogs"). A named remote (e.g. `origin`) is not a URL, so this is a no-op there.
+        prefix.push_str(&crate::http_client::scrub_url_credentials(remote));
     }
     for spec in &args.refspecs {
         prefix.push(' ');
