@@ -54,6 +54,30 @@ stuck at 81 because the cascade: failing tests 94-96 (overwrite-untracked) leave
 rebase in progress that breaks the later missingCommitsCheck tests 100-106 when run in
 sequence. MUST fix 94-96 (and 84/85/91/92) to unlock the sequence.
 
+## Fix 3: untracked-file overwrite obstruction on fast-forward pick + REBASE_HEAD + drop in `done`
+
+Three related machinery fixes (grit/src/commands/rebase.rs):
+- The fast-forward-pick shortcut (`cherry_pick_for_rebase`, when HEAD == picked commit's
+  original parent) skipped the untracked-file overwrite check. Added
+  `reset::check_untracked_cherry_pick_obstruction` there (+ `obstructed-pick` marker), so a
+  `pick` that would clobber an untracked working-tree file now halts (t3404 94-96).
+- The PickLike error path now writes `REBASE_HEAD = <commit>` on any stop (git always exposes
+  it; the conflict path set it inside cherry_pick, the obstruction path did not).
+- `RebaseReplayStep::Noop` (i.e. `drop`) now appends its line to `done` for interactive rebases,
+  so a later `--edit-todo` missing-commit check treats explicitly-dropped commits as "seen".
+- `validate_edited_interactive_todo` now also marks commits recorded in `done` as kept, so
+  mid-rebase `--edit-todo` after break/conflict doesn't falsely report already-replayed commits
+  as dropped (fixed the 102/105 regression my Fix 2 introduced).
+
+Now passing (full run): 99-102, 105, 106 (missingCommitsCheck), 108, 109 (static check),
+65-68, 93, 111. Full run 76 -> 83.
+
+Still failing: 103, 104 (`--edit-todo` missingCommitsCheck warn/error). These need git's
+TWO-PHASE `edit_todo_list` semantics: parse the OLD/backup todo first (emitting
+`error: invalid command 'pickled'` + `invalid line N`), THEN after the editor compare new-vs-backup
+for the warning — distinct from grit's single-pass model. 94-96 halt correctly now but the
+`--continue`-after-obstruction path (re-pick, "staged changes" guard) is still wrong.
+
 ## KEY: full-run vs isolation divergence
 Many tests pass with `--run=1,N` but fail in the full sequential run because an EARLIER
 failing test leaves a rebase-in-progress / wrong branch. `/tmp/run3404.sh` replicates the

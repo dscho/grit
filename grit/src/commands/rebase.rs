@@ -4126,6 +4126,10 @@ fn validate_edited_interactive_todo(
             continue;
         };
         if !is_known_todo_command(&word) {
+            // Git prints both the offending command word and the full line (parse_insn_line then
+            // todo_list_parse_insn_buffer); the original-case word is what the user typed.
+            let original_word = t.split_whitespace().next().unwrap_or(&word);
+            eprintln!("error: invalid command '{original_word}'");
             eprintln!("error: invalid line {}: {t}", idx + 1);
             eprintln!("{ADVICE}");
             return Err(crate::explicit_exit::SilentNonZeroExit { code: 1 }.into());
@@ -4168,6 +4172,15 @@ fn validate_edited_interactive_todo(
         }
         if let Some(oid) = todo_line_commit_oid(repo, line) {
             kept.insert(oid);
+        }
+    }
+    // Commits already replayed (recorded in `done`) are likewise "seen" and must not be reported as
+    // dropped when re-checking the todo mid-rebase (`--edit-todo` after a `break`/conflict).
+    if let Ok(done) = fs::read_to_string(rb_merge.join("done")) {
+        for line in rebase_todo_actionable_lines(&done) {
+            if let Some(oid) = todo_line_commit_oid(repo, line) {
+                kept.insert(oid);
+            }
         }
     }
 
@@ -6143,7 +6156,14 @@ fn replay_remaining(
             fs::write(rb_dir.join("next"), (i + 1).to_string())?;
 
             match step {
-                RebaseReplayStep::Noop => {}
+                RebaseReplayStep::Noop => {
+                    // Git consumes `drop`/`noop` lines into `done` like any other command, so a later
+                    // `--edit-todo` missing-commit check treats explicitly dropped commits as "seen"
+                    // (t3404 "rebase.missingCommitsCheck = error after resolving conflicts").
+                    if rebase_interactive {
+                        append_interactive_rebase_done_line(rb_dir, todo[i])?;
+                    }
+                }
                 RebaseReplayStep::Break => {
                     let _ = fs::remove_file(rb_dir.join("current"));
                     let _ = fs::remove_file(rb_dir.join("current-cmd"));
@@ -6686,6 +6706,14 @@ fn replay_remaining(
                                 rb_dir.join("stopped-sha"),
                                 format!("{}\n", commit_oid.to_hex()),
                             );
+                            // Git always exposes the commit being replayed as REBASE_HEAD when a pick
+                            // stops (conflict *or* untracked-file obstruction). The conflict path sets
+                            // it inside `cherry_pick_for_rebase`; ensure it is set for the obstruction
+                            // path too (t3404 "rebase -i commits that overwrite untracked files").
+                            let _ = fs::write(
+                                git_dir.join("REBASE_HEAD"),
+                                format!("{}\n", commit_oid.to_hex()),
+                            );
 
                             let obj = repo.odb.read(&commit_oid)?;
                             let commit = parse_commit(&obj.data)?;
@@ -7145,6 +7173,19 @@ fn cherry_pick_for_rebase(
                     apply_ws_fix_to_index(repo, &mut idx, rule)?;
                 }
                 if let Some(wt) = &repo.work_tree {
+                    // A newly added path that would overwrite an untracked working tree file must abort
+                    // even on this fast-forward-pick shortcut (git's unpack-trees `verify_absent`).
+                    // The cwd preflight below does not cover plain untracked-file collisions
+                    // (t3404 "rebase -i commits that overwrite untracked files").
+                    if let Err(e) =
+                        super::reset::check_untracked_cherry_pick_obstruction(wt, &old_index, &idx)
+                    {
+                        let _ = fs::write(
+                            rb_dir.join("obstructed-pick"),
+                            format!("{}\n", commit_oid.to_hex()),
+                        );
+                        return Err(e);
+                    }
                     preflight_cherry_pick_cwd_obstruction(repo, wt, &idx, &BTreeMap::new(), None)?;
                 }
                 repo.write_index(&mut idx)?;
