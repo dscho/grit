@@ -3291,8 +3291,15 @@ fn build_initial_commit_buffer(
 
 pub(crate) fn launch_commit_editor(repo: &Repository, path: &Path) -> Result<()> {
     let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
-    let editor = crate::editor::resolve_commit_launch_editor(&config)
+    let mut editor = crate::editor::resolve_commit_launch_editor(&config)
         .ok_or_else(|| anyhow::anyhow!("Terminal is dumb, but EDITOR unset"))?;
+    if editor.trim() == ":" && std::env::var("GIT_GRIT_MERGE_EXPLICIT_EDIT").as_deref() == Ok("1") {
+        if let Ok(env_editor) = std::env::var("EDITOR") {
+            if !env_editor.trim().is_empty() && env_editor.trim() != ":" {
+                editor = env_editor;
+            }
+        }
+    }
 
     // Git treats `:` as a no-op editor (`launch_specified_editor`).
     if editor.trim() == ":" {

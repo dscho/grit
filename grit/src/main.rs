@@ -3279,6 +3279,23 @@ fn preprocess_status_argv(rest: &[String]) -> Vec<String> {
     out
 }
 
+fn preprocess_merge_argv(rest: &[String]) -> Vec<String> {
+    let mut explicit_edit: Option<&str> = None;
+    for arg in rest {
+        match arg.as_str() {
+            "--edit" | "-e" => explicit_edit = Some("1"),
+            "--no-edit" => explicit_edit = Some("0"),
+            _ => {}
+        }
+    }
+    if let Some(value) = explicit_edit {
+        std::env::set_var("GIT_GRIT_MERGE_EXPLICIT_EDIT", value);
+    } else {
+        std::env::remove_var("GIT_GRIT_MERGE_EXPLICIT_EDIT");
+    }
+    rest.to_vec()
+}
+
 /// Git's `blame` accepts options after the pathspec (e.g. `git blame file --ignore-rev X`).
 /// Clap stops at the first positional (`args`), so trailing flags would be left in `args` and
 /// mis-parsed as revisions. Move any trailing option block before the pathspec tokens.
@@ -5594,16 +5611,19 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "mailinfo" => commands::mailinfo::run(parse_cmd_args(subcmd, rest)),
         "mailsplit" => commands::mailsplit::run(parse_cmd_args(subcmd, rest)),
         "maintenance" => commands::maintenance::run_from_argv(rest),
-        "merge" => match commands::merge::run(parse_cmd_args(subcmd, rest)) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if commands::merge::is_internal_merge_execution_error(&err) {
-                    eprintln!("error: failed to execute internal merge");
-                    std::process::exit(2);
+        "merge" => {
+            let rest = preprocess_merge_argv(rest);
+            match commands::merge::run(parse_cmd_args(subcmd, &rest)) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if commands::merge::is_internal_merge_execution_error(&err) {
+                        eprintln!("error: failed to execute internal merge");
+                        std::process::exit(2);
+                    }
+                    Err(err)
                 }
-                Err(err)
             }
-        },
+        }
         "merge-recursive" => commands::merge_recursive::run(parse_cmd_args(subcmd, rest)),
         "merge-resolve" => commands::merge_resolve::run(parse_cmd_args(subcmd, rest)),
         "merge-base" => commands::merge_base::run(parse_cmd_args(subcmd, rest)),
