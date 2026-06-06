@@ -2190,6 +2190,11 @@ fn push_to_url(
         let thin_pack = pack_objects::build_thin_push_pack(repo, &push_tips, &remote_repo.git_dir)
             .context("building push pack")?;
 
+        // Emit the `pack-objects` `write_pack_file/wrote` trace2 event (object count) for the
+        // local-transport push too, so `GIT_TRACE2_EVENT`-based assertions see how many objects
+        // were sent (t5516 push negotiation tests count this).
+        maybe_emit_push_pack_wrote_trace2(&thin_pack);
+
         if !thin_pack.is_empty() {
             let pre_ingest = list_remote_object_files(&remote_repo.git_dir);
             crate::receive_ingest::ingest_received_pack_with_shallow(
