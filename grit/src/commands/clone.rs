@@ -1733,6 +1733,11 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    // Record the fetched remote-tracking refs in `packed-refs` (initial ref transaction), so a
+    // later up-to-date push does not re-create a loose tracking ref (t5516 'push preserves
+    // up-to-date packed refs'). Best-effort: a packing failure must not fail the clone.
+    let _ = crate::commands::pack_refs::pack_clone_tracking_refs(&dest.git_dir);
+
     // Clone succeeded: keep the directories we created (upstream `junk_mode = JUNK_LEAVE_ALL`).
     junk_guard.disarm();
     Ok(())

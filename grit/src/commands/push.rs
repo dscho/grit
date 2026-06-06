@@ -3841,8 +3841,16 @@ fn update_remote_tracking_ref(
     let tracking_ref = format!("refs/remotes/{remote_name}/{branch}");
 
     match new_oid {
-        Some(oid) => refs::write_ref(&repo.git_dir, &tracking_ref, &oid)
-            .with_context(|| format!("updating tracking ref {tracking_ref}"))?,
+        Some(oid) => {
+            // Skip the write when the tracking ref already records this value. Otherwise an
+            // up-to-date push would re-materialize a packed tracking ref as a loose file
+            // (t5516 'push preserves up-to-date packed refs').
+            if refs::resolve_ref(&repo.git_dir, &tracking_ref).ok() == Some(oid) {
+                return Ok(());
+            }
+            refs::write_ref(&repo.git_dir, &tracking_ref, &oid)
+                .with_context(|| format!("updating tracking ref {tracking_ref}"))?
+        }
         None => {
             let _ = refs::delete_ref(&repo.git_dir, &tracking_ref);
         }
