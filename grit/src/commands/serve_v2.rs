@@ -9,7 +9,7 @@ use clap::Args as ClapArgs;
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::git_date::parse::parse_date_basic;
 use grit_lib::merge_base;
-use grit_lib::objects::{self, parse_commit, ObjectId, ObjectKind};
+use grit_lib::objects::{self, parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::rev_parse::resolve_revision;
@@ -698,10 +698,26 @@ fn cmd_fetch(
     // The client accepted one or more advertised promisor remotes: it will lazily fetch any
     // omitted objects from them, so the server may omit locally-missing promisor objects from the
     // filtered pack instead of back-filling its ODB to serve them.
-    let omit_missing_promisor = accepted_promisor_remotes
+    let accepted_promisor = accepted_promisor_remotes
+        .as_deref()
         .map(|r| !r.trim().is_empty())
-        .unwrap_or(false)
-        && filter_spec.is_some();
+        .unwrap_or(false);
+    let omit_missing_promisor = accepted_promisor && filter_spec.is_some();
+    let force_lazy_fetch = if filter_spec.is_some() {
+        !omit_missing_promisor
+    } else {
+        caps.promisor_remote_info.is_none()
+    };
+    let mut exclude_commits = if client_shallow_oids.is_empty() {
+        have_commits.clone()
+    } else {
+        Vec::new()
+    };
+    exclude_commits.sort_by_key(|oid| oid.to_hex());
+    exclude_commits.dedup();
+    if force_lazy_fetch && !exclude_commits.is_empty() {
+        hydrate_upload_pack_blobs_missing_from_client(&repo, &wants, &exclude_commits)?;
+    }
     let mut child = crate::pack_objects_upload::spawn_pack_objects_upload_shallow(
         git_dir,
         thin,
@@ -709,19 +725,13 @@ fn cmd_fetch(
         !shallow_commits.is_empty(),
         !no_progress,
         omit_missing_promisor,
+        force_lazy_fetch,
     )?;
     {
         let mut pin = child
             .stdin
             .take()
             .ok_or_else(|| anyhow::anyhow!("pack-objects stdin"))?;
-        let mut exclude_commits = if client_shallow_oids.is_empty() {
-            have_commits.clone()
-        } else {
-            Vec::new()
-        };
-        exclude_commits.sort_by_key(|oid| oid.to_hex());
-        exclude_commits.dedup();
         crate::pack_objects_upload::write_pack_objects_revs_stdin_shallow(
             &mut pin,
             &wants,
@@ -754,6 +764,79 @@ fn ok_to_give_up_v2(
             .iter()
             .any(|h| merge_base::is_ancestor(repo, *h, *w).unwrap_or(false))
     })
+}
+
+fn hydrate_upload_pack_blobs_missing_from_client(
+    repo: &Repository,
+    wants: &[ObjectId],
+    exclusions: &[ObjectId],
+) -> Result<()> {
+    let mut needed = reachable_blob_oids(repo, wants);
+    for oid in reachable_blob_oids(repo, exclusions) {
+        needed.remove(&oid);
+    }
+    let mut missing: Vec<ObjectId> = needed
+        .into_iter()
+        .filter(|oid| repo.odb.read(oid).is_err())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    let previous = std::env::var_os("GIT_NO_LAZY_FETCH");
+    std::env::set_var("GIT_NO_LAZY_FETCH", "0");
+    let result =
+        crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(repo, &missing);
+    if let Some(value) = previous {
+        std::env::set_var("GIT_NO_LAZY_FETCH", value);
+    } else {
+        std::env::remove_var("GIT_NO_LAZY_FETCH");
+    }
+    result
+}
+
+fn reachable_blob_oids(repo: &Repository, roots: &[ObjectId]) -> HashSet<ObjectId> {
+    let mut blobs = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<ObjectId> = roots.to_vec();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let Ok(obj) = repo.odb.read(&oid) else {
+            continue;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                if let Ok(commit) = parse_commit(&obj.data) {
+                    stack.push(commit.tree);
+                    stack.extend(commit.parents);
+                }
+            }
+            ObjectKind::Tree => {
+                if let Ok(entries) = parse_tree(&obj.data) {
+                    for entry in entries {
+                        match entry.mode {
+                            0o040000 => stack.push(entry.oid),
+                            0o160000 => {}
+                            _ => {
+                                blobs.insert(entry.oid);
+                            }
+                        }
+                    }
+                }
+            }
+            ObjectKind::Tag => {
+                if let Ok(tag) = parse_tag(&obj.data) {
+                    stack.push(tag.object);
+                }
+            }
+            ObjectKind::Blob => {
+                blobs.insert(oid);
+            }
+        }
+    }
+    blobs
 }
 
 fn merge_ancestors_into_v2(

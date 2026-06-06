@@ -205,6 +205,8 @@ fn unbundle_pack_into_repo(
         strict: false,
         dry_run: false,
         quiet: true,
+        allowed_missing: Default::default(),
+        allow_promisor_missing_references: false,
         max_input_bytes: None,
         ..Default::default()
     };

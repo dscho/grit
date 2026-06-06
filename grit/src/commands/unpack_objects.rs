@@ -7,12 +7,20 @@
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use std::io::{self, Read};
+use std::path::PathBuf;
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use grit_lib::config::{parse_i64, ConfigSet};
+<<<<<<< ours
+use grit_lib::objects::ObjectKind;
+use grit_lib::promisor::{promisor_expanded_object_ids, repo_treats_promisor_packs};
+||||||| ancestor
+use grit_lib::objects::ObjectKind;
+=======
 use grit_lib::objects::{ObjectId, ObjectKind};
+>>>>>>> theirs
 use grit_lib::repo::Repository;
 use grit_lib::unpack_objects::{unpack_objects, UnpackOptions};
 
@@ -48,7 +56,12 @@ pub struct Args {
 
 /// Run `grit unpack-objects`.
 pub fn run(args: Args) -> Result<()> {
-    let repo = Repository::discover(None).context("not a git repository")?;
+    let repo = if let Some(git_dir) = std::env::var_os("GIT_DIR").filter(|v| !v.is_empty()) {
+        let git_dir = PathBuf::from(git_dir);
+        Repository::open(&git_dir, None).context("not a git repository")?
+    } else {
+        Repository::discover(None).context("not a git repository")?
+    };
 
     let max_input_bytes = if let Some(raw) = args.max_input_size.as_deref() {
         let v = parse_i64(raw.trim()).map_err(|e| anyhow::anyhow!(e))?;
@@ -66,15 +79,31 @@ pub fn run(args: Args) -> Result<()> {
 
     enforce_alloc_limit_for_non_streaming_large_objects(&repo, args.dry_run)?;
 
+<<<<<<< ours
+    let cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let allow_promisor_missing_references = args.strict
+        && (repo_treats_promisor_packs(&repo.git_dir, &cfg)
+            || std::env::var_os("GRIT_ALLOW_PROMISOR_MISSING_REFERENCES").is_some());
+    let allowed_missing = if allow_promisor_missing_references {
+        promisor_expanded_object_ids(&repo).unwrap_or_default()
+    } else {
+        Default::default()
+    };
+
+||||||| ancestor
+=======
     let shallow_boundaries = match args.shallow_file.as_deref() {
         Some(path) => read_shallow_file_oids(path),
         None => Default::default(),
     };
 
+>>>>>>> theirs
     let opts = UnpackOptions {
         dry_run: args.dry_run,
         quiet: args.quiet,
         strict: args.strict,
+        allowed_missing,
+        allow_promisor_missing_references,
         max_input_bytes,
         shallow_boundaries,
     };

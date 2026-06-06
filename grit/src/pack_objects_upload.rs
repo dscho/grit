@@ -29,7 +29,7 @@ pub fn spawn_pack_objects_upload(
     thin: bool,
     filter_spec: Option<&str>,
 ) -> Result<Child> {
-    spawn_pack_objects_upload_shallow(git_dir, thin, filter_spec, false, true, false)
+    spawn_pack_objects_upload_shallow(git_dir, thin, filter_spec, false, true, false, false)
 }
 
 /// Like [`spawn_pack_objects_upload`], but passes `--shallow` so `--shallow <oid>` stdin lines cut
@@ -46,6 +46,7 @@ pub fn spawn_pack_objects_upload_shallow(
     shallow: bool,
     progress: bool,
     omit_missing_promisor: bool,
+    force_lazy_fetch: bool,
 ) -> Result<Child> {
     let protected = ConfigSet::load_protected(true).unwrap_or_default();
     let hook_raw = protected.get("uploadpack.packobjectshook");
@@ -96,6 +97,10 @@ pub fn spawn_pack_objects_upload_shallow(
         // the local promisor-enabled ODB when applying `--filter` — used when the fetching client
         // accepted an advertised promisor remote (`t5710`).
         cmd.env("GRIT_OMIT_MISSING_PROMISOR", "1");
+    } else if force_lazy_fetch {
+        // `upload-pack` disables lazy fetching by default, but when the server did not advertise a
+        // promisor remote the filtered pack must back-fill omitted blobs before serving the client.
+        cmd.env("GIT_NO_LAZY_FETCH", "0");
     }
 
     cmd.current_dir(git_dir)

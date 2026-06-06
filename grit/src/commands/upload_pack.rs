@@ -8,8 +8,14 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::merge_base;
+<<<<<<< ours
+use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
+||||||| ancestor
+use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
+=======
 use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
 use grit_lib::ref_namespace;
+>>>>>>> theirs
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::state::resolve_head;
@@ -408,13 +414,21 @@ pub fn run(args: Args) -> Result<()> {
         let thin = client_shallow_boundaries.is_empty()
             && !exclusion_commits.is_empty()
             && wants_include_only_commits(&repo, &want_unique);
+        let advertises_promisor = config_bool(&config, "promisor.advertise");
+        let omit_missing_promisor = filter_spec.is_some() && advertises_promisor;
+        let force_lazy_fetch =
+            !advertises_promisor && (filter_spec.is_some() || !exclusion_commits.is_empty());
+        if force_lazy_fetch && !exclusion_commits.is_empty() {
+            hydrate_upload_pack_blobs_missing_from_client(&repo, &want_unique, &exclusion_commits)?;
+        }
         let mut child = crate::pack_objects_upload::spawn_pack_objects_upload_shallow(
             &repo.git_dir,
             thin,
             filter_spec.as_deref(),
             !shallow_commits.is_empty(),
             !no_progress,
-            false,
+            omit_missing_promisor,
+            force_lazy_fetch,
         )?;
         {
             let mut pin = child.stdin.take().context("pack-objects stdin")?;
@@ -436,6 +450,79 @@ pub fn run(args: Args) -> Result<()> {
 /// Read a boolean config value (default `false`).
 fn config_bool(config: &ConfigSet, key: &str) -> bool {
     config.get_bool(key).and_then(|r| r.ok()).unwrap_or(false)
+}
+
+fn hydrate_upload_pack_blobs_missing_from_client(
+    repo: &Repository,
+    wants: &[ObjectId],
+    exclusions: &[ObjectId],
+) -> Result<()> {
+    let mut needed = reachable_blob_oids(repo, wants);
+    for oid in reachable_blob_oids(repo, exclusions) {
+        needed.remove(&oid);
+    }
+    let mut missing: Vec<ObjectId> = needed
+        .into_iter()
+        .filter(|oid| repo.odb.read(oid).is_err())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    missing.sort();
+    let previous = std::env::var_os("GIT_NO_LAZY_FETCH");
+    std::env::set_var("GIT_NO_LAZY_FETCH", "0");
+    let result =
+        crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(repo, &missing);
+    if let Some(value) = previous {
+        std::env::set_var("GIT_NO_LAZY_FETCH", value);
+    } else {
+        std::env::remove_var("GIT_NO_LAZY_FETCH");
+    }
+    result
+}
+
+fn reachable_blob_oids(repo: &Repository, roots: &[ObjectId]) -> HashSet<ObjectId> {
+    let mut blobs = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut stack: Vec<ObjectId> = roots.to_vec();
+    while let Some(oid) = stack.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let Ok(obj) = repo.odb.read(&oid) else {
+            continue;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                if let Ok(commit) = parse_commit(&obj.data) {
+                    stack.push(commit.tree);
+                    stack.extend(commit.parents);
+                }
+            }
+            ObjectKind::Tree => {
+                if let Ok(entries) = parse_tree(&obj.data) {
+                    for entry in entries {
+                        match entry.mode {
+                            0o040000 => stack.push(entry.oid),
+                            0o160000 => {}
+                            _ => {
+                                blobs.insert(entry.oid);
+                            }
+                        }
+                    }
+                }
+            }
+            ObjectKind::Tag => {
+                if let Ok(tag) = parse_tag(&obj.data) {
+                    stack.push(tag.object);
+                }
+            }
+            ObjectKind::Blob => {
+                blobs.insert(oid);
+            }
+        }
+    }
+    blobs
 }
 
 /// Emit the protocol-v0 shallow-list response (`shallow`/`unshallow` lines + flush) for a

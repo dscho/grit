@@ -1113,6 +1113,8 @@ fn run_unbundle(args: UnbundleArgs) -> Result<()> {
         strict: false,
         dry_run: false,
         quiet: !args.progress,
+        allowed_missing: Default::default(),
+        allow_promisor_missing_references: false,
         max_input_bytes: None,
         ..Default::default()
     };
