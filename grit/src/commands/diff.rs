@@ -2600,9 +2600,14 @@ pub fn run(mut args: Args) -> Result<()> {
         .iter()
         .filter(|r| r.contains("..") && !is_symmetric_diff(r))
         .count();
+    // A range argument (`A..B` or `A...B`) cannot be combined with any other
+    // revision. This mirrors builtin/diff.c's `symdiff_prepare`, which rejects
+    // "git diff A..B C", "git diff C A...B", "git diff A..B C..D", etc. with the
+    // usage message (the C check is `lpos >= 0 && othercount > 0`).
     if symmetric_tokens > 1
         || (symmetric_tokens == 1 && revs.len() != 1)
         || two_dot_range_tokens > 1
+        || (two_dot_range_tokens == 1 && revs.len() != 1)
     {
         bail!("usage: grit diff [<options>] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] --cached [--merge-base] [<commit>] [--] [<path>...]\n   or: grit diff [<options>] [--merge-base] <commit> [<commit>...] <commit> [--] [<path>...]");
     }
