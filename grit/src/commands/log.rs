@@ -5199,7 +5199,17 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let merged_argv_for_walk_probe = merge_log_revision_argv(&repo, &args)?;
-    let probe_pathspecs = pathspecs_after_dashdash(&merged_argv_for_walk_probe, &args.pathspecs);
+    let mut probe_pathspecs =
+        pathspecs_after_dashdash(&merged_argv_for_walk_probe, &args.pathspecs);
+    // Implied pathspecs from bare tokens (e.g. `git log ..` naming the parent directory from a
+    // subdir, with no `--`) must count here too; otherwise such a path-limited walk skips
+    // `run_rev_list_log` and loses default merge simplification (t4202 "dotdot is a parent
+    // directory" showed TREESAME merges that `git log -- ..` correctly hides).
+    if let Ok((_specs, implied)) =
+        extract_log_cli_revision_specs(&repo, &args, &merged_argv_for_walk_probe)
+    {
+        probe_pathspecs.extend(implied);
+    }
     let effective_for_rev_list = resolve_effective_pathspecs(&repo, &probe_pathspecs)?;
     let wants_rev_list_walk = !args.follow
         && args.branches.is_none()
