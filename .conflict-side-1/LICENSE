@@ -1,0 +1,6 @@
+This repository contains code under multiple licenses:
+
+- All original Rust source code in /grit and /grit-lib is licensed under the MIT License.
+- Files under /git and /tests are copied from the Git project and are licensed under GPLv2.
+
+The GPLv2-licensed files are included for testing and compatibility verification only and are not part of the MIT-licensed library.

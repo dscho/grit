@@ -1,0 +1,48 @@
+[package]
+name = "grit-cli"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+license = "MIT"
+description = "A Git implementation in Rust"
+readme = "README.md"
+repository = "https://github.com/schacon/grit"
+
+[[bin]]
+name = "grit"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-httpd"
+path = "src/bin/test_httpd.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+libc = { workspace = true }
+grit-lib = { version = "0.3", path = "../grit-lib" }
+anyhow.workspace = true
+clap.workspace = true
+time.workspace = true
+tempfile.workspace = true
+regex.workspace = true
+regex-automata = { version = "0.4", features = ["dfa-build", "dfa-search", "syntax", "std", "perf"] }
+similar.workspace = true
+merge3.workspace = true
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hex.workspace = true
+flate2.workspace = true
+unicode-width.workspace = true
+encoding_rs = "0.8.35"
+hungarian.workspace = true
+ureq.workspace = true
+url.workspace = true
+base64.workspace = true
+shell-words.workspace = true
+filetime.workspace = true
+atty = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }

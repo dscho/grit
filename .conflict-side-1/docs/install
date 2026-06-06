@@ -1,0 +1,70 @@
+#!/bin/sh
+# grit installer - downloads a pre-built binary from GitHub Releases
+# Usage: curl -fsSL https://grit-scm.com/install | sh
+
+main() {
+  set -eu
+
+  REPO="schacon/grit"
+  INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+  for cmd in command uname tr curl tar mkdir; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "error: required command '$cmd' not found" >&2
+      exit 1
+    fi
+  done
+
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  ARCH=$(uname -m)
+
+  case "$OS" in
+    darwin)  OS_TARGET="apple-darwin" ;;
+    linux)   OS_TARGET="unknown-linux-gnu" ;;
+    mingw*|msys*|cygwin*)
+      echo "On Windows, download from: https://github.com/$REPO/releases/latest" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: unsupported OS: $OS" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$ARCH" in
+    x86_64|amd64)  ARCH_TARGET="x86_64" ;;
+    arm64|aarch64) ARCH_TARGET="aarch64" ;;
+    *)
+      echo "error: unsupported architecture: $ARCH" >&2
+      exit 1
+      ;;
+  esac
+
+  TARGET="${ARCH_TARGET}-${OS_TARGET}"
+  URL="https://github.com/$REPO/releases/latest/download/grit-${TARGET}.tar.gz"
+
+  echo "Detected: $OS/$ARCH -> $TARGET"
+  echo "Downloading from: $URL"
+
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+
+  curl -fSL "$URL" -o "$TMP/grit.tar.gz"
+  tar xzf "$TMP/grit.tar.gz" -C "$TMP"
+
+  mkdir -p "$INSTALL_DIR"
+  mv "$TMP/grit" "$INSTALL_DIR/grit"
+  chmod +x "$INSTALL_DIR/grit"
+
+  echo "Installed grit to $INSTALL_DIR/grit"
+
+  if ! command -v grit >/dev/null 2>&1; then
+    echo ""
+    echo "Note: $INSTALL_DIR is not on your PATH."
+    echo "Add it with:  export PATH=\"$INSTALL_DIR:\$PATH\""
+  else
+    echo "$(grit --version)"
+  fi
+}
+
+main "$@"
