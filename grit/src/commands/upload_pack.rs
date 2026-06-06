@@ -91,6 +91,18 @@ pub fn run(args: Args) -> Result<()> {
             out.flush()?;
         }
         drop(out);
+        if args.stateless_rpc {
+            // Smart-HTTP: the backend re-invokes upload-pack per negotiation round, so process a
+            // single request statelessly (when the server becomes `ready`, end the response after
+            // the `acknowledgments` section instead of streaming the pack inline).
+            let _ = crate::commands::serve_v2::process_one_v2_request(
+                &mut input,
+                &repo.git_dir,
+                &caps,
+                true,
+            )?;
+            return Ok(());
+        }
         return serve_loop(&mut input, &repo.git_dir, &caps);
     }
 
