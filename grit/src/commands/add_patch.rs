@@ -286,6 +286,9 @@ pub(crate) fn run_add_patch_with_reader(
         // An intent-to-add path (or a `DiffStatus::Added` entry) is rendered as a *new file*: the
         // index side is empty and the prompt verb is "Stage addition", with no mode-change prompt.
         let is_addition = entry.status == DiffStatus::Added || ie.intent_to_add();
+        // A whole-file deletion (the worktree path is gone): Git renders this as `Stage deletion`
+        // with no split (`s`) or edit (`e`) option, and the file header shows `deleted file mode`.
+        let is_deletion = entry.status == DiffStatus::Deleted;
         let mode_differs =
             !is_addition && parse_mode_u32(&entry.old_mode) != parse_mode_u32(&entry.new_mode);
         let content_differs = index_blob != work_blob;
@@ -381,7 +384,8 @@ pub(crate) fn run_add_patch_with_reader(
                     );
 
                     // File header. An addition shows `new file mode`/`index 000..`/`--- /dev/null`,
-                    // matching `git diff` for an intent-to-add path; everything else uses `a/`,`b/`.
+                    // a deletion shows `deleted file mode`/`index ..000`/`+++ /dev/null`, matching
+                    // `git diff`; everything else uses `a/`,`b/`.
                     writeln!(out, "diff --git a/{path_str} b/{path_str}").ok();
                     if is_addition {
                         let short = short_oid_of(odb, &cur_work);
@@ -389,6 +393,11 @@ pub(crate) fn run_add_patch_with_reader(
                         writeln!(out, "new file mode {new_mode:06o}").ok();
                         writeln!(out, "index 0000000..{short}").ok();
                         write!(out, "--- /dev/null\n+++ b/{path_str}\n").ok();
+                    } else if is_deletion {
+                        let short = short_oid_of(odb, &index_side_bytes);
+                        writeln!(out, "deleted file mode {:06o}", ie.mode).ok();
+                        writeln!(out, "index {short}..0000000").ok();
+                        write!(out, "--- a/{path_str}\n+++ /dev/null\n").ok();
                     } else {
                         write!(out, "--- a/{path_str}\n+++ b/{path_str}\n").ok();
                     }
@@ -396,7 +405,9 @@ pub(crate) fn run_add_patch_with_reader(
                 }
                 render = true;
 
-                let kind = if is_addition {
+                let kind = if is_deletion {
+                    HunkKind::Deletion
+                } else if is_addition {
                     HunkKind::Addition
                 } else if mode_differs && hunk_cursor == 0 {
                     HunkKind::ModeChange
@@ -409,8 +420,8 @@ pub(crate) fn run_add_patch_with_reader(
                     HunkKind::Addition => "Stage addition",
                     HunkKind::Hunk => "Stage this hunk",
                 };
-                let splittable = splittable_into(&ops, s, e) > 1;
-                let suffix = prompt_suffix(n_hunks, splittable, false);
+                let splittable = !is_deletion && splittable_into(&ops, s, e) > 1;
+                let suffix = prompt_suffix(n_hunks, splittable, is_deletion);
                 write!(
                     out,
                     "({display_idx}/{n_hunks}) {verb} [y,n,q,a,d{suffix},?]? "
@@ -658,12 +669,19 @@ fn handle_deleted_file(
         let (s, e) = hunk_ranges[hunk_cursor];
         let hunk_only =
             partial_unified_for_op_range(path_str, &index_blob, &work_blob, &ops[s..e], 3, true);
+        // Deletion file header: `deleted file mode`, `index <old>..0000000`, `+++ /dev/null`.
+        let short = short_oid_of(odb, &index_blob);
         writeln!(out, "diff --git a/{path_str} b/{path_str}").ok();
-        write!(out, "--- a/{path_str}\n+++ b/{path_str}\n").ok();
+        writeln!(out, "deleted file mode {:06o}", ie.mode).ok();
+        writeln!(out, "index {short}..0000000").ok();
+        write!(out, "--- a/{path_str}\n+++ /dev/null\n").ok();
         write!(out, "{hunk_only}").ok();
+        // Deletions never offer edit (`e`); split (`s`) only when the hunk is actually splittable.
+        let splittable = splittable_into(&ops, s, e) > 1;
+        let suffix = prompt_suffix(n_hunks, splittable, true);
         write!(
             out,
-            "({display_idx}/{n_hunks}) Stage deletion [y,n,q,a,d,s,e,p,P,?]? "
+            "({display_idx}/{n_hunks}) Stage deletion [y,n,q,a,d{suffix},?]? "
         )
         .ok();
         out.flush().ok();
