@@ -2262,6 +2262,20 @@ fn fetch_remote(
                     return true;
                 }
                 let target = peel_tag_target(&local_repo_for_tag_filter, *tag_oid);
+                // Only gate tags that point (ultimately) at a *commit* on commit-ancestry from a
+                // fetched head: a dangling tag whose commit was reset off the remote branch must not
+                // be followed (t5505 "add with reachable tags"). Tags pointing at trees/blobs (e.g.
+                // t5515's `tag-one-tree`/`tag-three-file`) are content reachable from a fetched
+                // commit and are kept as long as their object was downloaded (the existence retain
+                // above already guarantees that).
+                let target_is_commit = local_repo_for_tag_filter
+                    .odb
+                    .read(&target)
+                    .map(|o| o.kind == ObjectKind::Commit)
+                    .unwrap_or(false);
+                if !target_is_commit {
+                    return true;
+                }
                 head_tips.iter().any(|tip| {
                     target == *tip
                         || merge_base::is_ancestor(&local_repo_for_tag_filter, target, *tip)
@@ -2770,10 +2784,25 @@ fn fetch_remote(
                         &mut ref_update_failures,
                     )?;
 
+                    // Classify based on the *remote* ref name: a resolved branch/tag, else the
+                    // raw OID source (which yields `[new ref]`, matching Git's update_local_ref).
+                    let classify_name = resolved_remote_ref.as_deref().unwrap_or(src.as_str());
+                    if !args.atomic {
+                        let fast_forward = old_oid.is_none_or(|old| {
+                            merge_base::is_ancestor(&ff_repo, old, remote_oid).unwrap_or(true)
+                        });
+                        write_fetch_explicit_reflog(
+                            args,
+                            git_dir,
+                            &local_ref,
+                            classify_name,
+                            old_oid.as_ref(),
+                            &remote_oid,
+                            fast_forward,
+                        );
+                    }
+
                     if !args.quiet {
-                        // Classify based on the *remote* ref name: a resolved branch/tag, else the
-                        // raw OID source (which yields `[new ref]`, matching Git's update_local_ref).
-                        let classify_name = resolved_remote_ref.as_deref().unwrap_or(src.as_str());
                         let (code, summary, error) = classify_ref_update(
                             &ff_repo,
                             classify_name,
@@ -3577,7 +3606,30 @@ fn fetch_remote(
         && cli_refspecs.is_empty()
         && !refspecs.is_empty()
         && follow.mode != FollowRemoteHead::Never;
-    if do_set_head {
+    // A bare *mirror* (`is_bare_repository() && remote->mirror`) updates the repository's own
+    // `HEAD` to `refs/heads/<remote-head>` rather than `refs/remotes/<remote>/HEAD`, and does so
+    // unconditionally (Git's `set_head`: `create_only = !baremirror`). This is how
+    // `git remote add --mirror -f` makes a freshly `init --bare -b notmain` mirror adopt the
+    // source's HEAD branch (t5505 "add --mirror setting HEAD").
+    let remote_is_mirror = config
+        .get(&format!("remote.{remote_name}.mirror"))
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if do_set_head && is_bare_repo && remote_is_mirror {
+        if follow.mode != FollowRemoteHead::Never {
+            trace_ls_refs_head_prefix();
+        }
+        if let Some(default_branch) = remote_symbolic_head_branch.as_deref() {
+            let target = format!("refs/heads/{default_branch}");
+            // Only adopt the remote HEAD when that branch actually arrived in the mirror.
+            if refs::resolve_ref(git_dir, &target).is_ok()
+                || pending_writes_ref(&pending_atomic_ref_ops, &target)
+            {
+                refs::write_symbolic_ref(git_dir, "HEAD", &target)
+                    .context("updating bare mirror HEAD")?;
+            }
+        }
+    } else if do_set_head {
         if follow.mode != FollowRemoteHead::Never {
             trace_ls_refs_head_prefix();
         }
@@ -4823,6 +4875,62 @@ fn append_fetch_reflog(
     let ident = fetch_reflog_identity(git_dir);
     refs::append_reflog(git_dir, refname, &old, new_oid, &ident, &message, true)
         .map_err(|e| anyhow::anyhow!("{e}"))
+}
+
+/// Reflog action prefix (`rla`) for fetch ref updates, mirroring Git's `default_rla`
+/// (`builtin/fetch.c`): `GIT_REFLOG_ACTION` when set, otherwise `fetch` followed by the
+/// non-option command-line arguments (remote then refspecs).
+fn fetch_reflog_action_prefix(args: &Args) -> String {
+    if let Ok(rla) = std::env::var("GIT_REFLOG_ACTION") {
+        if !rla.is_empty() {
+            return rla;
+        }
+    }
+    let mut prefix = String::from("fetch");
+    if let Some(remote) = &args.remote {
+        prefix.push(' ');
+        prefix.push_str(remote);
+    }
+    for spec in &args.refspecs {
+        prefix.push(' ');
+        prefix.push_str(spec);
+    }
+    prefix
+}
+
+/// Write the fetch reflog entry for an updated local ref, matching Git's `s_update_ref`
+/// message `"<rla>: <action>"`. The action is `storing {head,tag,ref}` for a new ref (based
+/// on the *remote* ref name), or `fast-forward`/`forced-update` for an existing ref. Honors
+/// `core.logallrefupdates` (including a `true` setting in a bare repo) via `append_reflog`.
+fn write_fetch_explicit_reflog(
+    args: &Args,
+    git_dir: &Path,
+    local_ref: &str,
+    remote_refname: &str,
+    old_oid: Option<&ObjectId>,
+    new_oid: &ObjectId,
+    fast_forward: bool,
+) {
+    if args.dry_run {
+        return;
+    }
+    let action = match old_oid {
+        None => {
+            if remote_refname.starts_with("refs/tags/") {
+                "storing tag"
+            } else if remote_refname.starts_with("refs/heads/") {
+                "storing head"
+            } else {
+                "storing ref"
+            }
+        }
+        Some(_) if fast_forward => "fast-forward",
+        Some(_) => "forced-update",
+    };
+    let message = format!("{}: {action}", fetch_reflog_action_prefix(args));
+    let old = old_oid.cloned().unwrap_or_else(zero_oid);
+    let ident = fetch_reflog_identity(git_dir);
+    let _ = refs::append_reflog(git_dir, local_ref, &old, new_oid, &ident, &message, false);
 }
 
 /// OIDs whose object closure should be copied for this fetch (non-refetch local transport).
