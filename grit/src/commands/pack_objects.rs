@@ -1083,6 +1083,21 @@ pub fn run(mut args: Args) -> Result<()> {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no base name"))?;
 
+        // When writing bitmaps, Git's bitmap writer reads `pack.preferbitmaptips` as a
+        // multi-valued string (`pack-bitmap.c:bitmap_preferred_tips`). A value-less key
+        // (`[pack]\n\tpreferBitmapTips`) makes `repo_config_get_string_multi` fail via
+        // `config_error_nonbool`, which prints `error: missing value for '<key>'` to stderr.
+        // Emit the same diagnostic once before writing the placeholder bitmap.
+        if !args.no_write_bitmap_index
+            && (args.write_bitmap_index || args.write_bitmap_index_quiet)
+            && config
+                .get_all_raw("pack.preferBitmapTips")
+                .iter()
+                .any(|v| v.is_none())
+        {
+            eprintln!("error: missing value for 'pack.preferbitmaptips'");
+        }
+
         let mut pack_hashes: Vec<String> = Vec::new();
         for chunk in &chunks {
             let pack_bytes = build_pack(chunk, use_ofs_delta, pack_hash_bytes, zlib_compression)?;
@@ -1118,7 +1133,18 @@ pub fn run(mut args: Args) -> Result<()> {
             }
 
             println!("{pack_hash}");
-            if !args.quiet {
+            // Git only prints the final "Total ..." summary when progress is enabled, which
+            // defaults to `isatty(2)` (`builtin/pack-objects.c`: `progress = isatty(2)` and the
+            // summary is guarded by `if (progress)`). For the file-output path (`repack`), honor
+            // that gating: tests that redirect stderr to a file (e.g. t5310 pack.preferBitmapTips)
+            // expect this progress line to be suppressed. `--progress`/`--all-progress-implied`
+            // and GIT_PROGRESS_DELAY still force it on.
+            let show_total = !args.quiet
+                && (io::stderr().is_terminal()
+                    || args.progress
+                    || args.all_progress_implied
+                    || progress_delay_env.is_some());
+            if show_total {
                 eprintln!(
                     "Total {} (delta {}), reused 0 (delta {})",
                     chunk.len(),
