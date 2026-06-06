@@ -17,6 +17,7 @@ use grit_lib::hooks::{
     HookResult,
 };
 use grit_lib::index::{Index, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
+use grit_lib::interpret_trailers::{NewTrailerArg, ProcessTrailerOptions};
 use grit_lib::mailmap::load_mailmap_table;
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::reflog::read_reflog;
@@ -1124,6 +1125,9 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let template_path = resolve_commit_template_path(&args, &config)?;
     let use_editor_for_message = commit_uses_editor(&args, fixup_parsed.as_ref(), &repo.git_dir);
+    if use_editor_for_message {
+        let _ = resolve_committer(&config, OffsetDateTime::now_utc())?;
+    }
 
     let verbose_level = resolve_commit_verbose_level(&args, &config);
     let commit_cleanup_mode = resolve_commit_cleanup_mode(&args, &config, use_editor_for_message);
@@ -1146,6 +1150,11 @@ pub fn run(mut args: Args) -> Result<()> {
         &msg_result.message,
     );
     let mut raw_message = msg_result.raw_bytes;
+    let post_editor_editmsg = if use_editor_for_message {
+        fs::read(repo.git_dir.join("COMMIT_EDITMSG")).ok()
+    } else {
+        None
+    };
     let template_for_aborted_check = template_path.filter(|_| use_editor_for_message);
 
     // prepare-commit-msg runs for normal commits (not skipped by `--no-verify`; only pre-commit
@@ -1223,7 +1232,8 @@ pub fn run(mut args: Args) -> Result<()> {
 
     if let Some(ref tpl) = template_for_aborted_check {
         let cp = comment_line_prefix_full(&config);
-        if template_untouched(&message, tpl, cp.as_ref(), commit_cleanup_mode)
+        if commit_cleanup_mode != CommitMsgCleanupMode::None
+            && template_untouched(&message, tpl, cp.as_ref(), commit_cleanup_mode)
             && !args.allow_empty_message
         {
             eprintln!("Aborting commit; you did not edit the message.");
@@ -1330,7 +1340,12 @@ pub fn run(mut args: Args) -> Result<()> {
                 format!("{before}\n\n{trailer}\n{after}")
             }
 
-            if (had_cp_head || had_rv_head) && message.contains(SCISSORS) {
+            if message.trim().is_empty() {
+                message = format!("\n\n{trailer}\n");
+                if raw_message.is_some() {
+                    raw_message = Some(message.clone().into_bytes());
+                }
+            } else if (had_cp_head || had_rv_head) && message.contains(SCISSORS) {
                 if let Some(pos) = message.find(SCISSORS) {
                     message = insert_trailer_before(&message, pos, &trailer);
                     if let Some(ref raw) = raw_message {
@@ -1396,9 +1411,48 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
 
+    if !args.trailer.is_empty() {
+        let trailer_args: Vec<NewTrailerArg> = args
+            .trailer
+            .iter()
+            .map(|text| NewTrailerArg {
+                text: text.clone(),
+                where_: Default::default(),
+                if_exists: Default::default(),
+                if_missing: Default::default(),
+            })
+            .collect();
+        let trailer_opts = ProcessTrailerOptions {
+            no_divider: true,
+            ..Default::default()
+        };
+        message = grit_lib::interpret_trailers::process_trailers(
+            &message,
+            &trailer_opts,
+            &trailer_args,
+            Some(repo.git_dir.as_path()),
+        );
+        if let Some(ref raw) = raw_message {
+            if let Ok(s) = std::str::from_utf8(raw) {
+                raw_message = Some(
+                    grit_lib::interpret_trailers::process_trailers(
+                        s,
+                        &trailer_opts,
+                        &trailer_args,
+                        Some(repo.git_dir.as_path()),
+                    )
+                    .into_bytes(),
+                );
+            }
+        }
+    }
+
     // commit-msg hook (skipped with `--no-verify` / `-n`).
     if !args.no_verify {
         let msg_file = repo.git_dir.join("COMMIT_EDITMSG");
+        let pre_commit_msg_hook_editmsg = post_editor_editmsg
+            .clone()
+            .or_else(|| fs::read(&msg_file).ok());
         // When finishing a conflicted cherry-pick/revert, git keeps the trailing `# Conflicts:`
         // comment block in COMMIT_EDITMSG even though it is stripped from the committed message
         // — and a `-s` sign-off sits above it (t3507 "commit after failed cherry-pick adds -s at
@@ -1447,7 +1501,11 @@ pub fn run(mut args: Args) -> Result<()> {
                     }
                 }
             }
-            _ => {}
+            HookResult::NotFound => {
+                if let Some(previous) = pre_commit_msg_hook_editmsg {
+                    fs::write(&msg_file, previous)?;
+                }
+            }
         }
     }
 
@@ -3904,6 +3962,21 @@ fn append_commit_verbose_diffs(
     Ok(())
 }
 
+fn commit_template_includes_status(args: &Args, config: &ConfigSet) -> bool {
+    if args.no_status {
+        return false;
+    }
+    if args.status {
+        return true;
+    }
+    config.get("commit.status").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "no" | "off" | "0"
+        )
+    })
+}
+
 fn commit_template_status_append(
     args: &Args,
     repo: &Repository,
@@ -3943,6 +4016,11 @@ fn commit_template_status_append(
         .map(|(a, _)| format!("{}>", a.trim()))
         .unwrap_or_else(|| author.clone());
     append_commented_line(buf, p, &format!("Author:    {author_display}"));
+    if args.date.is_some() {
+        if let Some(display) = format_commit_summary_date(&author) {
+            append_commented_line(buf, p, &format!("Date:      {display}"));
+        }
+    }
     append_commented_line(buf, p, "");
     append_commented_line(buf, p, &format!("On branch {}", branch_display_name(head)));
     append_commented_line(buf, p, "Changes to be committed:");
@@ -4067,7 +4145,7 @@ fn prepare_commit_message(
                 let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
                 let mut file_body = prefix.clone();
                 file_body.push_str(&commit.message);
-                if !args.no_status {
+                if commit_template_includes_status(args, config) {
                     commit_template_status_append(args, repo, head, config, &mut file_body)?;
                 }
                 if verbose_level > 0 {
@@ -4106,7 +4184,7 @@ fn prepare_commit_message(
             if file_body.trim().is_empty() {
                 file_body.push('\n');
             }
-            if !args.no_status {
+            if commit_template_includes_status(args, config) {
                 commit_template_status_append(args, repo, head, config, &mut file_body)?;
             }
             if verbose_level > 0 {
@@ -4148,7 +4226,7 @@ fn prepare_commit_message(
             if !file_body.ends_with('\n') {
                 file_body.push('\n');
             }
-            if !args.no_status {
+            if commit_template_includes_status(args, config) {
                 commit_template_status_append(args, repo, head, config, &mut file_body)?;
             }
             if verbose_level > 0 {
@@ -4184,7 +4262,46 @@ fn prepare_commit_message(
     }
 
     if let Some(ref file_path) = args.file {
-        return raw_to_message_result(read_message_file_raw(file_path)?);
+        let raw = read_message_file_raw(file_path)?;
+        let text = String::from_utf8_lossy(&raw).to_string();
+        if use_editor {
+            let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
+            let mut file_body = ensure_trailing_newline(&text);
+            if commit_template_includes_status(args, config) {
+                commit_template_status_append(args, repo, head, config, &mut file_body)?;
+            }
+            if verbose_level > 0 {
+                append_commit_verbose_diffs(
+                    args,
+                    repo,
+                    config,
+                    head,
+                    staged,
+                    unstaged,
+                    verbose_level,
+                    &mut file_body,
+                )?;
+            }
+            fs::write(&edit_path, &file_body)?;
+            launch_commit_editor(repo, &edit_path)?;
+            let edited = fs::read_to_string(&edit_path)?;
+            let cleaned =
+                apply_cleanup_message(&edited, verbose_level, comment_prefix, cleanup_mode);
+            return Ok(MessageResult {
+                message: ensure_trailing_newline(&cleaned),
+                raw_bytes: None,
+                from_merge_msg: false,
+            });
+        }
+        if cleanup_mode == CommitMsgCleanupMode::None {
+            return raw_to_message_result(raw);
+        }
+        let cleaned = apply_cleanup_message(&text, 0, comment_prefix, cleanup_mode);
+        return Ok(MessageResult {
+            message: ensure_trailing_newline(&cleaned),
+            raw_bytes: None,
+            from_merge_msg: false,
+        });
     }
 
     let reuse_rev = args.reuse_message.as_ref().or(args.reedit_message.as_ref());
@@ -4195,7 +4312,7 @@ fn prepare_commit_message(
         if args.reedit_message.is_some() {
             let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
             let mut file_body = ensure_trailing_newline(&commit.message);
-            if !args.no_status {
+            if commit_template_includes_status(args, config) {
                 commit_template_status_append(args, repo, head, config, &mut file_body)?;
             }
             if verbose_level > 0 {
@@ -4269,7 +4386,7 @@ fn prepare_commit_message(
     if use_editor {
         let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
         let mut file_body = initial;
-        if !args.no_status {
+        if commit_template_includes_status(args, config) {
             commit_template_status_append(args, repo, head, config, &mut file_body)?;
         }
         if verbose_level > 0 {
