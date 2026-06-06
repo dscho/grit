@@ -1014,6 +1014,33 @@ fn log_resolve_stdout_color(args: &Args, git_dir: &Path) -> bool {
     c
 }
 
+/// Resolve the custom graph column palette from `log.graphColors`, if set.
+///
+/// Returns `None` when the config is absent or empty, in which case the caller
+/// keeps Git's built-in ANSI palette. Each comma-separated entry is parsed as a
+/// color spec; invalid entries are silently skipped (Git warns and skips them).
+/// The resulting list does NOT include the RESET sentinel — `AsciiGraph` appends
+/// that itself.
+fn load_graph_colors(git_dir: &Path) -> Option<Vec<String>> {
+    let cfg = ConfigSet::load(Some(git_dir), true).ok()?;
+    // Git looks up the lowercased key "log.graphcolors".
+    let raw = cfg
+        .get("log.graphColors")
+        .or_else(|| cfg.get("log.graphcolors"))?;
+    let mut colors = Vec::new();
+    for part in raw.split(',') {
+        match grit_lib::config::parse_color(part) {
+            Ok(code) if !code.is_empty() => colors.push(code),
+            _ => {}
+        }
+    }
+    if colors.is_empty() {
+        None
+    } else {
+        Some(colors)
+    }
+}
+
 fn effective_use_mailmap(args: &Args, cfg: &ConfigSet) -> bool {
     if args.no_use_mailmap {
         return false;
@@ -1303,6 +1330,14 @@ fn run_line_log(
 
         let abbrev_len = parse_abbrev(&args.abbrev);
         let mut graph = AsciiGraph::new();
+        // Honor `--color`/`color.*` and the `log.graphColors` palette so that the
+        // graph edge characters are drawn with column colors, matching Git.
+        let graph_palette = if use_color {
+            load_graph_colors(&repo.git_dir)
+        } else {
+            None
+        };
+        graph.set_colors(use_color, graph_palette);
 
         let node_count = nodes.len();
         for (node_idx, node) in nodes.into_iter().enumerate() {
@@ -3095,6 +3130,13 @@ fn run_graph_log(
     let line_prefix = args.line_prefix.as_deref().unwrap_or("");
     let abbrev_len = parse_abbrev(&args.abbrev);
     let use_color = log_resolve_stdout_color(args, &repo.git_dir);
+    // Color the graph edge characters per column, honoring `log.graphColors`.
+    let graph_palette = if use_color {
+        load_graph_colors(&repo.git_dir)
+    } else {
+        None
+    };
+    graph.set_colors(use_color, graph_palette);
     let head_state = resolve_head(&repo.git_dir).unwrap_or(HeadState::Invalid);
     let decoration_paint = if use_color {
         Some(load_decoration_paint(&repo.git_dir))
@@ -3917,6 +3959,10 @@ enum GraphState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct GraphColumn {
     oid: ObjectId,
+    /// Index into the color palette (`AsciiGraph::colors`). When this index is
+    /// `>= colors_max` (i.e. points at the RESET sentinel), the column is drawn
+    /// without color codes, exactly like Git's `struct column.color`.
+    color: usize,
 }
 
 #[derive(Debug)]
@@ -3939,10 +3985,49 @@ struct AsciiGraph {
     new_columns: Vec<GraphColumn>,
     mapping: Vec<isize>,
     old_mapping: Vec<isize>,
+    /// Color palette: a list of ANSI color escape sequences. The final entry is
+    /// always the RESET sequence and its index is `colors_max`. Mirrors Git's
+    /// `column_colors` array (set via `graph_set_column_colors`).
+    colors: Vec<String>,
+    /// The index of the RESET sentinel in `colors` (== `colors.len() - 1`).
+    /// Equivalent to Git's `column_colors_max`.
+    colors_max: usize,
+    /// The current default column color, an index into `colors`. Mirrors Git's
+    /// `git_graph::default_column_color`.
+    default_column_color: usize,
+    /// Whether to emit color escape sequences at all (i.e. `--color`/`color.*`).
+    use_color: bool,
 }
+
+/// Git's default ANSI graph column colors (`column_colors_ansi` in color.c).
+/// The RESET sentinel is appended by `AsciiGraph::resolve_graph_colors`, so this
+/// list contains only the drawable colors.
+const GRAPH_COLUMN_COLORS_ANSI: &[&str] = &[
+    "\x1b[31m",   // red
+    "\x1b[32m",   // green
+    "\x1b[33m",   // yellow
+    "\x1b[34m",   // blue
+    "\x1b[35m",   // magenta
+    "\x1b[36m",   // cyan
+    "\x1b[1;31m", // bold red
+    "\x1b[1;32m", // bold green
+    "\x1b[1;33m", // bold yellow
+    "\x1b[1;34m", // bold blue
+    "\x1b[1;35m", // bold magenta
+    "\x1b[1;36m", // bold cyan
+];
+
+const GRAPH_COLOR_RESET: &str = "\x1b[m";
 
 impl AsciiGraph {
     fn new() -> Self {
+        // The default palette (red..bold-cyan) plus the RESET sentinel.
+        let mut colors: Vec<String> = GRAPH_COLUMN_COLORS_ANSI
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        colors.push(GRAPH_COLOR_RESET.to_string());
+        let colors_max = colors.len() - 1;
         Self {
             current: None,
             num_parents: 0,
@@ -3962,7 +4047,82 @@ impl AsciiGraph {
             new_columns: Vec::new(),
             mapping: Vec::new(),
             old_mapping: Vec::new(),
+            colors,
+            colors_max,
+            // Start at the maximum value, since we always increment before the
+            // first commit we output; this way we start at index 0.
+            default_column_color: colors_max.saturating_sub(1),
+            use_color: false,
         }
+    }
+
+    /// Configure the color palette and whether color codes are emitted.
+    ///
+    /// When `use_color` is false the graph renders exactly as before (no escape
+    /// sequences). When `palette` is `Some`, it overrides the default ANSI
+    /// colors (this is how `log.graphColors` is honored). The RESET sentinel is
+    /// always appended automatically.
+    fn set_colors(&mut self, use_color: bool, palette: Option<Vec<String>>) {
+        self.use_color = use_color;
+        if let Some(custom) = palette {
+            if !custom.is_empty() {
+                let mut colors = custom;
+                colors.push(GRAPH_COLOR_RESET.to_string());
+                self.colors = colors;
+                self.colors_max = self.colors.len() - 1;
+            }
+        }
+        self.default_column_color = self.colors_max.saturating_sub(1);
+    }
+
+    /// The color index used for newly created columns. When color is disabled,
+    /// this returns `colors_max` (the RESET sentinel index) so the column draws
+    /// without any escape codes, matching Git's `graph_get_current_column_color`.
+    fn current_column_color(&self) -> usize {
+        if !self.use_color {
+            return self.colors_max;
+        }
+        self.default_column_color
+    }
+
+    /// Advance the default column color, wrapping modulo `colors_max`.
+    fn increment_column_color(&mut self) {
+        if self.colors_max == 0 {
+            return;
+        }
+        self.default_column_color = (self.default_column_color + 1) % self.colors_max;
+    }
+
+    /// Find the color of an existing column for `oid`, or the current default.
+    fn find_commit_color(&self, oid: ObjectId) -> usize {
+        for i in 0..self.num_columns {
+            if self.columns[i].oid == oid {
+                return self.columns[i].color;
+            }
+        }
+        self.current_column_color()
+    }
+
+    /// Append a single graph character, optionally wrapped in `col`'s color.
+    /// Mirrors Git's `graph_line_write_column`: only the visible char counts
+    /// toward `width`, the escape sequences do not.
+    fn write_column(&self, line: &mut String, width: &mut usize, col: &GraphColumn, ch: char) {
+        let colored = col.color < self.colors_max;
+        if colored {
+            line.push_str(&self.colors[col.color]);
+        }
+        line.push(ch);
+        *width += 1;
+        if colored {
+            line.push_str(&self.colors[self.colors_max]);
+        }
+    }
+
+    /// Append an uncolored character (used for the commit mark, spaces, dashes
+    /// that have no owning column). Counts toward visible `width`.
+    fn add_char(line: &mut String, width: &mut usize, ch: char) {
+        line.push(ch);
+        *width += 1;
     }
 
     fn update(&mut self, commit: GraphCommitNode) {
@@ -3989,13 +4149,17 @@ impl AsciiGraph {
             return (String::new(), false);
         }
         let mut line = String::new();
+        // Visible width of the line, excluding any color escape sequences.
+        // This mirrors Git's `graph_line.width` and is what padding uses.
+        let mut width: usize = 0;
         let shown_commit_line = match self.state {
             GraphState::Padding => {
-                self.output_padding_line(&mut line);
+                self.output_padding_line(&mut line, &mut width);
                 false
             }
             GraphState::Skip => {
                 line.push_str("...");
+                width += 3;
                 if self.needs_pre_commit_line() {
                     self.update_state(GraphState::PreCommit);
                 } else {
@@ -4004,26 +4168,29 @@ impl AsciiGraph {
                 false
             }
             GraphState::PreCommit => {
-                self.output_pre_commit_line(&mut line);
+                self.output_pre_commit_line(&mut line, &mut width);
                 false
             }
             GraphState::Commit => {
-                self.output_commit_line(&mut line);
+                self.output_commit_line(&mut line, &mut width);
                 true
             }
             GraphState::PostMerge => {
-                self.output_post_merge_line(&mut line);
+                self.output_post_merge_line(&mut line, &mut width);
                 false
             }
             GraphState::Collapsing => {
-                self.output_collapsing_line(&mut line);
+                self.output_collapsing_line(&mut line, &mut width);
                 false
             }
         };
 
+        // Pad to the commit's total width using the *visible* width, so that
+        // color escape sequences do not throw off the alignment of trailing
+        // text. Mirrors Git's `graph_pad_horizontally`.
         let pad_width = self.width;
-        if line.len() < pad_width {
-            line.push_str(&" ".repeat(pad_width - line.len()));
+        if width < pad_width {
+            line.push_str(&" ".repeat(pad_width - width));
         }
         (line, shown_commit_line)
     }
@@ -4038,13 +4205,15 @@ impl AsciiGraph {
             Some(current) => current.oid,
             None => return,
         };
+        let placeholder_col = GraphColumn {
+            oid: placeholder,
+            color: self.colors_max,
+        };
         if self.columns.len() < needed_columns {
-            self.columns
-                .resize(needed_columns, GraphColumn { oid: placeholder });
+            self.columns.resize(needed_columns, placeholder_col);
         }
         if self.new_columns.len() < needed_columns {
-            self.new_columns
-                .resize(needed_columns, GraphColumn { oid: placeholder });
+            self.new_columns.resize(needed_columns, placeholder_col);
         }
         let map_len = needed_columns.saturating_mul(2);
         if self.mapping.len() < map_len {
@@ -4060,12 +4229,18 @@ impl AsciiGraph {
     }
 
     fn insert_into_new_columns(&mut self, oid: ObjectId, idx: isize) {
-        let mut i = self.find_new_column_by_commit(oid).unwrap_or_else(|| {
-            let pos = self.num_new_columns;
-            self.new_columns[pos] = GraphColumn { oid };
-            self.num_new_columns += 1;
-            pos
-        });
+        // If the commit is not already in new_columns, add it and record the
+        // color it should be drawn with (mirrors `graph_insert_into_new_columns`).
+        let mut i = match self.find_new_column_by_commit(oid) {
+            Some(pos) => pos,
+            None => {
+                let color = self.find_commit_color(oid);
+                let pos = self.num_new_columns;
+                self.new_columns[pos] = GraphColumn { oid, color };
+                self.num_new_columns += 1;
+                pos
+            }
+        };
 
         let mapping_idx: usize;
         if self.num_parents > 1 && idx > -1 && self.merge_layout == -1 {
@@ -4142,12 +4317,17 @@ impl AsciiGraph {
                     .unwrap_or_default();
                 for parent in parents {
                     let idx = i as isize;
+                    // If this is a merge, or the start of a new childless
+                    // column, advance the current color before inserting the
+                    // parent column (mirrors `graph_update_columns`).
+                    if self.num_parents > 1 || !is_commit_in_columns {
+                        self.increment_column_color();
+                    }
                     self.insert_into_new_columns(parent, idx);
                 }
                 if self.num_parents == 0 {
                     self.width = self.width.saturating_add(2);
                 }
-                let _ = is_commit_in_columns;
             } else {
                 self.insert_into_new_columns(col_oid, -1);
             }
@@ -4186,15 +4366,15 @@ impl AsciiGraph {
         true
     }
 
-    fn output_padding_line(&self, line: &mut String) {
+    fn output_padding_line(&self, line: &mut String, width: &mut usize) {
         for i in 0..self.num_new_columns {
-            let _ = i;
-            line.push('|');
-            line.push(' ');
+            let col = self.new_columns[i];
+            self.write_column(line, width, &col, '|');
+            Self::add_char(line, width, ' ');
         }
     }
 
-    fn output_pre_commit_line(&mut self, line: &mut String) {
+    fn output_pre_commit_line(&mut self, line: &mut String, width: &mut usize) {
         let mut seen_this = false;
         let current_oid = match self.current.as_ref() {
             Some(c) => c.oid,
@@ -4202,23 +4382,26 @@ impl AsciiGraph {
         };
 
         for i in 0..self.num_columns {
-            let col_oid = self.columns[i].oid;
+            let col = self.columns[i];
+            let col_oid = col.oid;
             if col_oid == current_oid {
                 seen_this = true;
-                line.push('|');
-                line.push_str(&" ".repeat(self.expansion_row));
+                self.write_column(line, width, &col, '|');
+                for _ in 0..self.expansion_row {
+                    Self::add_char(line, width, ' ');
+                }
             } else if seen_this && self.expansion_row == 0 {
                 if self.prev_state == GraphState::PostMerge && self.prev_commit_index < i {
-                    line.push('\\');
+                    self.write_column(line, width, &col, '\\');
                 } else {
-                    line.push('|');
+                    self.write_column(line, width, &col, '|');
                 }
             } else if seen_this && self.expansion_row > 0 {
-                line.push('\\');
+                self.write_column(line, width, &col, '\\');
             } else {
-                line.push('|');
+                self.write_column(line, width, &col, '|');
             }
-            line.push(' ');
+            Self::add_char(line, width, ' ');
         }
 
         self.expansion_row += 1;
@@ -4235,7 +4418,7 @@ impl AsciiGraph {
         }
     }
 
-    fn draw_octopus_merge(&self, line: &mut String) {
+    fn draw_octopus_merge(&self, line: &mut String, width: &mut usize) {
         let dashed = self.num_dashed_parents().max(0) as usize;
         for i in 0..dashed {
             let map_idx = (self.commit_index + i + 2) * 2;
@@ -4243,12 +4426,13 @@ impl AsciiGraph {
             if j < 0 || j as usize >= self.num_new_columns {
                 continue;
             }
-            line.push('-');
-            line.push(if i == dashed - 1 { '.' } else { '-' });
+            let col = self.new_columns[j as usize];
+            self.write_column(line, width, &col, '-');
+            self.write_column(line, width, &col, if i == dashed - 1 { '.' } else { '-' });
         }
     }
 
-    fn output_commit_line(&mut self, line: &mut String) {
+    fn output_commit_line(&mut self, line: &mut String, width: &mut usize) {
         let mut seen_this = false;
         let current_oid = match self.current.as_ref() {
             Some(c) => c.oid,
@@ -4256,31 +4440,39 @@ impl AsciiGraph {
         };
 
         for i in 0..=self.num_columns {
+            let col = if i == self.num_columns {
+                GraphColumn {
+                    oid: current_oid,
+                    color: self.colors_max,
+                }
+            } else {
+                self.columns[i]
+            };
             let col_oid = if i == self.num_columns {
                 if seen_this {
                     break;
                 }
                 current_oid
             } else {
-                self.columns[i].oid
+                col.oid
             };
 
             if col_oid == current_oid {
                 seen_this = true;
-                line.push(self.output_commit_char());
+                Self::add_char(line, width, self.output_commit_char());
                 if self.num_parents > 2 {
-                    self.draw_octopus_merge(line);
+                    self.draw_octopus_merge(line, width);
                 }
             } else if seen_this && self.edges_added > 1 {
-                line.push('\\');
+                self.write_column(line, width, &col, '\\');
             } else if seen_this && self.edges_added == 1 {
                 if self.prev_state == GraphState::PostMerge
                     && self.prev_edges_added > 0
                     && self.prev_commit_index < i
                 {
-                    line.push('\\');
+                    self.write_column(line, width, &col, '\\');
                 } else {
-                    line.push('|');
+                    self.write_column(line, width, &col, '|');
                 }
             } else if self.prev_state == GraphState::Collapsing
                 && (2 * i + 1) < self.old_mapping.len()
@@ -4288,11 +4480,11 @@ impl AsciiGraph {
                 && (2 * i) < self.mapping.len()
                 && self.mapping[2 * i] < i as isize
             {
-                line.push('/');
+                self.write_column(line, width, &col, '/');
             } else {
-                line.push('|');
+                self.write_column(line, width, &col, '|');
             }
-            line.push(' ');
+            Self::add_char(line, width, ' ');
         }
 
         if self.num_parents > 1 {
@@ -4304,58 +4496,79 @@ impl AsciiGraph {
         }
     }
 
-    fn output_post_merge_line(&mut self, line: &mut String) {
+    fn output_post_merge_line(&mut self, line: &mut String, width: &mut usize) {
         let merge_chars = ['/', '|', '\\'];
         let current = match self.current.as_ref() {
-            Some(c) => c,
+            Some(c) => c.clone(),
             None => return,
         };
         let first_parent = current.parents.first().copied();
-        let mut parent_col_seen = false;
+        // The column that owns the first parent, once we have walked past it.
+        // Used to color the horizontal '_' edges (Git's `parent_col`).
+        let mut parent_col: Option<GraphColumn> = None;
         let mut seen_this = false;
 
         for i in 0..=self.num_columns {
+            let col = if i == self.num_columns {
+                GraphColumn {
+                    oid: current.oid,
+                    color: self.colors_max,
+                }
+            } else {
+                self.columns[i]
+            };
             let col_oid = if i == self.num_columns {
                 if seen_this {
                     break;
                 }
                 current.oid
             } else {
-                self.columns[i].oid
+                col.oid
             };
 
             if col_oid == current.oid {
                 seen_this = true;
                 let mut idx = self.merge_layout.clamp(0, 2) as usize;
                 for (j, parent) in current.parents.iter().enumerate() {
-                    if self.find_new_column_by_commit(*parent).is_none() {
-                        continue;
-                    }
+                    let par_column = match self.find_new_column_by_commit(*parent) {
+                        Some(p) => p,
+                        None => continue,
+                    };
                     let c = merge_chars[idx.min(2)];
-                    line.push(c);
+                    let pcol = self.new_columns[par_column];
+                    self.write_column(line, width, &pcol, c);
                     if idx == 2 {
                         if self.edges_added > 0 || j < current.parents.len().saturating_sub(1) {
-                            line.push(' ');
+                            Self::add_char(line, width, ' ');
                         }
                     } else {
                         idx += 1;
                     }
                 }
                 if self.edges_added == 0 {
-                    line.push(' ');
+                    Self::add_char(line, width, ' ');
                 }
             } else if seen_this {
-                line.push(if self.edges_added > 0 { '\\' } else { '|' });
-                line.push(' ');
+                self.write_column(
+                    line,
+                    width,
+                    &col,
+                    if self.edges_added > 0 { '\\' } else { '|' },
+                );
+                Self::add_char(line, width, ' ');
             } else {
-                line.push('|');
+                self.write_column(line, width, &col, '|');
                 if self.merge_layout != 0 || i != self.commit_index.saturating_sub(1) {
-                    line.push(if parent_col_seen { '_' } else { ' ' });
+                    if let Some(pcol) = parent_col {
+                        self.write_column(line, width, &pcol, '_');
+                    } else {
+                        Self::add_char(line, width, ' ');
+                    }
                 }
             }
 
             if first_parent.is_some_and(|p| p == col_oid) {
-                parent_col_seen = true;
+                parent_col = Some(col);
             }
         }
 
@@ -4366,7 +4579,7 @@ impl AsciiGraph {
         }
     }
 
-    fn output_collapsing_line(&mut self, line: &mut String) {
+    fn output_collapsing_line(&mut self, line: &mut String, width: &mut usize) {
         std::mem::swap(&mut self.mapping, &mut self.old_mapping);
         for i in 0..self.mapping_size {
             self.mapping[i] = -1;
@@ -4420,20 +4633,23 @@ impl AsciiGraph {
         for i in 0..self.mapping_size {
             let target = self.mapping[i];
             if target < 0 {
-                line.push(' ');
+                Self::add_char(line, width, ' ');
             } else if (target as usize) * 2 == i {
-                line.push('|');
+                let col = self.new_columns[target as usize];
+                self.write_column(line, width, &col, '|');
             } else if target == horizontal_target && i as isize != horizontal_edge - 1 {
                 if i != (target as usize).saturating_mul(2).saturating_add(3) {
                     self.mapping[i] = -1;
                 }
                 used_horizontal = true;
-                line.push('_');
+                let col = self.new_columns[target as usize];
+                self.write_column(line, width, &col, '_');
             } else {
                 if used_horizontal && (i as isize) < horizontal_edge {
                     self.mapping[i] = -1;
                 }
-                line.push('/');
+                let col = self.new_columns[target as usize];
+                self.write_column(line, width, &col, '/');
             }
         }
 
