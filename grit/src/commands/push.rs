@@ -5218,6 +5218,72 @@ fn resolve_push_src_for_refspec(
     }
 }
 
+/// DWIM rules matching Git `ref_rev_parse_rules` (`refs.c` `refname_match`): does the
+/// abbreviated push destination `abbrev` name the full remote ref `full_name`?
+fn push_refname_match(abbrev: &str, full_name: &str) -> bool {
+    const REV_PARSE_RULES: &[&str] = &[
+        "{}",
+        "refs/{}",
+        "refs/tags/{}",
+        "refs/heads/{}",
+        "refs/remotes/{}",
+        "refs/remotes/{}/HEAD",
+    ];
+    REV_PARSE_RULES
+        .iter()
+        .any(|rule| rule.replace("{}", abbrev) == full_name)
+}
+
+/// Mirror of Git `count_refspec_match` (`remote.c`): match the short destination `pattern`
+/// against the remote's advertised refs, distinguishing **strong** matches (full/top-level
+/// names, or refs under `refs/heads`/`refs/tags`) from **weak** ones (e.g. a short name
+/// resolving under `refs/remotes/`). One strong match (with any number of weak ones), or a
+/// single weak match with no strong match, is an unambiguous destination — return it. More
+/// than one strong match, or several weak matches with no strong match, is ambiguous (`None`
+/// with `ambiguous = true`).
+fn count_refspec_match_push(
+    pattern: &str,
+    remote_refs: &[(String, ObjectId)],
+) -> (Option<String>, bool) {
+    let patlen = pattern.len();
+    let mut matched_strong: Option<&str> = None;
+    let mut matched_weak: Option<&str> = None;
+    let mut strong = 0usize;
+    let mut weak = 0usize;
+    for (name, _) in remote_refs {
+        if !push_refname_match(pattern, name) {
+            continue;
+        }
+        let namelen = name.len();
+        // Weak: not a full ("refs/remotes/origin/main") or top-level ("remotes/origin/main")
+        // spelling, and not under refs/heads or refs/tags.
+        let is_weak = namelen != patlen
+            && patlen != namelen.wrapping_sub(5)
+            && !name.starts_with("refs/heads/")
+            && !name.starts_with("refs/tags/");
+        if is_weak {
+            matched_weak = Some(name);
+            weak += 1;
+        } else {
+            matched_strong = Some(name);
+            strong += 1;
+        }
+    }
+    if strong == 0 {
+        // Only weak matches: unambiguous iff exactly one.
+        (
+            matched_weak.map(str::to_owned).filter(|_| weak == 1),
+            weak > 1,
+        )
+    } else {
+        // One strong match (with any weak) is fine; more than one strong is ambiguous.
+        (
+            matched_strong.map(str::to_owned).filter(|_| strong == 1),
+            strong > 1,
+        )
+    }
+}
+
 fn resolve_destination_ref_for_push(
     remote_git_dir: &Path,
     dst: &str,
@@ -5229,6 +5295,23 @@ fn resolve_destination_ref_for_push(
     }
     if dst == "HEAD" {
         return Ok("HEAD".to_owned());
+    }
+    // Colon-less push (`git push remote frotz`): Git resolves `dst_value` to the *full source
+    // ref name* (`match_explicit`), so a remote that carries both `refs/heads/frotz` and
+    // `refs/tags/frotz` is not ambiguous — the branch source picks `refs/heads/frotz`. Match
+    // the full source ref against the remote refs; fall back to the source ref name verbatim
+    // (it already starts with `refs/`, like Git's `make_linked_ref(dst_value)`).
+    if prefer_source_namespace && local_ref.starts_with("refs/") {
+        let remote_refs = refs::list_refs(remote_git_dir, "refs/").unwrap_or_default();
+        let (matched, ambiguous) = count_refspec_match_push(local_ref, &remote_refs);
+        if let Some(name) = matched {
+            return Ok(name);
+        }
+        if ambiguous {
+            eprintln!("error: dst refspec {dst} matches more than one");
+            bail!("failed to push some refs");
+        }
+        return Ok(local_ref.to_owned());
     }
     if let Some(tag) = dst.strip_prefix("tags/") {
         return Ok(format!("refs/tags/{tag}"));
@@ -5250,13 +5333,25 @@ fn resolve_destination_ref_for_push(
         }
         return Ok(dst.to_owned());
     }
-    if dst.starts_with("refs/") || dst.contains('/') {
-        // `refs/<name>` without a category component is not a full refname.
-        if dst.starts_with("refs/") && dst.matches('/').count() < 2 {
-            bail!("The destination you provided is not a full refname");
-        }
-        bail!("The destination you provided is not a full refname");
+    // Short destination (no `refs/` prefix). Mirror Git's `match_explicit` for the dst side:
+    // first try to match the short name against the remote's advertised refs
+    // (`count_refspec_match`); on a unique match use that ref, on multiple strong matches
+    // report ambiguity. With no existing match, `guess_ref` derives the namespace from the
+    // *source* ref (push `main:origin/main` to a new remote re-uses refs/heads/; an existing
+    // refs/remotes/origin/main is matched as a weak DWIM target).
+    let remote_refs = refs::list_refs(remote_git_dir, "refs/").unwrap_or_default();
+    let (matched, ambiguous) = count_refspec_match_push(dst, &remote_refs);
+    if let Some(name) = matched {
+        return Ok(name);
     }
+    if ambiguous {
+        eprintln!("error: dst refspec {dst} matches more than one");
+        bail!("failed to push some refs");
+    }
+
+    // No existing remote ref matched: validate the name, then guess the namespace from the
+    // source ref (Git `guess_ref`). A onelevel name (`origin/main` has a slash; `foo` does not)
+    // must still be a syntactically valid refname.
     let onelevel_opts = RefNameOptions {
         allow_onelevel: true,
         refspec_pattern: false,
@@ -5265,55 +5360,16 @@ fn resolve_destination_ref_for_push(
     if check_refname_format(dst, &onelevel_opts).is_err() {
         bail!("The destination you provided is not a full refname");
     }
-    if prefer_source_namespace {
-        if local_ref.starts_with("refs/heads/") {
-            return Ok(format!("refs/heads/{dst}"));
-        }
-        if local_ref.starts_with("refs/tags/") {
-            return Ok(format!("refs/tags/{dst}"));
-        }
+    if local_ref.starts_with("refs/heads/") {
+        return Ok(format!("refs/heads/{dst}"));
     }
     if local_ref.starts_with("refs/tags/") {
         return Ok(format!("refs/tags/{dst}"));
     }
-
-    let candidates = [
-        format!("refs/heads/{dst}"),
-        format!("refs/tags/{dst}"),
-        format!("refs/remotes/{dst}"),
-    ];
-    let existing: Vec<String> = candidates
-        .iter()
-        .filter_map(|c| {
-            refs::resolve_ref(remote_git_dir, c)
-                .ok()
-                .map(|_| c.to_owned())
-        })
-        .collect();
-    if !local_ref.starts_with("refs/") {
-        return match existing.len() {
-            1 => Ok(existing
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| dst.to_owned())),
-            0 => bail!("The destination you provided is not a full refname"),
-            _ => {
-                eprintln!("error: dst refspec {dst} matches more than one");
-                bail!("failed to push some refs");
-            }
-        };
-    }
-    match existing.len() {
-        0 => Ok(format!("refs/heads/{dst}")),
-        1 => Ok(existing
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| dst.to_owned())),
-        _ => {
-            eprintln!("error: dst refspec {dst} matches more than one");
-            bail!("failed to push some refs");
-        }
-    }
+    // `prefer_source_namespace` (colon-less push) and a non-ref source both fall here; the
+    // source did not resolve to a branch or tag, so the destination cannot be guessed.
+    let _ = prefer_source_namespace;
+    bail!("The destination you provided is not a full refname");
 }
 
 fn map_short_destination_under_existing_namespace(
