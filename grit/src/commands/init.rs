@@ -956,16 +956,27 @@ fn create_git_dir(git_dir: &Path, opts: CreateGitDirOptions<'_>) -> Result<()> {
         work_tree,
     } = opts;
 
-    // Create core directories
-    for sub in &[
+    // `hooks/`, `info/`, and `description` are *template* content in upstream Git
+    // (git/setup.c `create_default_files` only copies them via `copy_templates`). When templates
+    // are skipped entirely — `git init --template=` (empty) or `TEST_CREATE_REPO_NO_TEMPLATE` with
+    // no explicit `--template` — none of these are created, so a later `mkdir .git/hooks` in the
+    // harness's `mk_empty` succeeds (t5516). Only the built-in default-template branch below
+    // recreates `info/exclude`.
+    let has_template_content = template_dir.is_some() || !skip_default_templates;
+
+    // Create core directories (git/setup.c always creates objects/refs; `hooks` only from templates).
+    let mut core_dirs: Vec<&str> = vec![
         "objects",
         "objects/info",
         "objects/pack",
-        "hooks",
         "refs",
         "refs/heads",
         "refs/tags",
-    ] {
+    ];
+    if has_template_content {
+        core_dirs.push("hooks");
+    }
+    for sub in &core_dirs {
         fs::create_dir_all(git_dir.join(sub))?;
     }
 
@@ -1072,13 +1083,15 @@ fn create_git_dir(git_dir: &Path, opts: CreateGitDirOptions<'_>) -> Result<()> {
         cfg.write()?;
     }
 
-    // Write description (only on fresh init)
-    let desc_path = git_dir.join("description");
-    if !desc_path.exists() {
-        fs::write(
-            &desc_path,
-            "Unnamed repository; edit this file 'description' to name the repository.\n",
-        )?;
+    // Write description (template content; skipped when templates are skipped — t5516 `mk_empty`).
+    if has_template_content {
+        let desc_path = git_dir.join("description");
+        if !desc_path.exists() {
+            fs::write(
+                &desc_path,
+                "Unnamed repository; edit this file 'description' to name the repository.\n",
+            )?;
+        }
     }
 
     Ok(())

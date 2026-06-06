@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::diff::zero_oid;
 use grit_lib::fetch_negotiator::SkippingNegotiator;
-use grit_lib::objects::ObjectId;
+use grit_lib::objects::{parse_tag, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::refs;
 use grit_lib::repo::Repository;
@@ -62,6 +62,70 @@ fn peel_commit_oid_for_negotiation(repo: &Repository, oid: ObjectId) -> Result<O
         grit_lib::error::Error::InvalidRef(msg) => anyhow::anyhow!(msg),
         other => other.into(),
     })
+}
+
+/// Collect the local tips usable as `have` lines for a v2 fetch negotiation: refs under
+/// `refs/bundles/` (applied by `--bundle-uri`), `refs/heads/`, `refs/tags/`, and `HEAD`. Each tip
+/// is peeled to a commit and kept only if its object is present locally; `wants` are excluded.
+///
+/// When `negotiation_tip_oids` is `Some`, the haves are restricted to those tips (matching the
+/// `--negotiation-tip` semantics applied by the v1 negotiation path) so that
+/// `git fetch --negotiation-tip=...` limits the advertised `have` lines. Returns a deterministic,
+/// deduplicated list.
+fn local_negotiation_haves(
+    local_git_dir: &Path,
+    wants: &[ObjectId],
+    negotiation_tip_oids: Option<&[ObjectId]>,
+) -> Vec<ObjectId> {
+    let Ok(repo) = Repository::open(local_git_dir, None) else {
+        return Vec::new();
+    };
+    let want_set: HashSet<ObjectId> = wants.iter().copied().collect();
+
+    // `--negotiation-tip`: restrict the `have` set to the peeled tip commits the caller named.
+    let tip_filter: Option<HashSet<ObjectId>> = negotiation_tip_oids.map(|tips| {
+        tips.iter()
+            .filter_map(|tip| peel_commit_oid_for_negotiation(&repo, *tip).ok().flatten())
+            .collect()
+    });
+
+    let mut haves: Vec<ObjectId> = Vec::new();
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+
+    let consider = |oid: ObjectId, haves: &mut Vec<ObjectId>, seen: &mut HashSet<ObjectId>| {
+        if repo.odb.read(&oid).is_err() {
+            return;
+        }
+        let Ok(Some(peeled)) = peel_commit_oid_for_negotiation(&repo, oid) else {
+            return;
+        };
+        if want_set.contains(&peeled) {
+            return;
+        }
+        if tip_filter
+            .as_ref()
+            .is_some_and(|filter| !filter.contains(&peeled))
+        {
+            return;
+        }
+        if seen.insert(peeled) {
+            haves.push(peeled);
+        }
+    };
+
+    for prefix in ["refs/bundles/", "refs/heads/", "refs/tags/"] {
+        if let Ok(entries) = refs::list_refs(local_git_dir, prefix) {
+            for (name, oid) in entries {
+                let tip = resolve_revision(&repo, &name).unwrap_or(oid);
+                consider(tip, &mut haves, &mut seen);
+            }
+        }
+    }
+    if let Ok(h) = refs::resolve_ref(local_git_dir, "HEAD") {
+        consider(h, &mut haves, &mut seen);
+    }
+
+    haves
 }
 
 /// Split a simple upload-pack command string into leading `VAR=value` tokens (shell-style, no
@@ -364,6 +428,19 @@ pub(crate) fn read_advertisement(
                             head_symref = Some(target.to_string());
                         }
                     }
+                }
+                // `0{40} capabilities^{}` is the no-refs capability carrier (an empty repo or empty
+                // namespace), not an advertised ref — never record it (t5509 empty namespace).
+                if refname == "capabilities^{}" {
+                    continue;
+                }
+                // A protocol v0/v1 ref advertisement emits a `<peeled-oid> <refname>^{}` line after
+                // each annotated tag (the peeled object). These `^{}` lines are not refs and must
+                // never be recorded as fetchable/trackable refs — otherwise a v0 fetch would write
+                // bogus `refs/tags/<name>^{}` refs and FETCH_HEAD lines (t5515 with
+                // GIT_TEST_PROTOCOL_VERSION=0). The real ref already preceded this peeled line.
+                if refname.ends_with("^{}") {
+                    continue;
                 }
                 out.push((refname, oid));
             }
@@ -1108,7 +1185,7 @@ pub fn fetch_via_upload_pack_skipping(
     if !has_cli_refspecs {
         merge_remote_refs_into_upload_pack_advertisement(remote_repo_path, &mut advertised)?;
     }
-    let wants = compute_wants(&advertised)?;
+    let wants = filter_wants_already_local(local_git_dir, compute_wants(&advertised)?);
     if has_hide_refs_for_fetch_connectivity(local_git_dir) {
         crate::trace_run_command_git_invocation(&[
             "rev-list",
@@ -1188,10 +1265,27 @@ pub fn fetch_via_upload_pack_skipping(
             } else {
                 (Vec::new(), None, false, None, &[][..], false)
             };
+        // Advertise locally-available tips (bundle refs applied via `--bundle-uri`, plus existing
+        // heads/tags/HEAD) as `have` lines so the server can build a thin pack and skip objects we
+        // already obtained from the bundle (t5558 `negotiation:` cases require the bundle tip to be
+        // sent as `have`). Skipped during a shallow/deepening request, where the local objects do
+        // not form a usable negotiation base. Note `shallow_options` is `Some` for every clone, so
+        // gate on an actual shallow/deepen request rather than its presence.
+        let shallow_request = depth.is_some()
+            || shallow_since.is_some()
+            || !shallow_exclude.is_empty()
+            || unshallow
+            || !shallow_oids.is_empty();
+        let haves: Vec<ObjectId> = if shallow_request {
+            Vec::new()
+        } else {
+            local_negotiation_haves(local_git_dir, &wants, negotiation_tip_oids)
+        };
         write_v2_fetch_request(
             &mut stdin,
             &default_hash,
             &wants,
+            &haves,
             sideband_all,
             include_tag,
             deepen_relative,
@@ -1240,6 +1334,49 @@ pub fn fetch_via_upload_pack_skipping(
     unpack_upload_pack_bytes(local_git_dir, &pack_buf, filter_active)?;
 
     Ok((remote_heads, remote_tags, head_symref, head_advertised_oid))
+}
+
+/// Git's `everything_local`: a wanted ref tip need not be requested when its object — and its full
+/// reachable closure — is already available in the local object store (which includes `--reference`
+/// / alternate object directories). Dropping such wants is what keeps a `--reference` clone or a
+/// fetch into a repo with an alternate from asking the server for objects it can already borrow
+/// (`t5604` "fetched no objects" / "fetch with incomplete alternates").
+fn want_is_locally_complete(repo: &Repository, oid: &ObjectId) -> bool {
+    let Ok(obj) = repo.odb.read(oid) else {
+        return false;
+    };
+    match obj.kind {
+        ObjectKind::Commit => {
+            grit_lib::connectivity::push_tip_objects_exist(repo, *oid).unwrap_or(false)
+        }
+        ObjectKind::Tag => {
+            // A tag is complete only if its (possibly chained) target's closure is present.
+            match parse_tag(&obj.data) {
+                Ok(tag) => want_is_locally_complete(repo, &tag.object),
+                Err(_) => false,
+            }
+        }
+        // A tree or blob ref tip is complete once the object itself is present.
+        ObjectKind::Tree | ObjectKind::Blob => true,
+    }
+}
+
+/// Drop wants already satisfied locally (see [`want_is_locally_complete`]). Returns the surviving
+/// wants. Never removes everything-vs-nothing distinctions the caller relies on: an empty result
+/// means the fetch needs no pack, which callers already handle.
+fn filter_wants_already_local(local_git_dir: &Path, wants: Vec<ObjectId>) -> Vec<ObjectId> {
+    if wants.is_empty() {
+        return wants;
+    }
+    let Ok(repo) = Repository::open(local_git_dir, None) else {
+        return wants;
+    };
+    // Only filter when there is at least one alternate / borrowable store; otherwise a normal
+    // clone (empty local ODB) keeps all wants and the check is pure overhead.
+    wants
+        .into_iter()
+        .filter(|oid| !want_is_locally_complete(&repo, oid))
+        .collect()
 }
 
 fn fetch_negotiation_algorithm(local_git_dir: &Path) -> Option<String> {
@@ -1603,6 +1740,7 @@ fn fetch_upload_pack_negotiate_pack_bytes(
             &mut stdin,
             &default_hash,
             wants,
+            &[],
             sideband_all,
             false,
             false,
@@ -2153,6 +2291,7 @@ pub fn fetch_via_git_protocol_skipping(
             &mut stream_w,
             &default_hash,
             &wants,
+            &[],
             false,
             true,
             false,
@@ -2274,6 +2413,7 @@ pub fn fetch_via_ssh_upload_pack_skipping(
             &mut stdin,
             &default_hash,
             &wants,
+            &[],
             false,
             true,
             false,

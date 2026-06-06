@@ -763,7 +763,12 @@ pub fn run(mut args: Args) -> Result<()> {
             } else if remote_name.starts_with('.')
                 || remote_name.contains('/')
                 || std::path::Path::new(&remote_name).is_dir()
+                || std::path::Path::new(&remote_name).is_file()
             {
+                // A bare filename that exists on disk (e.g. `git fetch foo.bundle`)
+                // is a path-style URL, not a configured remote. Without the
+                // is_file() arm it would fall through to a config lookup and die
+                // with "does not appear to be a git repository".
                 if remote_name.starts_with('-') {
                     bail!("fatal: repository '{remote_name}' does not exist");
                 }
@@ -841,7 +846,7 @@ fn parse_git_bool(value: &str) -> Option<bool> {
 /// The repository default branch name (Git `repo_default_branch_name`): `init.defaultBranch`
 /// config when set and valid, otherwise `master`. Used to pick the branch a `#frag`-less
 /// `.git/branches/<name>` remote fetches.
-fn repo_default_branch_name(config: &ConfigSet) -> String {
+pub fn repo_default_branch_name(config: &ConfigSet) -> String {
     if let Ok(env) = std::env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME") {
         let env = env.trim();
         if !env.is_empty() {
@@ -1007,12 +1012,39 @@ fn fetch_recurse_submodules_mode(
             .map_err(|e| anyhow::anyhow!(e))?;
         return Ok((mode != FetchRecurseSubmodules::Off).then_some(mode));
     }
-    if let Some(raw) = config
-        .get("fetch.recursesubmodules")
-        .or_else(|| config.get("fetch.recurseSubmodules"))
-    {
-        let mode = parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", raw.trim())
-            .map_err(|e| anyhow::anyhow!(e))?;
+    // Both `fetch.recurseSubmodules` and `submodule.recurse` feed the same `recurse_submodules`
+    // field in Git (builtin/fetch.c `fetch_config_callback`); the *last* one in config order wins.
+    // `submodule.recurse` is a boolean → on/off; `fetch.recurseSubmodules` is the on/off/on-demand
+    // enum. Scan config entries in order so a later key overrides an earlier one.
+    let mut from_config: Option<FetchRecurseSubmodules> = None;
+    for entry in config.entries() {
+        let key_lc = entry.key.to_ascii_lowercase();
+        if key_lc == "fetch.recursesubmodules" {
+            if let Some(v) = entry.value.as_deref() {
+                let mode = parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", v.trim())
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                from_config = Some(mode);
+            }
+        } else if key_lc == "submodule.recurse" {
+            // `-c submodule.recurse` with no value parses as boolean true.
+            let on = entry
+                .value
+                .as_deref()
+                .map(|v| {
+                    !matches!(
+                        v.trim().to_ascii_lowercase().as_str(),
+                        "false" | "no" | "off" | "0"
+                    )
+                })
+                .unwrap_or(true);
+            from_config = Some(if on {
+                FetchRecurseSubmodules::On
+            } else {
+                FetchRecurseSubmodules::Off
+            });
+        }
+    }
+    if let Some(mode) = from_config {
         return Ok((mode != FetchRecurseSubmodules::Off).then_some(mode));
     }
     Ok(Some(FetchRecurseSubmodules::Default))
@@ -1316,6 +1348,28 @@ fn collect_wants_for_upload_pack(
             }
             crate::fetch_transport::push_want_unique(&mut wants, *oid);
         }
+    }
+
+    // Explicit tag refspecs that map a `refs/tags/<name>` source to a `refs/tags/` destination —
+    // e.g. a `--single-branch --branch <tag>` clone's `+refs/tags/<tag>:refs/tags/<tag>` — must
+    // fetch the named tag's object even when tag auto-following is off (`tagOpt = --no-tags`). The
+    // heads loop above only covers `refs/heads/` sources. Restrict this to genuine `refs/tags/`
+    // sources whose destination is also under `refs/tags/` so we never request peeled `^{}`
+    // advertisement entries or other namespaces (t5515).
+    for rs in &effective_refspecs {
+        if rs.negative || !rs.src.starts_with("refs/tags/") || rs.src.contains('*') {
+            continue;
+        }
+        if !rs.dst.starts_with("refs/tags/") {
+            continue;
+        }
+        let Some(remote_oid) = refs::resolve_ref(remote_git_dir, &rs.src).ok() else {
+            continue;
+        };
+        if local_odb.exists(&remote_oid) {
+            continue;
+        }
+        crate::fetch_transport::push_want_unique(&mut wants, remote_oid);
     }
 
     wants.dedup();
@@ -2610,29 +2664,10 @@ fn fetch_remote(
                     dst.is_empty(),
                 ));
             }
-            if args.set_upstream {
-                if let Some(remote_ref_name) = resolved_remote_ref.as_deref() {
-                    if remote_ref_name.starts_with("refs/heads/") {
-                        let local_branch = if !dst.is_empty() {
-                            normalize_fetch_refspec_dst(&dst)
-                                .strip_prefix("refs/heads/")
-                                .map(ToOwned::to_owned)
-                        } else {
-                            remote_ref_name
-                                .strip_prefix("refs/heads/")
-                                .map(ToOwned::to_owned)
-                        };
-                        if let Some(local_branch) = local_branch {
-                            set_fetch_upstream_config(
-                                git_dir,
-                                &local_branch,
-                                remote_name,
-                                remote_ref_name,
-                            )?;
-                        }
-                    }
-                }
-            }
+            // `--set-upstream` is handled once, after all refspecs are processed, in
+            // `apply_set_upstream` (mirroring builtin/fetch.c). Doing it per-refspec here would set
+            // the wrong branch (it must configure the *current* branch, not the fetched one) and
+            // would ignore the "exactly one branch / no explicit destination" rules.
 
             // If a destination is specified, write the ref there
             if !dst.is_empty() {
@@ -2936,6 +2971,15 @@ fn fetch_remote(
                     // opportunistic remote-tracking updates. Never synthesize `refs/remotes/<url>/*`,
                     // which would write malformed refs from the URL path (t5515 `main ../.git`).
                     Vec::new()
+                } else if config.get(&format!("remote.{remote_name}.url")).is_some()
+                    || config
+                        .get(&format!("remote.{remote_name}.pushurl"))
+                        .is_some()
+                {
+                    // A configured remote with a url but no fetch refspec performs no opportunistic
+                    // remote-tracking updates (e.g. a `--single-branch` clone of a detached HEAD,
+                    // whose origin has only `url`). Match upstream's empty `remote->fetch`.
+                    Vec::new()
                 } else {
                     default_fetch_refspecs(remote_name)
                 };
@@ -3191,6 +3235,7 @@ fn fetch_remote(
     }
 
     if should_fetch_tags {
+        let cli_refspecs_parsed = parse_cli_fetch_refspecs(cli_refspecs);
         for (refname, remote_oid) in &remote_tags {
             let old_oid = read_ref_oid(git_dir, refname);
             if old_oid.as_ref() == Some(remote_oid) {
@@ -3198,22 +3243,33 @@ fn fetch_remote(
             }
 
             if let Some(old) = old_oid {
-                if old != *remote_oid && !should_force_tag_update(config, remote_name, args) {
-                    let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
-                    if !args.quiet {
-                        display.push(
-                            '!',
-                            "[rejected]",
-                            refname,
-                            refname,
-                            refname,
-                            old,
-                            *remote_oid,
-                            Some("would clobber existing tag"),
-                        );
+                if old != *remote_oid {
+                    // Distinguish an explicit tag refspec (force semantics, clobber rejection)
+                    // from opportunistic auto-follow (add-only: leave an existing local tag as is).
+                    let forced =
+                        match tag_update_kind(refname, args, &refspecs, &cli_refspecs_parsed) {
+                            TagUpdateKind::Opportunistic => continue,
+                            TagUpdateKind::Explicit { force } => {
+                                force || should_force_tag_update(config, remote_name, args)
+                            }
+                        };
+                    if !forced {
+                        let tag_name = refname.strip_prefix("refs/tags/").unwrap_or(refname);
+                        if !args.quiet {
+                            display.push(
+                                '!',
+                                "[rejected]",
+                                refname,
+                                refname,
+                                refname,
+                                old,
+                                *remote_oid,
+                                Some("would clobber existing tag"),
+                            );
+                        }
+                        tag_clobber_failures.push(tag_name.to_owned());
+                        continue;
                     }
-                    tag_clobber_failures.push(tag_name.to_owned());
-                    continue;
                 }
             }
 
@@ -3592,6 +3648,30 @@ fn fetch_remote(
             eprintln!("would write to .git/FETCH_HEAD");
         }
     }
+
+    // `--set-upstream` runs after FETCH_HEAD is committed and is independent of ref-update results:
+    // git installs the branch config even when a remote-tracking ref update fails (t5510 "upstream
+    // tracking info is added even with conflicts"). Run it before the failure bails below.
+    if args.set_upstream && !args.dry_run {
+        // Build the combined list of advertised remote refs so a bare branch/tag/HEAD source
+        // argument can be resolved to its full ref name (matching `builtin/fetch.c`).
+        let mut all_refs: Vec<(String, ObjectId)> = remote_advertised.clone();
+        for (name, oid) in remote_heads.iter().chain(remote_tags.iter()) {
+            if !all_refs.iter().any(|(n, _)| n == name) {
+                all_refs.push((name.clone(), *oid));
+            }
+        }
+        apply_set_upstream(
+            git_dir,
+            remote_name,
+            cli_refspecs,
+            user_passed_cli_refspecs,
+            url_override.is_some(),
+            &all_refs,
+            remote_symbolic_head_branch.as_deref(),
+        );
+    }
+
     if !tag_clobber_failures.is_empty() {
         bail!("some local refs could not be updated");
     }
@@ -3651,6 +3731,99 @@ fn fetch_remote(
     }
 
     Ok(())
+}
+
+/// Implement `git fetch --set-upstream` (mirrors the `set_upstream` block in `builtin/fetch.c`).
+///
+/// The upstream configuration is written for the *current* branch (HEAD). The merge value is the
+/// single "source ref" being fetched into FETCH_HEAD without a tracking destination (i.e. a CLI
+/// refspec with no explicit `:dst`, or — for an anonymous URL fetch with no refspec — the remote
+/// `HEAD`). If more than one such branch is requested, or none is found, nothing is configured.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_set_upstream(
+    git_dir: &Path,
+    remote_name: &str,
+    cli_refspecs: &[String],
+    user_passed_cli_refspecs: bool,
+    is_anonymous_url: bool,
+    remote_all_refs: &[(String, ObjectId)],
+    remote_symbolic_head_branch: Option<&str>,
+) {
+    // Collect the source refs: refs fetched to FETCH_HEAD only (no peer/tracking destination).
+    let mut source_refs: Vec<String> = Vec::new();
+    if user_passed_cli_refspecs {
+        for spec in cli_refspecs {
+            if spec.starts_with('^') {
+                continue;
+            }
+            let spec_clean = spec.strip_prefix('+').unwrap_or(spec.as_str());
+            let (src, has_dst) = match spec_clean.split_once(':') {
+                Some((src, dst)) => (src, !dst.is_empty()),
+                None => (spec_clean, false),
+            };
+            // A refspec with an explicit destination has a peer_ref and is skipped.
+            if has_dst {
+                continue;
+            }
+            // Source refs containing globs are not eligible upstream sources for --set-upstream.
+            if src.contains('*') {
+                continue;
+            }
+            let resolved = resolve_advertised_ref_for_fetch_src(
+                src,
+                remote_all_refs,
+                remote_symbolic_head_branch,
+            )
+            .unwrap_or_else(|| {
+                if src.is_empty() || src == "HEAD" {
+                    "HEAD".to_owned()
+                } else if src.starts_with("refs/") {
+                    src.to_owned()
+                } else {
+                    format!("refs/heads/{src}")
+                }
+            });
+            source_refs.push(resolved);
+        }
+    } else if is_anonymous_url {
+        // `git fetch --set-upstream <url>` with no refspec fetches the remote HEAD into FETCH_HEAD
+        // with no tracking destination, so HEAD is the single source ref.
+        source_refs.push("HEAD".to_owned());
+    }
+    // A named remote with a configured tracking refspec maps every ref to a remote-tracking ref
+    // (peer_ref set), so there is no FETCH_HEAD-only source branch and nothing is configured.
+
+    if source_refs.len() > 1 {
+        eprintln!("warning: multiple branches detected, incompatible with --set-upstream");
+        return;
+    }
+    let Some(source_ref) = source_refs.into_iter().next() else {
+        return;
+    };
+
+    let branch = current_branch_from_head(git_dir);
+    let Some(branch) = branch else {
+        let shortname = source_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&source_ref);
+        eprintln!(
+            "warning: could not set upstream of HEAD to '{shortname}' from '{remote_name}' when \
+             it does not point to any branch."
+        );
+        return;
+    };
+
+    if source_ref == "HEAD" || source_ref.starts_with("refs/heads/") {
+        if let Err(err) = set_fetch_upstream_config(git_dir, &branch, remote_name, &source_ref) {
+            eprintln!("warning: failed to set upstream for branch '{branch}': {err}");
+        }
+    } else if source_ref.starts_with("refs/remotes/") {
+        eprintln!("warning: not setting upstream for a remote remote-tracking branch");
+    } else if source_ref.starts_with("refs/tags/") {
+        eprintln!("warning: not setting upstream for a remote tag");
+    } else {
+        eprintln!("warning: unknown branch type");
+    }
 }
 
 fn maybe_write_commit_graph_after_fetch(git_dir: &Path, args: &Args) -> Result<()> {
@@ -4936,7 +5109,7 @@ fn copy_reachable_objects_internal(
     Ok(())
 }
 
-fn prune_loose_objects_available_from_alternates(git_dir: &Path) -> Result<()> {
+pub(crate) fn prune_loose_objects_available_from_alternates(git_dir: &Path) -> Result<()> {
     let objects_dir = git_dir.join("objects");
     let alternates = grit_lib::pack::read_alternates_recursive(&objects_dir).unwrap_or_default();
     if alternates.is_empty() {
@@ -5724,6 +5897,49 @@ fn should_force_tag_update(config: &ConfigSet, remote_name: &str, args: &Args) -
         .unwrap_or(false)
 }
 
+/// How a tag should be updated during fetch.
+///
+/// Mirrors upstream Git's distinction between tags fetched through an *explicit* refspec
+/// (`--tags`, or a configured/CLI refspec whose destination lands under `refs/tags/`, e.g.
+/// `+refs/tags/two:refs/tags/two`) and tags that are merely *opportunistically auto-followed*
+/// because their target object was downloaded as part of a branch fetch.
+///
+/// Explicit tag updates honor force semantics: a non-fast-forward (a tag that moved) is rejected
+/// with `! [rejected] (would clobber existing tag)` unless the refspec is forced. Opportunistic
+/// auto-follow is strictly *add-only* — an existing local tag is left untouched (no update, no
+/// rejection, no error), matching `git fetch` against the default `+refs/heads/*:...` refspec.
+enum TagUpdateKind {
+    /// Tag is covered by an explicit tag refspec; `bool` is whether that refspec is forced.
+    Explicit { force: bool },
+    /// Tag is only opportunistically auto-followed (not covered by any explicit tag refspec).
+    Opportunistic,
+}
+
+/// Determine how `tag_refname` (a `refs/tags/...` ref) should be updated, given the active
+/// configured/CLI fetch refspecs and the `--tags` flag.
+fn tag_update_kind(
+    tag_refname: &str,
+    args: &Args,
+    configured_refspecs: &[FetchRefspec],
+    cli_refspecs: &[FetchRefspec],
+) -> TagUpdateKind {
+    // `--tags` behaves like an explicit `refs/tags/*:refs/tags/*` refspec (non-forced).
+    if args.tags {
+        return TagUpdateKind::Explicit { force: false };
+    }
+    for rs in cli_refspecs.iter().chain(configured_refspecs.iter()) {
+        if rs.negative {
+            continue;
+        }
+        if let Some(dst) = match_refspec_pattern(&rs.src, &rs.dst, tag_refname) {
+            if dst.starts_with("refs/tags/") {
+                return TagUpdateKind::Explicit { force: rs.force };
+            }
+        }
+    }
+    TagUpdateKind::Opportunistic
+}
+
 fn trace_ls_refs_head_prefix() {
     crate::trace_packet::trace_packet_line(b"fetch> ref-prefix HEAD");
 }
@@ -6173,12 +6389,22 @@ pub fn remote_fetch_refspecs(config: &ConfigSet, remote_name: &str) -> Vec<Fetch
     let specs = collect_refspecs(config, &key);
     let has_positive = specs.iter().any(|s| !s.negative);
     if has_positive {
-        specs
-    } else {
-        let mut out = default_fetch_refspecs(remote_name);
-        out.extend(specs);
-        out
+        return specs;
     }
+    // A configured remote that exists (has a `url`/`pushurl`) but carries no positive fetch
+    // refspec performs *no* opportunistic remote-tracking updates — matching upstream, where
+    // `remote->fetch` is left empty. (A `--single-branch` clone of a detached source HEAD writes
+    // exactly such a remote: only `url`, no `fetch`.) Only synthesize the default tracking spec
+    // for an otherwise-undefined remote name.
+    let url_key = format!("remote.{remote_name}.url");
+    let pushurl_key = format!("remote.{remote_name}.pushurl");
+    let remote_defined = config.get(&url_key).is_some() || config.get(&pushurl_key).is_some();
+    if remote_defined {
+        return specs;
+    }
+    let mut out = default_fetch_refspecs(remote_name);
+    out.extend(specs);
+    out
 }
 
 /// Returns true if a local (destination) ref is shielded from pruning by a negative refspec.
@@ -6955,25 +7181,16 @@ fn resolve_fetch_display_url(
 
 fn resolve_fetch_from_line_url(
     raw_url: &str,
-    url_override: Option<&str>,
-    remote_repo: Option<&Repository>,
-    default_display_url: &str,
+    _url_override: Option<&str>,
+    _remote_repo: Option<&Repository>,
+    _default_display_url: &str,
 ) -> String {
-    if url_override.is_none() && !crate::ssh_transport::is_configured_ssh_url(raw_url) {
-        if let Some(remote_repo) = remote_repo {
-            if let Ok(canon_remote) = canonical_repo_path(&remote_repo.git_dir) {
-                let mut s = canon_remote.to_string_lossy().to_string();
-                if let Some(prefix) = s.strip_suffix("/.git") {
-                    s = prefix.to_owned();
-                }
-                if !s.ends_with("/.") {
-                    s.push_str("/.");
-                }
-                return s;
-            }
-        }
-    }
-    default_display_url.to_owned()
+    // Git's `From <url>` header is the configured remote URL verbatim, only trimmed of trailing
+    // slashes and a `.git` suffix (builtin/fetch.c `display_state_init` -> `transport_anonymize_url`).
+    // It is NOT canonicalized and no `/.` is synthesized: `git clone .` stores the URL as `<cwd>/.`
+    // (see `absolute_clone_source_url` in clone.rs), so a superproject shows `From <cwd>/.` while a
+    // submodule whose URL is `<cwd>/submodule` shows `From <cwd>/submodule` with no trailing `/.`.
+    normalize_fetch_url_display(raw_url)
 }
 
 fn remotes_match_same_repository(git_dir: &Path, remote_repo: &Repository, url_str: &str) -> bool {

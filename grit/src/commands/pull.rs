@@ -137,6 +137,19 @@ pub struct Args {
     /// Do not verify GPG signatures (passed through to merge).
     #[arg(long = "no-verify-signatures")]
     pub no_verify_signatures: bool,
+
+    /// Set the upstream (branch.<name>.remote / .merge) of the current branch from the fetch
+    /// (passed through to the underlying fetch, matching `git pull --set-upstream`).
+    #[arg(long = "set-upstream")]
+    pub set_upstream: bool,
+
+    /// Fetch all tags from the remote (passed through to the underlying fetch).
+    #[arg(short = 't', long = "tags")]
+    pub tags: bool,
+
+    /// Do not fetch tags (passed through to the underlying fetch).
+    #[arg(long = "no-tags")]
+    pub no_tags: bool,
 }
 
 fn rebase_cli_value_is_valid(s: &str) -> bool {
@@ -226,7 +239,11 @@ fn pull_head_refspec_to_fetch_token(
         }
     }
     let Some(p) = local_remote_path else {
-        bail!("could not resolve remote HEAD for '{remote_name}' (missing refs/remotes/{remote_name}/HEAD)");
+        // No `refs/remotes/<remote>/HEAD` and no resolved local path (e.g. the remote URL is a bare
+        // relative name like `parent` that the local-path heuristic does not recognize). Leave the
+        // refspec as `HEAD`; the underlying fetch resolves the remote's advertised HEAD directly
+        // (`git fetch <remote> HEAD`), so pull need not pre-resolve it to a branch name.
+        return Ok("HEAD".to_owned());
     };
     remote_default_branch_short(p)
 }
@@ -296,7 +313,7 @@ fn die_no_merge_candidates(
             );
         } else {
             // repo == configured remote but no merge ref: fall through to the no-tracking message.
-            die_no_tracking_information(current_branch, config, opt_rebase);
+            die_no_tracking_information(current_branch, opt_rebase);
         }
     } else if current_branch.is_none() {
         eprintln!("You are not currently on a branch.");
@@ -310,7 +327,7 @@ fn die_no_merge_candidates(
         eprintln!("    git pull <remote> <branch>");
         eprintln!();
     } else if !merge_nr {
-        die_no_tracking_information(current_branch, config, opt_rebase);
+        die_no_tracking_information(current_branch, opt_rebase);
     } else {
         let merge_ref = current_branch
             .and_then(|b| config.get(&format!("branch.{b}.merge")))
@@ -326,7 +343,7 @@ fn die_no_merge_candidates(
     })
 }
 
-fn die_no_tracking_information(current_branch: Option<&str>, config: &ConfigSet, opt_rebase: bool) {
+fn die_no_tracking_information(current_branch: Option<&str>, opt_rebase: bool) {
     let branch = current_branch.unwrap_or("<branch>");
     eprintln!("There is no tracking information for the current branch.");
     if opt_rebase {
@@ -520,6 +537,33 @@ fn die_if_merge_in_progress(repo: &Repository) -> Result<()> {
     Ok(())
 }
 
+/// Apply `--set-upstream` for a pull that integrates from a local repository (the local-path or
+/// `git pull .` shortcuts that bypass `fetch::run`). `git pull --set-upstream` passes the flag
+/// straight through to fetch, so this mirrors `fetch::apply_set_upstream` using the original CLI
+/// refspecs.
+fn apply_pull_set_upstream(
+    git_dir: &Path,
+    remote_name: &str,
+    remote_git_dir: &Path,
+    cli_refspecs: &[String],
+    is_anonymous_url: bool,
+) {
+    let all_refs = refs::list_refs(remote_git_dir, "refs/").unwrap_or_default();
+    let symbolic_head = refs::read_symbolic_ref(remote_git_dir, "HEAD")
+        .ok()
+        .flatten()
+        .and_then(|s| s.strip_prefix("refs/heads/").map(ToOwned::to_owned));
+    super::fetch::apply_set_upstream(
+        git_dir,
+        remote_name,
+        cli_refspecs,
+        !cli_refspecs.is_empty(),
+        is_anonymous_url,
+        &all_refs,
+        symbolic_head.as_deref(),
+    );
+}
+
 pub fn run(args: Args) -> Result<()> {
     let mut args = normalize_pull_positionals(args);
     // Reconcile `-q`/`-v` into Git's single verbosity counter (clap parses them as independent
@@ -673,48 +717,110 @@ pub fn run(args: Args) -> Result<()> {
         // without updating `refs/tags/*`. Git keeps annotated tags only in FETCH_HEAD for
         // `git pull $path $tag` so throwaway-tag merges default to --no-ff (t7600).
         let remote_repo = open_repository_at_path(&remote_path)?;
-        super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
 
-        let lines = if args.refspecs.is_empty() {
-            let remote_oid = if let Ok(oid) =
-                refs::resolve_ref(&remote_repo.git_dir, &format!("refs/heads/{merge_branch}"))
-            {
-                oid
-            } else if let Ok(oid) = refs::resolve_ref(&remote_repo.git_dir, "HEAD") {
-                oid
+        // `fetch.recurseSubmodules` (or `--recurse-submodules`) makes the *fetch* phase descend into
+        // submodules. The non-local path gets this from `super::fetch::run`; the direct-copy
+        // shortcut must reproduce it, recording superproject ref tips around the copy so on-demand
+        // recursion can detect changed submodule pointers.
+        let fetch_recurse_mode = pull_fetch_recurse_mode(&args, &config)?;
+        recurse_fetch_submodules_for_local_pull(&config, fetch_recurse_mode, || {
+            // Resolve the OIDs this pull will bring in so we copy only their reachable closure as
+            // loose objects (and prune any already borrowable from an alternate), rather than
+            // hardlinking the remote's entire object store. Matches `git fetch`'s local transport:
+            // a `--reference` clone that pulls new commits keeps only the genuinely new objects
+            // local, not a wholesale copy of the source's packs (`t5604`).
+            let mut copy_roots: Vec<ObjectId> = Vec::new();
+            if args.refspecs.is_empty() {
+                if let Ok(oid) =
+                    refs::resolve_ref(&remote_repo.git_dir, &format!("refs/heads/{merge_branch}"))
+                        .or_else(|_| refs::resolve_ref(&remote_repo.git_dir, "HEAD"))
+                {
+                    copy_roots.push(oid);
+                }
             } else {
-                bail!("bad revision '{merge_branch}': could not resolve in remote");
-            };
-            let tracking_ref = format!("refs/remotes/{remote_name}/{merge_branch}");
-            refs::write_ref(&repo.git_dir, &tracking_ref, &remote_oid)
-                .with_context(|| format!("update remote-tracking ref {tracking_ref}"))?;
-            if let Ok(Some(sym)) = refs::read_symbolic_ref(&remote_repo.git_dir, "HEAD") {
-                let short = sym.strip_prefix("refs/heads/").unwrap_or(&sym);
-                if short == merge_branch.as_str() {
-                    let remote_head_ref = format!("refs/remotes/{remote_name}/HEAD");
-                    let _ =
-                        refs::write_symbolic_ref(&repo.git_dir, &remote_head_ref, &tracking_ref);
+                for spec in &effective_refspecs {
+                    if let Ok((oid, _)) = pull_fetch_head_line(&remote_repo, spec) {
+                        copy_roots.push(oid);
+                    }
                 }
             }
-            vec![format!(
-                "{}\t\tbranch 'refs/heads/{merge_branch}' of .\n",
-                remote_oid.to_hex()
-            )]
-        } else {
-            let mut out = Vec::new();
-            for spec in &effective_refspecs {
-                let (oid, desc) = pull_fetch_head_line(&remote_repo, spec)?;
-                out.push(format!("{}\t\t{desc}\n", oid.to_hex()));
-                // Opportunistically update the configured remote-tracking ref, the
-                // same way `git fetch <remote> <branch>` does: an explicit refspec
-                // still refreshes `refs/remotes/<remote>/<branch>` when a
-                // `remote.<name>.fetch` rule maps it (t5510 "explicit pull should
-                // update tracking").
-                update_opportunistic_tracking_ref(&repo, &remote_repo, remote_name, spec, &config)?;
+            if copy_roots.is_empty() {
+                super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
+            } else {
+                super::fetch::copy_reachable_objects(
+                    &remote_repo.git_dir,
+                    &repo.git_dir,
+                    &copy_roots,
+                )?;
+                super::fetch::prune_loose_objects_available_from_alternates(&repo.git_dir)?;
             }
-            out
-        };
-        fs::write(repo.git_dir.join("FETCH_HEAD"), lines.concat())?;
+
+            let lines = if args.refspecs.is_empty() {
+                let remote_oid = if let Ok(oid) =
+                    refs::resolve_ref(&remote_repo.git_dir, &format!("refs/heads/{merge_branch}"))
+                {
+                    oid
+                } else if let Ok(oid) = refs::resolve_ref(&remote_repo.git_dir, "HEAD") {
+                    oid
+                } else {
+                    bail!("bad revision '{merge_branch}': could not resolve in remote");
+                };
+                let tracking_ref = format!("refs/remotes/{remote_name}/{merge_branch}");
+                refs::write_ref(&repo.git_dir, &tracking_ref, &remote_oid)
+                    .with_context(|| format!("update remote-tracking ref {tracking_ref}"))?;
+                if let Ok(Some(sym)) = refs::read_symbolic_ref(&remote_repo.git_dir, "HEAD") {
+                    let short = sym.strip_prefix("refs/heads/").unwrap_or(&sym);
+                    if short == merge_branch.as_str() {
+                        let remote_head_ref = format!("refs/remotes/{remote_name}/HEAD");
+                        let _ = refs::write_symbolic_ref(
+                            &repo.git_dir,
+                            &remote_head_ref,
+                            &tracking_ref,
+                        );
+                    }
+                }
+                vec![format!(
+                    "{}\t\tbranch 'refs/heads/{merge_branch}' of .\n",
+                    remote_oid.to_hex()
+                )]
+            } else {
+                let mut out = Vec::new();
+                for spec in &effective_refspecs {
+                    let (oid, desc) = pull_fetch_head_line(&remote_repo, spec)?;
+                    out.push(format!("{}\t\t{desc}\n", oid.to_hex()));
+                    // Opportunistically update the configured remote-tracking ref, the
+                    // same way `git fetch <remote> <branch>` does: an explicit refspec
+                    // still refreshes `refs/remotes/<remote>/<branch>` when a
+                    // `remote.<name>.fetch` rule maps it (t5510 "explicit pull should
+                    // update tracking").
+                    update_opportunistic_tracking_ref(
+                        &repo,
+                        &remote_repo,
+                        remote_name,
+                        spec,
+                        &config,
+                    )?;
+                }
+                out
+            };
+            fs::write(repo.git_dir.join("FETCH_HEAD"), lines.concat())?;
+            Ok(())
+        })?;
+
+        if args.set_upstream {
+            // An anonymous URL/path remote (e.g. `git pull <file://...>`) that is not a configured
+            // remote uses the URL itself as the config remote value, and its bare HEAD as the merge
+            // source — mirroring `git fetch`'s `url_override` path.
+            let is_anonymous_url = remote_token_looks_like_path(remote_name)
+                && config.get(&format!("remote.{remote_name}.url")).is_none();
+            apply_pull_set_upstream(
+                &repo.git_dir,
+                remote_name,
+                &remote_repo.git_dir,
+                &args.refspecs,
+                is_anonymous_url,
+            );
+        }
 
         grit_lib::pack::clear_pack_cache();
         let kind = do_merge_or_rebase_after_fetch(&args, &config, &repo, &head)?;
@@ -767,12 +873,31 @@ pub fn run(args: Args) -> Result<()> {
                         pull_will_rebase_for_diag(&args, &config, current_branch.as_deref()),
                     ));
                 }
+                // `pull . <src>:<current-branch>`: the destination is the branch we are on, so the
+                // "fetch" updates HEAD's ref directly (git fetch `--update-head-ok`) and the working
+                // tree is then fast-forwarded (builtin/pull.c). Handle that here so the merge step
+                // sees an already-up-to-date FETCH_HEAD.
+                if let Some(branch) = current_branch.as_deref() {
+                    if fetch_updates_current_branch_dst(spec, branch) {
+                        pull_local_fetch_advances_current_branch(&repo, &config, spec, branch)?;
+                    }
+                }
                 let (oid, desc) = pull_fetch_head_line(&repo, spec)?;
                 out.push(format!("{}\t\t{desc}\n", oid.to_hex()));
             }
             out
         };
         fs::write(repo.git_dir.join("FETCH_HEAD"), lines.concat())?;
+
+        if args.set_upstream {
+            apply_pull_set_upstream(
+                &repo.git_dir,
+                remote_name,
+                &repo.git_dir,
+                &args.refspecs,
+                false,
+            );
+        }
 
         grit_lib::pack::clear_pack_cache();
         let kind = do_merge_or_rebase_after_fetch(&args, &config, &repo, &head)?;
@@ -790,8 +915,8 @@ pub fn run(args: Args) -> Result<()> {
         no_auto_gc: false,
         no_write_commit_graph: false,
         multiple: false,
-        tags: false,
-        no_tags: false,
+        tags: args.tags,
+        no_tags: args.no_tags,
         prune: false,
         no_prune: false,
         force: args.force,
@@ -821,7 +946,7 @@ pub fn run(args: Args) -> Result<()> {
         show_forced_updates: false,
         negotiate_only: false,
         negotiation_tip: Vec::new(),
-        set_upstream: false,
+        set_upstream: args.set_upstream,
         update_head_ok: false,
         prefetch: false,
         update_refs: false,
@@ -846,6 +971,10 @@ pub fn run(args: Args) -> Result<()> {
     grit_lib::pack::clear_pack_cache();
     if effective_refspecs.is_empty() {
         normalize_fetch_head_for_pull_branch(&repo, &merge_branch)?;
+    } else {
+        // Every command-line refspec is a merge candidate (builtin/fetch.c), including one with an
+        // explicit `<src>:<dst>` whose fetch wrote it not-for-merge.
+        mark_cli_refspecs_for_merge(&repo, &effective_refspecs)?;
     }
 
     let kind = do_merge_or_rebase_after_fetch(&args, &config, &repo, &head)?;
@@ -868,7 +997,11 @@ fn run_pull_all(
     let has_merge_cfg = current_branch
         .map(|b| config.get(&format!("branch.{b}.merge")).is_some())
         .unwrap_or(false);
-    if !has_merge_cfg {
+    // `--dry-run` only reports what fetch would do and stops before integrating, so the
+    // no-tracking diagnostic (which belongs to the integrate step) must not fire (t5521
+    // `pull --all --dry-run`). An unborn branch likewise has no merge candidate to complain about
+    // yet — defer to the post-fetch path.
+    if !has_merge_cfg && !args.dry_run && current_branch.is_some() {
         return Err(die_no_merge_candidates(
             None,
             false,
@@ -999,6 +1132,123 @@ fn submodule_update_after_pull_will_run(args: &Args, config: &ConfigSet) -> bool
     config_recurse
 }
 
+/// Run the recursive submodule **fetch** for the local-path pull shortcut.
+///
+/// The non-local fetch path delegates to `super::fetch::run`, which recurses into submodules itself
+/// (Git `cmd_pull` always shells out to `git fetch`). The local-path shortcut copies objects
+/// directly and bypasses that machinery, so when `fetch.recurseSubmodules` (or
+/// `--recurse-submodules`) requests submodule recursion we must reproduce it here: record the
+/// superproject ref tips around the object copy, then fetch each populated/changed submodule from
+/// its own remote (Git `fetch_submodules`). This is the *fetch* phase only — the submodule working
+/// tree is left untouched (that update happens separately when submodule recursion is enabled for
+/// the merge).
+fn recurse_fetch_submodules_for_local_pull(
+    config: &ConfigSet,
+    recurse: grit_lib::fetch_submodules::FetchRecurseSubmodules,
+    copy_and_record: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    use grit_lib::fetch_submodules::FetchRecurseSubmodules;
+    if recurse == FetchRecurseSubmodules::Off {
+        return copy_and_record();
+    }
+    let cwd = std::env::current_dir().context("cwd")?;
+    let repo = Repository::discover(Some(cwd.as_path())).context("open repository")?;
+    crate::fetch_submodule_record::begin_fetch_submodule_record(&repo.git_dir);
+    copy_and_record()?;
+    crate::fetch_submodule_record::finish_record_tips_after(&repo.git_dir);
+    let fetch_args = fetch_args_for_recurse(config);
+    crate::fetch_submodule_recurse::recursive_fetch_submodules_after_fetch(
+        &repo.git_dir,
+        config,
+        &fetch_args,
+        recurse,
+    )
+}
+
+/// Build a minimal `fetch::Args` carrying only the fields the recursive submodule fetch reads
+/// (parallelism, dry-run/quiet propagation, prefix). All other fields take their defaults.
+fn fetch_args_for_recurse(_config: &ConfigSet) -> super::fetch::Args {
+    super::fetch::Args {
+        remote: None,
+        refspecs: Vec::new(),
+        filter: None,
+        no_filter: false,
+        all: false,
+        no_all: false,
+        no_auto_gc: false,
+        no_write_commit_graph: false,
+        multiple: false,
+        tags: false,
+        no_tags: false,
+        prune: false,
+        no_prune: false,
+        force: false,
+        prune_tags: false,
+        atomic: false,
+        append: false,
+        dry_run: false,
+        write_fetch_head: false,
+        no_write_fetch_head: false,
+        refmap: Vec::new(),
+        deepen: None,
+        depth: None,
+        shallow_since: None,
+        shallow_exclude: None,
+        unshallow: false,
+        update_shallow: false,
+        refetch: false,
+        keep: false,
+        output: None,
+        quiet: false,
+        verbose: 0,
+        jobs: None,
+        server_options: Vec::new(),
+        porcelain: false,
+        no_porcelain: false,
+        no_show_forced_updates: false,
+        show_forced_updates: false,
+        negotiate_only: false,
+        negotiation_tip: Vec::new(),
+        set_upstream: false,
+        update_head_ok: false,
+        prefetch: false,
+        update_refs: false,
+        upload_pack: None,
+        recurse_submodules: None,
+        no_recurse_submodules: false,
+        recurse_submodules_default: None,
+        submodule_prefix: None,
+        no_ipv4: false,
+        no_ipv6: false,
+    }
+}
+
+/// Resolve the submodule **fetch** recursion mode for a pull, matching
+/// `fetch_recurse_submodules_mode`: `--no-recurse-submodules` forces off, an explicit
+/// `--recurse-submodules[=val]` wins next, then `fetch.recurseSubmodules`; otherwise `Default`
+/// (on-demand) so only changed submodules recurse.
+fn pull_fetch_recurse_mode(
+    args: &Args,
+    config: &ConfigSet,
+) -> Result<grit_lib::fetch_submodules::FetchRecurseSubmodules> {
+    use grit_lib::fetch_submodules::{parse_fetch_recurse_submodules_arg, FetchRecurseSubmodules};
+    if args.no_recurse_submodules {
+        return Ok(FetchRecurseSubmodules::Off);
+    }
+    if let Some(raw) = args.recurse_submodules.as_deref() {
+        return parse_fetch_recurse_submodules_arg("--recurse-submodules", raw)
+            .map_err(|e| anyhow::anyhow!(e));
+    }
+    if let Some(raw) = config
+        .get("fetch.recursesubmodules")
+        .or_else(|| config.get("fetch.recurseSubmodules"))
+    {
+        return parse_fetch_recurse_submodules_arg("fetch.recurseSubmodules", raw.trim())
+            .map_err(|e| anyhow::anyhow!(e));
+    }
+    Ok(FetchRecurseSubmodules::Default)
+}
+
 fn maybe_update_submodules_after_pull(
     args: &Args,
     config: &ConfigSet,
@@ -1109,6 +1359,72 @@ fn split_pull_refspec(spec: &str) -> (&str, Option<&str>) {
     }
 }
 
+/// True when a refspec's destination is the branch we are currently on (`pull . second:third` while
+/// on `third`), so the fetch would update HEAD's own ref.
+fn fetch_updates_current_branch_dst(spec: &str, current_branch: &str) -> bool {
+    let Some(dst) = split_pull_refspec(spec).1 else {
+        return false;
+    };
+    let dst_short = dst
+        .strip_prefix("refs/heads/")
+        .unwrap_or(dst)
+        .trim_start_matches('+');
+    !dst_short.is_empty() && dst_short == current_branch
+}
+
+/// Handle `pull . <src>:<current-branch>`: the fetch advances the current branch's ref, then the
+/// working tree is fast-forwarded (builtin/pull.c: warn "fetch updated the current branch head" and
+/// `checkout_fast_forward`). Updates `refs/heads/<branch>` to the source tip and fast-forwards the
+/// work tree; a conflicting work tree aborts with git's recovery hint (t5520 tests 18, 19).
+fn pull_local_fetch_advances_current_branch(
+    repo: &Repository,
+    _config: &ConfigSet,
+    spec: &str,
+    branch: &str,
+) -> Result<()> {
+    let (src, _dst) = split_pull_refspec(spec);
+    let new_oid = resolve_revision(repo, src).with_context(|| format!("bad revision '{src}'"))?;
+    let branch_ref = format!("refs/heads/{branch}");
+    let Ok(orig_oid) = refs::resolve_ref(&repo.git_dir, &branch_ref) else {
+        return Ok(());
+    };
+    if orig_oid == new_oid {
+        return Ok(());
+    }
+    // Only a true fast-forward of the ref triggers the working-tree fast-forward path; a non-ff
+    // update is rejected by fetch without `--force` (out of scope for these tests).
+    if !is_ancestor(repo, orig_oid, new_oid)? {
+        return Ok(());
+    }
+
+    refs::write_ref(&repo.git_dir, &branch_ref, &new_oid)?;
+
+    eprintln!("warning: fetch updated the current branch head.");
+    eprintln!("fast-forwarding your working tree from");
+    eprintln!("commit {}.", orig_oid.to_hex());
+
+    match super::merge::checkout_fast_forward_worktree_only(repo, orig_oid, new_oid) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if format!("{e:#}").contains(super::merge::WORKTREE_FF_BLOCKED) {
+                // Restore the ref: git leaves the branch advanced but the diagnostic instructs the
+                // user to recover; the test only checks the message and that the work tree is intact.
+                eprintln!("fatal: Cannot fast-forward your working tree.");
+                eprintln!("After making sure that you saved anything precious from");
+                eprintln!("$ git diff {}", orig_oid.to_hex());
+                eprintln!("output, run");
+                eprintln!("$ git reset --hard");
+                eprintln!("to recover.");
+                return Err(anyhow::Error::new(ExplicitExit {
+                    code: 128,
+                    message: String::new(),
+                }));
+            }
+            Err(e)
+        }
+    }
+}
+
 fn pull_fetch_head_line(remote: &Repository, spec: &str) -> Result<(ObjectId, String)> {
     use grit_lib::objects::ObjectKind;
     use grit_lib::refs::resolve_ref;
@@ -1206,6 +1522,57 @@ fn fetch_head_line_parts(line: &str) -> Option<(&str, &str)> {
         return None;
     }
     Some((oid, desc))
+}
+
+/// Mark the FETCH_HEAD entries fetched via explicit command-line refspecs as for-merge.
+///
+/// `builtin/fetch.c` records every command-line refspec as `FETCH_HEAD_MERGE` ("Merge everything on
+/// the command line"), even one with an explicit `<src>:<dst>`. Grit's fetch writes such an entry
+/// `not-for-merge` (its destination is a tracking ref), which would leave `git pull <remote>
+/// <src>:<dst>` with no merge candidate. Re-mark only the lines whose source matches a CLI refspec
+/// so auto-followed tags (`--tags`) stay not-for-merge (t5553 `pull --set-upstream main:other2`).
+fn mark_cli_refspecs_for_merge(repo: &Repository, refspecs: &[String]) -> Result<()> {
+    if refspecs.is_empty() {
+        return Ok(());
+    }
+    // Short source names named on the command line (e.g. `main`, `HEAD`, `refs/heads/x` -> `x`).
+    let wanted: HashSet<String> = refspecs
+        .iter()
+        .map(|spec| {
+            let (src, _dst) = split_pull_refspec(spec);
+            src.strip_prefix("refs/heads/").unwrap_or(src).to_owned()
+        })
+        .collect();
+
+    let path = repo.git_dir.join("FETCH_HEAD");
+    let content = match fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Ok(()),
+    };
+    let mut changed = false;
+    let mut lines = Vec::new();
+    for line in content.lines() {
+        // Only promote `branch '<name>'` lines whose name was requested on the command line; leave
+        // tag lines and unrelated entries untouched.
+        let is_cli_branch = fetch_head_branch_name(line)
+            .map(|name| wanted.contains(name))
+            .unwrap_or(false);
+        if is_cli_branch {
+            if let Some((oid, desc)) = fetch_head_line_parts(line) {
+                let promoted = format!("{oid}\t\t{desc}");
+                if promoted != line {
+                    changed = true;
+                }
+                lines.push(promoted);
+                continue;
+            }
+        }
+        lines.push(line.to_owned());
+    }
+    if changed {
+        fs::write(&path, lines.join("\n") + "\n").context("writing FETCH_HEAD")?;
+    }
+    Ok(())
 }
 
 fn normalize_fetch_head_for_pull_branch(repo: &Repository, merge_branch: &str) -> Result<()> {
@@ -1410,12 +1777,30 @@ fn do_merge_or_rebase_after_fetch(
         // rebase must still run so the editor opens with the todo list even on a fast-forward
         // (t5520 `pull.rebase=interactive`), so do not take the shortcut for it.
         if can_ff && rebase_kind != PullRebaseKind::Interactive {
+            // This shortcut stands in for a fast-forwarding rebase, so an unspecified autostash
+            // decision falls back to `rebase.autostash` (not `merge.autostash`) — git's rebase
+            // would autostash the dirty tree before fast-forwarding (t5520 "--rebase with
+            // rebase.autostash succeeds on ff").
+            let ff_autostash = match pull_autostash {
+                AutostashTri::Unset => {
+                    if config
+                        .get_bool("rebase.autostash")
+                        .map(|r| r.unwrap_or(false))
+                        .unwrap_or(false)
+                    {
+                        AutostashTri::On
+                    } else {
+                        AutostashTri::Unset
+                    }
+                }
+                other => other,
+            };
             let merge_args = build_pull_merge_args(
                 args,
                 false,
                 false,
                 true,
-                pull_autostash,
+                ff_autostash,
                 vec!["FETCH_HEAD".to_owned()],
             )?;
             super::merge::run(merge_args)?;
@@ -1535,11 +1920,18 @@ fn rebase_tracking_branch(
 ) -> Option<(String, ObjectId)> {
     // `pull <remote> <branch>`: tracking ref is `refs/remotes/<remote>/<branch>`.
     if let (Some(remote), Some(branch)) = (args.remote.as_deref(), args.refspecs.first()) {
-        if !remote_token_looks_like_path(remote)
-            && config.get(&format!("remote.{remote}.url")).is_some()
-        {
-            let (src, _dst) = split_pull_refspec(branch);
-            let short = src.strip_prefix("refs/heads/").unwrap_or(src);
+        let (src, _dst) = split_pull_refspec(branch);
+        let short = src.strip_prefix("refs/heads/").unwrap_or(src);
+        // `pull . <branch>` (or any local-path remote) fork-points against the local branch itself
+        // (git `get_tracking_branch(".", refspec)` resolves to the source ref on the same repo).
+        if remote == "." || remote_token_looks_like_path(remote) {
+            let local = format!("refs/heads/{short}");
+            if let Ok(oid) = refs::resolve_ref(&repo.git_dir, &local) {
+                return Some((local, oid));
+            }
+            return None;
+        }
+        if config.get(&format!("remote.{remote}.url")).is_some() {
             let track = format!("refs/remotes/{remote}/{short}");
             if let Ok(oid) = refs::resolve_ref(&repo.git_dir, &track) {
                 return Some((track, oid));

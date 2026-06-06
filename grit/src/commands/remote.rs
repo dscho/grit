@@ -272,12 +272,27 @@ struct RemoteUrls {
     push: Vec<String>,
 }
 
+/// Collect a remote's URL list applying Git's `add_url` semantics: an empty value clears the
+/// accumulated list (so later non-empty values start a fresh list), matching
+/// `git -c remote.<n>.url= -c remote.<n>.url=real`.
+fn collect_url_list(config: &ConfigSet, key: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in config.get_all(key) {
+        if v.is_empty() {
+            out.clear();
+        } else {
+            out.push(v);
+        }
+    }
+    out
+}
+
 fn remote_urls_effective(config: &ConfigSet, name: &str) -> Option<RemoteUrls> {
-    let fetch = config.get_all(&format!("remote.{name}.url"));
+    let fetch = collect_url_list(config, &format!("remote.{name}.url"));
     if fetch.is_empty() {
         return None;
     }
-    let push = config.get_all(&format!("remote.{name}.pushurl"));
+    let push = collect_url_list(config, &format!("remote.{name}.pushurl"));
     Some(RemoteUrls { fetch, push })
 }
 
@@ -431,11 +446,12 @@ fn cmd_add(rest: &[String]) -> Result<()> {
         config_file.set(&format!("remote.{name}.mirror"), "true")?;
     }
     match tags {
+        // Git writes the camelCase `tagOpt` variable name (t5505 greps for `tagOpt`).
         TagsMode::All => {
-            config_file.set(&format!("remote.{name}.tagopt"), "--tags")?;
+            config_file.set(&format!("remote.{name}.tagOpt"), "--tags")?;
         }
         TagsMode::None => {
-            config_file.set(&format!("remote.{name}.tagopt"), "--no-tags")?;
+            config_file.set(&format!("remote.{name}.tagOpt"), "--no-tags")?;
         }
         _ => {}
     }
@@ -546,6 +562,9 @@ fn cmd_remove(rest: &[String]) -> Result<()> {
     let config_path = git_dir.join("config");
     let mut config_file = load_or_create_config_file(&config_path)?;
     unset_branch_remote_for(&mut config_file, name)?;
+    // Git's `rm` calls `handle_push_default(name, NULL)`: a *local* `remote.pushDefault` that names
+    // the removed remote is unset (global/system pushDefault is left untouched).
+    unset_local_push_default_if(&mut config_file, name)?;
     let section = format!("remote.{name}");
     if !config_file.remove_section(&section)? {
         return Err(anyhow::Error::new(ExplicitExit {
@@ -704,6 +723,69 @@ fn reverse_map_src(dst_pat: &str, src_pat: &str, local_ref: &str) -> Option<Stri
     None
 }
 
+/// Migrate a legacy `$GIT_DIR/remotes/<name>` or `$GIT_DIR/branches/<name>` remote into config
+/// (Git's `migrate_file`): write `remote.<name>.{url,push,fetch}` then unlink the source file.
+fn migrate_remote_file(git_dir: &Path, name: &str) -> Result<()> {
+    let remotes_file = git_dir.join("remotes").join(name);
+    let branches_file = git_dir.join("branches").join(name);
+
+    let (url, push, fetch): (Vec<String>, Vec<String>, Vec<String>) = if remotes_file.is_file() {
+        // `$GIT_DIR/remotes/<name>`: `URL:`, `Push:`, `Pull:` lines.
+        let content = std::fs::read_to_string(&remotes_file).context("reading remotes file")?;
+        let mut url = Vec::new();
+        let mut push = Vec::new();
+        let mut fetch = Vec::new();
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("URL:") {
+                url.push(rest.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix("Push:") {
+                push.push(rest.trim().to_owned());
+            } else if let Some(rest) = line.strip_prefix("Pull:") {
+                fetch.push(rest.trim().to_owned());
+            }
+        }
+        (url, push, fetch)
+    } else {
+        // `$GIT_DIR/branches/<name>`: a single `url` or `url#branch` line.
+        let raw = std::fs::read_to_string(&branches_file).context("reading branches file")?;
+        let line = raw.lines().next().unwrap_or("").trim().to_owned();
+        let (url_part, frag) = match line.split_once('#') {
+            Some((u, b)) => (u.trim().to_owned(), b.trim().to_owned()),
+            None => {
+                let cfg = load_local_config(git_dir)?;
+                (
+                    line.clone(),
+                    crate::commands::fetch::repo_default_branch_name(&cfg),
+                )
+            }
+        };
+        let fetch = vec![format!("refs/heads/{frag}:refs/heads/{name}")];
+        let push = vec![format!("HEAD:refs/heads/{frag}")];
+        (vec![url_part], push, fetch)
+    };
+
+    let config_path = git_dir.join("config");
+    let mut config_file = load_or_create_config_file(&config_path)?;
+    for u in &url {
+        config_file.add_value(&format!("remote.{name}.url"), u)?;
+    }
+    for p in &push {
+        config_file.add_value(&format!("remote.{name}.push"), p)?;
+    }
+    for f in &fetch {
+        config_file.add_value(&format!("remote.{name}.fetch"), f)?;
+    }
+    config_file.write().context("writing config")?;
+
+    if remotes_file.is_file() {
+        let _ = std::fs::remove_file(&remotes_file);
+    } else {
+        let _ = std::fs::remove_file(&branches_file);
+    }
+    Ok(())
+}
+
 fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     let mut i = 0usize;
     let mut show_progress = false;
@@ -721,11 +803,22 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     let new = rest[1].clone();
     let git_dir = resolve_git_dir()?;
     let config = load_local_config(&git_dir)?;
-    if !remote_section_exists(&config, &old) {
+
+    // A remote may be configured via `remote.<name>.*` config OR a legacy `$GIT_DIR/remotes/<name>`
+    // / `$GIT_DIR/branches/<name>` file. Renaming a file-based remote to its own name migrates it
+    // into config (Git's `migrate_file`).
+    let in_config = remote_section_exists(&config, &old);
+    let remotes_file = git_dir.join("remotes").join(&old);
+    let branches_file = git_dir.join("branches").join(&old);
+    let from_file = remotes_file.is_file() || branches_file.is_file();
+    if !in_config && !from_file {
         return Err(anyhow::Error::new(ExplicitExit {
             code: 2,
             message: format!("error: No such remote: '{old}'"),
         }));
+    }
+    if old == new && !in_config && from_file {
+        return migrate_remote_file(&git_dir, &old);
     }
     // Git's collision check uses `remote_is_configured(..., in_repo=1)`: a remote that exists only
     // via global/system config (e.g. a stray `remote.<new>.prune`) does not block the rename.
@@ -837,6 +930,17 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     }
 
     let identity = git_identity_line()?;
+    // Capture each ref's existing reflog before deletion so it can be carried over to the new ref
+    // (Git renames the reflog along with the ref).
+    let saved_reflogs: HashMap<String, String> = refs_to_move
+        .iter()
+        .filter_map(|(old_ref, _, _)| {
+            let p = git_dir.join("logs").join(old_ref);
+            std::fs::read_to_string(&p)
+                .ok()
+                .map(|c| (old_ref.clone(), c))
+        })
+        .collect();
     // Delete every old ref first so nesting `parent` into `parent/child` does not leave a file
     // blocking the new directory, then recreate at the renamed path.
     for (old_ref, _, _) in &refs_to_move {
@@ -860,9 +964,13 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
             continue;
         };
         refs::write_ref(&git_dir, &new_ref, oid)?;
-        // Move the existing reflog (if any) to the new ref, then append the rename entry with the
-        // ref's current OID for both old and new value (matching Git's reflog rename).
-        move_reflog_file(&git_dir, old_ref, &new_ref);
+        // Restore the carried-over reflog, then append the rename entry (current OID for both
+        // old and new value), matching Git's reflog rename.
+        restore_reflog(
+            &git_dir,
+            &new_ref,
+            saved_reflogs.get(old_ref).map(String::as_str),
+        );
         let msg = format!("remote: renamed {old_ref} to {new_ref}");
         refs::append_reflog(&git_dir, &new_ref, oid, oid, &identity, &msg, true)?;
     }
@@ -870,17 +978,22 @@ fn cmd_rename(rest: &[String], _from_add: bool) -> Result<()> {
     Ok(())
 }
 
-/// Move the loose reflog file from `old_ref` to `new_ref` under `.git/logs/`, if it exists.
-fn move_reflog_file(git_dir: &Path, old_ref: &str, new_ref: &str) {
-    let old_log = git_dir.join("logs").join(old_ref);
+/// Restore a previously captured reflog (`old_contents`) at the `new_ref`'s loose log path. When
+/// no reflog was carried over, any reflog stub created by `write_ref` is removed so only the
+/// subsequent rename entry remains.
+fn restore_reflog(git_dir: &Path, new_ref: &str, old_contents: Option<&str>) {
     let new_log = git_dir.join("logs").join(new_ref);
-    if !old_log.is_file() {
-        return;
-    }
     if let Some(parent) = new_log.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::rename(&old_log, &new_log);
+    match old_contents {
+        Some(contents) => {
+            let _ = std::fs::write(&new_log, contents);
+        }
+        None => {
+            let _ = std::fs::remove_file(&new_log);
+        }
+    }
 }
 
 /// Whether creating `new_ref` would clash with an existing ref in the store as a name-prefix or
@@ -1030,6 +1143,23 @@ fn update_push_default_if_local(config_file: &mut ConfigFile, old: &str, new: &s
     {
         // Preserve Git's camelCase variable name `pushDefault` (t5505 greps for it).
         config_file.set("remote.pushDefault", new)?;
+    }
+    Ok(())
+}
+
+/// Unset the repository-local `remote.pushDefault` when it names `remote` (Git's
+/// `handle_push_default(remote, NULL)` for `git remote remove`).
+fn unset_local_push_default_if(config_file: &mut ConfigFile, remote: &str) -> Result<()> {
+    let key = "remote.pushdefault";
+    let matches = config_file
+        .entries
+        .iter()
+        .rev()
+        .find(|e| e.key == key)
+        .and_then(|e| e.value.as_deref())
+        == Some(remote);
+    if matches {
+        let _ = config_file.unset(key);
     }
     Ok(())
 }
@@ -1205,21 +1335,29 @@ fn cmd_set_url(rest: &[String]) -> Result<()> {
 }
 
 fn cmd_set_branches(rest: &[String]) -> Result<()> {
+    // Git uses `parse_options` (permuting), so `--add` may appear anywhere among the positional
+    // arguments, e.g. `set-branches scratch --add other`. Collect it wherever it lands; `--` ends
+    // option parsing.
     let mut add_mode = false;
-    let mut i = 0usize;
-    if rest.first().map(|s| s.as_str()) == Some("--add") {
-        add_mode = true;
-        i = 1;
+    let mut positionals: Vec<String> = Vec::new();
+    let mut saw_dashdash = false;
+    for a in rest {
+        if !saw_dashdash && a == "--" {
+            saw_dashdash = true;
+        } else if !saw_dashdash && a == "--add" {
+            add_mode = true;
+        } else {
+            positionals.push(a.clone());
+        }
     }
-    let rest = &rest[i..];
-    if rest.is_empty() {
+    if positionals.is_empty() {
         return Err(anyhow::Error::new(ExplicitExit {
             code: 129,
             message: "error: no remote specified".to_owned(),
         }));
     }
-    let name = rest[0].clone();
-    let branches: Vec<String> = rest[1..].to_vec();
+    let name = positionals[0].clone();
+    let branches: Vec<String> = positionals[1..].to_vec();
     let git_dir = resolve_git_dir()?;
     let config = load_local_config(&git_dir)?;
     if !remote_section_exists(&config, &name) {
@@ -1466,6 +1604,7 @@ fn guess_remote_head_names(remote_git: &Path, config: &ConfigSet) -> Result<Vec<
             tags: false,
             refs_only: false,
             symref: true,
+            all_symrefs: false,
             patterns: Vec::new(),
         },
     )?;
@@ -1674,19 +1813,23 @@ fn show_one_remote(
         listed.sort_by(|a, b| a.0.cmp(&b.0));
         merge_remote_branch_status(&mut listed);
     } else {
-        for (lr, _) in refs::list_refs(git_dir, &format!("refs/remotes/{name}/"))? {
-            if lr.ends_with("/HEAD") {
-                continue;
-            }
+        // No-query mode (Git's `append_ref_to_tracked_list`): for every non-symbolic local ref,
+        // reverse-map it through the remote's fetch refspecs and list the abbreviated remote source
+        // name. This surfaces e.g. `refs/heads/main` for a `refs/heads/main:refs/heads/upstream`
+        // fetch line, not just `refs/remotes/<name>/*` tracking refs.
+        for (lr, _) in refs::list_refs(git_dir, "refs/")? {
             if let Ok(Some(_)) = grit_lib::refs::read_symbolic_ref(git_dir, &lr) {
                 continue;
             }
-            let branch = lr
-                .strip_prefix(&format!("refs/remotes/{name}/"))
-                .unwrap_or(&lr);
-            listed.push((branch.to_owned(), String::new()));
+            let mut src: Option<String> = None;
+            if remote_find_tracking_src(&remote_stub, &lr, &mut src).is_ok() {
+                if let Some(s) = src {
+                    listed.push((abbrev_branch(&s).to_owned(), String::new()));
+                }
+            }
         }
         listed.sort_by(|a, b| a.0.cmp(&b.0));
+        listed.dedup();
     }
 
     if !listed.is_empty() {
@@ -1759,29 +1902,35 @@ fn show_one_remote(
             }
         }
     } else {
+        // No-query push display (Git's `get_push_ref_states_noquery` + `show_push_info_item`).
         let specs = config.get_all(&format!("remote.{name}.push"));
+        // Build (src, dest, forced) triples matching Git's spec interpretation.
+        let mut rows: Vec<(String, String, bool)> = Vec::new();
         if specs.is_empty() {
-            println!("  Local refs configured for 'git push' (status not queried):");
-            println!("    (matching)           pushes to (matching)");
-        } else {
-            println!("  Local refs configured for 'git push' (status not queried):");
-            for s in specs {
-                let (forced, rest) = if let Some(r) = s.strip_prefix('+') {
-                    (true, r)
-                } else {
-                    (false, s.as_str())
-                };
-                if rest == ":" {
-                    println!("    (matching)           pushes to (matching)");
-                    continue;
-                }
-                if let Some((a, b)) = rest.split_once(':') {
-                    let verb = if forced { "forces to" } else { "pushes to" };
-                    println!("    {a:24} {verb} {b}");
-                } else {
-                    println!("    {rest}");
-                }
+            rows.push(("(matching)".to_owned(), "(matching)".to_owned(), false));
+        }
+        for s in &specs {
+            let (forced, rest) = if let Some(r) = s.strip_prefix('+') {
+                (true, r)
+            } else {
+                (false, s.as_str())
+            };
+            if rest == ":" {
+                rows.push(("(matching)".to_owned(), "(matching)".to_owned(), false));
+                continue;
             }
+            let (src, dst) = match rest.split_once(':') {
+                Some((a, b)) => (a.to_owned(), b.to_owned()),
+                // Source-only spec (e.g. `+refs/tags/lastbackup`): dest mirrors the source.
+                None => (rest.to_owned(), rest.to_owned()),
+            };
+            rows.push((src, dst, forced));
+        }
+        println!("  Local refs configured for 'git push' (status not queried):");
+        let width = rows.iter().map(|(s, _, _)| s.len()).max().unwrap_or(0);
+        for (src, dst, forced) in rows {
+            let verb = if forced { "forces to" } else { "pushes to" };
+            println!("    {src:width$} {verb} {dst}");
         }
     }
 
@@ -2129,6 +2278,17 @@ fn prune_one(git_dir: &Path, config: &ConfigSet, name: &str, dry: bool) -> Resul
     }
     println!("Pruning {name}");
     println!("URL: {url}");
+    // Capture symref targets before deletion so we can warn about any that become dangling.
+    let symrefs: Vec<(String, String)> = refs::list_refs(git_dir, "refs/remotes/")?
+        .into_iter()
+        .filter_map(|(rn, _)| {
+            grit_lib::refs::read_symbolic_ref(git_dir, &rn)
+                .ok()
+                .flatten()
+                .map(|target| (rn, target))
+        })
+        .collect();
+    let deleted: HashSet<&String> = stale.iter().collect();
     for r in &stale {
         let short = abbrev_branch(r);
         if dry {
@@ -2136,6 +2296,16 @@ fn prune_one(git_dir: &Path, config: &ConfigSet, name: &str, dry: bool) -> Resul
         } else {
             refs::delete_ref(git_dir, r).with_context(|| format!("pruning {r}"))?;
             println!(" * [pruned] {short}");
+        }
+    }
+    // Git's `refs_warn_dangling_symrefs`: any symref pointing at a (now) deleted ref is reported.
+    for (sym_name, target) in &symrefs {
+        if deleted.contains(target) {
+            if dry {
+                eprintln!("{sym_name} will become dangling after {target} is deleted");
+            } else {
+                eprintln!("{sym_name} has become dangling after {target} was deleted");
+            }
         }
     }
     Ok(())
@@ -2166,8 +2336,7 @@ fn cmd_update(rest: &[String], verbose: bool) -> Result<()> {
         if has_default {
             rest.push("default".to_owned());
         } else {
-            let names = collect_remote_names_from_config(&config);
-            for n in names {
+            for n in default_update_remotes(&config) {
                 run_fetch_for_update(&n, verbose, prune)?;
             }
             return Ok(());
@@ -2175,8 +2344,7 @@ fn cmd_update(rest: &[String], verbose: bool) -> Result<()> {
     }
     for g in rest {
         if g == "default" && !has_default {
-            let names = collect_remote_names_from_config(&config);
-            for n in names {
+            for n in default_update_remotes(&config) {
                 run_fetch_for_update(&n, verbose, prune)?;
             }
             continue;
@@ -2197,6 +2365,29 @@ fn cmd_update(rest: &[String], verbose: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Remotes fetched by the implicit `default` update group: all configured remotes minus any with
+/// `remote.<name>.skipDefaultUpdate` or `remote.<name>.skipFetchAll` set to a true value
+/// (Git's `default` pseudo-group). Returned sorted to match `git remote update`'s ordering.
+fn default_update_remotes(config: &ConfigSet) -> Vec<String> {
+    let mut names = collect_remote_names_from_config(config);
+    names.sort();
+    names
+        .into_iter()
+        .filter(|n| {
+            let skip = |key: &str| {
+                config
+                    .get(&format!("remote.{n}.{key}"))
+                    .map(|v| {
+                        let v = v.trim().to_ascii_lowercase();
+                        v == "true" || v == "yes" || v == "1" || v == "on"
+                    })
+                    .unwrap_or(false)
+            };
+            !(skip("skipdefaultupdate") || skip("skipfetchall"))
+        })
+        .collect()
 }
 
 fn run_fetch_for_update(remote: &str, verbose: bool, prune: Option<bool>) -> Result<()> {

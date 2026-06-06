@@ -177,7 +177,7 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     if args.stateless_rpc {
-        let _ = process_one_v2_request(&mut io::stdin().lock(), &git_dir, &caps)?;
+        let _ = process_one_v2_request(&mut io::stdin().lock(), &git_dir, &caps, true)?;
         return Ok(());
     }
 
@@ -190,9 +190,13 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 /// Read requests from `input` until EOF or a headerless flush (client hang-up).
+///
+/// This is the stateful (file/ssh local) transport: a single persistent connection carries the
+/// whole exchange, so once the server is `ready` it streams the packfile in the same response
+/// without reading a follow-up request.
 pub fn serve_loop(input: &mut impl Read, git_dir: &Path, caps: &ServerCaps) -> Result<()> {
     loop {
-        if process_one_v2_request(input, git_dir, caps)? {
+        if process_one_v2_request(input, git_dir, caps, false)? {
             break;
         }
     }
@@ -201,11 +205,17 @@ pub fn serve_loop(input: &mut impl Read, git_dir: &Path, caps: &ServerCaps) -> R
 
 /// Process a single protocol v2 request from `input`.
 ///
+/// `stateless_rpc` is true for the smart-HTTP transport, where each negotiation round is a separate
+/// request/response: when the server becomes `ready` it ends the response after the
+/// `acknowledgments` section and the client sends a follow-up request (with `done`) to receive the
+/// pack. In stateful mode (`false`) the server instead falls through to stream the pack inline.
+///
 /// Returns `Ok(true)` when the client ended the session (EOF or flush with no keys).
 pub fn process_one_v2_request(
     input: &mut impl Read,
     git_dir: &Path,
     caps: &ServerCaps,
+    stateless_rpc: bool,
 ) -> Result<bool> {
     let (header_lines, terminator) = pkt_line::read_until_flush_or_delim(input)?;
 
@@ -288,6 +298,7 @@ pub fn process_one_v2_request(
             &mut out,
             caps,
             accepted_promisor_remotes.as_deref(),
+            stateless_rpc,
         )?,
         "object-info" => cmd_object_info(git_dir, &args, &mut out)?,
         "bundle-uri" => cmd_bundle_uri(git_dir, &args, &mut out)?,
@@ -321,13 +332,22 @@ fn cmd_ls_refs(git_dir: &Path, args: &[String], out: &mut impl Write) -> Result<
     // If too many prefixes (>= 65536), ignore them all (list everything).
     let use_prefixes = prefixes.len() < 65536;
 
+    // `transfer.hideRefs` / `uploadpack.hideRefs`: hidden refs are not advertised. Patterns prefixed
+    // `^` match the full storage name, otherwise the namespace-stripped advertised name.
+    let cfg = ConfigSet::load(Some(git_dir), false).unwrap_or_default();
+    let hide = grit_lib::hide_refs::hide_ref_patterns_uploadpack(&cfg);
+
     // Collect all refs.
     let mut entries: Vec<RefInfo> = Vec::new();
 
-    // HEAD
+    // HEAD (resolved relative to the active namespace). Its symref-target is the namespace-stripped
+    // logical ref so a clone under `GIT_NAMESPACE` selects the namespaced HEAD branch (t5509).
     if let Ok(head_oid) = refs::resolve_ref(git_dir, "HEAD") {
         let symref_target = if symrefs {
-            refs::read_symbolic_ref(git_dir, "HEAD").ok().flatten()
+            refs::read_symbolic_ref(git_dir, "HEAD")
+                .ok()
+                .flatten()
+                .map(|t| grit_lib::ref_namespace::strip_namespace_prefix(&t).into_owned())
         } else {
             None
         };
@@ -339,10 +359,14 @@ fn cmd_ls_refs(git_dir: &Path, args: &[String], out: &mut impl Write) -> Result<
         });
     }
 
-    // All refs under refs/
+    // All refs under refs/ (logical/stripped names when a namespace is active).
     for prefix in &["refs/heads/", "refs/tags/", "refs/remotes/", "refs/notes/"] {
         if let Ok(ref_list) = refs::list_refs(git_dir, prefix) {
             for (name, oid) in ref_list {
+                let full = grit_lib::ref_namespace::storage_ref_name(&name);
+                if grit_lib::hide_refs::ref_is_hidden(&name, &full, &hide) {
+                    continue;
+                }
                 let mut info = RefInfo {
                     name: name.clone(),
                     oid,
@@ -350,7 +374,10 @@ fn cmd_ls_refs(git_dir: &Path, args: &[String], out: &mut impl Write) -> Result<
                     peeled: None,
                 };
                 if symrefs {
-                    info.symref_target = refs::read_symbolic_ref(git_dir, &name).ok().flatten();
+                    info.symref_target = refs::read_symbolic_ref(git_dir, &name)
+                        .ok()
+                        .flatten()
+                        .map(|t| grit_lib::ref_namespace::strip_namespace_prefix(&t).into_owned());
                 }
                 if peel && name.starts_with("refs/tags/") {
                     info.peeled = peel_to_commit(git_dir, &oid);
@@ -412,6 +439,7 @@ fn cmd_fetch(
     out: &mut impl Write,
     caps: &ServerCaps,
     accepted_promisor_remotes: Option<&str>,
+    stateless_rpc: bool,
 ) -> Result<()> {
     let repo = Repository::open(git_dir, None)
         .with_context(|| format!("could not open repository at '{}'", git_dir.display()))?;
@@ -588,10 +616,22 @@ fn cmd_fetch(
         if ok_to_give_up_v2(&repo, &want_set, &have_commits) {
             pkt_line::write_line(out, "ready")?;
             pkt_line::write_delim(out)?;
+            if stateless_rpc {
+                // Smart-HTTP: end the response after `ready`; the client sends a follow-up request
+                // (with `done`) to receive the pack.
+                out.flush()?;
+                return Ok(());
+            }
+            // Stateful transport: the `acknowledgments` section is followed in the SAME response by
+            // the `packfile` section. Matches `upload-pack.c`'s state machine, where
+            // `UPLOAD_SEND_ACKS` transitions to `UPLOAD_SEND_PACK` without reading another request.
+            // A stateful client does not send a follow-up after `ready`, so returning here would
+            // deadlock the connection. Fall through to send wanted-refs / shallow-info / packfile.
         } else {
+            // Not ready yet: end the round with a flush so the client sends more haves.
             pkt_line::write_flush(out)?;
+            return Ok(());
         }
-        return Ok(());
     }
 
     // `wanted-refs` resolves the client's `want-ref` requests to concrete OIDs.
