@@ -5978,7 +5978,18 @@ fn validate_pathspec_scope(repo: &Repository, pathspecs: &[String]) -> Result<()
 
     let cwd = std::env::current_dir().context("resolving current directory")?;
     let Some(work_tree) = repo.work_tree.as_deref() else {
-        // Bare repos: pathspecs limit history without resolving against a work tree (t0410).
+        // Bare repos (and running inside `.git`): pathspecs still limit history without
+        // resolving against a work tree (t0410), but a pathspec that lexically escapes the
+        // repository — e.g. `..` from the repo root — is rejected just like upstream's
+        // `prefix_path_gently` failure (t6136).
+        for pathspec in pathspecs {
+            if pathspec.starts_with(':') {
+                continue;
+            }
+            if pathspec_escapes_repo_lexically(Path::new(pathspec)) {
+                anyhow::bail!("pathspec '{}' is outside repository", pathspec);
+            }
+        }
         return Ok(());
     };
 
@@ -6006,6 +6017,29 @@ fn validate_pathspec_scope(repo: &Repository, pathspecs: &[String]) -> Result<()
     }
 
     Ok(())
+}
+
+/// Whether a relative pathspec lexically escapes the repository (a leading `..`
+/// that walks above the root, or an absolute/rooted path). Used when there is no
+/// work tree (bare repo or running inside `.git`) to reproduce upstream's
+/// `'%s' is outside repository` diagnostic for pathspecs like `..` (t6136).
+fn pathspec_escapes_repo_lexically(pathspec: &Path) -> bool {
+    use std::path::Component;
+    let mut depth = 0usize;
+    for component in pathspec.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::ParentDir => {
+                if depth == 0 {
+                    return true;
+                }
+                depth -= 1;
+            }
+            Component::RootDir | Component::Prefix(_) => return true,
+        }
+    }
+    false
 }
 
 /// Resolve pathspecs relative to current working directory inside the worktree.
