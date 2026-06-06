@@ -3225,6 +3225,34 @@ fn worktree_clean_for_update_instead(
     Ok(())
 }
 
+/// Open a [`Repository`] handle bound to the worktree (main or linked) that has the pushed
+/// branch checked out, for a `denyCurrentBranch = updateInstead` work-tree update.
+///
+/// Returns `None` (so the caller falls back to `remote_repo`) when `worktree_path` is the main
+/// work tree. For a linked worktree, resolves its admin directory via the worktree's `.git`
+/// gitfile (`gitdir: <admin>`) and opens a repo with that admin git_dir and the worktree path,
+/// so the index/HEAD/work-tree all point at the linked worktree.
+fn open_worktree_repo_for_update_instead(
+    remote_repo: &Repository,
+    worktree_path: &Path,
+    _refname: &str,
+) -> Option<Repository> {
+    // Main worktree: the existing `remote_repo` already targets it.
+    if let Some(main_wt) = remote_repo.work_tree.as_ref() {
+        let main_canon = main_wt.canonicalize().ok();
+        let target_canon = worktree_path.canonicalize().ok();
+        if main_canon.is_some() && main_canon == target_canon {
+            return None;
+        }
+    }
+    // Linked worktree: read its `.git` gitfile to find the admin dir.
+    let gitfile = worktree_path.join(".git");
+    let content = fs::read_to_string(&gitfile).ok()?;
+    let admin = content.strip_prefix("gitdir:").map(str::trim)?;
+    let admin_dir = PathBuf::from(admin);
+    Repository::open(&admin_dir, Some(worktree_path)).ok()
+}
+
 fn update_worktree_after_push_update_instead(
     remote_repo: &Repository,
     new_oid: ObjectId,
@@ -3344,21 +3372,18 @@ fn check_receive_pack_policy(
         return Err("deny updating a hidden ref".to_owned());
     }
 
-    if remote_repo.is_bare() {
+    // The pushed branch is "current" if it is checked out in ANY worktree — the main worktree
+    // or a linked one (Git `branch_checked_out` / `find_shared_symref`). This applies to bare
+    // repositories too: a bare repo's *linked* worktrees can have branches checked out, while its
+    // own (worktree-less) HEAD never occupies a branch (t5516 116/117). `occupied_branch_refs`
+    // already excludes a bare main worktree.
+    let head_ref = update.remote_ref.clone();
+    let occupied = crate::commands::worktree_refs::occupied_branch_refs(remote_repo);
+    if !occupied.contains_key(&head_ref) {
         return Ok(());
     }
-
-    let head = resolve_head(&remote_repo.git_dir).map_err(|e| e.to_string())?;
-    let head_ref = match head {
-        grit_lib::state::HeadState::Branch { refname, .. } => refname,
-        _ => return Ok(()),
-    };
 
     let style = RemoteMessageColorStyle::from_config(pushing_config);
-
-    if update.remote_ref != head_ref {
-        return Ok(());
-    }
 
     if update.new_oid.is_some() {
         let deny = read_receive_deny_current(remote_config);
@@ -3609,17 +3634,16 @@ fn apply_ref_update(
         return Ok(ApplyRefResult::RemoteRejected(reason));
     }
 
-    let update_instead_after_ref = if !remote_repo.is_bare() {
-        let head = resolve_head(&remote_repo.git_dir).ok();
-        let head_ref = head.as_ref().and_then(|h| match h {
-            HeadState::Branch { refname, .. } => Some(refname.as_str()),
-            _ => None,
-        });
-        update.new_oid.is_some()
-            && head_ref.is_some_and(|hr| hr == update.remote_ref.as_str())
-            && read_receive_deny_current(remote_config) == ReceiveDenyAction::UpdateInstead
+    // The branch may be checked out in the main worktree or a linked one; `updateInstead` must
+    // update *that* worktree's working tree (t5516 116/117). Resolve it once here.
+    let update_instead_worktree: Option<PathBuf> = if update.new_oid.is_some()
+        && read_receive_deny_current(remote_config) == ReceiveDenyAction::UpdateInstead
+    {
+        crate::commands::worktree_refs::occupied_branch_refs(remote_repo)
+            .get(&update.remote_ref)
+            .map(PathBuf::from)
     } else {
-        false
+        None
     };
 
     match (&update.new_oid, &update.old_oid) {
@@ -3629,9 +3653,15 @@ fn apply_ref_update(
                 // the ref (git calls `update_worktree` first; a failed push_to_deploy leaves the
                 // branch untouched). Otherwise a refused push would leave the ref advanced, which
                 // corrupts the next push's "old value" check (t5516 updateInstead case (4)).
-                if update_instead_after_ref {
-                    match update_worktree_after_push_update_instead(
+                if let Some(worktree_path) = &update_instead_worktree {
+                    let target_repo = open_worktree_repo_for_update_instead(
                         remote_repo,
+                        worktree_path,
+                        &update.remote_ref,
+                    );
+                    let target_repo = target_repo.as_ref().unwrap_or(remote_repo);
+                    match update_worktree_after_push_update_instead(
+                        target_repo,
                         *new_oid,
                         update.old_oid,
                     ) {
