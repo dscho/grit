@@ -3672,11 +3672,11 @@ fn render_graph_commit_text(
 ) -> String {
     let hex = node.oid.to_hex();
     if log_uses_builtin_oneline(args) {
-        let first_line = info.message.lines().next().unwrap_or("");
+        let first_line = grit_lib::commit_pretty::message_subject(&info.message);
         let first_line = if args.expand_tabs_in_log > 0 {
-            grit_lib::tab_expand::expand_tabs_in_line(first_line, args.expand_tabs_in_log)
+            grit_lib::tab_expand::expand_tabs_in_line(&first_line, args.expand_tabs_in_log)
         } else {
-            first_line.to_owned()
+            first_line
         };
         let oid_color = if use_color {
             decoration_paint
@@ -3761,11 +3761,11 @@ fn render_graph_commit_text(
         }
     }
 
-    let subj = info.message.lines().next().unwrap_or("");
+    let subj = grit_lib::commit_pretty::message_subject(&info.message);
     if args.expand_tabs_in_log > 0 {
-        grit_lib::tab_expand::expand_tabs_in_line(subj, args.expand_tabs_in_log)
+        grit_lib::tab_expand::expand_tabs_in_line(&subj, args.expand_tabs_in_log)
     } else {
-        subj.to_owned()
+        subj
     }
 }
 
@@ -4698,7 +4698,7 @@ pub fn run(mut args: Args) -> Result<()> {
     );
 
     // Resolve the effective log output encoding: --encoding overrides
-    // i18n.logOutputEncoding; absent both, output stays UTF-8 (no reencoding).
+    // i18n.logOutputEncoding; absent both, Git falls back to i18n.commitEncoding.
     {
         let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
         let mut enc = args
@@ -4710,6 +4710,10 @@ pub fn run(mut args: Args) -> Result<()> {
             .or_else(|| {
                 cfg.get("i18n.logOutputEncoding")
                     .or_else(|| cfg.get("i18n.logoutputencoding"))
+            })
+            .or_else(|| {
+                cfg.get("i18n.commitEncoding")
+                    .or_else(|| cfg.get("i18n.commitencoding"))
             });
         if let Some(label) = enc.as_deref() {
             if label.eq_ignore_ascii_case("UTF-8") || label.eq_ignore_ascii_case("UTF8") {
@@ -6757,11 +6761,11 @@ fn run_reflog_walk(
                     )?;
                     let date = format_date_for_header(&commit_data.author);
                     writeln!(out, "Date: {}", date)?;
-                    let subject = commit_data.message.lines().next().unwrap_or("");
+                    let subject = grit_lib::commit_pretty::message_subject(&commit_data.message);
                     let subject = if et > 0 {
-                        grit_lib::tab_expand::expand_tabs_in_line(subject, et)
+                        grit_lib::tab_expand::expand_tabs_in_line(&subject, et)
                     } else {
-                        subject.to_owned()
+                        subject
                     };
                     writeln!(out, "Subject: [PATCH] {}", subject)?;
                     writeln!(out)?;
@@ -6934,7 +6938,7 @@ fn run_reflog_walk(
 }
 
 /// Apply format placeholders for reflog walk entries.
-/// Supports %H, %h, %s, %gd, %gs, %gn, %ge, %an, %ae, %cn, %ce, %B, %b, %N, %n.
+/// Supports %H, %h, %s, %gd, %gs, %gn, %ge, %an, %ae, %cn, %ce, %cd, %B, %b, %N, %n.
 fn apply_reflog_format_string(
     fmt: &str,
     oid: &ObjectId,
@@ -6950,7 +6954,7 @@ fn apply_reflog_format_string(
 ) -> String {
     let hex = oid.to_hex();
     let short = &hex[..abbrev_len.min(hex.len())];
-    let subject = commit.message.lines().next().unwrap_or("");
+    let subject = grit_lib::commit_pretty::message_subject(&commit.message);
     let body = extract_body(&commit.message);
 
     let reflog_name = extract_name(reflog_identity);
@@ -6973,11 +6977,11 @@ fn apply_reflog_format_string(
                     chars.next();
                     if expand_tabs_in_log > 0 {
                         result.push_str(&grit_lib::tab_expand::expand_tabs_in_line(
-                            subject,
+                            &subject,
                             expand_tabs_in_log,
                         ));
                     } else {
-                        result.push_str(subject);
+                        result.push_str(&subject);
                     }
                 }
                 Some('B') => {
@@ -7142,6 +7146,10 @@ fn apply_reflog_format_string(
                                 extract_email(&commit.committer)
                             };
                             result.push_str(&local_part_of_email(&email));
+                        }
+                        Some('d') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&commit.committer, None));
                         }
                         _ => {
                             result.push_str("%c");
@@ -9039,11 +9047,11 @@ fn format_commit(
     let et = args.expand_tabs_in_log;
 
     if log_uses_builtin_oneline(args) {
-        let first_line = info.message.lines().next().unwrap_or("");
+        let first_line = grit_lib::commit_pretty::message_subject(&info.message);
         let first_line = if et > 0 {
-            grit_lib::tab_expand::expand_tabs_in_line(first_line, et)
+            grit_lib::tab_expand::expand_tabs_in_line(&first_line, et)
         } else {
-            first_line.to_owned()
+            first_line
         };
         let enc = args.log_output_encoding.as_deref();
         let abbrev = &hex[..abbrev_len.min(hex.len())];
@@ -10095,7 +10103,7 @@ fn apply_format_string(
                 }
                 Some('s') => {
                     chars.next();
-                    let subj = pretty_subject(&info.message);
+                    let subj = grit_lib::commit_pretty::message_subject(&info.message);
                     if expand_tabs_in_log > 0 {
                         result.push_str(&grit_lib::tab_expand::expand_tabs_in_line(
                             &subj,
@@ -10117,7 +10125,7 @@ fn apply_format_string(
                 Some('f') => {
                     chars.next();
                     // Sanitized subject line, suitable for a filename.
-                    let subj = pretty_subject(&info.message);
+                    let subj = grit_lib::commit_pretty::message_subject(&info.message);
                     result.push_str(&crate::commands::format_patch::sanitize_subject(&subj));
                 }
                 Some('b') => {
@@ -10531,32 +10539,7 @@ fn apply_format_string(
 
 /// Extract the message body (everything after the subject + blank line).
 fn extract_body(message: &str) -> String {
-    let msg = message.trim_end_matches('\n');
-    let mut seen_separator = false;
-    let mut body = Vec::new();
-    for line in msg.lines() {
-        if seen_separator {
-            body.push(line);
-        } else if line.is_empty() {
-            seen_separator = true;
-        }
-    }
-    if !seen_separator || body.is_empty() {
-        String::new()
-    } else {
-        format!("{}\n", body.join("\n"))
-    }
-}
-
-fn pretty_subject(message: &str) -> String {
-    message
-        .trim_end_matches('\n')
-        .lines()
-        .take_while(|line| !line.is_empty())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    grit_lib::commit_pretty::message_body(message).to_owned()
 }
 
 /// Extract the name portion from a Git ident string.

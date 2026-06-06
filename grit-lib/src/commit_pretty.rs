@@ -15,6 +15,107 @@ pub fn abbrev_hex(oid: &ObjectId, abbrev_len: usize) -> String {
     hex[..n].to_owned()
 }
 
+/// Return the pretty subject for a commit or tag message.
+///
+/// The subject is the first non-empty paragraph with embedded line breaks
+/// collapsed to spaces. Both LF and CRLF line endings are recognized.
+///
+/// # Parameters
+///
+/// - `message` — raw commit or tag message text.
+#[must_use]
+pub fn message_subject(message: &str) -> String {
+    let mut subject_lines = Vec::new();
+    for line in MessageLines::new(message) {
+        if line.text.is_empty() {
+            if !subject_lines.is_empty() {
+                break;
+            }
+            continue;
+        }
+        subject_lines.push(line.text);
+    }
+    subject_lines.join(" ")
+}
+
+/// Return the body slice after the first message paragraph.
+///
+/// Leading blank lines before the first paragraph are ignored. The returned
+/// body starts after the blank-line separator and any additional blank lines,
+/// preserving the original body line endings and trailing newline bytes.
+///
+/// # Parameters
+///
+/// - `message` — raw commit or tag message text.
+#[must_use]
+pub fn message_body(message: &str) -> &str {
+    let mut saw_subject = false;
+    let mut body_start = message.len();
+    let mut iter = MessageLines::new(message).peekable();
+
+    while let Some(line) = iter.next() {
+        if line.text.is_empty() {
+            if saw_subject {
+                body_start = line.next_start;
+                while let Some(next) = iter.peek() {
+                    if !next.text.is_empty() {
+                        break;
+                    }
+                    body_start = next.next_start;
+                    iter.next();
+                }
+                break;
+            }
+            continue;
+        }
+        saw_subject = true;
+    }
+
+    &message[body_start..]
+}
+
+#[derive(Clone, Copy)]
+struct MessageLine<'a> {
+    text: &'a str,
+    next_start: usize,
+}
+
+struct MessageLines<'a> {
+    message: &'a str,
+    pos: usize,
+}
+
+impl<'a> MessageLines<'a> {
+    fn new(message: &'a str) -> Self {
+        Self { message, pos: 0 }
+    }
+}
+
+impl<'a> Iterator for MessageLines<'a> {
+    type Item = MessageLine<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.pos >= self.message.len() {
+            return None;
+        }
+        let start = self.pos;
+        let tail = &self.message[start..];
+        let newline_rel = tail.find('\n');
+        let (mut end, next_start) = match newline_rel {
+            Some(rel) => (start + rel, start + rel + 1),
+            None => (self.message.len(), self.message.len()),
+        };
+        if self.message.as_bytes().get(end.wrapping_sub(1)) == Some(&b'\r') && end > start {
+            end -= 1;
+        }
+        self.pos = next_start;
+        Some(MessageLine {
+            text: &self.message[start..end],
+            next_start,
+        })
+    }
+}
+
 fn parse_tz_offset_seconds(offset: &str) -> i64 {
     if offset.len() < 5 {
         return 0;

@@ -72,6 +72,10 @@ pub struct Args {
     #[arg(long = "sort")]
     pub sort: Option<String>,
 
+    /// Format to use when listing tags.
+    #[arg(long = "format")]
+    pub format: Option<String>,
+
     /// List only tags that contain the specified commit (defaults to HEAD).
     #[arg(long = "contains", num_args = 0..=1, default_missing_value = "HEAD")]
     pub contains: Option<String>,
@@ -179,6 +183,7 @@ pub fn run(args: Args) -> Result<()> {
             args.contains.as_deref(),
             args.no_contains.as_deref(),
             args.points_at.as_deref(),
+            args.format.as_deref(),
         );
     }
 
@@ -414,6 +419,7 @@ fn list_tags(
     contains: Option<&str>,
     no_contains: Option<&str>,
     points_at: Option<&str>,
+    format: Option<&str>,
 ) -> Result<()> {
     let mut tags: Vec<(String, ObjectId)> = grit_lib::refs::list_refs(&repo.git_dir, "refs/tags/")
         .map_err(|e| anyhow::anyhow!("{e}"))?
@@ -463,7 +469,10 @@ fn list_tags(
     let mut out = stdout.lock();
 
     for (name, oid) in &tags {
-        if let Some(n) = lines {
+        if let Some(format) = format {
+            let line = format_tag_line(repo, name, oid, format)?;
+            writeln!(out, "{line}")?;
+        } else if let Some(n) = lines {
             let annotation = get_tag_annotation(repo, oid, n);
             // When -n is specified, always pad name to 15 chars (git behavior)
             if let Some(ann) = annotation {
@@ -480,6 +489,65 @@ fn list_tags(
     }
 
     Ok(())
+}
+
+fn format_tag_line(repo: &Repository, name: &str, oid: &ObjectId, format: &str) -> Result<String> {
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < format.len() {
+        if let Some(rest) = format[i..].strip_prefix("%%") {
+            out.push('%');
+            i = format.len() - rest.len();
+            continue;
+        }
+        if let Some(rest) = format[i..].strip_prefix("%(") {
+            let Some(close) = rest.find(')') else {
+                bail!("unterminated format atom");
+            };
+            let atom = &rest[..close];
+            out.push_str(&expand_tag_atom(repo, name, oid, atom)?);
+            i += 2 + close + 1;
+            continue;
+        }
+        let ch = format[i..].chars().next().unwrap_or_default();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    Ok(out)
+}
+
+fn expand_tag_atom(repo: &Repository, name: &str, oid: &ObjectId, atom: &str) -> Result<String> {
+    let (base, modifier) = atom
+        .find(':')
+        .map(|p| (&atom[..p], Some(&atom[p + 1..])))
+        .unwrap_or((atom, None));
+    match base {
+        "refname" => match modifier {
+            Some("short") | None => Ok(name.to_owned()),
+            Some(m) => bail!("unrecognized %(refname) argument: {m}"),
+        },
+        "objectname" => match modifier {
+            None => Ok(oid.to_hex()),
+            Some("short") => Ok(oid.to_hex()[..7.min(oid.to_hex().len())].to_owned()),
+            Some(m) => bail!("unrecognized %(objectname) argument: {m}"),
+        },
+        "contents" => {
+            let obj = repo.odb.read(oid)?;
+            let message = match obj.kind {
+                ObjectKind::Tag => parse_tag(&obj.data)?.message,
+                ObjectKind::Commit => parse_commit(&obj.data)?.message,
+                _ => String::new(),
+            };
+            match modifier {
+                Some("subject") => Ok(grit_lib::commit_pretty::message_subject(&message)),
+                Some("body") => Ok(grit_lib::commit_pretty::message_body(&message).to_owned()),
+                Some("size") => Ok(message.len().to_string()),
+                Some("") | None => Ok(message),
+                Some(m) => bail!("unsupported contents modifier: {m}"),
+            }
+        }
+        _ => bail!("unsupported format atom: {base}"),
+    }
 }
 
 /// Get annotation text for a tag (up to `n` lines).

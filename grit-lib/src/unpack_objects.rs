@@ -32,6 +32,10 @@ pub struct UnpackOptions {
     pub quiet: bool,
     /// Reject packs whose commits/trees/tags reference missing objects.
     pub strict: bool,
+    /// Object IDs that strict connectivity may treat as promised by a configured promisor remote.
+    pub allowed_missing: HashSet<ObjectId>,
+    /// Whether strict connectivity may tolerate references to missing objects in a promisor repo.
+    pub allow_promisor_missing_references: bool,
     /// Maximum number of raw pack bytes that may be consumed (including the 20-byte trailer).
     ///
     /// Matches Git's `unpack-objects --max-input-size` / `receive.maxInputSize`: counts every
@@ -232,7 +236,18 @@ pub fn unpack_objects(reader: &mut dyn Read, odb: &Odb, opts: &UnpackOptions) ->
             dot_fsck_map.insert(*oid, (kind, data));
         }
         gitmodules::verify_packed_dot_special(&dot_fsck_map)?;
+<<<<<<< ours
+        strict_verify_packed_references_map(
+            Some(odb),
+            &by_oid,
+            &opts.allowed_missing,
+            opts.allow_promisor_missing_references,
+        )?;
+||||||| ancestor
+        strict_verify_packed_references_map(Some(odb), &by_oid)?;
+=======
         strict_verify_packed_references_map(Some(odb), &by_oid, &opts.shallow_boundaries)?;
+>>>>>>> theirs
     }
 
     Ok(count)
@@ -279,7 +294,13 @@ fn entry_object_bytes<'a>(entry: &'a PackedObjectEntry, odb: &Odb) -> Result<Cow
 fn strict_verify_packed_references_map(
     odb: Option<&Odb>,
     pack: &HashMap<ObjectId, PackedObjectEntry>,
+<<<<<<< ours
+    allowed_missing: &HashSet<ObjectId>,
+    allow_promisor_missing_references: bool,
+||||||| ancestor
+=======
     shallow_boundaries: &HashSet<ObjectId>,
+>>>>>>> theirs
 ) -> Result<()> {
     for (oid, entry) in pack {
         match entry {
@@ -294,7 +315,13 @@ fn strict_verify_packed_references_map(
                         if e.mode == MODE_GITLINK {
                             continue;
                         }
-                        if !strict_ref_resolves_map(&e.oid, pack, odb) {
+                        if !strict_ref_resolves_map(
+                            &e.oid,
+                            pack,
+                            odb,
+                            allowed_missing,
+                            allow_promisor_missing_references,
+                        ) {
                             return Err(Error::CorruptObject(format!(
                                 "strict: missing object {} referenced by tree",
                                 e.oid.to_hex()
@@ -304,7 +331,13 @@ fn strict_verify_packed_references_map(
                 }
                 ObjectKind::Commit => {
                     let c = parse_commit(data)?;
-                    if !strict_ref_resolves_map(&c.tree, pack, odb) {
+                    if !strict_ref_resolves_map(
+                        &c.tree,
+                        pack,
+                        odb,
+                        allowed_missing,
+                        allow_promisor_missing_references,
+                    ) {
                         return Err(Error::CorruptObject(format!(
                             "strict: missing tree {} referenced by commit",
                             c.tree.to_hex()
@@ -317,7 +350,13 @@ fn strict_verify_packed_references_map(
                         continue;
                     }
                     for p in &c.parents {
-                        if !strict_ref_resolves_map(p, pack, odb) {
+                        if !strict_ref_resolves_map(
+                            p,
+                            pack,
+                            odb,
+                            allowed_missing,
+                            allow_promisor_missing_references,
+                        ) {
                             return Err(Error::CorruptObject(format!(
                                 "strict: missing parent {} referenced by commit",
                                 p.to_hex()
@@ -327,7 +366,13 @@ fn strict_verify_packed_references_map(
                 }
                 ObjectKind::Tag => {
                     let t = parse_tag(data)?;
-                    if !strict_ref_resolves_map(&t.object, pack, odb) {
+                    if !strict_ref_resolves_map(
+                        &t.object,
+                        pack,
+                        odb,
+                        allowed_missing,
+                        allow_promisor_missing_references,
+                    ) {
                         return Err(Error::CorruptObject(format!(
                             "strict: missing object {} referenced by tag",
                             t.object.to_hex()
@@ -345,8 +390,13 @@ fn strict_ref_resolves_map(
     oid: &ObjectId,
     pack: &HashMap<ObjectId, PackedObjectEntry>,
     odb: Option<&Odb>,
+    allowed_missing: &HashSet<ObjectId>,
+    allow_promisor_missing_references: bool,
 ) -> bool {
-    pack.contains_key(oid) || odb.is_some_and(|o| o.exists(oid))
+    pack.contains_key(oid)
+        || allowed_missing.contains(oid)
+        || odb.is_some_and(|o| o.exists(oid))
+        || allow_promisor_missing_references
 }
 
 fn strict_ref_resolves(
@@ -1385,6 +1435,8 @@ mod tests {
             dry_run: true,
             quiet: true,
             strict: false,
+            allowed_missing: Default::default(),
+            allow_promisor_missing_references: false,
             max_input_bytes: None,
             ..Default::default()
         };

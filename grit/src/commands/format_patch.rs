@@ -2791,6 +2791,13 @@ fn is_rfc2047_special(c: u8, ty: Rfc2047Type) -> bool {
 
 /// Append `line` RFC2047-Q-encoded to `out`, folding at 76 columns with continuation lines.
 fn add_rfc2047(out: &mut String, line: &str, encoding: &str, ty: Rfc2047Type) {
+    if !encoding.eq_ignore_ascii_case("UTF-8") {
+        if let Some(bytes) = grit_lib::commit_encoding::encode_header_text(encoding, line) {
+            add_rfc2047_bytes(out, &bytes, encoding, ty);
+            return;
+        }
+    }
+
     const MAX_ENCODED_LENGTH: usize = 76;
     let mut line_len = last_line_length(out);
     out.push_str(&format!("=?{encoding}?q?"));
@@ -2815,6 +2822,31 @@ fn add_rfc2047(out: &mut String, line: &str, encoding: &str, ty: Rfc2047Type) {
             }
         } else {
             out.push(bytes[0] as char);
+        }
+        line_len += encoded_len;
+    }
+    out.push_str("?=");
+}
+
+fn add_rfc2047_bytes(out: &mut String, bytes: &[u8], encoding: &str, ty: Rfc2047Type) {
+    const MAX_ENCODED_LENGTH: usize = 76;
+    let mut line_len = last_line_length(out);
+    out.push_str(&format!("=?{encoding}?q?"));
+    line_len += encoding.len() + 5; // "=??q?"
+
+    for &byte in bytes {
+        let is_special = is_rfc2047_special(byte, ty);
+        let encoded_len = if is_special { 3 } else { 1 };
+
+        if line_len + encoded_len + 2 > MAX_ENCODED_LENGTH {
+            out.push_str(&format!("?=\n =?{encoding}?q?"));
+            line_len = encoding.len() + 5 + 1; // "=??q?" plus leading SP
+        }
+
+        if is_special {
+            out.push_str(&format!("={byte:02X}"));
+        } else {
+            out.push(byte as char);
         }
         line_len += encoded_len;
     }

@@ -6953,6 +6953,8 @@ fn run_bundle_clone(args: Args) -> Result<()> {
             strict: false,
             dry_run: false,
             quiet: true,
+            allowed_missing: Default::default(),
+            allow_promisor_missing_references: false,
             max_input_bytes: None,
             ..Default::default()
         };

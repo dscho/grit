@@ -2871,6 +2871,9 @@ fn approxidate(s: &str) -> Option<i64> {
         }
         return Some(now_ts);
     }
+    if let Ok((ts, _offset)) = crate::git_date::parse::parse_date_basic(s.trim()) {
+        return Some(ts as i64);
+    }
     // Handle relative time: "N.unit.ago" or "N unit ago"
     // e.g. "1.year.ago", "2.weeks.ago", "3 hours ago"
     let relative = lower.replace('.', " ");

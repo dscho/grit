@@ -2527,9 +2527,9 @@ fn omit_prefiltered_blobs(
 
     let mut keep = Vec::with_capacity(oids.len());
     for oid in oids.iter().copied() {
-        if omit_missing_promisor && !repo.odb.exists(&oid) {
-            // Truly absent from the local ODB (not even in a promisor pack) and lazily fetchable
-            // by the client from its accepted promisor remote: drop it without fetching.
+        if omit_missing_promisor && repo.odb.read(&oid).is_err() {
+            // Absent from the local ODB and lazily fetchable by the client from its accepted
+            // promisor remote: drop it without fetching.
             continue;
         }
         let obj = read_object_from_repo_unverified(repo, &oid)?;

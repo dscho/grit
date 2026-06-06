@@ -23,6 +23,9 @@ use grit_lib::config::ConfigSet;
 use grit_lib::diff::{self, count_changes, diff_index_to_tree, diff_index_to_worktree, DiffEntry};
 use grit_lib::hooks::{run_commit_hook, run_hook, CommitHookEnv, HookResult};
 use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
+use grit_lib::interpret_trailers::{
+    complete_line, process_trailers, NewTrailerArg, ProcessTrailerOptions,
+};
 use grit_lib::merge_base::{ancestor_closure, fork_point, is_ancestor, merge_bases_first_vs_rest};
 use grit_lib::merge_file::{merge, ConflictStyle, MergeFavor, MergeInput};
 use grit_lib::objects::{
@@ -53,6 +56,7 @@ use super::commit::{
 use super::merge::refresh_index_stat_cache_from_worktree;
 use super::replay::merge_trees_for_single_cherry_pick;
 use super::stash;
+use crate::explicit_exit::ExplicitExit;
 use crate::ident::{resolve_email, resolve_name, IdentRole};
 
 #[derive(Clone, Copy, Debug)]
@@ -190,6 +194,10 @@ pub struct Args {
     /// Do not add Signed-off-by trailers (overrides an alias with --signoff).
     #[arg(long = "no-signoff", overrides_with = "signoff")]
     pub no_signoff: bool,
+
+    /// Append a trailer to every rebased commit message.
+    #[arg(long = "trailer", value_name = "TRAILER")]
+    pub trailer: Vec<String>,
 
     /// Keep the base of the branch (rebase onto the merge-base of upstream and branch).
     /// May be passed multiple times for Git compatibility (`--keep-base --keep-base`).
@@ -612,8 +620,8 @@ fn run_internal_rebase_pick_line(line_index: usize) -> Result<()> {
     let force_rewrite = std::env::var(INTERNAL_REBASE_FORCE_FF_ENV).ok().as_deref() == Some("1")
         || rb_dir.join("force-rewrite").exists();
     let rebase_interactive = rb_dir.join("interactive").exists();
-    let todo_content = fs::read_to_string(rb_dir.join("todo"))?;
-    let todo: Vec<&str> = todo_content.lines().filter(|l| !l.is_empty()).collect();
+    let todo_content = read_rebase_todo_file(&repo, &rb_dir)?;
+    let todo: Vec<&str> = rebase_todo_actionable_lines(&todo_content);
     let i = line_index;
     if i >= todo.len() {
         bail!("internal rebase pick: line index out of range");
@@ -625,6 +633,7 @@ fn run_internal_rebase_pick_line(line_index: usize) -> Result<()> {
         RebaseReplayStep::PickLike {
             oid: commit_oid,
             cmd: todo_cmd,
+            fixup_message_mode,
         } => {
             let final_fixup = is_final_fixup_in_todo(&repo, &rb_dir, &todo, i, rebase_interactive);
             let next_after = peek_next_rebase_flush_hint(&repo, &todo, i + 1, rebase_interactive);
@@ -638,6 +647,7 @@ fn run_internal_rebase_pick_line(line_index: usize) -> Result<()> {
                 next_after,
                 true,
                 force_rewrite,
+                fixup_message_mode,
             )
         }
         RebaseReplayStep::Edit(commit_oid) => {
@@ -654,6 +664,7 @@ fn run_internal_rebase_pick_line(line_index: usize) -> Result<()> {
                 next_after,
                 false,
                 force_rewrite,
+                None,
             )
         }
         _ => bail!("internal rebase pick: unsupported step at line {i}"),
@@ -857,6 +868,38 @@ fn validate_apply_merge_backend_combo(
     Ok(())
 }
 
+fn validate_rebase_trailer_options(args: &Args) -> Result<()> {
+    if args.trailer.is_empty() {
+        return Ok(());
+    }
+    if apply_backend_forced(args) {
+        return Err(anyhow::Error::new(ExplicitExit {
+            code: 128,
+            message: "fatal: --trailer requires the merge backend".to_string(),
+        }));
+    }
+    for trailer in &args.trailer {
+        if trailer.is_empty() {
+            return Err(anyhow::Error::new(ExplicitExit {
+                code: 128,
+                message: "empty --trailer".to_string(),
+            }));
+        }
+        let trimmed = trailer.trim_start();
+        if trimmed.starts_with(':') || trimmed.starts_with('=') {
+            return Err(anyhow::Error::new(ExplicitExit {
+                code: 128,
+                message: "missing key before separator".to_string(),
+            }));
+        }
+    }
+    Ok(())
+}
+
+fn rebase_force_rewrite_requested(args: &Args) -> bool {
+    args.no_ff || args.signoff || !args.trailer.is_empty()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RebaseTodoCmd {
     Pick,
@@ -884,6 +927,12 @@ impl RebaseTodoCmd {
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FixupMessageMode {
+    UseCommit,
+    EditCommit,
 }
 
 /// First line of a commit message with continuation lines folded like `git format_subject(..., " ")`.
@@ -1033,29 +1082,44 @@ fn format_rebase_todo_line(
     let commit = parse_commit(&obj.data)?;
     let subj = commit.message.lines().next().unwrap_or("");
     let empty = is_commit_tree_unchanged(repo, oid).unwrap_or(false);
+    let cmd_word = rebase_todo_command_for_display(cmd, &commit);
     let oid_field = if short_oid_field {
         abbreviate_object_id(repo, *oid, 7)?
     } else {
         oid.to_hex()
     };
     let mut line = match config.get("rebase.instructionFormat") {
-        None => format!("{} {} # {}", cmd.as_str(), oid_field, subj),
-        Some(raw) if raw.trim().is_empty() => {
-            format!("{} {} # {}", cmd.as_str(), oid_field, subj)
-        }
+        None => format!("{cmd_word} {oid_field} # {subj}"),
+        Some(raw) if raw.trim().is_empty() => format!("{cmd_word} {oid_field} # {subj}"),
         Some(tmpl) => {
             let mut t = tmpl.clone();
             if !t.starts_with('#') {
                 t = format!("# {t}");
             }
             let rest = crate::commands::show::format_commit_placeholder(&t, oid, &commit);
-            format!("{} {} {}", cmd.as_str(), oid_field, rest)
+            format!("{cmd_word} {oid_field} {rest}")
         }
     };
     if empty {
         line.push_str(" # empty");
     }
     Ok(line)
+}
+
+fn rebase_todo_command_for_display(cmd: RebaseTodoCmd, commit: &CommitData) -> &'static str {
+    if cmd == RebaseTodoCmd::Fixup
+        && commit
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("amend! ")
+    {
+        "fixup -C"
+    } else {
+        cmd.as_str()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1572,6 +1636,7 @@ enum RebaseReplayStep {
     PickLike {
         oid: ObjectId,
         cmd: RebaseTodoCmd,
+        fixup_message_mode: Option<FixupMessageMode>,
     },
     Exec(String),
     Edit(ObjectId),
@@ -1602,9 +1667,15 @@ fn parse_rebase_replay_step(
     if interactive {
         return Ok(
             parse_interactive_rebase_todo_line(repo, line)?.map(|p| match p {
-                ParsedRebaseTodoLine::Commit { oid, cmd } => {
-                    RebaseReplayStep::PickLike { oid, cmd }
-                }
+                ParsedRebaseTodoLine::Commit {
+                    oid,
+                    cmd,
+                    fixup_message_mode,
+                } => RebaseReplayStep::PickLike {
+                    oid,
+                    cmd,
+                    fixup_message_mode,
+                },
                 ParsedRebaseTodoLine::Exec(s) => RebaseReplayStep::Exec(s),
                 ParsedRebaseTodoLine::Edit(oid) => RebaseReplayStep::Edit(oid),
                 ParsedRebaseTodoLine::MergeReuseMessage {
@@ -1649,8 +1720,13 @@ fn parse_rebase_replay_step(
             | ParsedRebaseTodoLine::MergePlain { .. } => {}
         }
     }
-    Ok(parse_todo_line_with_repo(Some(repo), line)?
-        .map(|(oid, cmd)| RebaseReplayStep::PickLike { oid, cmd }))
+    Ok(
+        parse_todo_line_with_repo(Some(repo), line)?.map(|(oid, cmd)| RebaseReplayStep::PickLike {
+            oid,
+            cmd,
+            fixup_message_mode: None,
+        }),
+    )
 }
 
 /// One line from an interactive rebase todo (after the user edits it).
@@ -1660,6 +1736,7 @@ enum ParsedRebaseTodoLine {
     Commit {
         oid: ObjectId,
         cmd: RebaseTodoCmd,
+        fixup_message_mode: Option<FixupMessageMode>,
     },
     /// `exec <shell command>` (rest of line after the command word).
     Exec(String),
@@ -1768,7 +1845,27 @@ fn parse_interactive_rebase_todo_line(
         return Ok(Some(ParsedRebaseTodoLine::MergePlain { merge_args }));
     }
     if let Some(cmd) = RebaseTodoCmd::parse_word(&cmd_lower) {
-        let Some(hex) = parts.next() else {
+        let mut fixup_message_mode = None;
+        let mut next = parts.next();
+        if cmd == RebaseTodoCmd::Fixup {
+            if let Some(flag) = next {
+                if flag.eq_ignore_ascii_case("-C") || flag.eq_ignore_ascii_case("-c") {
+                    fixup_message_mode = Some(if flag.as_bytes().get(1) == Some(&b'c') {
+                        FixupMessageMode::EditCommit
+                    } else {
+                        FixupMessageMode::UseCommit
+                    });
+                    next = parts.next();
+                } else if flag.len() > 2 && flag.starts_with("-C") {
+                    fixup_message_mode = Some(FixupMessageMode::UseCommit);
+                    next = Some(&flag[2..]);
+                } else if flag.len() > 2 && flag.starts_with("-c") {
+                    fixup_message_mode = Some(FixupMessageMode::EditCommit);
+                    next = Some(&flag[2..]);
+                }
+            }
+        }
+        let Some(hex) = next else {
             bail!("malformed rebase todo line: {line}");
         };
         let oid = if hex.len() == 40 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -1776,7 +1873,11 @@ fn parse_interactive_rebase_todo_line(
         } else {
             resolve_revision(repo, hex).with_context(|| format!("todo: bad revision '{hex}'"))?
         };
-        return Ok(Some(ParsedRebaseTodoLine::Commit { oid, cmd }));
+        return Ok(Some(ParsedRebaseTodoLine::Commit {
+            oid,
+            cmd,
+            fixup_message_mode,
+        }));
     }
     bail!("unknown rebase todo command: {line}");
 }
@@ -1791,6 +1892,7 @@ fn first_interactive_todo_pick_oid(repo: &Repository, todo_lines: &[&str]) -> Op
         if let Ok(Some(RebaseReplayStep::PickLike {
             oid,
             cmd: RebaseTodoCmd::Pick,
+            ..
         })) = parse_rebase_replay_step(repo, t, true)
         {
             return Some(oid);
@@ -2122,6 +2224,8 @@ fn clear_squash_ctx(rb_dir: &Path) {
     let _ = fs::remove_file(squash_ctx_path(rb_dir));
     let _ = fs::remove_file(rb_dir.join("message-squash"));
     let _ = fs::remove_file(rb_dir.join("message-fixup"));
+    let _ = fs::remove_file(rb_dir.join("message-fixup-edit"));
+    let _ = fs::remove_file(rb_dir.join("message-fixup-active-section"));
 }
 
 fn drop_last_squash_message_section(rb_dir: &Path) -> Result<()> {
@@ -2196,6 +2300,26 @@ fn message_body_after_subject(message: &str) -> &str {
     }
 }
 
+fn skip_blank_lines(mut message: &str) -> &str {
+    loop {
+        let trimmed = message.trim_start_matches([' ', '\t']);
+        if trimmed.starts_with('\n') {
+            message = &trimmed[1..];
+            continue;
+        }
+        return message;
+    }
+}
+
+fn fixup_replacement_message(message: &str) -> String {
+    let subject = message.lines().next().unwrap_or("").trim_start();
+    if subject.starts_with("amend! ") {
+        complete_line(skip_blank_lines(message_body_after_subject(message)))
+    } else {
+        complete_line(message)
+    }
+}
+
 fn first_line_len(body: &str) -> usize {
     match body.find('\n') {
         Some(i) => i,
@@ -2218,10 +2342,65 @@ fn squash_comment_subject_prefix(body: &str, cmd: RebaseTodoCmd, seen_squash: bo
 
 fn append_commented(buf: &mut String, text: &str) {
     for line in text.lines() {
-        buf.push_str("# ");
-        buf.push_str(line);
+        if line.is_empty() {
+            buf.push_str("#\n");
+        } else {
+            buf.push_str("# ");
+            buf.push_str(line);
+            buf.push('\n');
+        }
+    }
+}
+
+fn comment_block(text: &str) -> String {
+    let mut out = String::new();
+    append_commented(&mut out, text.trim_end_matches('\n'));
+    out
+}
+
+fn comment_block_preserving_comments(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.trim_end_matches('\n').lines() {
+        if line.starts_with('#') {
+            out.push_str(line);
+            out.push('\n');
+        } else if line.is_empty() {
+            out.push_str("#\n");
+        } else {
+            out.push_str("# ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn mark_squash_section_skipped(buf: &mut String, section: usize) {
+    let header = format!("# This is the commit message #{section}:\n\n");
+    let Some(start) = buf.find(&header) else {
+        return;
+    };
+    let body_start = start + header.len();
+    let tail = &buf[body_start..];
+    let next_rel = tail.find("\n# This is the commit message #");
+    let next_rel = next_rel.or_else(|| tail.find("\n# The commit message #"));
+    let body_end = next_rel.map_or(buf.len(), |pos| body_start + pos + 1);
+    let body = buf[body_start..body_end].to_string();
+    let replacement = format!(
+        "# The commit message #{section} will be skipped:\n\n{}",
+        comment_block_preserving_comments(&body)
+    );
+    buf.replace_range(start..body_end, &replacement);
+}
+
+fn append_skipped_squash_message(buf: &mut String, body: &str, n: usize) {
+    if !buf.ends_with("\n\n") {
         buf.push('\n');
     }
+    buf.push_str("# The commit message #");
+    buf.push_str(&n.to_string());
+    buf.push_str(" will be skipped:\n\n");
+    append_commented(buf, body.trim_end_matches('\n'));
 }
 
 fn append_nth_squash_message(
@@ -2240,6 +2419,10 @@ fn append_nth_squash_message(
     let pre = squash_comment_subject_prefix(body, cmd, seen_squash).min(body.len());
     if pre > 0 {
         append_commented(buf, &body[..pre]);
+        let rest = &body[pre..];
+        let rest = rest.strip_prefix('\n').unwrap_or(rest);
+        buf.push_str(rest);
+        return;
     }
     buf.push_str(&body[pre..]);
 }
@@ -2446,6 +2629,7 @@ fn cleanup_squash_editor_message(msg: &str, config: &ConfigSet) -> String {
         let skip = trimmed.starts_with("# This is a combination of ")
             || trimmed.starts_with("# This is the ")
             || trimmed.starts_with("# The commit message #")
+            || (trimmed.starts_with('#') && !uncomment_section)
             || trimmed
                 .strip_prefix("# ")
                 .is_some_and(|rest| rest.starts_with("fixup!") || rest.starts_with("squash!"));
@@ -2488,20 +2672,74 @@ fn final_squash_template_after_fixups(fixup_message: &str, squash_body: &str) ->
     out
 }
 
+fn fixup_edit_template(rb_dir: &Path, fixup_message: &str) -> String {
+    let ctx = read_squash_ctx(rb_dir);
+    let n = ctx.count + 1;
+    let mut out = String::new();
+    out.push_str(&format!("# This is a combination of {n} commits.\n"));
+    out.push_str("# This is the 1st commit message:\n\n");
+    out.push_str("\n# This is the commit message #");
+    out.push_str(&n.to_string());
+    out.push_str(":\n\n");
+    out.push_str(fixup_message.trim_end_matches('\n'));
+    out.push_str("\n\n");
+    out
+}
+
+fn message_with_editor_separator(message: &str) -> String {
+    let mut out = message.trim_end_matches('\n').to_string();
+    out.push_str("\n\n");
+    out
+}
+
+fn write_fixup_message_mode(rb_dir: &Path, mode: Option<FixupMessageMode>) -> Result<()> {
+    let edit_path = rb_dir.join("message-fixup-edit");
+    match mode {
+        Some(FixupMessageMode::EditCommit) => fs::write(edit_path, "1\n")?,
+        Some(FixupMessageMode::UseCommit) => {
+            let _ = fs::remove_file(edit_path);
+        }
+        None => {}
+    }
+    Ok(())
+}
+
+fn fixup_message_opens_editor(rb_dir: &Path) -> bool {
+    rb_dir.join("message-fixup-edit").exists()
+}
+
 fn update_squash_message_file(
     repo: &Repository,
     rb_dir: &Path,
     git_dir: &Path,
     cmd: RebaseTodoCmd,
+    fixup_message_mode: Option<FixupMessageMode>,
     picked: &CommitData,
     ctx: &mut SquashChainCtx,
 ) -> Result<()> {
     let squash_path = rb_dir.join("message-squash");
     let fixup_path = rb_dir.join("message-fixup");
-    let body = if cmd == RebaseTodoCmd::Squash {
-        picked.message.as_str()
+    let mut display_message = picked.message.clone();
+    if rebase_signoff(rb_dir)
+        && cmd == RebaseTodoCmd::Fixup
+        && fixup_message_mode.is_some()
+        && !ctx.seen_squash
+    {
+        let config = ConfigSet::load(Some(git_dir), true)?;
+        let committer = rebase_replayed_committer_line(
+            &config,
+            &picked.author,
+            load_rebase_replay_commit_opts(rb_dir),
+            time::OffsetDateTime::now_utc(),
+        )?;
+        let (name, email, _) = split_stored_author_line(&committer)?;
+        let sob = format_signoff_line(&name, &email);
+        append_signoff_trailer(&mut display_message, &sob, &config);
+    }
+    let body = if cmd == RebaseTodoCmd::Squash || cmd == RebaseTodoCmd::Fixup {
+        display_message.as_str()
     } else {
-        message_body_after_subject(&picked.message)
+        message_body_after_subject(&display_message)
     };
 
     if ctx.count == 0 {
@@ -2515,19 +2753,29 @@ fn update_squash_message_file(
         let hbody = message_body_after_subject(&head_commit.message);
         let mut buf = String::new();
         buf.push_str("# This is a combination of 2 commits.\n");
-        buf.push_str("# This is the 1st commit message:\n\n");
         if cmd == RebaseTodoCmd::Fixup {
-            let mut fixup_msg = String::new();
-            fixup_msg.push_str("# This is a combination of 2 commits.\n");
-            fixup_msg.push_str("# This is the 1st commit message:\n\n");
-            fixup_msg.push_str(hsubj);
-            fixup_msg.push('\n');
-            fixup_msg.push_str(hbody);
-            if !hbody.is_empty() && !hbody.ends_with('\n') {
+            buf.push_str("# The 1st commit message will be skipped:\n\n");
+        } else {
+            buf.push_str("# This is the 1st commit message:\n\n");
+        }
+        if cmd == RebaseTodoCmd::Fixup {
+            write_fixup_message_mode(rb_dir, fixup_message_mode)?;
+            let fixup_msg = if fixup_message_mode.is_some() {
+                fixup_replacement_message(&picked.message)
+            } else {
+                let mut fixup_msg = String::new();
+                fixup_msg.push_str("# This is a combination of 2 commits.\n");
+                fixup_msg.push_str("# This is the 1st commit message:\n\n");
+                fixup_msg.push_str(hsubj);
                 fixup_msg.push('\n');
-            }
-            fixup_msg.push_str("\n# The commit message #2 will be skipped:\n\n");
-            append_commented(&mut fixup_msg, picked.message.lines().next().unwrap_or(""));
+                fixup_msg.push_str(hbody);
+                if !hbody.is_empty() && !hbody.ends_with('\n') {
+                    fixup_msg.push('\n');
+                }
+                fixup_msg.push_str("\n# The commit message #2 will be skipped:\n\n");
+                append_commented(&mut fixup_msg, picked.message.lines().next().unwrap_or(""));
+                fixup_msg
+            };
             fs::write(&fixup_path, fixup_msg)?;
             append_commented(&mut buf, hsubj);
             if !hbody.is_empty() {
@@ -2541,10 +2789,29 @@ fn update_squash_message_file(
                 buf.push('\n');
             }
         }
-        append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, 2);
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_none() {
+            append_skipped_squash_message(&mut buf, body, 2);
+        } else {
+            append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, 2);
+        }
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() {
+            fs::write(rb_dir.join("message-fixup-active-section"), "2\n")?;
+        }
         fs::write(&squash_path, buf)?;
     } else {
         let mut buf = fs::read_to_string(&squash_path)?;
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() {
+            if !ctx.seen_squash {
+                if let Ok(section) = fs::read_to_string(rb_dir.join("message-fixup-active-section"))
+                {
+                    if let Ok(section) = section.trim().parse::<usize>() {
+                        mark_squash_section_skipped(&mut buf, section);
+                    }
+                }
+            }
+            write_fixup_message_mode(rb_dir, fixup_message_mode)?;
+            fs::write(&fixup_path, fixup_replacement_message(&picked.message))?;
+        }
         let n = ctx.count + 2;
         if let Some(pos) = buf.find('\n') {
             if buf.starts_with("# This is a combination of") {
@@ -2554,11 +2821,22 @@ fn update_squash_message_file(
                 );
             }
         }
-        append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, ctx.count + 2);
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_none() {
+            append_skipped_squash_message(&mut buf, body, ctx.count + 2);
+        } else {
+            append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, ctx.count + 2);
+        }
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() && !ctx.seen_squash {
+            fs::write(
+                rb_dir.join("message-fixup-active-section"),
+                format!("{}\n", ctx.count + 2),
+            )?;
+        }
         fs::write(&squash_path, buf)?;
     }
 
     if cmd == RebaseTodoCmd::Squash {
+        let _ = fs::remove_file(rb_dir.join("message-fixup-active-section"));
         ctx.seen_squash = true;
     }
     ctx.count += 1;
@@ -3464,7 +3742,9 @@ fn git_editor_cmd(config: &ConfigSet) -> Result<String> {
             }
         }
     }
-    crate::editor::resolve_git_editor(config, false)
+    // Preserve `EDITOR=:` as Git's no-op editor while still ignoring placeholder `VISUAL=:`
+    // when tests install a fake editor in `EDITOR`.
+    crate::editor::resolve_commit_launch_editor(config)
         .ok_or_else(|| anyhow::anyhow!("Terminal is dumb, but EDITOR unset"))
 }
 
@@ -3859,7 +4139,9 @@ fn do_rebase(
         validate_rebase_instruction_format(&config)?;
     }
 
+    validate_rebase_trailer_options(&args)?;
     validate_apply_merge_backend_combo(&args, &config, want_autosquash)?;
+    let force_rewrite_requested = rebase_force_rewrite_requested(&args);
 
     let mut autostash_oid: Option<ObjectId> = None;
     let mut had_rebase_autostash = false;
@@ -3930,6 +4212,8 @@ fn do_rebase(
     } else if args.fork_point {
         true
     } else if args.no_fork_point {
+        false
+    } else if args.keep_base > 0 {
         false
     } else {
         let cfg_default = config
@@ -4065,17 +4349,19 @@ Use '--' to separate paths from revisions, like this:\n\
         && !args.autosquash
         && !date_options_force_replay;
 
-    // `rebase --keep-base` with fork-point uses a different upstream OID for the replay list than
-    // the branch tip; preemptive fast-forward detection wrongly treats the branch as up-to-date
-    // (t3431 `--fork-point --keep-base`).
-    let skip_preemptive_ff_for_keep_base_fork_point = upstream_tip_oid != upstream_oid;
+    // `rebase --fork-point --keep-base` can use different commits for the replay range and the
+    // new base. If the fork point is not the same as `onto`, preemptive fast-forward detection
+    // would incorrectly treat the branch as up-to-date and skip required replay (t3431). When
+    // `onto` is the fork point, the preemptive noop path is valid (t3432).
+    let skip_preemptive_ff_for_keep_base_fork_point =
+        args.keep_base > 0 && upstream_tip_oid != upstream_oid && onto_oid != upstream_oid;
 
     if allow_preemptive_ff
         && !root_rebase_no_onto
         && !skip_preemptive_ff_for_keep_base_fork_point
         && rebase_can_preemptive_ff(&repo, onto_oid, upstream_tip_oid, head_oid)?
     {
-        if !args.no_ff {
+        if !force_rewrite_requested {
             print_branch_up_to_date(&head);
             if let Some(ref oid) = autostash_oid {
                 apply_autostash_after_ff(&repo, oid)?;
@@ -4263,7 +4549,7 @@ Use '--' to separate paths from revisions, like this:\n\
         )?;
         if !todo_changed
             && !want_autosquash
-            && !args.no_ff
+            && !force_rewrite_requested
             && args.onto.is_none()
             && args.exec.is_none()
             && !rebase_merges_on
@@ -4303,7 +4589,7 @@ Use '--' to separate paths from revisions, like this:\n\
         (rebase_state_todo_lines(&repo, &config, &entries)?, false)
     };
 
-    if !args.no_ff && rebase_todo_lines.is_empty() {
+    if !force_rewrite_requested && rebase_todo_lines.is_empty() {
         if !onto_oid.is_zero() && head_oid == onto_oid {
             print_branch_up_to_date(&head);
             if let Some(ref oid) = autostash_oid {
@@ -4376,6 +4662,7 @@ Use '--' to separate paths from revisions, like this:\n\
     fs::write(rb_dir.join("onto"), onto_oid.to_hex())?;
     if !args.root {
         fs::write(rb_dir.join("upstream"), upstream_oid.to_hex())?;
+        fs::write(rb_dir.join("upstream-tip"), upstream_tip_oid.to_hex())?;
     }
     fs::write(rb_dir.join("onto-name"), format!("{onto_name_for_state}\n"))?;
     fs::write(
@@ -4393,7 +4680,7 @@ Use '--' to separate paths from revisions, like this:\n\
     if args.root {
         fs::write(rb_dir.join("root"), "")?;
     }
-    if args.no_ff || args.signoff {
+    if force_rewrite_requested {
         fs::write(rb_dir.join("force-rewrite"), "")?;
     }
     if args.keep_empty || want_autosquash {
@@ -4411,6 +4698,7 @@ Use '--' to separate paths from revisions, like this:\n\
     if args.signoff && !args.no_signoff {
         fs::write(rb_dir.join("signoff"), "")?;
     }
+    write_rebase_trailer_args(&rb_dir, &args.trailer)?;
 
     let todo = rebase_todo_lines;
     let todo_body = todo.join("\n") + "\n";
@@ -4599,7 +4887,7 @@ Use '--' to separate paths from revisions, like this:\n\
         autostash_oid,
         backend,
         had_rebase_autostash,
-        args.no_ff || args.signoff,
+        force_rewrite_requested,
     )?;
 
     Ok(())
@@ -5464,6 +5752,7 @@ fn replay_remaining(
                             next_after,
                             true,
                             force_rewrite_commits,
+                            None,
                         )
                     } else {
                         run_rebase_pick_in_clean_child_process(repo, i, force_rewrite_commits)
@@ -5552,6 +5841,7 @@ fn replay_remaining(
                 RebaseReplayStep::PickLike {
                     oid: commit_oid,
                     cmd: todo_cmd,
+                    fixup_message_mode: _,
                 } => {
                     let commit_hex = commit_oid.to_hex();
                     fs::write(rb_dir.join("current"), format!("{commit_hex}\n"))?;
@@ -5734,21 +6024,92 @@ fn rebase_signoff(rb_dir: &Path) -> bool {
     rb_dir.join("signoff").exists()
 }
 
-fn maybe_apply_rebase_signoff_to_commit_data(
+fn rebase_trailer_args(rb_dir: &Path) -> Vec<String> {
+    let Ok(bytes) = fs::read(rb_dir.join("trailers")) else {
+        return Vec::new();
+    };
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+    bytes
+        .split(|b| *b == 0)
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect()
+}
+
+fn write_rebase_trailer_args(rb_dir: &Path, trailers: &[String]) -> Result<()> {
+    if trailers.is_empty() {
+        return Ok(());
+    }
+    let mut bytes = Vec::new();
+    for (idx, trailer) in trailers.iter().enumerate() {
+        if idx > 0 {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(trailer.as_bytes());
+    }
+    fs::write(rb_dir.join("trailers"), bytes)?;
+    Ok(())
+}
+
+fn rebase_has_explicit_trailers(rb_dir: &Path) -> bool {
+    rb_dir.join("trailers").exists()
+}
+
+fn apply_rebase_explicit_trailers_to_message(
+    message: String,
+    rb_dir: &Path,
+    config: &ConfigSet,
+) -> String {
+    let trailer_args = rebase_trailer_args(rb_dir);
+    if trailer_args.is_empty() {
+        return message;
+    }
+    let specs: Vec<NewTrailerArg> = trailer_args
+        .into_iter()
+        .map(|text| NewTrailerArg {
+            text,
+            where_: Default::default(),
+            if_exists: Default::default(),
+            if_missing: Default::default(),
+        })
+        .collect();
+    let opts = ProcessTrailerOptions {
+        no_divider: true,
+        ..Default::default()
+    };
+    let message = apply_commit_msg_cleanup(&message, rebase_commit_msg_cleanup(config));
+    let input = complete_line(&message);
+    let git_dir = rb_dir.parent().unwrap_or(rb_dir);
+    process_trailers(&input, &opts, &specs, Some(git_dir))
+}
+
+fn maybe_apply_rebase_message_trailers_to_commit_data(
     commit_data: &mut CommitData,
     rb_dir: &Path,
     config: &ConfigSet,
     todo_cmd: RebaseTodoCmd,
 ) -> Result<()> {
-    if !rebase_signoff(rb_dir) || !matches!(todo_cmd, RebaseTodoCmd::Pick | RebaseTodoCmd::Reword) {
+    let mut message = commit_data.message.clone();
+    let mut changed = false;
+
+    if rebase_signoff(rb_dir) && matches!(todo_cmd, RebaseTodoCmd::Pick | RebaseTodoCmd::Reword) {
+        let (name, email, _) = split_stored_author_line(&commit_data.committer)?;
+        let sob = format_signoff_line(&name, &email);
+        append_signoff_trailer(&mut message, &sob, config);
+        changed = true;
+    }
+
+    if rebase_has_explicit_trailers(rb_dir) {
+        message = apply_rebase_explicit_trailers_to_message(message, rb_dir, config);
+        changed = true;
+    }
+
+    if !changed {
         return Ok(());
     }
 
-    let (name, email, _) = split_stored_author_line(&commit_data.committer)?;
-    let sob = format_signoff_line(&name, &email);
-    append_signoff_trailer(&mut commit_data.message, &sob, config);
-    let (message, encoding, raw_message) =
-        finalize_message_for_commit_encoding(commit_data.message.clone(), config);
+    let (message, encoding, raw_message) = finalize_message_for_commit_encoding(message, config);
     commit_data.message = message;
     commit_data.encoding = encoding;
     commit_data.raw_message = raw_message;
@@ -5778,6 +6139,11 @@ fn rebase_initial_todo_count(rb_dir: &Path) -> Option<usize> {
 
 fn rebase_upstream_oid(rb_dir: &Path) -> Option<ObjectId> {
     let s = fs::read_to_string(rb_dir.join("upstream")).ok()?;
+    ObjectId::from_hex(s.trim()).ok()
+}
+
+fn rebase_upstream_tip_oid(rb_dir: &Path) -> Option<ObjectId> {
+    let s = fs::read_to_string(rb_dir.join("upstream-tip")).ok()?;
     ObjectId::from_hex(s.trim()).ok()
 }
 
@@ -5890,6 +6256,7 @@ fn cherry_pick_for_rebase(
     next_after_line: Option<RebaseTodoCmd>,
     record_rewrite: bool,
     force_rewrite_commits: bool,
+    fixup_message_mode: Option<FixupMessageMode>,
 ) -> Result<()> {
     let git_dir = &repo.git_dir;
     let keep_empty = rebase_keep_empty(rb_dir);
@@ -5940,7 +6307,12 @@ fn cherry_pick_for_rebase(
             message,
             raw_message,
         };
-        maybe_apply_rebase_signoff_to_commit_data(&mut commit_data, rb_dir, &config, todo_cmd)?;
+        maybe_apply_rebase_message_trailers_to_commit_data(
+            &mut commit_data,
+            rb_dir,
+            &config,
+            todo_cmd,
+        )?;
         let bytes = serialize_commit(&commit_data);
         let new_oid = write_replayed_commit(repo, rb_dir, &config, &commit_data.committer, bytes)?;
         fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
@@ -6004,10 +6376,17 @@ fn cherry_pick_for_rebase(
                     (Some(u), Some(o)) => u == o,
                     _ => false,
                 };
+                let rebase_range_starts_at_upstream_tip =
+                    match (rebase_upstream_oid(rb_dir), rebase_upstream_tip_oid(rb_dir)) {
+                        (Some(u), Some(tip)) => u == tip,
+                        _ => true,
+                    };
                 let single_noop_same_tip = force_rewrite_commits
                     && !rebase_signoff(rb_dir)
+                    && !rebase_has_explicit_trailers(rb_dir)
                     && ws_fix_rule.is_none()
                     && upstream_matches_onto
+                    && rebase_range_starts_at_upstream_tip
                     && rebase_initial_todo_count(rb_dir) == Some(1)
                     && rebase_orig_head_oid(rb_dir).as_ref() == Some(commit_oid);
 
@@ -6046,7 +6425,7 @@ fn cherry_pick_for_rebase(
                         message,
                         raw_message,
                     };
-                    maybe_apply_rebase_signoff_to_commit_data(
+                    maybe_apply_rebase_message_trailers_to_commit_data(
                         &mut commit_data,
                         rb_dir,
                         &config,
@@ -6096,7 +6475,7 @@ fn cherry_pick_for_rebase(
                         message,
                         raw_message,
                     };
-                    maybe_apply_rebase_signoff_to_commit_data(
+                    maybe_apply_rebase_message_trailers_to_commit_data(
                         &mut commit_data,
                         rb_dir,
                         &config,
@@ -6147,7 +6526,7 @@ fn cherry_pick_for_rebase(
                         message,
                         raw_message,
                     };
-                    maybe_apply_rebase_signoff_to_commit_data(
+                    maybe_apply_rebase_message_trailers_to_commit_data(
                         &mut commit_data,
                         rb_dir,
                         &config,
@@ -6245,7 +6624,7 @@ fn cherry_pick_for_rebase(
                     message: pick_message.clone(),
                     raw_message: raw_pick,
                 };
-                maybe_apply_rebase_signoff_to_commit_data(
+                maybe_apply_rebase_message_trailers_to_commit_data(
                     &mut pick_data,
                     rb_dir,
                     &config,
@@ -6296,7 +6675,7 @@ fn cherry_pick_for_rebase(
                     message,
                     raw_message,
                 };
-                maybe_apply_rebase_signoff_to_commit_data(
+                maybe_apply_rebase_message_trailers_to_commit_data(
                     &mut commit_data,
                     rb_dir,
                     &config,
@@ -6319,7 +6698,15 @@ fn cherry_pick_for_rebase(
 
     if matches!(todo_cmd, RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash) {
         let mut ctx = read_squash_ctx(rb_dir);
-        update_squash_message_file(repo, rb_dir, git_dir, todo_cmd, &commit, &mut ctx)?;
+        update_squash_message_file(
+            repo,
+            rb_dir,
+            git_dir,
+            todo_cmd,
+            fixup_message_mode,
+            &commit,
+            &mut ctx,
+        )?;
     }
 
     // Three-way merge: base=parent_tree, ours=HEAD_tree, theirs=commit_tree
@@ -6459,7 +6846,12 @@ fn cherry_pick_for_rebase(
 
     if !has_conflicts {
         let merged_tree_oid = write_tree_from_index(&repo.odb, &merged_index, "")?;
-        if matches!(todo_cmd, RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash) && !keep_empty {
+        let fixup_replacement_empty =
+            todo_cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some();
+        if matches!(todo_cmd, RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash)
+            && !fixup_replacement_empty
+            && !keep_empty
+        {
             let head_obj = repo.odb.read(&head_oid)?;
             let head_commit = parse_commit(&head_obj.data)?;
             if let Some(amend_parent) = head_commit.parents.first() {
@@ -6473,7 +6865,7 @@ fn cherry_pick_for_rebase(
                 }
             }
         }
-        if merged_tree_oid == head_tree_oid && !keep_empty {
+        if merged_tree_oid == head_tree_oid && !fixup_replacement_empty && !keep_empty {
             // A commit whose result is empty: if it did *not* start empty (its tree differed from
             // its parent's, so it became empty only because a prerequisite was already applied
             // upstream — e.g. `pull --rebase` after the upstream was rebased), a non-interactive
@@ -6553,11 +6945,8 @@ fn cherry_pick_for_rebase(
             git_dir.join("REBASE_HEAD"),
             format!("{}\n", commit_oid.to_hex()),
         );
-        if todo_cmd == RebaseTodoCmd::Reword {
-            let (unicode, _enc, _raw) = transcoded_replayed_message(&commit, &config);
-            write_rebase_conflict_message(git_dir, &commit, &config)?;
-            fs::write(rb_dir.join("message"), unicode)?;
-        } else {
+        write_rebase_conflict_message(git_dir, &commit, &config)?;
+        if todo_cmd != RebaseTodoCmd::Reword {
             let mut merge_msg = commit.message.clone();
             append_rebase_conflicts_comment_block(&mut merge_msg, &merge_conflict_files, &config);
             fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
@@ -6628,10 +7017,14 @@ fn cherry_pick_for_rebase(
         if todo_cmd == RebaseTodoCmd::Fixup {
             let fixup_path = rb_dir.join("message-fixup");
             let squash_ctx = read_squash_ctx(rb_dir);
-            let cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
+            let mut cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
                 let tmpl = fs::read_to_string(&fixup_path)?;
-                let raw =
-                    commit_message_after_prepare_hook(repo, git_dir, &tmpl, "message", Some(":"))?;
+                let raw = if fixup_message_opens_editor(rb_dir) {
+                    let edit_tmpl = fixup_edit_template(rb_dir, &tmpl);
+                    run_commit_editor_for_template(repo, git_dir, &edit_tmpl, "squash", None)?
+                } else {
+                    commit_message_after_prepare_hook(repo, git_dir, &tmpl, "message", Some(":"))?
+                };
                 cleanup_squash_editor_message(&raw, &config)
             } else {
                 let tmpl = fs::read_to_string(rb_dir.join("message-squash"))?;
@@ -6639,6 +7032,7 @@ fn cherry_pick_for_rebase(
                     run_commit_editor_for_template(repo, git_dir, &tmpl, "message", None)?;
                 cleanup_squash_editor_message(&after_editor, &config)
             };
+            cleaned = apply_rebase_explicit_trailers_to_message(cleaned, rb_dir, &config);
             let new_oid = commit_from_merged_index(
                 repo,
                 git_dir,
@@ -6660,7 +7054,7 @@ fn cherry_pick_for_rebase(
 
         let squash_path = rb_dir.join("message-squash");
         let fixup_path = rb_dir.join("message-fixup");
-        let cleaned = if fixup_path.exists() {
+        let mut cleaned = if fixup_path.exists() {
             let fixup_msg = fs::read_to_string(&fixup_path)?;
             let body = message_body_after_subject(&commit.message);
             let tmpl = final_squash_template_after_fixups(&fixup_msg, body);
@@ -6673,6 +7067,7 @@ fn cherry_pick_for_rebase(
                 run_commit_editor_for_template(repo, git_dir, &tmpl, "message", None)?;
             cleanup_squash_editor_message(&after_editor, &config)
         };
+        cleaned = apply_rebase_explicit_trailers_to_message(cleaned, rb_dir, &config);
         let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
         let new_oid = commit_from_merged_index(
             repo,
@@ -6711,6 +7106,7 @@ fn cherry_pick_for_rebase(
         let committer = rebase_replayed_committer_line(&config, &commit.author, replay_opts, now)?;
         let fast_forward_reword = commit.parents.first().copied() == Some(head_oid)
             && !rebase_signoff(rb_dir)
+            && !rebase_has_explicit_trailers(rb_dir)
             && !replay_opts.committer_date_is_author_date
             && !replay_opts.ignore_date;
         let pick_oid = if fast_forward_reword {
@@ -6735,7 +7131,7 @@ fn cherry_pick_for_rebase(
                 message: pick_message.clone(),
                 raw_message: raw_pick,
             };
-            maybe_apply_rebase_signoff_to_commit_data(
+            maybe_apply_rebase_message_trailers_to_commit_data(
                 &mut pick_data,
                 rb_dir,
                 &config,
@@ -6784,7 +7180,12 @@ fn cherry_pick_for_rebase(
             message,
             raw_message,
         };
-        maybe_apply_rebase_signoff_to_commit_data(&mut commit_data, rb_dir, &config, todo_cmd)?;
+        maybe_apply_rebase_message_trailers_to_commit_data(
+            &mut commit_data,
+            rb_dir,
+            &config,
+            todo_cmd,
+        )?;
         let commit_bytes = serialize_commit(&commit_data);
         let new_oid =
             write_replayed_commit(repo, rb_dir, &config, &commit_data.committer, commit_bytes)?;
@@ -6828,7 +7229,12 @@ fn cherry_pick_for_rebase(
         message,
         raw_message,
     };
-    maybe_apply_rebase_signoff_to_commit_data(&mut commit_data, rb_dir, &config, todo_cmd)?;
+    maybe_apply_rebase_message_trailers_to_commit_data(
+        &mut commit_data,
+        rb_dir,
+        &config,
+        todo_cmd,
+    )?;
 
     let commit_bytes = serialize_commit(&commit_data);
     let new_oid =
@@ -7293,6 +7699,7 @@ fn do_continue() -> Result<()> {
             let sob = format_signoff_line(&name, &email);
             append_signoff_trailer(&mut message, &sob, &config);
         }
+        message = apply_rebase_explicit_trailers_to_message(message, &rb_dir, &config);
         let message_subject = message.lines().next().unwrap_or("").to_owned();
         let new_oid = commit_from_merged_index(
             &repo,
@@ -7420,6 +7827,50 @@ fn do_continue() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("HEAD has no OID"))?
         .to_owned();
 
+    if interactive_continue && matches!(todo_cmd, RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash) {
+        let head_tree = commit_tree_oid_for_rebase(&repo, head_oid)?;
+        if diff_index_to_tree(&repo.odb, &index, Some(&head_tree), false)
+            .map(|diffs| diffs.is_empty())
+            .unwrap_or(false)
+        {
+            let _ = drop_last_squash_message_section(&rb_dir);
+            if todo_lines_continue
+                .first()
+                .and_then(|line| {
+                    parse_rebase_replay_step(&repo, line, interactive_continue)
+                        .ok()
+                        .flatten()
+                })
+                .and_then(|step| match step {
+                    RebaseReplayStep::PickLike { oid, .. } | RebaseReplayStep::Edit(oid) => {
+                        Some(oid)
+                    }
+                    _ => None,
+                })
+                == Some(current_oid)
+            {
+                pop_first_nonempty_todo_line(&repo, &rb_dir)?;
+            }
+            let remaining = read_rebase_todo_file(&repo, &rb_dir)?;
+            if rebase_todo_actionable_lines(&remaining).is_empty() {
+                cleanup_head_message_after_fixup_skip(&repo, git_dir, None)?;
+                clear_squash_ctx(&rb_dir);
+            }
+            let _ = fs::remove_file(rb_dir.join("current"));
+            let _ = fs::remove_file(rb_dir.join("current-cmd"));
+            let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
+            let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
+            return replay_remaining(
+                &repo,
+                &rb_dir,
+                autostash_continue,
+                backend_continue,
+                had_autostash_continue,
+                force_rewrite_continue,
+            );
+        }
+    }
+
     if stopped_oid.is_some() && worktree_matches_head(&repo, git_dir)? {
         let oid_for_rewrite = stopped_oid.as_ref().unwrap_or(&current_oid);
         let next_after_continue =
@@ -7509,7 +7960,7 @@ fn do_continue() -> Result<()> {
                 &index,
                 &config,
                 vec![amend_parent],
-                &original_commit.author,
+                &hc.author,
                 cleaned,
                 replay_opts_continue,
                 now_continue,
@@ -7525,7 +7976,7 @@ fn do_continue() -> Result<()> {
                 &index,
                 &config,
                 vec![amend_parent],
-                &original_commit.author,
+                &hc.author,
                 cleaned,
                 replay_opts_continue,
                 now_continue,
@@ -7533,10 +7984,16 @@ fn do_continue() -> Result<()> {
         } else if todo_cmd == RebaseTodoCmd::Fixup {
             let fixup_path = rb_dir.join("message-fixup");
             let squash_ctx = read_squash_ctx(&rb_dir);
-            let cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
+            let mut cleaned = if fixup_path.exists() && !squash_ctx.seen_squash {
                 let tmpl = fs::read_to_string(&fixup_path)?;
-                let after_editor =
-                    run_commit_editor_for_template(&repo, git_dir, &tmpl, "message", None)?;
+                let edit_tmpl;
+                let after_editor = if fixup_message_opens_editor(&rb_dir) {
+                    edit_tmpl = fixup_edit_template(&rb_dir, &tmpl);
+                    run_commit_editor_for_template(&repo, git_dir, &edit_tmpl, "squash", None)?
+                } else {
+                    edit_tmpl = message_with_editor_separator(&tmpl);
+                    run_commit_editor_for_template(&repo, git_dir, &edit_tmpl, "squash", None)?
+                };
                 cleanup_squash_editor_message(&after_editor, &config)
             } else {
                 let tmpl = fs::read_to_string(rb_dir.join("message-squash"))?;
@@ -7544,13 +8001,14 @@ fn do_continue() -> Result<()> {
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "message", None)?;
                 cleanup_squash_editor_message(&after_editor, &config)
             };
+            cleaned = apply_rebase_explicit_trailers_to_message(cleaned, &rb_dir, &config);
             let oid = commit_from_merged_index(
                 &repo,
                 git_dir,
                 &index,
                 &config,
                 vec![amend_parent],
-                &original_commit.author,
+                &hc.author,
                 cleaned,
                 replay_opts_continue,
                 now_continue,
@@ -7560,7 +8018,7 @@ fn do_continue() -> Result<()> {
         } else {
             let squash_path = rb_dir.join("message-squash");
             let fixup_path = rb_dir.join("message-fixup");
-            let cleaned = if fixup_path.exists() {
+            let mut cleaned = if fixup_path.exists() {
                 let fixup_msg = fs::read_to_string(&fixup_path)?;
                 let body = message_body_after_subject(&original_commit.message);
                 let tmpl = final_squash_template_after_fixups(&fixup_msg, body);
@@ -7573,13 +8031,14 @@ fn do_continue() -> Result<()> {
                     run_commit_editor_for_template(&repo, git_dir, &tmpl, "message", None)?;
                 cleanup_squash_editor_message(&after_editor, &config)
             };
+            cleaned = apply_rebase_explicit_trailers_to_message(cleaned, &rb_dir, &config);
             let oid = commit_from_merged_index(
                 &repo,
                 git_dir,
                 &index,
                 &config,
                 vec![amend_parent],
-                &original_commit.author,
+                &hc.author,
                 cleaned,
                 replay_opts_continue,
                 now_continue,
@@ -7630,7 +8089,12 @@ fn do_continue() -> Result<()> {
             message,
             raw_message,
         };
-        maybe_apply_rebase_signoff_to_commit_data(&mut commit_data, &rb_dir, &config, todo_cmd)?;
+        maybe_apply_rebase_message_trailers_to_commit_data(
+            &mut commit_data,
+            &rb_dir,
+            &config,
+            todo_cmd,
+        )?;
         let commit_bytes = serialize_commit(&commit_data);
         write_replayed_commit(
             &repo,
@@ -7703,7 +8167,12 @@ fn do_continue() -> Result<()> {
             message,
             raw_message,
         };
-        maybe_apply_rebase_signoff_to_commit_data(&mut commit_data, &rb_dir, &config, todo_cmd)?;
+        maybe_apply_rebase_message_trailers_to_commit_data(
+            &mut commit_data,
+            &rb_dir,
+            &config,
+            todo_cmd,
+        )?;
         let commit_bytes = serialize_commit(&commit_data);
         write_replayed_commit(
             &repo,
