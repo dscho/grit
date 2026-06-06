@@ -1170,6 +1170,36 @@ pub(crate) fn read_pkt_payload_raw(r: &mut impl Read) -> std::io::Result<Option<
     }
 }
 
+/// Whether an I/O error chain is a broken pipe (the upload-pack child closed its stdin after
+/// rejecting our request). Used to convert a mid-negotiation EPIPE into a clean fatal error.
+fn is_broken_pipe_io(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// After a broken-pipe write to upload-pack, read whatever it sent on stdout for an `ERR` packet
+/// (e.g. `ERR upload-pack: not our ref <oid>`) and surface it as a fatal error. Falls back to a
+/// generic message when no ERR packet is found. Always returns `Err`.
+fn fail_with_upload_pack_err(stdout: &mut impl Read) -> anyhow::Error {
+    loop {
+        match pkt_line::read_packet(stdout) {
+            Ok(Some(pkt_line::Packet::Data(ln))) => {
+                let line = ln.trim_end();
+                trace_packet_fetch('<', line);
+                if let Some(msg) = line.strip_prefix("ERR ") {
+                    return anyhow::anyhow!("fatal: remote error: {}", msg.trim_end());
+                }
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) | Err(_) => break,
+        }
+    }
+    anyhow::anyhow!("fatal: the remote end hung up unexpectedly")
+}
+
 fn read_sideband_pack_until_done(r: &mut impl Read, out: &mut Vec<u8>) -> Result<()> {
     let mut seen_pack = false;
     // Progress and pack data share side-band channel 1; the `PACK` magic may start mid-chunk or
@@ -1420,6 +1450,15 @@ pub fn fetch_via_upload_pack_skipping(
     if wants.is_empty() {
         // No pack to transfer (either already up-to-date or refspecs selected no refs), but we
         // still return advertised heads/tags so callers can perform ref/prune bookkeeping.
+        //
+        // The protocol-v2 `promisor-remote` capability is part of the handshake, not the pack
+        // round: Git applies `promisor.storeFields` (persisting advertised filter/token into local
+        // config) whenever the server advertises promisor remotes the client accepts, even when no
+        // objects are wanted. Evaluate it here so a `git fetch` against an up-to-date server whose
+        // advertised filter changed still updates the local config (t5710 storeFields).
+        if let Some(caps) = v2_caps.as_ref() {
+            evaluate_promisor_remote_advertisement(local_git_dir, caps, filter_spec)?;
+        }
         drop(stdin);
         let _ = drain_child_stdout_to_eof(&mut stdout);
         let status = child.wait()?;
@@ -2223,6 +2262,36 @@ pub(crate) fn fetch_upload_pack_negotiate_pack_bytes_with_streams(
     stdin.write_all(&req).context("write wants")?;
     stdin.flush()?;
 
+    // For a deepen/shallow request the server replies with a shallow-info section (terminated by a
+    // flush) *before* expecting `have` lines. Read it now so a rejected `want` (the server sends
+    // `ERR upload-pack: not our ref` and exits) is surfaced as a clean fatal error instead of an
+    // EPIPE abort when we go on to write `have`/`done` into the closed pipe
+    // (t5516 'deny fetch unreachable SHA1' / 'shallow fetch reachable SHA1').
+    let deepen_requested = shallow_options.is_some_and(|o| {
+        o.depth.is_some()
+            || o.deepen.is_some()
+            || o.shallow_since.is_some()
+            || !o.shallow_exclude.is_empty()
+            || o.unshallow
+    });
+    if deepen_requested {
+        loop {
+            match pkt_line::read_packet(stdout)? {
+                Some(pkt_line::Packet::Flush) | None => break,
+                Some(pkt_line::Packet::Data(ln)) => {
+                    let line = ln.trim_end();
+                    trace_packet_fetch('<', line);
+                    if let Some(msg) = line.strip_prefix("ERR ") {
+                        bail!("fatal: remote error: {}", msg.trim_end());
+                    }
+                    // `shallow <oid>` / `unshallow <oid>` lines are consumed here; the local shallow
+                    // boundary is (re)computed from the fetched heads after the pack is applied.
+                }
+                Some(other) => bail!("unexpected upload-pack shallow-info response: {other:?}"),
+            }
+        }
+    }
+
     let suppress_haves = negotiation_tip_oids.is_some_and(|tips| tips.is_empty());
     let mut negotiator = SkippingNegotiator::new(local_repo);
 
@@ -2361,8 +2430,16 @@ pub(crate) fn fetch_upload_pack_negotiate_pack_bytes_with_streams(
         count += 1;
         if flush_at <= count {
             pending.extend_from_slice(b"0000");
-            stdin.write_all(&pending).context("write have flush")?;
-            stdin.flush()?;
+            if let Err(e) = stdin
+                .write_all(&pending)
+                .and_then(|()| stdin.flush())
+                .context("write have flush")
+            {
+                if is_broken_pipe_io(&e) {
+                    return Err(fail_with_upload_pack_err(stdout));
+                }
+                return Err(e);
+            }
             pending.clear();
             flush_at = next_flush_count(stateless_rpc, count);
             flushes += 1;
@@ -2379,8 +2456,16 @@ pub(crate) fn fetch_upload_pack_negotiate_pack_bytes_with_streams(
 
     if !pending.is_empty() {
         pending.extend_from_slice(b"0000");
-        stdin.write_all(&pending).context("final have flush")?;
-        stdin.flush()?;
+        if let Err(e) = stdin
+            .write_all(&pending)
+            .and_then(|()| stdin.flush())
+            .context("final have flush")
+        {
+            if is_broken_pipe_io(&e) {
+                return Err(fail_with_upload_pack_err(stdout));
+            }
+            return Err(e);
+        }
         flushes += 1;
     }
 
@@ -2395,8 +2480,16 @@ pub(crate) fn fetch_upload_pack_negotiate_pack_bytes_with_streams(
     let mut tail = Vec::new();
     pkt_line::write_line_to_vec(&mut tail, "done")?;
     trace_packet_fetch('>', "done");
-    stdin.write_all(&tail).context("write done")?;
-    stdin.flush()?;
+    if let Err(e) = stdin
+        .write_all(&tail)
+        .and_then(|()| stdin.flush())
+        .context("write done")
+    {
+        if is_broken_pipe_io(&e) {
+            return Err(fail_with_upload_pack_err(stdout));
+        }
+        return Err(e);
+    }
 
     // `upload-pack` responds to `done` with `ACK <oid>` or `NAK` before streaming the pack.
     match pkt_line::read_packet(stdout)? {

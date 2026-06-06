@@ -173,6 +173,14 @@ pub struct Args {
     /// Accepted for Git compatibility; forwarded when delegating to system `git push`.
     #[arg(long = "upload-pack", value_name = "PATH")]
     pub upload_pack: Option<String>,
+
+    /// Use (or, with `--no-thin`, do not use) a thin pack when sending objects. `git push`
+    /// defaults to `--thin`; `--no-thin` forces a self-contained pack (the receiver may require it,
+    /// e.g. `receive-pack --reject-thin-pack-for-testing`).
+    #[arg(long = "thin", overrides_with = "no_thin", default_value_t = true)]
+    pub thin: bool,
+    #[arg(long = "no-thin", overrides_with = "thin")]
+    pub no_thin: bool,
 }
 
 /// A single ref update to perform on the remote.
@@ -2257,8 +2265,37 @@ fn push_to_url(
         maybe_emit_push_path_walk_region(config);
         maybe_emit_push_pack_objects_child(config);
 
-        let thin_pack = pack_objects::build_thin_push_pack(repo, &push_tips, &remote_repo.git_dir)
-            .context("building push pack")?;
+        // Decide the negative (`--not`) boundary for the thin pack the way the wire protocol would.
+        //
+        // * push.negotiate + protocol v2: a negotiation round runs and discovers the common
+        //   commits the receiver actually has (including objects only reachable from a *hidden*
+        //   ref). We approximate that with the direct object-membership boundary
+        //   (`build_thin_push_pack`) and emit a `total_rounds=1` trace2 event.
+        // * push.negotiate but not protocol v2: negotiation cannot run; Git warns
+        //   "push negotiation failed" and proceeds with a non-negotiated push.
+        // * no push.negotiate: the receiver only advertises non-hidden refs, so the negative
+        //   boundary is the reachable closure of those advertised tips only.
+        let negotiate_requested = push_negotiate_enabled(config);
+        let negotiate_active =
+            negotiate_requested && protocol_wire::effective_client_protocol_version() == 2;
+        if negotiate_requested && !negotiate_active {
+            eprintln!("warning: push negotiation failed: --negotiate-only requires protocol v2");
+        }
+        let thin_pack = if negotiate_active {
+            maybe_emit_push_negotiate_rounds_trace2(1);
+            pack_objects::build_thin_push_pack(repo, &push_tips, &remote_repo.git_dir)
+                .context("building push pack")?
+        } else {
+            let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+            hidden.load_hidden_refs_from_config(&receive_remote_config, "receive");
+            pack_objects::build_thin_push_pack_excluding_hidden(
+                repo,
+                &push_tips,
+                &remote_repo.git_dir,
+                &hidden,
+            )
+            .context("building push pack")?
+        };
 
         // Compute the "Enumerating objects" count against the receiver's PRE-ingest object set:
         // Git counts the packed objects plus the preferred-base (delta-base) objects pulled from
@@ -3098,6 +3135,8 @@ fn delegate_local_push_to_send_pack(
         dry_run: args.dry_run,
         receive_pack: args.receive_pack.clone(),
         exec: None,
+        thin: args.thin,
+        no_thin: args.no_thin,
     };
     crate::commands::send_pack::run(send_args).map_err(|e| {
         // `send-pack` signals ref rejections / remote failure via a quiet non-zero exit; surface
@@ -3812,8 +3851,16 @@ fn update_remote_tracking_ref(
     let tracking_ref = format!("refs/remotes/{remote_name}/{branch}");
 
     match new_oid {
-        Some(oid) => refs::write_ref(&repo.git_dir, &tracking_ref, &oid)
-            .with_context(|| format!("updating tracking ref {tracking_ref}"))?,
+        Some(oid) => {
+            // Skip the write when the tracking ref already records this value. Otherwise an
+            // up-to-date push would re-materialize a packed tracking ref as a loose file
+            // (t5516 'push preserves up-to-date packed refs').
+            if refs::resolve_ref(&repo.git_dir, &tracking_ref).ok() == Some(oid) {
+                return Ok(());
+            }
+            refs::write_ref(&repo.git_dir, &tracking_ref, &oid)
+                .with_context(|| format!("updating tracking ref {tracking_ref}"))?
+        }
         None => {
             let _ = refs::delete_ref(&repo.git_dir, &tracking_ref);
         }
@@ -4567,10 +4614,16 @@ fn push_to_http_url(
         .iter()
         .filter(|u| u.is_pushable())
         .all(|u| u.new_oid.is_none());
+    let use_thin = args.thin && !args.no_thin;
     let pack_data = if delete_only {
         Vec::new()
     } else {
-        pack_objects::build_thin_push_pack_from_remote_oids(repo, &push_tips, &remote_have_vec)?
+        pack_objects::build_push_pack_from_remote_oids(
+            repo,
+            &push_tips,
+            &remote_have_vec,
+            use_thin,
+        )?
     };
     maybe_emit_push_pack_wrote_trace2(&pack_data);
     if push_show_object_progress(args) && !delete_only {
@@ -5105,10 +5158,16 @@ fn push_over_receive_pack_child(
     let push_tips: Vec<ObjectId> = updates.iter().filter_map(|u| u.new_oid).collect();
     let remote_have_vec: Vec<ObjectId> = remote_have.into_iter().collect();
     let delete_only = updates.iter().all(|u| u.new_oid.is_none());
+    let use_thin = args.thin && !args.no_thin;
     let pack_data = if delete_only {
         Vec::new()
     } else {
-        pack_objects::build_thin_push_pack_from_remote_oids(repo, &push_tips, &remote_have_vec)?
+        pack_objects::build_push_pack_from_remote_oids(
+            repo,
+            &push_tips,
+            &remote_have_vec,
+            use_thin,
+        )?
     };
     if push_show_object_progress(args) && !delete_only {
         let written_objects = grit_lib::receive_pack::pack_object_count(&pack_data)
@@ -6240,6 +6299,25 @@ fn maybe_emit_push_pack_objects_child(config: &ConfigSet) {
         argv.push("--no-use-bitmap-index".to_owned());
     }
     let _ = crate::trace2_emit_child_start_json(&trace_path, &argv);
+}
+
+/// Emit the `negotiation_v2`/`total_rounds` trace2 data event a negotiating push records so
+/// `GIT_TRACE2_EVENT`-based assertions (`t5516` 'push with negotiation') can count negotiation
+/// rounds. The local fast path negotiates against the receiver's object store directly, so a single
+/// round suffices.
+fn maybe_emit_push_negotiate_rounds_trace2(rounds: u32) {
+    let Ok(path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = crate::trace2_write_json_data_line(
+        &path,
+        "negotiation_v2",
+        "total_rounds",
+        &rounds.to_string(),
+    );
 }
 
 fn maybe_emit_push_pack_wrote_trace2(pack: &[u8]) {

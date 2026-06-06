@@ -275,69 +275,644 @@ pub fn parse_indent_heuristic_cli_flags(argv: &[String]) -> (bool, bool) {
     (indent_heuristic, no_indent_heuristic)
 }
 
-/// Diff two token streams with imara's Myers implementation (Git's default xdiff engine) and
-/// return the result as `similar::DiffOp`s. Used by the word-diff machinery, where matching
-/// Git's exact LCS tie-breaking matters (`similar`'s Myers picks different — but equally
-/// minimal — alignments, mismatching Git's reference output for e.g. the `ada` driver).
+// ---------------------------------------------------------------------------
+// Faithful port of Git's xdiff Myers engine (xdiff/xdiffi.c + xprepare.c),
+// restricted to what the word-diff path needs (no rename/ignore-whitespace
+// flags). Git's word diff runs the *default* xdiff Myers over the per-word
+// token streams; matching Git's exact change-record selection requires
+// reproducing its preprocessing (record classification + `xdl_cleanup_records`
+// + `xdl_trim_ends`) and its divide-and-conquer split, because `imara-diff`
+// (and `similar`) pick different — but equally minimal — alignments for inputs
+// with many repeated tokens (e.g. the `{`/`}`/`,` in the `bibtex` driver).
+mod git_xdiff {
+    const XDL_MAX_COST_MIN: i64 = 256;
+    const XDL_HEUR_MIN_COST: i64 = 256;
+    const XDL_SNAKE_CNT: i64 = 20;
+    const XDL_K_HEUR: i64 = 4;
+    const XDL_LINE_MAX: i64 = i64::MAX;
+    const XDL_KPDIS_RUN: i64 = 4;
+    const XDL_MAX_EQLIMIT: i64 = 1024;
+    const XDL_SIMSCAN_WINDOW: i64 = 100;
+
+    // record-classification actions (xprepare.c)
+    const DISCARD: u8 = 0;
+    const KEEP: u8 = 1;
+    const INVESTIGATE: u8 = 2;
+
+    /// Classical integer square root approximation using shifts (`xdl_bogosqrt`).
+    fn bogosqrt(mut n: i64) -> i64 {
+        let mut i: i64 = 1;
+        while n > 0 {
+            i <<= 1;
+            n >>= 2;
+        }
+        i
+    }
+
+    struct XdAlgoEnv {
+        mxcost: i64,
+        snake_cnt: i64,
+        heur_min: i64,
+    }
+
+    struct XdpSplit {
+        i1: i64,
+        i2: i64,
+        min_lo: bool,
+        min_hi: bool,
+    }
+
+    /// A single side of the diff: token ids plus the `changed` flags and the
+    /// `reference_index` mapping from effective record -> original record.
+    struct XdFile<'a> {
+        ids: &'a [u32],
+        changed: Vec<bool>,
+        reference_index: Vec<usize>,
+        dstart: i64,
+        dend: i64,
+        nreff: i64,
+    }
+
+    /// Hash/id lookup over the *effective* records: index into `reference_index`.
+    #[inline]
+    fn get_id(xdf: &XdFile<'_>, idx: i64) -> u32 {
+        xdf.ids[xdf.reference_index[idx as usize]]
+    }
+
+    /// Faithful port of `xdl_split` (the middle-snake finder). `kvdf`/`kvdb` are
+    /// the forward/backward k-vectors, offset so index 0 maps to diagonal 0.
+    #[allow(clippy::too_many_arguments)]
+    fn xdl_split(
+        xdf1: &XdFile<'_>,
+        off1: i64,
+        lim1: i64,
+        xdf2: &XdFile<'_>,
+        off2: i64,
+        lim2: i64,
+        kvdf: &mut [i64],
+        kvdb: &mut [i64],
+        koff: i64,
+        need_min: bool,
+        spl: &mut XdpSplit,
+        xenv: &XdAlgoEnv,
+    ) -> i64 {
+        let dmin = off1 - lim2;
+        let dmax = lim1 - off2;
+        let fmid = off1 - off2;
+        let bmid = lim1 - lim2;
+        let odd = ((fmid - bmid) & 1) != 0;
+        let mut fmin = fmid;
+        let mut fmax = fmid;
+        let mut bmin = bmid;
+        let mut bmax = bmid;
+
+        let kf = |k: i64| -> usize { (k + koff) as usize };
+
+        kvdf[kf(fmid)] = off1;
+        kvdb[kf(bmid)] = lim1;
+
+        let mut ec: i64 = 1;
+        loop {
+            let mut got_snake = false;
+
+            if fmin > dmin {
+                fmin -= 1;
+                kvdf[kf(fmin - 1)] = -1;
+            } else {
+                fmin += 1;
+            }
+            if fmax < dmax {
+                fmax += 1;
+                kvdf[kf(fmax + 1)] = -1;
+            } else {
+                fmax -= 1;
+            }
+
+            let mut d = fmax;
+            while d >= fmin {
+                let mut i1 = if kvdf[kf(d - 1)] >= kvdf[kf(d + 1)] {
+                    kvdf[kf(d - 1)] + 1
+                } else {
+                    kvdf[kf(d + 1)]
+                };
+                let prev1 = i1;
+                let mut i2 = i1 - d;
+                while i1 < lim1 && i2 < lim2 && get_id(xdf1, i1) == get_id(xdf2, i2) {
+                    i1 += 1;
+                    i2 += 1;
+                }
+                if i1 - prev1 > xenv.snake_cnt {
+                    got_snake = true;
+                }
+                kvdf[kf(d)] = i1;
+                if odd && bmin <= d && d <= bmax && kvdb[kf(d)] <= i1 {
+                    spl.i1 = i1;
+                    spl.i2 = i2;
+                    spl.min_lo = true;
+                    spl.min_hi = true;
+                    return ec;
+                }
+                d -= 2;
+            }
+
+            if bmin > dmin {
+                bmin -= 1;
+                kvdb[kf(bmin - 1)] = XDL_LINE_MAX;
+            } else {
+                bmin += 1;
+            }
+            if bmax < dmax {
+                bmax += 1;
+                kvdb[kf(bmax + 1)] = XDL_LINE_MAX;
+            } else {
+                bmax -= 1;
+            }
+
+            let mut d = bmax;
+            while d >= bmin {
+                let mut i1 = if kvdb[kf(d - 1)] < kvdb[kf(d + 1)] {
+                    kvdb[kf(d - 1)]
+                } else {
+                    kvdb[kf(d + 1)] - 1
+                };
+                let prev1 = i1;
+                let mut i2 = i1 - d;
+                while i1 > off1 && i2 > off2 && get_id(xdf1, i1 - 1) == get_id(xdf2, i2 - 1) {
+                    i1 -= 1;
+                    i2 -= 1;
+                }
+                if prev1 - i1 > xenv.snake_cnt {
+                    got_snake = true;
+                }
+                kvdb[kf(d)] = i1;
+                if !odd && fmin <= d && d <= fmax && i1 <= kvdf[kf(d)] {
+                    spl.i1 = i1;
+                    spl.i2 = i2;
+                    spl.min_lo = true;
+                    spl.min_hi = true;
+                    return ec;
+                }
+                d -= 2;
+            }
+
+            if need_min {
+                ec += 1;
+                continue;
+            }
+
+            if got_snake && ec > xenv.heur_min {
+                let mut best = 0i64;
+                let mut d = fmax;
+                while d >= fmin {
+                    let dd = if d > fmid { d - fmid } else { fmid - d };
+                    let i1 = kvdf[kf(d)];
+                    let i2 = i1 - d;
+                    let v = (i1 - off1) + (i2 - off2) - dd;
+                    if v > XDL_K_HEUR * ec
+                        && v > best
+                        && off1 + xenv.snake_cnt <= i1
+                        && i1 < lim1
+                        && off2 + xenv.snake_cnt <= i2
+                        && i2 < lim2
+                    {
+                        let mut k = 1i64;
+                        while get_id(xdf1, i1 - k) == get_id(xdf2, i2 - k) {
+                            if k == xenv.snake_cnt {
+                                best = v;
+                                spl.i1 = i1;
+                                spl.i2 = i2;
+                                break;
+                            }
+                            k += 1;
+                        }
+                    }
+                    d -= 2;
+                }
+                if best > 0 {
+                    spl.min_lo = true;
+                    spl.min_hi = false;
+                    return ec;
+                }
+
+                let mut best = 0i64;
+                let mut d = bmax;
+                while d >= bmin {
+                    let dd = if d > bmid { d - bmid } else { bmid - d };
+                    let i1 = kvdb[kf(d)];
+                    let i2 = i1 - d;
+                    let v = (lim1 - i1) + (lim2 - i2) - dd;
+                    if v > XDL_K_HEUR * ec
+                        && v > best
+                        && off1 < i1
+                        && i1 <= lim1 - xenv.snake_cnt
+                        && off2 < i2
+                        && i2 <= lim2 - xenv.snake_cnt
+                    {
+                        let mut k = 0i64;
+                        while get_id(xdf1, i1 + k) == get_id(xdf2, i2 + k) {
+                            if k == xenv.snake_cnt - 1 {
+                                best = v;
+                                spl.i1 = i1;
+                                spl.i2 = i2;
+                                break;
+                            }
+                            k += 1;
+                        }
+                    }
+                    d -= 2;
+                }
+                if best > 0 {
+                    spl.min_lo = false;
+                    spl.min_hi = true;
+                    return ec;
+                }
+            }
+
+            if ec >= xenv.mxcost {
+                let mut fbest = -1i64;
+                let mut fbest1 = -1i64;
+                let mut d = fmax;
+                while d >= fmin {
+                    let mut i1 = kvdf[kf(d)].min(lim1);
+                    let mut i2 = i1 - d;
+                    if lim2 < i2 {
+                        i1 = lim2 + d;
+                        i2 = lim2;
+                    }
+                    if fbest < i1 + i2 {
+                        fbest = i1 + i2;
+                        fbest1 = i1;
+                    }
+                    d -= 2;
+                }
+
+                let mut bbest = XDL_LINE_MAX;
+                let mut bbest1 = XDL_LINE_MAX;
+                let mut d = bmax;
+                while d >= bmin {
+                    let mut i1 = off1.max(kvdb[kf(d)]);
+                    let mut i2 = i1 - d;
+                    if i2 < off2 {
+                        i1 = off2 + d;
+                        i2 = off2;
+                    }
+                    if i1 + i2 < bbest {
+                        bbest = i1 + i2;
+                        bbest1 = i1;
+                    }
+                    d -= 2;
+                }
+
+                if (lim1 + lim2) - bbest < fbest - (off1 + off2) {
+                    spl.i1 = fbest1;
+                    spl.i2 = fbest - fbest1;
+                    spl.min_lo = true;
+                    spl.min_hi = false;
+                } else {
+                    spl.i1 = bbest1;
+                    spl.i2 = bbest - bbest1;
+                    spl.min_lo = false;
+                    spl.min_hi = true;
+                }
+                return ec;
+            }
+
+            ec += 1;
+        }
+    }
+
+    /// Faithful port of `xdl_recs_cmp` (divide & conquer). Marks `changed` flags.
+    #[allow(clippy::too_many_arguments)]
+    fn xdl_recs_cmp(
+        xdf1: &mut XdFile<'_>,
+        mut off1: i64,
+        mut lim1: i64,
+        xdf2: &mut XdFile<'_>,
+        mut off2: i64,
+        mut lim2: i64,
+        kvdf: &mut [i64],
+        kvdb: &mut [i64],
+        koff: i64,
+        need_min: bool,
+        xenv: &XdAlgoEnv,
+    ) {
+        while off1 < lim1 && off2 < lim2 && get_id(xdf1, off1) == get_id(xdf2, off2) {
+            off1 += 1;
+            off2 += 1;
+        }
+        while off1 < lim1 && off2 < lim2 && get_id(xdf1, lim1 - 1) == get_id(xdf2, lim2 - 1) {
+            lim1 -= 1;
+            lim2 -= 1;
+        }
+
+        if off1 == lim1 {
+            while off2 < lim2 {
+                let r = xdf2.reference_index[off2 as usize];
+                xdf2.changed[r] = true;
+                off2 += 1;
+            }
+        } else if off2 == lim2 {
+            while off1 < lim1 {
+                let r = xdf1.reference_index[off1 as usize];
+                xdf1.changed[r] = true;
+                off1 += 1;
+            }
+        } else {
+            let mut spl = XdpSplit {
+                i1: 0,
+                i2: 0,
+                min_lo: false,
+                min_hi: false,
+            };
+            xdl_split(
+                xdf1, off1, lim1, xdf2, off2, lim2, kvdf, kvdb, koff, need_min, &mut spl, xenv,
+            );
+            xdl_recs_cmp(
+                xdf1, off1, spl.i1, xdf2, off2, spl.i2, kvdf, kvdb, koff, spl.min_lo, xenv,
+            );
+            xdl_recs_cmp(
+                xdf1, spl.i1, lim1, xdf2, spl.i2, lim2, kvdf, kvdb, koff, spl.min_hi, xenv,
+            );
+        }
+    }
+
+    /// `xdl_clean_mmatch`: decide whether a multimatch record should be discarded.
+    fn clean_mmatch(action: &[u8], i: i64, mut s: i64, mut e: i64) -> bool {
+        if i - s > XDL_SIMSCAN_WINDOW {
+            s = i - XDL_SIMSCAN_WINDOW;
+        }
+        if e - i > XDL_SIMSCAN_WINDOW {
+            e = i + XDL_SIMSCAN_WINDOW;
+        }
+
+        let mut rdis0 = 0i64;
+        let mut rpdis0 = 1i64;
+        let mut r = 1i64;
+        while i - r >= s {
+            match action[(i - r) as usize] {
+                DISCARD => rdis0 += 1,
+                INVESTIGATE => rpdis0 += 1,
+                _ => break, // KEEP
+            }
+            r += 1;
+        }
+        if rdis0 == 0 {
+            return false;
+        }
+        let mut rdis1 = 0i64;
+        let mut rpdis1 = 1i64;
+        let mut r = 1i64;
+        while i + r <= e {
+            match action[(i + r) as usize] {
+                DISCARD => rdis1 += 1,
+                INVESTIGATE => rpdis1 += 1,
+                _ => break, // KEEP
+            }
+            r += 1;
+        }
+        if rdis1 == 0 {
+            return false;
+        }
+        rdis1 += rdis0;
+        rpdis1 += rpdis0;
+        rpdis1 * XDL_KPDIS_RUN < (rpdis1 + rdis1)
+    }
+
+    /// Build the `changed` flags for both token streams using Git's xdiff Myers
+    /// pipeline. `ids1`/`ids2` are interned token ids (equal id <=> equal token).
+    /// Returns `(changed1, changed2)`, one bool per original token.
+    pub fn changed_flags(ids1: &[u32], ids2: &[u32]) -> (Vec<bool>, Vec<bool>) {
+        let nrec1 = ids1.len();
+        let nrec2 = ids2.len();
+
+        // Per-token occurrence counts on each side (class len1/len2).
+        use std::collections::HashMap;
+        let mut count1: HashMap<u32, i64> = HashMap::new();
+        let mut count2: HashMap<u32, i64> = HashMap::new();
+        for &id in ids1 {
+            *count1.entry(id).or_insert(0) += 1;
+        }
+        for &id in ids2 {
+            *count2.entry(id).or_insert(0) += 1;
+        }
+
+        let mut xdf1 = XdFile {
+            ids: ids1,
+            changed: vec![false; nrec1],
+            reference_index: Vec::new(),
+            dstart: 0,
+            dend: nrec1 as i64 - 1,
+            nreff: 0,
+        };
+        let mut xdf2 = XdFile {
+            ids: ids2,
+            changed: vec![false; nrec2],
+            reference_index: Vec::new(),
+            dstart: 0,
+            dend: nrec2 as i64 - 1,
+            nreff: 0,
+        };
+
+        // xdl_trim_ends: trim leading/trailing matching records.
+        let lim = nrec1.min(nrec2) as i64;
+        let mut i = 0i64;
+        while i < lim && ids1[i as usize] == ids2[i as usize] {
+            i += 1;
+        }
+        xdf1.dstart = i;
+        xdf2.dstart = i;
+        let mut j = 0i64;
+        let rem = lim - i;
+        while j < rem && ids1[nrec1 - 1 - j as usize] == ids2[nrec2 - 1 - j as usize] {
+            j += 1;
+        }
+        xdf1.dend = nrec1 as i64 - j - 1;
+        xdf2.dend = nrec2 as i64 - j - 1;
+
+        // xdl_cleanup_records: classify and reduce to effective records.
+        let mut action1 = vec![0u8; nrec1 + 1];
+        let mut action2 = vec![0u8; nrec2 + 1];
+
+        let mut mlim = bogosqrt(nrec1 as i64);
+        if mlim > XDL_MAX_EQLIMIT {
+            mlim = XDL_MAX_EQLIMIT;
+        }
+        let mut idx = xdf1.dstart;
+        while idx <= xdf1.dend {
+            let id = ids1[idx as usize];
+            let nm = *count2.get(&id).unwrap_or(&0);
+            action1[idx as usize] = if nm == 0 {
+                DISCARD
+            } else if nm >= mlim {
+                INVESTIGATE
+            } else {
+                KEEP
+            };
+            idx += 1;
+        }
+
+        let mut mlim = bogosqrt(nrec2 as i64);
+        if mlim > XDL_MAX_EQLIMIT {
+            mlim = XDL_MAX_EQLIMIT;
+        }
+        let mut idx = xdf2.dstart;
+        while idx <= xdf2.dend {
+            let id = ids2[idx as usize];
+            let nm = *count1.get(&id).unwrap_or(&0);
+            action2[idx as usize] = if nm == 0 {
+                DISCARD
+            } else if nm >= mlim {
+                INVESTIGATE
+            } else {
+                KEEP
+            };
+            idx += 1;
+        }
+
+        let mut idx = xdf1.dstart;
+        while idx <= xdf1.dend {
+            let a = action1[idx as usize];
+            if a == KEEP
+                || (a == INVESTIGATE && !clean_mmatch(&action1, idx, xdf1.dstart, xdf1.dend))
+            {
+                xdf1.reference_index.push(idx as usize);
+            } else {
+                xdf1.changed[idx as usize] = true;
+            }
+            idx += 1;
+        }
+        xdf1.nreff = xdf1.reference_index.len() as i64;
+
+        let mut idx = xdf2.dstart;
+        while idx <= xdf2.dend {
+            let a = action2[idx as usize];
+            if a == KEEP
+                || (a == INVESTIGATE && !clean_mmatch(&action2, idx, xdf2.dstart, xdf2.dend))
+            {
+                xdf2.reference_index.push(idx as usize);
+            } else {
+                xdf2.changed[idx as usize] = true;
+            }
+            idx += 1;
+        }
+        xdf2.nreff = xdf2.reference_index.len() as i64;
+
+        // Allocate K vectors (xdl_do_diff). koff lets us use negative diagonals.
+        let ndiags = xdf1.nreff + xdf2.nreff + 3;
+        let kvd_len = (2 * ndiags + 2) as usize;
+        let mut kvd = vec![0i64; kvd_len];
+        // kvdf base offset = nreff2 + 1; kvdb base offset = ndiags + nreff2 + 1.
+        let koff = xdf2.nreff + 1;
+        let (kvdf_slice, kvdb_slice) = kvd.split_at_mut(ndiags as usize);
+        // Both slices are indexed as [k + koff]; their length covers the diagonal range.
+
+        let xenv = XdAlgoEnv {
+            mxcost: bogosqrt(ndiags).max(XDL_MAX_COST_MIN),
+            snake_cnt: XDL_SNAKE_CNT,
+            heur_min: XDL_HEUR_MIN_COST,
+        };
+
+        let nreff1 = xdf1.nreff;
+        let nreff2 = xdf2.nreff;
+        xdl_recs_cmp(
+            &mut xdf1, 0, nreff1, &mut xdf2, 0, nreff2, kvdf_slice, kvdb_slice, koff, false, &xenv,
+        );
+
+        (xdf1.changed, xdf2.changed)
+    }
+}
+
+/// Convert per-token `changed` flags (Git xdiff style) into `similar::DiffOp`s.
+fn changed_flags_to_ops(
+    changed1: &[bool],
+    changed2: &[bool],
+    old_len: usize,
+    new_len: usize,
+) -> Vec<similar::DiffOp> {
+    use similar::DiffOp;
+    let mut ops: Vec<DiffOp> = Vec::new();
+    let mut i = 0usize;
+    let mut j = 0usize;
+    while i < old_len || j < new_len {
+        let del = i < old_len && changed1[i];
+        let ins = j < new_len && changed2[j];
+        if !del && !ins {
+            // Equal run.
+            let start_i = i;
+            let start_j = j;
+            while i < old_len && j < new_len && !changed1[i] && !changed2[j] {
+                i += 1;
+                j += 1;
+            }
+            ops.push(DiffOp::Equal {
+                old_index: start_i,
+                new_index: start_j,
+                len: i - start_i,
+            });
+        } else {
+            // Changed run: consecutive deletions then/and insertions.
+            let start_i = i;
+            let start_j = j;
+            while i < old_len && changed1[i] {
+                i += 1;
+            }
+            while j < new_len && changed2[j] {
+                j += 1;
+            }
+            let dlen = i - start_i;
+            let ilen = j - start_j;
+            if dlen > 0 && ilen > 0 {
+                ops.push(DiffOp::Replace {
+                    old_index: start_i,
+                    old_len: dlen,
+                    new_index: start_j,
+                    new_len: ilen,
+                });
+            } else if dlen > 0 {
+                ops.push(DiffOp::Delete {
+                    old_index: start_i,
+                    old_len: dlen,
+                    new_index: start_j,
+                });
+            } else if ilen > 0 {
+                ops.push(DiffOp::Insert {
+                    old_index: start_i,
+                    new_index: start_j,
+                    new_len: ilen,
+                });
+            }
+        }
+    }
+    ops
+}
+
+/// Diff two token streams with a faithful port of Git's xdiff Myers engine and return the
+/// result as `similar::DiffOp`s. Used by the word-diff machinery, where matching Git's exact
+/// record selection and tie-breaking matters: `imara-diff`/`similar` pick different — but
+/// equally minimal — alignments for streams with many repeated tokens (e.g. the `bibtex`
+/// driver's `{`/`}`/`,`), mismatching Git's reference output.
 #[must_use]
 pub fn word_diff_ops_imara(old_words: &[&str], new_words: &[&str]) -> Vec<similar::DiffOp> {
-    use imara_diff::{Algorithm, Diff, InternedInput};
-    use similar::DiffOp;
+    use std::collections::HashMap;
 
-    let mut input: InternedInput<&str> = InternedInput::default();
-    input.update_before(old_words.iter().copied());
-    input.update_after(new_words.iter().copied());
-    let mut diff = Diff::compute(Algorithm::Myers, &input);
-    diff.postprocess_lines(&input);
+    // Intern tokens to ids (equal id <=> equal token), mirroring xdiff's record hashing.
+    let mut interner: HashMap<&str, u32> = HashMap::new();
+    let mut ids1: Vec<u32> = Vec::with_capacity(old_words.len());
+    for &w in old_words {
+        let next = interner.len() as u32;
+        let id = *interner.entry(w).or_insert(next);
+        ids1.push(id);
+    }
+    let mut ids2: Vec<u32> = Vec::with_capacity(new_words.len());
+    for &w in new_words {
+        let next = interner.len() as u32;
+        let id = *interner.entry(w).or_insert(next);
+        ids2.push(id);
+    }
 
-    let mut ops: Vec<DiffOp> = Vec::new();
-    let mut old_pos = 0usize;
-    let mut new_pos = 0usize;
-    for hunk in diff.hunks() {
-        let b_start = hunk.before.start as usize;
-        let b_end = hunk.before.end as usize;
-        let a_start = hunk.after.start as usize;
-        let a_end = hunk.after.end as usize;
-        if b_start > old_pos {
-            let len = b_start - old_pos;
-            ops.push(DiffOp::Equal {
-                old_index: old_pos,
-                new_index: new_pos,
-                len,
-            });
-        }
-        let del = b_end - b_start;
-        let ins = a_end - a_start;
-        if del > 0 && ins > 0 {
-            ops.push(DiffOp::Replace {
-                old_index: b_start,
-                old_len: del,
-                new_index: a_start,
-                new_len: ins,
-            });
-        } else if del > 0 {
-            ops.push(DiffOp::Delete {
-                old_index: b_start,
-                old_len: del,
-                new_index: a_start,
-            });
-        } else if ins > 0 {
-            ops.push(DiffOp::Insert {
-                old_index: b_start,
-                new_index: a_start,
-                new_len: ins,
-            });
-        }
-        old_pos = b_end;
-        new_pos = a_end;
-    }
-    if old_pos < old_words.len() {
-        ops.push(DiffOp::Equal {
-            old_index: old_pos,
-            new_index: new_pos,
-            len: old_words.len() - old_pos,
-        });
-    }
+    let (changed1, changed2) = git_xdiff::changed_flags(&ids1, &ids2);
+    let ops = changed_flags_to_ops(&changed1, &changed2, old_words.len(), new_words.len());
+
     // Slide changed runs to Git's canonical position (`xdl_change_compact`); the word
     // diff never enables the indent heuristic.
     diff_indent_heuristic::apply_change_compact_to_ops(&ops, old_words, new_words, false)

@@ -1494,6 +1494,54 @@ fn append_tag_wants_for_cli_fetch(
 ///
 /// If `url_override` is Some, use it directly as the remote URL instead of
 /// looking it up in config.  This supports path-based remotes like `../one`.
+/// Client-side guard mirroring `fetch-pack.c`: refuse an explicit `want <oid>` for an unadvertised
+/// object *before* sending it, but ONLY when the server advertises none of the
+/// `allow{Tip,Reachable,Any}SHA1InWant` capabilities. When the server enables any of them the client
+/// sends the want and lets upload-pack validate it (so an unreachable/non-tip want is rejected
+/// server-side with `not our ref`, not pre-empted here) — see t5516 'deny fetch unreachable SHA1',
+/// whose final fetch with `allowReachableSHA1InWant=true` must surface `not our ref`.
+///
+/// `remote_all_refs` is the receiver's full ref list (all of `refs/`, unfiltered). An OID matching a
+/// *non-hidden* advertised tip (`transfer.hideRefs` / `uploadpack.hideRefs`) is always allowed.
+fn enforce_uploadpack_want_policy(
+    remote_repo: &Repository,
+    remote_all_refs: &[(String, ObjectId)],
+    oid: ObjectId,
+) -> Result<()> {
+    let remote_config =
+        ConfigSet::load(Some(&remote_repo.git_dir), false).unwrap_or_else(|_| ConfigSet::new());
+
+    // Non-hidden advertised tips are always fetchable.
+    let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+    hidden.load_hidden_refs_from_config(&remote_config, "uploadpack");
+    let is_advertised_tip = remote_all_refs
+        .iter()
+        .any(|(name, tip)| *tip == oid && !hidden.ref_excluded(Some(name), name));
+    if is_advertised_tip {
+        return Ok(());
+    }
+
+    let cfg_flag = |key: &str| -> bool {
+        remote_config
+            .get_bool(key)
+            .and_then(|r| r.ok())
+            .unwrap_or(false)
+    };
+    // If the server advertises any allow-*-sha1-in-want capability, defer to it: the client sends
+    // the want and upload-pack decides (and reports `not our ref` for a non-tip/unreachable OID).
+    if cfg_flag("uploadpack.allowAnySHA1InWant")
+        || cfg_flag("uploadpack.allowTipSHA1InWant")
+        || cfg_flag("uploadpack.allowReachableSHA1InWant")
+    {
+        return Ok(());
+    }
+
+    bail!(
+        "Server does not allow request for unadvertised object {}",
+        oid.to_hex()
+    );
+}
+
 fn fetch_remote(
     git_dir: &Path,
     config: &ConfigSet,
@@ -2097,10 +2145,32 @@ fn fetch_remote(
         let remote_nm = remote_name.to_owned();
         let has_cli_refspecs = !cli_owned.is_empty();
         let refetch = args.refetch;
+        let want_policy_proto_v0 = protocol_version < 2;
         let compute_wants = move |adv: &[(String, ObjectId)]| -> Result<Vec<ObjectId>> {
             if !cli_owned.is_empty() {
                 let mut wants =
                     crate::fetch_transport::collect_wants_cli(&remote_gd, adv, &cli_owned)?;
+                // Reject an explicit `want <oid>` for an unadvertised object up front (protocol v0/v1)
+                // unless the receiver enables `uploadpack.allow*SHA1InWant`. Doing this client-side
+                // (mirroring `fetch-pack.c`) avoids the upload-pack child rejecting mid-stream, which
+                // would otherwise surface as a broken-pipe abort (t5516 'fetch exact oid',
+                // 'peeled advertisements are not considered ref tips').
+                if want_policy_proto_v0 {
+                    if let Ok(rr) = open_repo(&remote_gd) {
+                        let all_refs = refs::list_refs(&remote_gd, "refs/").unwrap_or_default();
+                        for spec in &cli_owned {
+                            let src = spec
+                                .strip_prefix('+')
+                                .unwrap_or(spec)
+                                .split_once(':')
+                                .map(|(a, _)| a)
+                                .unwrap_or_else(|| spec.strip_prefix('+').unwrap_or(spec));
+                            if let Ok(oid) = ObjectId::from_hex(src) {
+                                enforce_uploadpack_want_policy(&rr, &all_refs, oid)?;
+                            }
+                        }
+                    }
+                }
                 if should_fetch_tags {
                     append_follow_tags_for_wants(&local_git, &remote_gd, &mut wants)?;
                 }
@@ -2684,6 +2754,17 @@ fn fetch_remote(
             // Resolve source: full OID, ref name, or short branch/tag (match `collect_wants_cli`).
             let (remote_oid, resolved_remote_ref): (ObjectId, Option<String>) =
                 if let Ok(oid) = ObjectId::from_hex(src.as_str()) {
+                    // An explicit `want <oid>` for an object that is not an advertised ref tip is
+                    // rejected by upload-pack unless the server enables one of the
+                    // `uploadpack.allow{Tip,Reachable,Any}SHA1InWant` policies. Protocol v2 always
+                    // allows fetching unadvertised objects, so only enforce this for v0/v1
+                    // (t5516 'fetch exact oid', 'shallow fetch reachable SHA1', 'deny ...',
+                    // 'peeled advertisements are not considered ref tips').
+                    if protocol_version < 2 {
+                        if let Some(rr) = remote_repo {
+                            enforce_uploadpack_want_policy(rr, &remote_all_refs, oid)?;
+                        }
+                    }
                     (oid, None)
                 } else {
                     let resolved_ref = resolve_advertised_ref_for_fetch_src(
@@ -3299,6 +3380,29 @@ fn fetch_remote(
                         remote_oid,
                         error,
                     );
+                }
+            }
+        }
+
+        // Git `builtin/fetch.c` `get_ref_map` default case: when the remote has no configured fetch
+        // refspec (and there is no matching `branch.<name>.merge`), `git fetch <remote>` fetches the
+        // remote's HEAD ref and marks it `FETCH_HEAD_MERGE`. The loop above maps refs only through
+        // configured refspecs, so with none it emits no branch line — record the remote HEAD branch
+        // here as the single for-merge FETCH_HEAD entry (t5710 `update-ref HEAD FETCH_HEAD`).
+        if refspecs.is_empty()
+            && union_refspecs.is_empty()
+            && !has_merge_cfg
+            && !args.prefetch
+            && !user_passed_cli_refspecs
+            && !implicit_path_fetch
+        {
+            if let Some(rb) = remote_symbolic_head_branch.as_deref() {
+                if let Some(oid) = refs_for_mapping
+                    .iter()
+                    .find(|(r, _)| r == &format!("refs/heads/{rb}"))
+                    .map(|(_, o)| *o)
+                {
+                    fetch_head_entries.push(fetch_head_branch_line(&oid, rb, &display_url, true));
                 }
             }
         }
@@ -5171,7 +5275,7 @@ pub(crate) fn copy_reachable_objects(
     dst_git_dir: &Path,
     roots: &[ObjectId],
 ) -> Result<()> {
-    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, false, false)
+    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, false, false, false)
 }
 
 /// Copy objects reachable from `roots`, skipping gitlink tree entries.
@@ -5183,7 +5287,7 @@ pub(crate) fn copy_reachable_objects_skipping_gitlinks(
     dst_git_dir: &Path,
     roots: &[ObjectId],
 ) -> Result<()> {
-    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, false, true)
+    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, false, true, false)
 }
 
 fn copy_reachable_objects_filtered(
@@ -5266,12 +5370,41 @@ fn filter_omits_blob(filter: &ObjectFilter, size: u64) -> bool {
 /// When `respect_remote_shallow_boundaries` is true, commits listed in the source shallow file are
 /// treated as traversal boundaries: the commit object and its tree are copied, but parent commits
 /// beyond that boundary are not copied.
+/// Copy objects reachable from `roots`, tolerating objects that are missing on the source because
+/// the source is itself a partial clone (its promisor objects live on its lazy-fetch remote).
+///
+/// Used by local `git pull`/`fetch` when the destination treats promisor packs (`extensions.
+/// partialclone` set or some `remote.*.promisor=true`). A missing source object is recorded in the
+/// destination's promisor markers so it can be lazy-fetched on first access, mirroring Git's local
+/// transport against a partial-clone server (t5710 subsequent fetch).
+pub(crate) fn copy_reachable_objects_skipping_missing_promisor(
+    src_git_dir: &Path,
+    dst_git_dir: &Path,
+    roots: &[ObjectId],
+) -> Result<()> {
+    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, false, true, true)
+}
+
+/// True when the source repository advertises its promisor remotes (`promisor.advertise=true`).
+///
+/// Mirrors the server-side decision in protocol v2: when the source advertises, a partial-clone
+/// client accepts the advertisement and the source may omit its promisor objects (the client
+/// lazy-fetches them later). When the source does *not* advertise, the source must instead
+/// lazy-fetch any missing promisor objects from its own remote so it can serve them.
+fn source_advertises_promisor(src_git_dir: &Path) -> bool {
+    ConfigSet::load(Some(src_git_dir), true)
+        .ok()
+        .and_then(|cfg| cfg.get_bool("promisor.advertise").and_then(|r| r.ok()))
+        .unwrap_or(false)
+}
+
 fn copy_reachable_objects_internal(
     src_git_dir: &Path,
     dst_git_dir: &Path,
     roots: &[ObjectId],
     respect_remote_shallow_boundaries: bool,
     skip_gitlinks: bool,
+    skip_missing_promisor: bool,
 ) -> Result<()> {
     let src_odb = Odb::new(&src_git_dir.join("objects"));
     let dst_odb = Odb::new(&dst_git_dir.join("objects"));
@@ -5280,42 +5413,143 @@ fn copy_reachable_objects_internal(
     } else {
         HashSet::new()
     };
+    // When the source is a partial clone that does *not* advertise its promisor remotes, it must
+    // serve every requested object, so lazy-fetch any object missing on the source from the
+    // source's own promisor remote before copying (t5710 subsequent fetch, advertise=false). When
+    // it *does* advertise, the source may omit them and the destination records them for its own
+    // later lazy-fetch.
+    let source_lazy_fetches = skip_missing_promisor && !source_advertises_promisor(src_git_dir);
+    let src_repo = if source_lazy_fetches {
+        Repository::open(src_git_dir, None).ok()
+    } else {
+        None
+    };
     let mut stack: Vec<ObjectId> = roots.to_vec();
     let mut seen = HashSet::new();
+    let mut missing_promisor: HashSet<ObjectId> = HashSet::new();
 
     while let Some(oid) = stack.pop() {
         if !seen.insert(oid) {
             continue;
         }
-        let obj = src_odb.read(&oid).with_context(|| {
-            format!("missing object {} while copying from remote", oid.to_hex())
-        })?;
+        // Prune at objects the destination already has (its "haves"): when the destination already
+        // holds an object, it holds that object's whole closure, so the source need not send (or
+        // lazy-fetch) it or its ancestors. This mirrors Git's negotiation, where the client's
+        // "have" lines mark its tips as uninteresting so the remote `pack-objects` never walks
+        // below them.
+        //
+        // For the promisor case it is essential so a pull that introduces only a new commit does
+        // not lazy-fetch unrelated promisor objects the destination already had (t5710 subsequent
+        // fetch, advertise=false: only the new `bar` blob is fetched, leaving the old `foo` blob
+        // missing on the server). For the ordinary local copy it lets a fetch of a new tip whose
+        // history overlaps the destination stop at the shared boundary instead of walking into the
+        // source's missing ancestors — e.g. fetching commit C (parent B) from a repository that is
+        // itself missing B's older ancestors, when the destination already has B's full closure
+        // (t5306 indirectly clone patch_clone). A later `check_connectivity` pass still verifies the
+        // destination really holds the pruned closure, so a genuinely incomplete fetch still fails.
+        if dst_odb.exists_local(&oid) {
+            continue;
+        }
+        let obj = match src_odb.read(&oid) {
+            Ok(obj) => obj,
+            Err(err) => {
+                // When the destination is a partial clone, the source legitimately omits its own
+                // promisor objects (they live on the source's lazy-fetch remote). If the source
+                // does not advertise its promisor remotes, lazy-fetch the object onto the source
+                // first (so the source serves it and the destination receives a full object);
+                // otherwise skip it, recording it as missing so the destination lazy-fetches it
+                // later. `exists` can report true for an object only referenced by a promisor pack
+                // index without its data, so test `exists_local` for an actual local copy.
+                if skip_missing_promisor {
+                    if let Some(repo) = src_repo.as_ref() {
+                        if crate::commands::promisor_hydrate::try_lazy_fetch_promisor_objects_batch(
+                            repo,
+                            &[oid],
+                        )
+                        .is_ok()
+                        {
+                            if let Ok(obj) = src_odb.read(&oid) {
+                                if !dst_odb.exists(&oid) {
+                                    dst_odb.write(obj.kind, &obj.data).with_context(|| {
+                                        format!("write object {}", oid.to_hex())
+                                    })?;
+                                }
+                                push_object_children(
+                                    &obj,
+                                    &oid,
+                                    skip_gitlinks,
+                                    &remote_shallow_boundaries,
+                                    &mut stack,
+                                )?;
+                                continue;
+                            }
+                        }
+                    }
+                    if !dst_odb.exists_local(&oid) {
+                        missing_promisor.insert(oid);
+                    }
+                    continue;
+                }
+                return Err(err).with_context(|| {
+                    format!("missing object {} while copying from remote", oid.to_hex())
+                });
+            }
+        };
         if !dst_odb.exists(&oid) {
             dst_odb
                 .write(obj.kind, &obj.data)
                 .with_context(|| format!("write object {}", oid.to_hex()))?;
         }
-        match obj.kind {
-            ObjectKind::Commit => {
-                let c = parse_commit(&obj.data)?;
-                stack.push(c.tree);
-                if !remote_shallow_boundaries.contains(&oid) {
-                    stack.extend_from_slice(&c.parents);
-                }
+        push_object_children(
+            &obj,
+            &oid,
+            skip_gitlinks,
+            &remote_shallow_boundaries,
+            &mut stack,
+        )?;
+    }
+
+    if !missing_promisor.is_empty() {
+        let mut marker_set: HashSet<ObjectId> = read_promisor_missing_oids(dst_git_dir)
+            .into_iter()
+            .collect();
+        marker_set.extend(missing_promisor);
+        marker_set.retain(|oid| !dst_odb.exists_local(oid));
+        write_promisor_marker(dst_git_dir, &marker_set)?;
+    }
+    Ok(())
+}
+
+/// Push the reachable children of `obj` (with object id `oid`) onto `stack` for a reachable-object
+/// copy walk: a commit's tree (and parents, unless `oid` is a shallow boundary), a tree's entries
+/// (skipping gitlink entries when `skip_gitlinks`), and a tag's target.
+fn push_object_children(
+    obj: &grit_lib::objects::Object,
+    oid: &ObjectId,
+    skip_gitlinks: bool,
+    remote_shallow_boundaries: &HashSet<ObjectId>,
+    stack: &mut Vec<ObjectId>,
+) -> Result<()> {
+    match obj.kind {
+        ObjectKind::Commit => {
+            let c = parse_commit(&obj.data)?;
+            stack.push(c.tree);
+            if !remote_shallow_boundaries.contains(oid) {
+                stack.extend_from_slice(&c.parents);
             }
-            ObjectKind::Tree => {
-                for e in parse_tree(&obj.data)? {
-                    if skip_gitlinks && e.mode == 0o160000 {
-                        continue;
-                    }
-                    stack.push(e.oid);
-                }
-            }
-            ObjectKind::Tag => {
-                stack.push(parse_tag(&obj.data)?.object);
-            }
-            ObjectKind::Blob => {}
         }
+        ObjectKind::Tree => {
+            for e in parse_tree(&obj.data)? {
+                if skip_gitlinks && e.mode == 0o160000 {
+                    continue;
+                }
+                stack.push(e.oid);
+            }
+        }
+        ObjectKind::Tag => {
+            stack.push(parse_tag(&obj.data)?.object);
+        }
+        ObjectKind::Blob => {}
     }
     Ok(())
 }
@@ -5489,7 +5723,7 @@ fn copy_reachable_objects_respecting_source_shallow(
     dst_git_dir: &Path,
     roots: &[ObjectId],
 ) -> Result<()> {
-    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, true, false)
+    copy_reachable_objects_internal(src_git_dir, dst_git_dir, roots, true, false, false)
 }
 
 fn copy_objects(src_git_dir: &Path, dst_git_dir: &Path, refetch: bool) -> Result<()> {
