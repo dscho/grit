@@ -747,7 +747,13 @@ pub fn run(args: Args) -> Result<()> {
             if copy_roots.is_empty() {
                 super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
             } else {
-                super::fetch::copy_reachable_objects(
+                // Skip gitlink (submodule) tree entries: a superproject tree records nested
+                // submodule commit IDs that live in the submodule's object store, not the
+                // superproject's, so they are never part of the superproject's transferred
+                // object closure (Git's pack-objects ignores `S_ISGITLINK` entries). Walking
+                // them would error with "missing object" when pulling a branch that adds a
+                // submodule (t5572 git_pull cases).
+                super::fetch::copy_reachable_objects_skipping_gitlinks(
                     &remote_repo.git_dir,
                     &repo.git_dir,
                     &copy_roots,

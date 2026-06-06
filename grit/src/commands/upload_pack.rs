@@ -8,14 +8,8 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::merge_base;
-<<<<<<< ours
 use grit_lib::objects::{parse_commit, parse_tag, parse_tree, ObjectId, ObjectKind};
-||||||| ancestor
-use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
-=======
-use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
 use grit_lib::ref_namespace;
->>>>>>> theirs
 use grit_lib::refs;
 use grit_lib::repo::Repository;
 use grit_lib::state::resolve_head;
@@ -133,6 +127,7 @@ pub fn run(args: Args) -> Result<()> {
     let mut requested_depth: Option<usize> = None;
     let mut filter_spec: Option<String> = None;
     let mut multi_ack_detailed = false;
+    let mut no_done = false;
     let mut no_progress = false;
     loop {
         match pkt_line::read_packet(&mut stdin)? {
@@ -144,6 +139,13 @@ pub fn run(args: Args) -> Result<()> {
                     let features = rest.strip_prefix(hex).unwrap_or("").trim();
                     if wants.is_empty() && features.contains("multi_ack_detailed") {
                         multi_ack_detailed = true;
+                    }
+                    // `no-done` (only honored with `multi_ack_detailed`) lets the server skip the
+                    // client's final `done`: when it sends `ACK <oid> ready` at a flush it follows
+                    // with `ACK <oid>` and streams the pack in the same stateless RPC, so the client
+                    // never has to send `done` (upload-pack.c get_common_commits, t5539 test 3).
+                    if wants.is_empty() && features.split_whitespace().any(|f| f == "no-done") {
+                        no_done = true;
                     }
                     if wants.is_empty() && features.split_whitespace().any(|f| f == "no-progress") {
                         no_progress = true;
@@ -270,21 +272,32 @@ pub fn run(args: Args) -> Result<()> {
         match pkt_line::read_packet(&mut stdin)? {
             None => break,
             Some(pkt_line::Packet::Flush) => {
+                let mut sent_ready = false;
                 if multi_ack_detailed
                     && got_common
                     && !got_other
                     && ok_to_give_up(&repo, &want_set, &client_known)
                 {
                     pkt_line::write_line(&mut out, &format!("ACK {last_hex} ready"))?;
+                    sent_ready = true;
                 }
                 if args.stateless_rpc {
                     // Stateless negotiation ends at a flush: mirror `get_common_commits` —
-                    // write NAK only when no server-known `have` was received (or multi-ack), then
-                    // exit without generating a pack. The client re-sends its haves in a later RPC
-                    // (t5530 ACKs repeated non-commit objects; EOF after stateless wants).
+                    // write NAK only when no server-known `have` was received (or multi-ack).
                     if have_obj_count == 0 || multi_ack_detailed {
                         pkt_line::write_line(&mut out, "NAK")?;
                     }
+                    // `no-done` short-circuit: once `ACK <oid> ready` has been sent, the server
+                    // does not wait for the client's `done`. It sends a final `ACK <oid>` and
+                    // streams the pack in this same RPC (upload-pack.c: `no_done && sent_ready`),
+                    // so the client never sends `done` (t5539 "no shallow lines after ACK ready").
+                    if no_done && sent_ready {
+                        pkt_line::write_line(&mut out, &format!("ACK {last_hex}"))?;
+                        out.flush()?;
+                        break;
+                    }
+                    // Otherwise the client re-sends its haves in a later RPC (t5530 ACKs repeated
+                    // non-commit objects; EOF after stateless wants).
                     out.flush()?;
                     return Ok(());
                 }
@@ -823,8 +836,15 @@ fn write_ref_advertisement(w: &mut impl Write, git_dir: &Path) -> Result<()> {
                     write!(w, "{:04x}{}", len, line)?;
                 }
                 Ok(HeadState::Branch { oid: None, .. }) => {
+                    // Empty repository (unborn HEAD, no refs). Git advertises the no-ref carrier
+                    // line `<zero-oid> capabilities^{}` here, NOT `<zero-oid> HEAD`: a client that
+                    // sees a `HEAD` ref pointing at the all-zero OID would try to `want` it and the
+                    // negotiation would fail, whereas `capabilities^{}` tells the client there are
+                    // no refs to fetch while still carrying the capability list (incl.
+                    // `object-format`) so a hash-aware client records the object format
+                    // (t5551 "clone empty SHA-256 repository", proto v0).
                     let z = zero_oid_hex_for_format(&object_format);
-                    let line = format!("{z} HEAD\0{caps}\n");
+                    let line = format!("{z} capabilities^{{}}\0{caps}\n");
                     let len = 4 + line.len();
                     write!(w, "{:04x}{}", len, line)?;
                 }

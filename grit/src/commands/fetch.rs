@@ -222,7 +222,7 @@ pub struct Args {
     pub set_upstream: bool,
 
     /// Allow updating the current branch head (normally refused).
-    #[arg(long)]
+    #[arg(short = 'u', long)]
     pub update_head_ok: bool,
     /// Rewrite positive refspec destinations under `refs/prefetch/` (Git maintenance prefetch).
     #[arg(long)]
@@ -2594,10 +2594,7 @@ fn fetch_remote(
                             false,
                         ));
 
-                        if local_ref.starts_with("refs/heads/")
-                            && !args.update_head_ok
-                            && !is_bare_repo
-                        {
+                        if local_ref.starts_with("refs/heads/") && !args.update_head_ok {
                             if let Some(wt_path) = is_branch_in_worktree(git_dir, &local_ref) {
                                 bail!(
                                     "refusing to fetch into branch '{}' checked out at '{}'",
@@ -2747,17 +2744,48 @@ fn fetch_remote(
                 updated_refs.push(local_ref.clone());
 
                 let old_oid = read_ref_oid(git_dir, &local_ref);
-                if local_ref.starts_with("refs/heads/")
-                    && !src.is_empty()
-                    && !args.update_head_ok
-                    && !is_bare_repo
-                {
+                // Refuse fetching into a branch checked out in *any* worktree (Git
+                // `branch_checked_out`). This applies even to bare repositories, whose linked
+                // worktrees can have branches checked out (t5516 119); `is_branch_in_worktree`
+                // already excludes a bare main worktree, so no `is_bare_repo` guard is needed.
+                if local_ref.starts_with("refs/heads/") && !src.is_empty() && !args.update_head_ok {
                     if let Some(wt_path) = is_branch_in_worktree(git_dir, &local_ref) {
                         bail!(
                             "refusing to fetch into branch '{}' checked out at '{}'",
                             local_ref,
                             wt_path
                         );
+                    }
+                }
+
+                // Tags are not fast-forwardable: an explicit `refs/tags/<t>` destination whose
+                // existing local tag points elsewhere is rejected unless the refspec is forced
+                // (or `--force`/tagOpt force is in effect), mirroring Git's `update_local_ref`
+                // "would clobber existing tag". The `+refs/tags/*:refs/tags/*` retry passes `force`.
+                if local_ref.starts_with("refs/tags/") {
+                    if let Some(ref old) = old_oid {
+                        if old != &remote_oid
+                            && !(force
+                                || args.force
+                                || should_force_tag_update(config, remote_name, args))
+                        {
+                            let tag_name =
+                                local_ref.strip_prefix("refs/tags/").unwrap_or(&local_ref);
+                            if !args.quiet {
+                                display.push(
+                                    '!',
+                                    "[rejected]",
+                                    branch_label,
+                                    &local_ref,
+                                    &local_ref,
+                                    *old,
+                                    remote_oid,
+                                    Some("would clobber existing tag"),
+                                );
+                            }
+                            tag_clobber_failures.push(tag_name.to_owned());
+                            continue;
+                        }
                     }
                 }
 
@@ -2833,10 +2861,7 @@ fn fetch_remote(
                     updated_refs.push(local_ref.clone());
                     let old_oid = read_ref_oid(git_dir, &local_ref);
                     if old_oid.as_ref() != Some(&remote_oid) {
-                        if local_ref.starts_with("refs/heads/")
-                            && !args.update_head_ok
-                            && !is_bare_repo
-                        {
+                        if local_ref.starts_with("refs/heads/") && !args.update_head_ok {
                             if let Some(wt_path) = is_branch_in_worktree(git_dir, &local_ref) {
                                 bail!(
                                     "refusing to fetch into branch '{}' checked out at '{}'",
@@ -4867,6 +4892,9 @@ fn append_fetch_reflog(
     branch: &str,
 ) -> anyhow::Result<()> {
     let old = old_oid.cloned().unwrap_or_else(zero_oid);
+    // Strip URL userinfo so credentials never reach the reflog (t5541 "clone/fetch scrubs
+    // password from reflogs"); a named remote passes through unchanged.
+    let remote_url = crate::http_client::scrub_url_credentials(remote_url);
     let message = if branch.is_empty() {
         format!("fetch --append --prune {remote_url}")
     } else {
@@ -4889,7 +4917,10 @@ fn fetch_reflog_action_prefix(args: &Args) -> String {
     let mut prefix = String::from("fetch");
     if let Some(remote) = &args.remote {
         prefix.push(' ');
-        prefix.push_str(remote);
+        // Scrub any userinfo (`user:pass@`) from a URL remote so credentials never land in the
+        // reflog, matching Git's `transport_anonymize_url` (t5541 "clone/fetch scrubs password
+        // from reflogs"). A named remote (e.g. `origin`) is not a URL, so this is a no-op there.
+        prefix.push_str(&crate::http_client::scrub_url_credentials(remote));
     }
     for spec in &args.refspecs {
         prefix.push(' ');
@@ -7098,7 +7129,7 @@ fn update_refs_from_bundle_fetch(
     git_dir: &Path,
     bundle_refs: &[(String, ObjectId)],
     args: &Args,
-    is_bare_repo: bool,
+    _is_bare_repo: bool,
 ) -> Result<()> {
     if args.refspecs.is_empty() {
         return Ok(());
@@ -7118,7 +7149,7 @@ fn update_refs_from_bundle_fetch(
     for (remote_ref, oid, local_ref) in &bundle_updates {
         let remote_ref = remote_ref.as_str();
         let local_ref = normalize_fetch_refspec_dst(local_ref);
-        if local_ref.starts_with("refs/heads/") && !args.update_head_ok && !is_bare_repo {
+        if local_ref.starts_with("refs/heads/") && !args.update_head_ok {
             if let Some(wt_path) = is_branch_in_worktree(git_dir, &local_ref) {
                 bail!(
                     "refusing to fetch into branch '{}' checked out at '{}'",
