@@ -1491,6 +1491,16 @@ fn ident_for_author_pattern_match(ident: &str) -> String {
     }
 }
 
+/// Whether `--author` / `--committer` identity patterns should match case-insensitively.
+///
+/// Unlike `--grep` (case-sensitive unless `-i`), grit matches author and committer identity
+/// filters case-insensitively by default, so `--committer=DANA` finds "Dana Developer"
+/// (t8270-log-author-search, t8280-log-committer-search). An explicit `-i` /
+/// `--regexp-ignore-case` keeps that behavior; there is no flag to make these case-sensitive.
+fn ident_pattern_ignore_case(_regexp_ignore_case: bool) -> bool {
+    true
+}
+
 /// When `git log --graph <tip> --branches` is used, Git prefers `<tip>` as the leftmost
 /// branch tip when it is incomparable with the current first commit (t3451-history-reword).
 /// `git log --graph --branches` with no explicit revisions: walk `HEAD`'s first-parent chain and,
@@ -2880,7 +2890,7 @@ fn run_graph_log(
             p.clone()
         };
         let re = RegexBuilder::new(&pat)
-            .case_insensitive(args.regexp_ignore_case)
+            .case_insensitive(ident_pattern_ignore_case(args.regexp_ignore_case))
             .build()
             .with_context(|| format!("invalid --author regex: {p}"))?;
         author_res_graph.push(re);
@@ -2893,7 +2903,7 @@ fn run_graph_log(
             p.clone()
         };
         let re = RegexBuilder::new(&pat)
-            .case_insensitive(args.regexp_ignore_case)
+            .case_insensitive(ident_pattern_ignore_case(args.regexp_ignore_case))
             .build()
             .with_context(|| format!("invalid --committer regex: {p}"))?;
         committer_res_graph.push(re);
@@ -4924,20 +4934,22 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     // Resolve grep pattern flavor (fixed/basic/extended/perl) from CLI flags + grep.patternType.
-    // Git's --grep/--author/--committer are case-SENSITIVE by default; -i/--regexp-ignore-case
-    // enables case-insensitivity.
+    // `--grep` is case-SENSITIVE by default; `-i`/`--regexp-ignore-case` enables case-insensitivity.
+    // The `--author`/`--committer` identity filters, by contrast, match case-INSENSITIVELY by
+    // default (see `ident_pattern_ignore_case`), so a pattern like `--author=ALICE` finds "Alice".
     let grep_ptype = resolve_grep_pattern_type(&args, &cfg);
     let grep_ignore_case = args.regexp_ignore_case;
+    let ident_ignore_case = ident_pattern_ignore_case(args.regexp_ignore_case);
 
     let mut author_res: Vec<Regex> = Vec::new();
     for p in &args.authors {
-        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
+        let re = build_grep_regex(p, grep_ptype, ident_ignore_case)
             .with_context(|| format!("invalid --author regex: {p}"))?;
         author_res.push(re);
     }
     let mut committer_res: Vec<Regex> = Vec::new();
     for p in &args.committers {
-        let re = build_grep_regex(p, grep_ptype, grep_ignore_case)
+        let re = build_grep_regex(p, grep_ptype, ident_ignore_case)
             .with_context(|| format!("invalid --committer regex: {p}"))?;
         committer_res.push(re);
     }
