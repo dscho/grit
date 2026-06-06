@@ -2871,7 +2871,7 @@ fn commit_to_tree(repo: &Repository, commit_oid: &ObjectId) -> Result<ObjectId> 
 }
 
 /// Recursively flatten a tree object into a list of [`IndexEntry`] values.
-fn tree_to_flat_entries(
+pub(crate) fn tree_to_flat_entries(
     repo: &Repository,
     tree_oid: &ObjectId,
     prefix: &str,

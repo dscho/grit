@@ -131,6 +131,21 @@ pub(crate) fn run_add_patch(
     add_cfg: &AddConfig,
     opts: &PatchOptions,
 ) -> Result<()> {
+    run_add_patch_with_reader(repo, pathspecs, add_cfg, opts, None)
+}
+
+/// Like [`run_add_patch`] but lets a caller (e.g. `add -i`'s patch sub-command) thread its own
+/// already-buffered stdin reader through, so input is not lost between the two BufReaders.
+///
+/// # Errors
+/// Propagates I/O, ODB, and index errors.
+pub(crate) fn run_add_patch_with_reader(
+    repo: &Repository,
+    pathspecs: &[String],
+    add_cfg: &AddConfig,
+    opts: &PatchOptions,
+    external_reader: Option<&mut dyn BufRead>,
+) -> Result<()> {
     let _ = opts.inter_hunk_context;
     let _ = opts.auto_advance;
     let context = opts.context;
@@ -171,7 +186,14 @@ pub(crate) fn run_add_patch(
     }
 
     let stdin = io::stdin();
-    let mut reader = stdin.lock();
+    let mut owned_reader;
+    let mut reader: &mut dyn BufRead = match external_reader {
+        Some(r) => r,
+        None => {
+            owned_reader = stdin.lock();
+            &mut owned_reader
+        }
+    };
     let mut out = io::stdout();
 
     let odb = &repo.odb;

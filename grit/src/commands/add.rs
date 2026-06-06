@@ -210,7 +210,7 @@ fn run_add_edit(repo: &Repository, pathspecs: &[String]) -> Result<()> {
 
 /// Resolve the number of context lines for `git add -p`: the `-U`/`--unified` flag wins (when
 /// `>= 0`); otherwise `diff.context` (rejecting negatives like Git's `add-patch.c`); default 3.
-fn resolve_patch_context(unified: Option<i32>, config: &ConfigSet) -> Result<usize> {
+pub(crate) fn resolve_patch_context(unified: Option<i32>, config: &ConfigSet) -> Result<usize> {
     if let Some(n) = unified {
         if n >= 0 {
             return Ok(n as usize);
@@ -229,7 +229,7 @@ fn resolve_patch_context(unified: Option<i32>, config: &ConfigSet) -> Result<usi
 
 /// Resolve the inter-hunk context for `git add -p`: `--inter-hunk-context` flag wins (when
 /// `>= 0`); otherwise `diff.interhunkcontext`; default 0.
-fn resolve_patch_interhunk(inter: Option<i32>, config: &ConfigSet) -> Result<usize> {
+pub(crate) fn resolve_patch_interhunk(inter: Option<i32>, config: &ConfigSet) -> Result<usize> {
     if let Some(n) = inter {
         if n >= 0 {
             return Ok(n as usize);
@@ -578,8 +578,14 @@ pub fn run(mut args: Args) -> Result<()> {
     }
     if args.interactive {
         maybe_emit_interactive_add_sparse_index_trace(&repo, &raw_index, &index, work_tree)?;
-        eprintln!("warning: -i/--interactive mode is not yet implemented; doing nothing");
-        return Ok(());
+        return super::add_interactive::run_add_i(
+            &repo,
+            index,
+            work_tree,
+            &config,
+            &add_cfg,
+            &args.pathspec,
+        );
     }
 
     let _dry_stdout_guard =
