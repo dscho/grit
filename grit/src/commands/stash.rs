@@ -29,7 +29,7 @@ use grit_lib::diff::{
 };
 use grit_lib::diffstat::{terminal_columns, write_diffstat_block, DiffstatOptions, FileStatInput};
 use grit_lib::error::Error;
-use grit_lib::ignore::{normalize_repo_relative, IgnoreMatcher};
+use grit_lib::ignore::IgnoreMatcher;
 use grit_lib::index::{
     entry_from_stat, Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK,
 };
@@ -91,8 +91,8 @@ pub struct Args {
     #[arg(short = 'q', long = "quiet", global = true)]
     pub quiet: bool,
 
-    /// Pathspec arguments (for bare `grit stash -- <path>`).
-    #[arg(last = true)]
+    /// Pathspec arguments (for bare `grit stash <path>` or `grit stash -- <path>`).
+    #[arg(trailing_var_arg = true)]
     pub pathspec: Vec<String>,
 }
 
@@ -534,17 +534,32 @@ fn skip_implicit_stash_push_prefix(rest: &[String]) -> (usize, bool) {
 
 /// Run before clap parses `stash` so `git stash -q drop` is not mistaken for `git stash drop`.
 pub fn pre_parse_stash_argv_guard(rest: &[String]) -> Result<()> {
+    validate_implicit_push_tokens(rest)
+}
+
+fn assume_push_or_error(args: &Args) -> Result<()> {
+    let t = tokens_after_stash_argv();
+    let _ = args;
+    validate_implicit_push_tokens(&t)
+}
+
+fn validate_implicit_push_tokens(rest: &[String]) -> Result<()> {
     let (i, saw_push_flag) = skip_implicit_stash_push_prefix(rest);
-    if !saw_push_flag {
-        return Ok(());
-    }
     let Some(tok) = rest.get(i) else {
         return Ok(());
     };
     if tok == "--" {
         return Ok(());
     }
-    if STASH_VERB_AFTER_PUSH_FLAGS.contains(&tok.as_str()) {
+    if tok == "push" || tok == "save" {
+        return Ok(());
+    }
+    if STASH_VERB_AFTER_PUSH_FLAGS.contains(&tok.as_str()) && !saw_push_flag {
+        return Ok(());
+    }
+    if (STASH_VERB_AFTER_PUSH_FLAGS.contains(&tok.as_str()) && saw_push_flag)
+        || (!tok.starts_with('-') && rest[i + 1..].iter().any(|a| a.starts_with('-')))
+    {
         return Err(anyhow::Error::new(ExplicitExit {
             code: 128,
             message: format!(
@@ -552,26 +567,6 @@ pub fn pre_parse_stash_argv_guard(rest: &[String]) -> Result<()> {
             ),
         }));
     }
-    Ok(())
-}
-
-fn assume_push_or_error(args: &Args) -> Result<()> {
-    let t = tokens_after_stash_argv();
-    let (i, _) = skip_implicit_stash_push_prefix(&t);
-    if let Some(tok) = t.get(i) {
-        if tok == "--" {
-            return Ok(());
-        }
-        if STASH_VERB_AFTER_PUSH_FLAGS.contains(&tok.as_str()) {
-            return Err(anyhow::Error::new(ExplicitExit {
-                code: 128,
-                message: format!(
-                    "fatal: subcommand wasn't specified; 'push' can't be assumed due to unexpected token '{tok}'"
-                ),
-            }));
-        }
-    }
-    let _ = args;
     Ok(())
 }
 
@@ -860,9 +855,12 @@ fn do_push(mut opts: PushOpts) -> Result<()> {
         .collect();
 
     let head = resolve_head(&repo.git_dir)?;
-    let head_oid = head
-        .oid()
-        .ok_or_else(|| anyhow::anyhow!("cannot stash on an unborn branch"))?;
+    let Some(head_oid) = head.oid() else {
+        if !opts.quiet {
+            eprintln!("You do not have the initial commit yet");
+        }
+        return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
+    };
 
     // Load index
     let index = match repo.load_index() {
@@ -888,11 +886,7 @@ fn do_push(mut opts: PushOpts) -> Result<()> {
     let has_pathspec = !opts.pathspec.is_empty();
 
     let cwd = std::env::current_dir().context("current directory")?;
-    let normalized_pathspec: Vec<String> = opts
-        .pathspec
-        .iter()
-        .map(|p| normalize_repo_relative(&repo, &cwd, p).map_err(|e| anyhow::anyhow!("{e}")))
-        .collect::<Result<Vec<_>>>()?;
+    let normalized_pathspec = opts.pathspec.clone();
 
     // Find untracked (and optionally ignored) files when `-u` / `-a` is used.
     let untracked_files = if opts.include_untracked && !opts.staged {
@@ -965,7 +959,7 @@ fn do_push(mut opts: PushOpts) -> Result<()> {
     update_stash_ref(
         &repo,
         &stash_oid,
-        &stash_reflog_msg(&head, opts.message.as_deref()),
+        &stash_reflog_msg(&repo, &head, opts.message.as_deref()),
     )?;
 
     // Determine effective keep_index
@@ -1028,9 +1022,9 @@ fn do_push(mut opts: PushOpts) -> Result<()> {
     }
 
     if !opts.quiet {
-        let msg = stash_save_msg(&head, opts.message.as_deref());
+        let msg = stash_save_msg(&repo, &head, opts.message.as_deref());
         // Match Git: this line goes to stdout (t3905 redirects stderr only).
-        println!("Saved working directory and index state {msg}");
+        print!("Saved working directory and index state {msg}");
     }
 
     Ok(())
@@ -1052,11 +1046,7 @@ fn do_stash_patch_push(
 
     stash_preflight_index_writable(repo)?;
     let cwd = std::env::current_dir().context("current directory")?;
-    let normalized_pathspec: Vec<String> = opts
-        .pathspec
-        .iter()
-        .map(|p| normalize_repo_relative(repo, &cwd, p).map_err(|e| anyhow::anyhow!("{e}")))
-        .collect::<Result<Vec<_>>>()?;
+    let normalized_pathspec = opts.pathspec.clone();
     let untracked_for_patch = if opts.include_untracked && !opts.staged {
         find_untracked_for_stash(
             repo,
@@ -1076,6 +1066,14 @@ fn do_stash_patch_push(
 
     let head_obj = repo.odb.read(&head_oid)?;
     let head_commit = parse_commit(&head_obj.data)?;
+    if has_pathspec {
+        validate_stash_pathspecs_match_known_files(
+            repo,
+            index,
+            &head_commit.tree,
+            &normalized_pathspec,
+        )?;
+    }
     let head_tree_entries = flatten_tree_full(&repo.odb, &head_commit.tree, "")?;
     let head_flat_map: BTreeMap<String, &FlatTreeEntry> = head_tree_entries
         .iter()
@@ -1361,29 +1359,29 @@ fn do_stash_patch_push(
     }
 
     let now = OffsetDateTime::now_utc();
-    let identity = resolve_identity(repo, now)?;
+    let identities = resolve_identities(repo, now)?;
     let index_tree_oid = write_tree_from_expanded_index(&repo.odb, index)?;
     let index_commit_data = CommitData {
         tree: index_tree_oid,
         parents: vec![head_oid],
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
-        message: format!("index on {}\n", branch_description(head)),
+        message: format!("index on {}\n", branch_description(repo, head)),
         raw_message: None,
     };
     let index_commit_oid = repo
         .odb
         .write(ObjectKind::Commit, &serialize_commit(&index_commit_data))?;
     let wt_tree_oid = write_tree_from_expanded_index(&repo.odb, &wt_index)?;
-    let stash_msg = stash_save_msg(head, opts.message.as_deref());
+    let stash_msg = stash_save_msg(repo, head, opts.message.as_deref());
     let stash_commit = CommitData {
         tree: wt_tree_oid,
         parents: vec![head_oid, index_commit_oid],
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -1451,7 +1449,7 @@ fn do_stash_patch_push(
     update_stash_ref(
         repo,
         &stash_oid,
-        &stash_reflog_msg(head, opts.message.as_deref()),
+        &stash_reflog_msg(repo, head, opts.message.as_deref()),
     )?;
 
     if !opts.quiet {
@@ -1640,6 +1638,9 @@ fn do_push_pathspec(
     stash_preflight_index_writable(repo)?;
     let head_obj = repo.odb.read(head_oid)?;
     let head_commit = parse_commit(&head_obj.data)?;
+    if !opts.include_untracked {
+        validate_stash_pathspecs_match_known_files(repo, index, &head_commit.tree, pathspec)?;
+    }
 
     // Get all changes
     let staged = diff_index_to_tree(&repo.odb, index, Some(&head_commit.tree), false)?;
@@ -1687,19 +1688,19 @@ fn do_push_pathspec(
     }
 
     let now = OffsetDateTime::now_utc();
-    let identity = resolve_identity(repo, now)?;
+    let identities = resolve_identities(repo, now)?;
 
     // 1. Create index-state commit (current full index)
     let index_tree_oid = write_tree_from_expanded_index(&repo.odb, index)?;
     let index_commit_data = CommitData {
         tree: index_tree_oid,
         parents: vec![*head_oid],
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
-        message: format!("index on {}\n", branch_description(head)),
+        message: format!("index on {}\n", branch_description(repo, head)),
         raw_message: None,
     };
     let index_commit_bytes = serialize_commit(&index_commit_data);
@@ -1709,13 +1710,13 @@ fn do_push_pathspec(
         let tree_oid = create_untracked_tree(&repo.odb, work_tree, &matched_untracked)?;
         let ut_commit = CommitData {
             tree: tree_oid,
-            parents: vec![*head_oid],
-            author: identity.clone(),
-            committer: identity.clone(),
+            parents: Vec::new(),
+            author: identities.author.clone(),
+            committer: identities.committer.clone(),
             author_raw: Vec::new(),
             committer_raw: Vec::new(),
             encoding: None,
-            message: format!("untracked files on {}\n", branch_description(head)),
+            message: format!("untracked files on {}\n", branch_description(repo, head)),
             raw_message: None,
         };
         let ut_bytes = serialize_commit(&ut_commit);
@@ -1783,8 +1784,8 @@ fn do_push_pathspec(
         write_tree_from_expanded_index(&repo.odb, &wt_index)?
     };
 
-    let stash_msg = stash_save_msg(head, opts.message.as_deref());
-    let reflog_msg = stash_reflog_msg(head, opts.message.as_deref());
+    let stash_msg = stash_save_msg(repo, head, opts.message.as_deref());
+    let reflog_msg = stash_reflog_msg(repo, head, opts.message.as_deref());
 
     let mut parents = vec![*head_oid, index_commit_oid];
     if let Some(u) = untracked_commit_oid {
@@ -1794,8 +1795,8 @@ fn do_push_pathspec(
     let stash_commit = CommitData {
         tree: wt_tree_oid,
         parents,
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -1872,7 +1873,7 @@ fn do_push_pathspec(
     }
 
     if !opts.quiet {
-        println!("Saved working directory and index state {stash_msg}");
+        print!("Saved working directory and index state {stash_msg}");
     }
 
     Ok(())
@@ -1900,33 +1901,33 @@ fn do_push_staged(
     }
 
     let now = OffsetDateTime::now_utc();
-    let identity = resolve_identity(repo, now)?;
+    let identities = resolve_identities(repo, now)?;
 
     // The "index commit" is the current index state (which has staged changes)
     let index_tree_oid = write_tree_from_expanded_index(&repo.odb, index)?;
     let index_commit_data = CommitData {
         tree: index_tree_oid,
         parents: vec![*head_oid],
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
-        message: format!("index on {}\n", branch_description(head)),
+        message: format!("index on {}\n", branch_description(repo, head)),
         raw_message: None,
     };
     let index_commit_bytes = serialize_commit(&index_commit_data);
     let index_commit_oid = repo.odb.write(ObjectKind::Commit, &index_commit_bytes)?;
 
     // The stash commit tree is the index tree (since we're only stashing staged)
-    let stash_msg = stash_save_msg(head, opts.message.as_deref());
-    let reflog_msg = stash_reflog_msg(head, opts.message.as_deref());
+    let stash_msg = stash_save_msg(repo, head, opts.message.as_deref());
+    let reflog_msg = stash_reflog_msg(repo, head, opts.message.as_deref());
 
     let stash_commit = CommitData {
         tree: index_tree_oid,
         parents: vec![*head_oid, index_commit_oid],
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -1987,7 +1988,7 @@ fn do_push_staged(
     repo.write_index(&mut new_index)?;
 
     if !opts.quiet {
-        println!("Saved working directory and index state {stash_msg}");
+        print!("Saved working directory and index state {stash_msg}");
     }
 
     Ok(())
@@ -3334,6 +3335,110 @@ fn do_apply(stash_ref: Option<String>, _drop_after: bool, index: bool, quiet: bo
     Ok(())
 }
 
+fn worktree_bytes_for_index_mode(path: &Path, mode: u32) -> io::Result<Vec<u8>> {
+    if mode == MODE_SYMLINK {
+        let target = fs::read_link(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            return Ok(target.as_os_str().as_bytes().to_vec());
+        }
+        #[cfg(not(unix))]
+        {
+            return Ok(target.to_string_lossy().as_bytes().to_vec());
+        }
+    }
+    fs::read(path)
+}
+
+fn write_regular_file_replacing_symlink(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if path
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        fs::remove_file(path)?;
+    }
+    fs::write(path, contents)
+}
+
+fn stash_worktree_change_paths(
+    repo: &Repository,
+    stash_commit: &CommitData,
+) -> Result<BTreeSet<String>> {
+    let head_at_stash = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("corrupt stash commit: expected at least 2 parents"))?;
+    let stash_tree_entries = flatten_tree_full(&repo.odb, &stash_commit.tree, "")?;
+    let head_obj = repo.odb.read(head_at_stash)?;
+    let head_commit = parse_commit(&head_obj.data)?;
+    let base_tree_entries = flatten_tree_full(&repo.odb, &head_commit.tree, "")?;
+
+    let base_map: BTreeMap<String, &FlatTreeEntry> = base_tree_entries
+        .iter()
+        .map(|e| (e.path.clone(), e))
+        .collect();
+    let stash_map: BTreeMap<String, &FlatTreeEntry> = stash_tree_entries
+        .iter()
+        .map(|e| (e.path.clone(), e))
+        .collect();
+
+    let mut paths = BTreeSet::new();
+    for (path, stash_entry) in &stash_map {
+        match base_map.get(path) {
+            Some(base_entry)
+                if base_entry.oid != stash_entry.oid || base_entry.mode != stash_entry.mode =>
+            {
+                paths.insert(path.clone());
+            }
+            None => {
+                paths.insert(path.clone());
+            }
+            _ => {}
+        }
+    }
+    for path in base_map.keys() {
+        if !stash_map.contains_key(path) {
+            paths.insert(path.clone());
+        }
+    }
+    Ok(paths)
+}
+
+fn check_stash_apply_would_overwrite_local_changes(
+    repo: &Repository,
+    work_tree: &Path,
+    stash_commit: &CommitData,
+) -> Result<()> {
+    let current_index = match repo.load_index() {
+        Ok(idx) => idx,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    for path in stash_worktree_change_paths(repo, stash_commit)? {
+        let file_path = work_tree.join(&path);
+        let Some(idx_entry) = current_index.get(path.as_bytes(), 0) else {
+            continue;
+        };
+        if idx_entry.mode == MODE_GITLINK {
+            continue;
+        }
+        match worktree_bytes_for_index_mode(&file_path, idx_entry.mode) {
+            Ok(contents) => {
+                if let Ok(idx_blob) = repo.odb.read(&idx_entry.oid) {
+                    if contents != idx_blob.data {
+                        bail!("error: Your local changes to the following files would be overwritten by merge:\n\t{path}\nPlease commit your changes or stash them before you merge.");
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
 /// Apply a stash. Returns true if there were conflicts.
 fn apply_stash_impl(
     repo: &Repository,
@@ -3348,6 +3453,8 @@ fn apply_stash_impl(
     if stash_commit.parents.len() < 2 {
         bail!("corrupt stash commit: expected at least 2 parents");
     }
+
+    check_stash_apply_would_overwrite_local_changes(&repo, &work_tree, &stash_commit)?;
 
     let head_at_stash = &stash_commit.parents[0];
     let index_commit_oid = &stash_commit.parents[1];
@@ -3411,12 +3518,10 @@ fn apply_stash_impl(
                 continue;
             }
             // Read the worktree file
-            match fs::read(&file_path) {
+            match worktree_bytes_for_index_mode(&file_path, idx_entry.mode) {
                 Ok(contents) => {
-                    // Check if worktree differs from index
                     if let Ok(idx_blob) = repo.odb.read(&idx_entry.oid) {
                         if contents != idx_blob.data {
-                            // Worktree has local changes that would be overwritten
                             bail!("error: Your local changes to the following files would be overwritten by merge:\n\t{path}\nPlease commit your changes or stash them before you merge.");
                         }
                     }
@@ -3569,10 +3674,10 @@ fn apply_stash_impl(
 
                     // If ours == base, no conflict (only stash changed this file)
                     if ours_content == base_content {
-                        fs::write(&file_path, &theirs_content)?;
+                        write_regular_file_replacing_symlink(&file_path, &theirs_content)?;
                     } else if ours_content == theirs_content {
                         // Both changed the same way, no conflict
-                        fs::write(&file_path, &ours_content)?;
+                        write_regular_file_replacing_symlink(&file_path, &ours_content)?;
                     } else {
                         // Both sides changed differently — try content merge
                         use grit_lib::merge_file::{merge, ConflictStyle, MergeFavor, MergeInput};
@@ -3593,7 +3698,7 @@ fn apply_stash_impl(
                             ignore_cr_at_eol: false,
                         };
                         let output = merge(&input)?;
-                        fs::write(&file_path, &output.content)?;
+                        write_regular_file_replacing_symlink(&file_path, &output.content)?;
                         if output.conflicts > 0 {
                             has_conflicts = true;
                             // Write conflict stages to index
@@ -3623,7 +3728,7 @@ fn apply_stash_impl(
                         }
                     }
                 } else {
-                    fs::write(&file_path, &stash_blob.data)?;
+                    write_regular_file_replacing_symlink(&file_path, &stash_blob.data)?;
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::PermissionsExt;
@@ -4093,8 +4198,7 @@ fn do_branch(branch_name: String, stash_ref: Option<String>) -> Result<()> {
         .to_path_buf();
 
     stash_preflight_index_writable(&repo)?;
-    let stash_index = parse_stash_index(stash_ref.as_deref())?;
-    let stash_oid = resolve_stash_ref(&repo, stash_ref.as_deref())?;
+    let (stash_oid, stash_index_to_drop) = resolve_stash_for_branch(&repo, stash_ref.as_deref())?;
 
     // Read the stash commit to get the parent (HEAD at stash time)
     let obj = repo.odb.read(&stash_oid)?;
@@ -4103,6 +4207,8 @@ fn do_branch(branch_name: String, stash_ref: Option<String>) -> Result<()> {
     if stash_commit.parents.len() < 2 {
         bail!("corrupt stash commit: expected at least 2 parents");
     }
+
+    check_stash_apply_would_overwrite_local_changes(&repo, &work_tree, &stash_commit)?;
 
     let head_at_stash = &stash_commit.parents[0];
 
@@ -4128,8 +4234,11 @@ fn do_branch(branch_name: String, stash_ref: Option<String>) -> Result<()> {
         bail!("Conflicts in index. Try without --index or use stash branch.");
     }
 
-    // Drop the stash entry only after a successful apply
-    drop_stash_entry(&repo, stash_index)?;
+    // Drop only stash stack entries. A stash-like commit from `stash create`
+    // is not stored in the reflog and must remain untouched.
+    if let Some(stash_index) = stash_index_to_drop {
+        drop_stash_entry(&repo, stash_index)?;
+    }
 
     Ok(())
 }
@@ -4192,6 +4301,40 @@ fn stash_pathspecs_use_attr_magic(pathspecs: &[String]) -> bool {
     pathspecs
         .iter()
         .any(|spec| spec.starts_with(":(attr:") || spec.contains(",attr:"))
+}
+
+fn validate_stash_pathspecs_match_known_files(
+    repo: &Repository,
+    index: &Index,
+    head_tree: &ObjectId,
+    pathspecs: &[String],
+) -> Result<()> {
+    let mut known_paths: BTreeSet<String> = flatten_tree_full(&repo.odb, head_tree, "")?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect();
+    known_paths.extend(
+        index
+            .entries
+            .iter()
+            .filter(|entry| entry.stage() == 0)
+            .map(|entry| String::from_utf8_lossy(&entry.path).to_string()),
+    );
+
+    for spec in pathspecs {
+        if spec == "--" || grit_lib::pathspec::pathspec_is_exclude(spec) {
+            continue;
+        }
+        if !known_paths
+            .iter()
+            .any(|path| matches_pathspec(path, std::slice::from_ref(spec)))
+        {
+            eprintln!("error: pathspec ':(prefix:0){spec}' did not match any file(s) known to git");
+            eprintln!("Did you forget to 'git add'?");
+            return Err(anyhow::Error::new(SilentNonZeroExit { code: 1 }));
+        }
+    }
+    Ok(())
 }
 
 fn stash_pathspec_matches_worktree(
@@ -4278,19 +4421,19 @@ fn create_stash_commit(
     untracked_files: &[String],
 ) -> Result<ObjectId> {
     let now = OffsetDateTime::now_utc();
-    let identity = resolve_identity(repo, now)?;
+    let identities = resolve_identities(repo, now)?;
 
     // 1. Create index-state commit (tree from current index)
     let index_tree_oid = write_tree_from_expanded_index(&repo.odb, index)?;
     let index_commit_data = CommitData {
         tree: index_tree_oid,
         parents: vec![*head_oid],
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
-        message: format!("index on {}\n", branch_description(head)),
+        message: format!("index on {}\n", branch_description(repo, head)),
         raw_message: None,
     };
     let index_commit_bytes = serialize_commit(&index_commit_data);
@@ -4301,13 +4444,13 @@ fn create_stash_commit(
         let tree_oid = create_untracked_tree(&repo.odb, work_tree, untracked_files)?;
         let ut_commit = CommitData {
             tree: tree_oid,
-            parents: vec![*head_oid],
-            author: identity.clone(),
-            committer: identity.clone(),
+            parents: Vec::new(),
+            author: identities.author.clone(),
+            committer: identities.committer.clone(),
             author_raw: Vec::new(),
             committer_raw: Vec::new(),
             encoding: None,
-            message: format!("untracked files on {}\n", branch_description(head)),
+            message: format!("untracked files on {}\n", branch_description(repo, head)),
             raw_message: None,
         };
         let ut_bytes = serialize_commit(&ut_commit);
@@ -4322,7 +4465,7 @@ fn create_stash_commit(
     let wt_tree_oid =
         create_worktree_tree(&repo.odb, index, work_tree, &head_commit_for_tree.tree)?;
 
-    let stash_msg = stash_save_msg(head, message);
+    let stash_msg = stash_save_msg(repo, head, message);
 
     let mut parents = vec![*head_oid, index_commit_oid];
     if let Some(ut_oid) = untracked_commit_oid {
@@ -4332,8 +4475,8 @@ fn create_stash_commit(
     let stash_commit = CommitData {
         tree: wt_tree_oid,
         parents,
-        author: identity.clone(),
-        committer: identity.clone(),
+        author: identities.author.clone(),
+        committer: identities.committer.clone(),
         author_raw: Vec::new(),
         committer_raw: Vec::new(),
         encoding: None,
@@ -4353,22 +4496,22 @@ fn write_tree_from_expanded_index(odb: &Odb, index: &Index) -> Result<ObjectId> 
 }
 
 /// Generate the stash save message (used as commit message).
-fn stash_save_msg(head: &HeadState, message: Option<&str>) -> String {
+fn stash_save_msg(repo: &Repository, head: &HeadState, message: Option<&str>) -> String {
     match message {
         Some(msg) => format!("On {}: {msg}\n", branch_short_name(head)),
-        None => format!("WIP on {}\n", branch_description(head)),
+        None => format!("WIP on {}\n", branch_description(repo, head)),
     }
 }
 
 /// Generate the stash reflog message.
-fn stash_reflog_msg(head: &HeadState, message: Option<&str>) -> String {
-    stash_save_msg(head, message)
+fn stash_reflog_msg(repo: &Repository, head: &HeadState, message: Option<&str>) -> String {
+    stash_save_msg(repo, head, message)
 }
 
 /// Update refs/stash and its reflog.
 fn update_stash_ref(repo: &Repository, stash_oid: &ObjectId, message: &str) -> Result<()> {
     let now = OffsetDateTime::now_utc();
-    let identity = resolve_identity(repo, now)?;
+    let identity = resolve_identities(repo, now)?.committer;
 
     let old_stash = resolve_ref(&repo.git_dir, "refs/stash").ok();
     let zero_oid = ObjectId::from_hex("0000000000000000000000000000000000000000")?;
@@ -4481,6 +4624,70 @@ fn reject_bare_oid_for_stash_stack_op(repo: &Repository, stash_ref: Option<&str>
     Ok(())
 }
 
+fn resolve_stash_like_commit(repo: &Repository, stash_ref: &str) -> Result<ObjectId> {
+    let oid = match resolve_revision(repo, stash_ref) {
+        Ok(oid) => oid,
+        Err(_) if stash_ref.len() == 40 && stash_ref.chars().all(|c| c.is_ascii_hexdigit()) => {
+            ObjectId::from_hex(stash_ref)?
+        }
+        Err(_) => bail!("invalid stash reference: {stash_ref}"),
+    };
+    if !is_stash_like_commit(repo, &oid)? {
+        bail!("not a stash-like commit: {stash_ref}");
+    }
+    Ok(oid)
+}
+
+fn resolve_stash_for_branch(
+    repo: &Repository,
+    stash_ref: Option<&str>,
+) -> Result<(ObjectId, Option<usize>)> {
+    match parse_stash_index(stash_ref) {
+        Ok(index) => {
+            let oid = resolve_stash_ref(repo, stash_ref)?;
+            Ok((oid, Some(index)))
+        }
+        Err(_) => {
+            let stash_ref = stash_ref.ok_or_else(|| anyhow::anyhow!("No stash entries"))?;
+            let oid = resolve_stash_like_commit(repo, stash_ref)?;
+            Ok((oid, None))
+        }
+    }
+}
+
+fn reflog_entry_timestamp(entry: &grit_lib::reflog::ReflogEntry) -> Option<i64> {
+    let parts: Vec<&str> = entry.identity.rsplitn(3, ' ').collect();
+    if parts.len() >= 2 {
+        parts[1].parse::<i64>().ok()
+    } else {
+        None
+    }
+}
+
+fn resolve_stash_date_ref(repo: &Repository, stash_ref: &str) -> Result<Option<ObjectId>> {
+    let Some(inner) = stash_ref
+        .strip_prefix("stash@{")
+        .and_then(|s| s.strip_suffix('}'))
+    else {
+        return Ok(None);
+    };
+    let Some(target_ts) = grit_lib::rev_parse::reflog_date_selector_timestamp(inner) else {
+        return Ok(None);
+    };
+    let entries = read_reflog(&repo.git_dir, "refs/stash")?;
+    if entries.is_empty() {
+        bail!("No stash entries");
+    }
+    for entry in entries.iter().rev() {
+        if let Some(ts) = reflog_entry_timestamp(entry) {
+            if ts <= target_ts {
+                return Ok(Some(entry.new_oid));
+            }
+        }
+    }
+    Ok(entries.first().map(|entry| entry.new_oid))
+}
+
 /// Resolve a stash reference to an ObjectId.
 fn resolve_stash_ref(repo: &Repository, stash_ref: Option<&str>) -> Result<ObjectId> {
     // Try to parse as a stash index first
@@ -4499,6 +4706,9 @@ fn resolve_stash_ref(repo: &Repository, stash_ref: Option<&str>) -> Result<Objec
         }
         Err(_) => {
             if let Some(s) = stash_ref {
+                if let Some(oid) = resolve_stash_date_ref(repo, s)? {
+                    return Ok(oid);
+                }
                 if let Ok(oid) = resolve_revision(repo, s) {
                     return Ok(oid);
                 }
@@ -4548,17 +4758,39 @@ fn drop_stash_entry(repo: &Repository, index: usize) -> Result<()> {
     Ok(())
 }
 
+fn commit_subject_for_description(repo: &Repository, oid: &ObjectId) -> Option<String> {
+    let obj = repo.odb.read(oid).ok()?;
+    if obj.kind != ObjectKind::Commit {
+        return None;
+    }
+    let commit = parse_commit(&obj.data).ok()?;
+    let subject = grit_lib::commit_pretty::message_subject(&commit.message);
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject)
+    }
+}
+
+fn oid_description(repo: &Repository, oid: &ObjectId) -> String {
+    let short = &oid.to_hex()[..7];
+    match commit_subject_for_description(repo, oid) {
+        Some(subject) => format!("{short} {subject}"),
+        None => short.to_string(),
+    }
+}
+
 /// Get a branch description string for stash messages (e.g. "main: abc1234 commit msg").
-fn branch_description(head: &HeadState) -> String {
+fn branch_description(repo: &Repository, head: &HeadState) -> String {
     match head {
         HeadState::Branch { refname, oid, .. } => {
             let name = refname.strip_prefix("refs/heads/").unwrap_or(refname);
             match oid {
-                Some(oid) => format!("{name}: {}", &oid.to_hex()[..7]),
+                Some(oid) => format!("{name}: {}", oid_description(repo, oid)),
                 None => name.to_string(),
             }
         }
-        HeadState::Detached { oid } => format!("(no branch): {}", &oid.to_hex()[..7]),
+        HeadState::Detached { oid } => format!("(no branch): {}", oid_description(repo, oid)),
         HeadState::Invalid => "(invalid HEAD)".to_string(),
     }
 }
@@ -4575,22 +4807,56 @@ fn branch_short_name(head: &HeadState) -> String {
     }
 }
 
-/// Resolve committer identity from config/env.
-fn resolve_identity(repo: &Repository, now: OffsetDateTime) -> Result<String> {
+struct StashIdentities {
+    author: String,
+    committer: String,
+}
+
+/// Resolve stash author and committer identities from config/env.
+fn resolve_identities(repo: &Repository, now: OffsetDateTime) -> Result<StashIdentities> {
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
-    let name = std::env::var("GIT_COMMITTER_NAME")
+    let author = resolve_stash_identity_for_role(
+        &config,
+        "GIT_AUTHOR_NAME",
+        "GIT_AUTHOR_EMAIL",
+        "GIT_AUTHOR_DATE",
+        "author.name",
+        "author.email",
+        now,
+    );
+    let committer = resolve_stash_identity_for_role(
+        &config,
+        "GIT_COMMITTER_NAME",
+        "GIT_COMMITTER_EMAIL",
+        "GIT_COMMITTER_DATE",
+        "committer.name",
+        "committer.email",
+        now,
+    );
+    Ok(StashIdentities { author, committer })
+}
+
+fn resolve_stash_identity_for_role(
+    config: &ConfigSet,
+    name_env: &str,
+    email_env: &str,
+    date_env: &str,
+    name_config: &str,
+    email_config: &str,
+    now: OffsetDateTime,
+) -> String {
+    let name = std::env::var(name_env)
         .ok()
-        .or_else(|| std::env::var("GIT_AUTHOR_NAME").ok())
+        .or_else(|| config.get(name_config))
         .or_else(|| config.get("user.name"))
-        .unwrap_or_else(|| "Unknown".to_owned());
-    let email = std::env::var("GIT_COMMITTER_EMAIL")
+        .unwrap_or_else(|| "git stash".to_owned());
+    let email = std::env::var(email_env)
         .ok()
-        .or_else(|| std::env::var("GIT_AUTHOR_EMAIL").ok())
+        .or_else(|| config.get(email_config))
         .or_else(|| config.get("user.email"))
-        .unwrap_or_default();
-    let timestamp = std::env::var("GIT_COMMITTER_DATE")
+        .unwrap_or_else(|| "git@stash".to_owned());
+    let timestamp = std::env::var(date_env)
         .ok()
-        .or_else(|| std::env::var("GIT_AUTHOR_DATE").ok())
         .and_then(|d| crate::commands::commit::parse_date_to_git_timestamp(&d).or(Some(d)))
         .unwrap_or_else(|| {
             let epoch = now.unix_timestamp();
@@ -4599,7 +4865,7 @@ fn resolve_identity(repo: &Repository, now: OffsetDateTime) -> Result<String> {
             let minutes = offset.minutes_past_hour().unsigned_abs();
             format!("{epoch} {hours:+03}{minutes:02}")
         });
-    Ok(format!("{name} <{email}> {timestamp}"))
+    format!("{name} <{email}> {timestamp}")
 }
 
 fn split_ident_timestamp_offset(ident: &str) -> Option<(&str, &str)> {

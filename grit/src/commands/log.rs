@@ -6938,7 +6938,7 @@ fn run_reflog_walk(
 }
 
 /// Apply format placeholders for reflog walk entries.
-/// Supports %H, %h, %s, %gd, %gs, %gn, %ge, %an, %ae, %cn, %ce, %B, %b, %N, %n.
+/// Supports %H, %h, %s, %gd, %gs, %gn, %ge, %an, %ae, %cn, %ce, %cd, %B, %b, %N, %n.
 fn apply_reflog_format_string(
     fmt: &str,
     oid: &ObjectId,
@@ -7146,6 +7146,10 @@ fn apply_reflog_format_string(
                                 extract_email(&commit.committer)
                             };
                             result.push_str(&local_part_of_email(&email));
+                        }
+                        Some('d') => {
+                            chars.next();
+                            result.push_str(&format_date_with_mode(&commit.committer, None));
                         }
                         _ => {
                             result.push_str("%c");
