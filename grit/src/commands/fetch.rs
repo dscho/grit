@@ -5011,7 +5011,7 @@ fn copy_reachable_objects_internal(
     Ok(())
 }
 
-fn prune_loose_objects_available_from_alternates(git_dir: &Path) -> Result<()> {
+pub(crate) fn prune_loose_objects_available_from_alternates(git_dir: &Path) -> Result<()> {
     let objects_dir = git_dir.join("objects");
     let alternates = grit_lib::pack::read_alternates_recursive(&objects_dir).unwrap_or_default();
     if alternates.is_empty() {

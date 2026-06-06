@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use grit_lib::config::{ConfigFile, ConfigScope, ConfigSet};
 use grit_lib::diff::zero_oid;
 use grit_lib::fetch_negotiator::SkippingNegotiator;
-use grit_lib::objects::ObjectId;
+use grit_lib::objects::{parse_tag, ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::refs;
 use grit_lib::repo::Repository;
@@ -1113,7 +1113,7 @@ pub fn fetch_via_upload_pack_skipping(
     if !has_cli_refspecs {
         merge_remote_refs_into_upload_pack_advertisement(remote_repo_path, &mut advertised)?;
     }
-    let wants = compute_wants(&advertised)?;
+    let wants = filter_wants_already_local(local_git_dir, compute_wants(&advertised)?);
     if has_hide_refs_for_fetch_connectivity(local_git_dir) {
         crate::trace_run_command_git_invocation(&[
             "rev-list",
@@ -1245,6 +1245,49 @@ pub fn fetch_via_upload_pack_skipping(
     unpack_upload_pack_bytes(local_git_dir, &pack_buf, filter_active)?;
 
     Ok((remote_heads, remote_tags, head_symref, head_advertised_oid))
+}
+
+/// Git's `everything_local`: a wanted ref tip need not be requested when its object — and its full
+/// reachable closure — is already available in the local object store (which includes `--reference`
+/// / alternate object directories). Dropping such wants is what keeps a `--reference` clone or a
+/// fetch into a repo with an alternate from asking the server for objects it can already borrow
+/// (`t5604` "fetched no objects" / "fetch with incomplete alternates").
+fn want_is_locally_complete(repo: &Repository, oid: &ObjectId) -> bool {
+    let Ok(obj) = repo.odb.read(oid) else {
+        return false;
+    };
+    match obj.kind {
+        ObjectKind::Commit => {
+            grit_lib::connectivity::push_tip_objects_exist(repo, *oid).unwrap_or(false)
+        }
+        ObjectKind::Tag => {
+            // A tag is complete only if its (possibly chained) target's closure is present.
+            match parse_tag(&obj.data) {
+                Ok(tag) => want_is_locally_complete(repo, &tag.object),
+                Err(_) => false,
+            }
+        }
+        // A tree or blob ref tip is complete once the object itself is present.
+        ObjectKind::Tree | ObjectKind::Blob => true,
+    }
+}
+
+/// Drop wants already satisfied locally (see [`want_is_locally_complete`]). Returns the surviving
+/// wants. Never removes everything-vs-nothing distinctions the caller relies on: an empty result
+/// means the fetch needs no pack, which callers already handle.
+fn filter_wants_already_local(local_git_dir: &Path, wants: Vec<ObjectId>) -> Vec<ObjectId> {
+    if wants.is_empty() {
+        return wants;
+    }
+    let Ok(repo) = Repository::open(local_git_dir, None) else {
+        return wants;
+    };
+    // Only filter when there is at least one alternate / borrowable store; otherwise a normal
+    // clone (empty local ODB) keeps all wants and the check is pure overhead.
+    wants
+        .into_iter()
+        .filter(|oid| !want_is_locally_complete(&repo, oid))
+        .collect()
 }
 
 fn fetch_negotiation_algorithm(local_git_dir: &Path) -> Option<String> {

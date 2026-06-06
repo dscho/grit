@@ -771,6 +771,7 @@ pub fn run(mut args: Args) -> Result<()> {
         let upload_cmd = args.upload_pack.as_deref().filter(|s| !s.trim().is_empty());
         let bundle_cli = args.bundle_uri.is_some();
         let request_bundle = crate::file_upload_pack_v2::transfer_bundle_uri_enabled();
+        let reference_object_dirs = resolve_reference_object_dirs(&args);
         let preflight_head = crate::fetch_transport::with_packet_trace_identity("clone", || {
             crate::file_upload_pack_v2::clone_preflight_file_v2_if_needed(
                 &source.git_dir,
@@ -778,6 +779,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 request_bundle,
                 bundle_cli,
                 &server_options,
+                &reference_object_dirs,
             )
         })
         .context("file:// protocol v2 clone preflight")?;
@@ -1196,6 +1198,18 @@ pub fn run(mut args: Args) -> Result<()> {
         // `--no-local` always negotiates via upload-pack. A shallow source (including an empty
         // `.git/shallow` file) disables Git's local clone optimization; use upload-pack instead of
         // copying objects / alternates (`t0411-clone-from-partial`, `t5605`).
+        //
+        // Set up `--reference` alternates *before* the fetch so the negotiation can borrow the
+        // reference's objects (Git records the alternate, then fetch-pack's `everything_local`
+        // skips wanting objects the reference already has). Without this an `--no-local
+        // --reference=P` clone would fetch the reference's objects too, so removing P later would
+        // not corrupt the clone (`t5604` "clone and dissociate from reference").
+        append_reference_alternates(
+            &dest.git_dir.join("objects"),
+            &args.reference,
+            &args.reference_if_able,
+        )
+        .context("adding --reference alternates")?;
         let upload_cmd = args.upload_pack.as_deref().filter(|s| !s.trim().is_empty());
         match crate::fetch_transport::with_packet_trace_identity("clone", || {
             crate::fetch_transport::fetch_via_upload_pack_skipping(
@@ -1235,7 +1249,12 @@ pub fn run(mut args: Args) -> Result<()> {
     } else {
         let has_reference = !args.reference.is_empty() || !args.reference_if_able.is_empty();
         let try_hardlink_objects = !args.no_hardlinks && !args.repository.starts_with("file://");
-        if !has_reference {
+        // A genuine local-path clone (`git clone --reference G F H`, F a plain path) still copies
+        // the source's objects via `copy_or_link_directory`; `--reference` only adds an *extra*
+        // alternate. Only a `file://` clone borrows-without-copying when a reference is given
+        // (it fetches via upload-pack and the reference satisfies the wants — `t5604` test 8 vs 19).
+        let copy_source_objects = !has_reference || !is_file_url;
+        if copy_source_objects {
             copy_objects(&source.git_dir, &dest.git_dir, try_hardlink_objects)
                 .context("copying objects")?;
             merge_alternates_from_source_objects(&source.git_dir, &dest.git_dir.join("objects"))
@@ -4666,6 +4685,20 @@ fn object_store_git_dir(git_dir: &Path) -> PathBuf {
 }
 
 /// Open a source repository (bare or non-bare).
+/// Resolve every `--reference` / `--reference-if-able` repo to its `objects` directory. Missing
+/// optional references are skipped; missing required references are skipped here too (the later
+/// `append_reference_alternates` reports the hard error) — this list is only used to suppress
+/// `want`s for objects the reference already holds.
+fn resolve_reference_object_dirs(args: &Args) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for reference in args.reference.iter().chain(args.reference_if_able.iter()) {
+        if let Ok(repo) = open_source_repo(&PathBuf::from(reference)) {
+            dirs.push(repo.git_dir.join("objects"));
+        }
+    }
+    dirs
+}
+
 fn open_source_repo(path: &Path) -> Result<Repository> {
     if path.is_file() {
         let work_tree = path.parent().map(Path::to_path_buf);
@@ -4909,71 +4942,91 @@ fn copy_objects(src_git_dir: &Path, dst_git_dir: &Path, try_hardlink: bool) -> R
     let src_objects = object_store_git_dir(src_git_dir).join("objects");
     let dst_objects = dst_git_dir.join("objects");
 
-    // Copy loose objects
-    if src_objects.is_dir() {
-        copy_dir_contents(&src_objects, &dst_objects, &["info", "pack"], try_hardlink)?;
-    }
-
-    // Copy pack files
-    let src_pack = src_objects.join("pack");
-    let dst_pack = dst_objects.join("pack");
-    if src_pack.is_dir() {
-        fs::create_dir_all(&dst_pack)?;
-        for entry in fs::read_dir(&src_pack)? {
-            let entry = entry?;
-            let src_file = entry.path();
-            if src_file.is_file() {
-                let dst_file = dst_pack.join(entry.file_name());
-                if dst_file.exists() {
-                    continue;
-                }
-                if try_hardlink && fs::hard_link(&src_file, &dst_file).is_ok() {
-                    continue;
-                }
-                // A concurrent `git maintenance`/repack on the source can remove a pack file
-                // between the directory scan and this copy. Treat a vanished source file as a
-                // skip rather than aborting the whole clone (Git's local clone is similarly
-                // robust to maintenance running on the source).
-                copy_skip_vanished_source(&src_file, &dst_file)?;
-            }
+    // Mirror Git's `copy_or_link_directory`: refuse to clone locally when the source's
+    // `objects` directory is itself a symlink (an adversary could point it at a sensitive
+    // directory). `lstat` the path before recursing.
+    if let Ok(meta) = fs::symlink_metadata(&src_objects) {
+        if meta.file_type().is_symlink() {
+            bail!(
+                "'{}' is a symlink, refusing to clone with --local",
+                src_objects.display()
+            );
         }
     }
 
-    // Copy objects/info if it exists (alternates, packs list, etc.)
-    let src_info = src_objects.join("info");
-    let dst_info = dst_objects.join("info");
-    if src_info.is_dir() {
-        fs::create_dir_all(&dst_info)?;
-        for entry in fs::read_dir(&src_info)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_file() {
-                let dst_file = dst_info.join(entry.file_name());
-                copy_skip_vanished_source(&path, &dst_file)?;
-            } else if path.is_dir() && entry.file_name().to_string_lossy() == "commit-graphs" {
-                // A local clone copies the split commit-graph chain (Git's
-                // local-clone copies the whole objects tree). Recurse into
-                // `info/commit-graphs/` so the cloned repo keeps the chain file
-                // and its graph-*.graph layers.
-                let dst_cg = dst_info.join(entry.file_name());
-                fs::create_dir_all(&dst_cg)?;
-                for inner in fs::read_dir(&path)? {
-                    let inner = inner?;
-                    if inner.path().is_file() {
-                        let dst_file = dst_cg.join(inner.file_name());
-                        copy_skip_vanished_source(&inner.path(), &dst_file)?;
-                        // Git's local clone copies content but the destination
-                        // takes the umask-default mode, not the source's read-only
-                        // 0444. Tests rely on being able to corrupt these files.
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::PermissionsExt;
-                            let _ =
-                                fs::set_permissions(&dst_file, fs::Permissions::from_mode(0o644));
-                        }
-                    }
-                }
-            }
+    if src_objects.is_dir() {
+        fs::create_dir_all(&dst_objects)?;
+        copy_or_link_objects_tree(&src_objects, &dst_objects, Path::new(""), try_hardlink)?;
+    }
+
+    Ok(())
+}
+
+/// Recursively copy/hardlink the entire `objects` tree, faithfully replicating Git's
+/// `copy_or_link_directory` (builtin/clone.c). Every file and directory — including hidden,
+/// unknown, and garbage entries — is reproduced. Encountering any symlink aborts the clone
+/// with Git's "refusing to clone with --local" error; `info/alternates` is special-cased and
+/// resolved by the caller (`merge_alternates_from_source_objects`) rather than copied verbatim.
+fn copy_or_link_objects_tree(src: &Path, dst: &Path, rel: &Path, try_hardlink: bool) -> Result<()> {
+    let read = match fs::read_dir(src) {
+        Ok(rd) => rd,
+        // A concurrent repack can remove a whole fan-out directory while we walk it; treat a
+        // vanished source directory as nothing to copy rather than aborting the clone.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    for entry in read {
+        let entry = entry?;
+        let name = entry.file_name();
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+        let entry_rel = rel.join(&name);
+
+        let meta = match fs::symlink_metadata(&src_path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let ftype = meta.file_type();
+
+        if ftype.is_symlink() {
+            bail!(
+                "symlink '{}' exists, refusing to clone with --local",
+                entry_rel.display()
+            );
+        }
+
+        if ftype.is_dir() {
+            fs::create_dir_all(&dst_path)?;
+            copy_or_link_objects_tree(&src_path, &dst_path, &entry_rel, try_hardlink)?;
+            continue;
+        }
+
+        // `info/alternates` is resolved (relative paths rebased onto the source) by the caller
+        // rather than copied byte-for-byte; skip it here, matching Git's `copy_alternates`.
+        if entry_rel == Path::new("info/alternates") {
+            continue;
+        }
+
+        if dst_path.exists() {
+            continue;
+        }
+        if try_hardlink && fs::hard_link(&src_path, &dst_path).is_ok() {
+            continue;
+        }
+        // A concurrent `git maintenance`/repack on the source can remove a file between the
+        // directory scan and this copy. Treat a vanished source file as a skip rather than
+        // aborting the whole clone (Git's local clone is similarly robust).
+        copy_skip_vanished_source(&src_path, &dst_path)?;
+
+        // Git's local clone copies content but the destination takes the umask-default mode,
+        // not the source's possibly read-only 0444. Tests rely on being able to corrupt
+        // these files (e.g. commit-graph layers under `info/commit-graphs/`).
+        #[cfg(unix)]
+        if entry_rel.starts_with("info/commit-graphs") {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&dst_path, fs::Permissions::from_mode(0o644));
         }
     }
 
@@ -4996,45 +5049,6 @@ fn copy_skip_vanished_source(src: &Path, dst: &Path) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Copy directory contents recursively, skipping named subdirectories.
-fn copy_dir_contents(src: &Path, dst: &Path, skip_dirs: &[&str], try_hardlink: bool) -> Result<()> {
-    for entry in fs::read_dir(src)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if entry.file_type()?.is_dir() {
-            if skip_dirs.contains(&name_str.as_ref()) {
-                continue;
-            }
-            // This is a loose object fan-out directory (2-char hex prefix)
-            let dst_dir = dst.join(&*name);
-            fs::create_dir_all(&dst_dir)?;
-            // A concurrent repack can remove a whole fan-out directory while we walk it; treat a
-            // vanished source directory as nothing to copy rather than aborting the clone.
-            let inner_rd = match fs::read_dir(entry.path()) {
-                Ok(rd) => rd,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            for inner in inner_rd {
-                let inner = inner?;
-                if inner.file_type()?.is_file() {
-                    let dst_file = dst_dir.join(inner.file_name());
-                    if dst_file.exists() {
-                        continue;
-                    }
-                    if try_hardlink && fs::hard_link(inner.path(), &dst_file).is_ok() {
-                        continue;
-                    }
-                    copy_skip_vanished_source(&inner.path(), &dst_file)?;
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Fail early when the source has obviously corrupt ref files under `refs/heads` or `refs/tags`,

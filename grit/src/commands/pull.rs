@@ -680,7 +680,36 @@ pub fn run(args: Args) -> Result<()> {
         // recursion can detect changed submodule pointers.
         let fetch_recurse_mode = pull_fetch_recurse_mode(&args, &config)?;
         recurse_fetch_submodules_for_local_pull(&config, fetch_recurse_mode, || {
-            super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
+            // Resolve the OIDs this pull will bring in so we copy only their reachable closure as
+            // loose objects (and prune any already borrowable from an alternate), rather than
+            // hardlinking the remote's entire object store. Matches `git fetch`'s local transport:
+            // a `--reference` clone that pulls new commits keeps only the genuinely new objects
+            // local, not a wholesale copy of the source's packs (`t5604`).
+            let mut copy_roots: Vec<ObjectId> = Vec::new();
+            if args.refspecs.is_empty() {
+                if let Ok(oid) =
+                    refs::resolve_ref(&remote_repo.git_dir, &format!("refs/heads/{merge_branch}"))
+                        .or_else(|_| refs::resolve_ref(&remote_repo.git_dir, "HEAD"))
+                {
+                    copy_roots.push(oid);
+                }
+            } else {
+                for spec in &effective_refspecs {
+                    if let Ok((oid, _)) = pull_fetch_head_line(&remote_repo, spec) {
+                        copy_roots.push(oid);
+                    }
+                }
+            }
+            if copy_roots.is_empty() {
+                super::fetch::copy_objects_for_pull(&remote_repo.git_dir, &repo.git_dir)?;
+            } else {
+                super::fetch::copy_reachable_objects(
+                    &remote_repo.git_dir,
+                    &repo.git_dir,
+                    &copy_roots,
+                )?;
+                super::fetch::prune_loose_objects_available_from_alternates(&repo.git_dir)?;
+            }
 
             let lines = if args.refspecs.is_empty() {
                 let remote_oid = if let Ok(oid) =

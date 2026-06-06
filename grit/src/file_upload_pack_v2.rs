@@ -624,12 +624,18 @@ pub(crate) fn ls_remote_file_v2(
 }
 
 /// Optional v2 handshake + bundle-uri + fetch for `file://` clone tests (discards pack).
+///
+/// `reference_object_dirs` lists the `objects` directories of any `--reference` repos. Wants that
+/// are already present in one of those alternates are dropped from the fetch request, matching
+/// Git's `everything_local()` — so a `--reference` clone of a ref the reference already has sends
+/// no `want` at all (`t5604` "fetched no objects").
 pub(crate) fn clone_preflight_file_v2_if_needed(
     source_git_dir: &Path,
     upload_pack_cmd: Option<&str>,
     request_bundle_uri: bool,
     bundle_uri_cli_override: bool,
     server_options: &[String],
+    reference_object_dirs: &[PathBuf],
 ) -> Result<(Option<String>, Option<String>)> {
     if !client_wants_protocol_v2() {
         return Ok((None, None));
@@ -658,11 +664,30 @@ pub(crate) fn clone_preflight_file_v2_if_needed(
     let mut ls_buf = Vec::new();
     read_pkt_lines_until_flush(&mut stdout, &mut ls_buf, 512 * 1024)
         .context("read ls-refs for clone preflight")?;
-    let (wants, mut head_symref, head_oid) = collect_clone_ls_refs_metadata(&ls_buf)?;
+    let (mut wants, mut head_symref, head_oid) = collect_clone_ls_refs_metadata(&ls_buf)?;
     if head_symref.is_none() && should_use_source_head_symref_fallback(source_git_dir) {
         // `serve-v2 ls-refs` can omit unborn HEAD metadata. For file:// clone parity, preserve
         // source HEAD's symbolic target unless the repository explicitly disables unborn ads.
         head_symref = source_head_symref_from_repo_head_file(source_git_dir);
+    }
+    // Drop wants already available via a `--reference` alternate (Git's `everything_local`): the
+    // server need not (and must not, per `t5604`) be asked for objects we can already borrow.
+    if !reference_object_dirs.is_empty() && !wants.is_empty() {
+        let reference_repos: Vec<Repository> = reference_object_dirs
+            .iter()
+            .filter_map(|obj_dir| {
+                obj_dir
+                    .parent()
+                    .and_then(|git_dir| Repository::open(git_dir, None).ok())
+            })
+            .collect();
+        if !reference_repos.is_empty() {
+            wants.retain(|oid| {
+                !reference_repos
+                    .iter()
+                    .any(|repo| repo.odb.read(oid).is_ok())
+            });
+        }
     }
     if wants.is_empty() {
         // Close stdin so upload-pack exits; otherwise it stays in serve-loop waiting for the
