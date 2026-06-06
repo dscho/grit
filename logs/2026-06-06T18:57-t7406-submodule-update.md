@@ -24,7 +24,36 @@ superproject keeps its submodule pointing at the copy. After each submodule clon
 `.git` gitlink to relative via `write_submodule_gitfile`.
 Fixed tests 64, 65, 66 (cp -r top-clean top-cloned then operating on the copy).
 
-## Remaining: 48, 51, 58
-- 48: submodule add places git-dir in superprojects git-dir recursive
-- 51: submodule update properly revives a moved submodule
-- 58: submodule update --quiet passes quietness to merge/rebase
+## Fix 3: `push origin :` (matching refspec) no-op success
+Test 48 ran `git push origin :` on a detached HEAD with no matching branches. grit `bail!`ed with
+"No refs in common and none specified". C Git (send-pack.c / transport.c) returns 0 in that case
+and prints "Everything up-to-date". Changed grit/src/commands/push.rs to not bail when the
+matching `:`/`+:` refspec matches nothing; only warn (to stderr) when the remote advertises no
+refs at all, then fall through to the empty-updates "Everything up-to-date" path. Fixed test 48.
+
+## Fix 4: submodule update no-op when already at recorded commit (ignore dirtiness)
+Tests 51 and 58. grit's "already at recorded commit" fast path in
+_submodule_run_update_inner.rs.inc additionally required a clean worktree; a dirty submodule
+already at the recorded oid fell through to `pull --rebase`, which died with "cannot pull with
+rebase: You have unstaged changes". C Git's update_submodule only runs the checkout/rebase/merge
+procedure when `!oideq(oid, suboid) || force` (builtin/submodule--helper.c) — dirtiness is
+irrelevant. Removed the `submodule_worktree_clean_for_update` requirement from the checkout-path
+fast skip. Fixed 51; 58 was a cascade of 51's broken state (a dirty submodule with update=rebase).
+
+## Fix 5: `submodule add` relative gitlink (t7400 regression repair)
+Commit 27cd94c89 ("absolute separate-git-dir gitfile", in the common base) made
+`clone --separate-git-dir` write an absolute `gitdir:` path. That regressed `submodule add`
+(t7400.19) and the t7406 recursive tests, which need a *relative* gitlink. Added a
+`write_submodule_gitfile` call after the clone in `submodule add` (grit/src/commands/submodule.rs)
+to match C's `connect_work_tree_and_git_dir`. Restored t7400 to 124/124.
+
+## Result
+t7406: 70/70 (was 58/70 at start). t7400: 124/124 (regression repaired). No new clippy warnings;
+grit-lib unit tests pass modulo the 2 known ignore::gitignore_glob failures.
+
+## Out of scope (pre-existing, from 27cd94c89 in the common base, NOT regressed by this work)
+- t7407-submodule-foreach 20/23 (TOML baseline 23 is stale, pre-dates 27cd94c89): `submodule
+  status --recursive` shows `(remotes/origin/main)` instead of `(heads/main)` for recursively-
+  updated submodules — the at-recorded fast path skips local-branch HEAD attachment. Separate bug.
+- t5601-clone 112/115 (unchanged from baseline; the absolute top-level gitlink that 27cd94c89
+  added is intentionally preserved by this work — only submodule gitlinks are rewritten relative).

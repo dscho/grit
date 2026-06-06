@@ -3102,6 +3102,10 @@ fn run_add(args: &AddArgs) -> Result<()> {
             if !status.success() {
                 bail!("failed to clone submodule from '{}'", args.url);
             }
+            // `clone --separate-git-dir` writes an absolute `gitdir:` path; submodules need a
+            // relative gitlink (C Git's `connect_work_tree_and_git_dir`) so the worktree survives
+            // being moved/copied with its superproject (t7400 "submodule add").
+            write_submodule_gitfile(&sub_path, &modules_dir).map_err(|e| anyhow::anyhow!("{e}"))?;
             set_separate_gitdir_worktree(&grit_bin, &modules_dir, &sub_path);
             did_clone = true;
         }
