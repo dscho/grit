@@ -1126,6 +1126,7 @@ pub fn run(mut args: Args) -> Result<()> {
     let template_path = resolve_commit_template_path(&args, &config)?;
     let use_editor_for_message = commit_uses_editor(&args, fixup_parsed.as_ref(), &repo.git_dir);
     if use_editor_for_message {
+        validate_explicit_committer_identity(&config)?;
         let _ = resolve_committer(&config, OffsetDateTime::now_utc())?;
     }
 
@@ -1503,7 +1504,17 @@ pub fn run(mut args: Args) -> Result<()> {
             }
             HookResult::NotFound => {
                 if let Some(previous) = pre_commit_msg_hook_editmsg {
-                    fs::write(&msg_file, previous)?;
+                    let cp = comment_line_prefix_full(&config);
+                    let restored = if post_editor_editmsg.is_some()
+                        && (commit_cleanup_mode != CommitMsgCleanupMode::None
+                            || args.signoff
+                            || !args.trailer.is_empty())
+                    {
+                        replace_editmsg_user_message(&previous, &message, cp.as_ref())
+                    } else {
+                        previous
+                    };
+                    fs::write(&msg_file, restored)?;
                 }
             }
         }
@@ -3596,6 +3607,31 @@ fn rest_is_empty_signedoff_only(s: &str, start: usize) -> bool {
     true
 }
 
+fn replace_editmsg_user_message(previous: &[u8], message: &str, comment_prefix: &str) -> Vec<u8> {
+    let Ok(previous_text) = std::str::from_utf8(previous) else {
+        return previous.to_vec();
+    };
+    let suffix_start = previous_text
+        .split_inclusive('\n')
+        .scan(0usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len();
+            Some((current, line))
+        })
+        .find_map(|(offset, line)| line.starts_with(comment_prefix).then_some(offset))
+        .unwrap_or(previous_text.len());
+    let suffix = &previous_text[suffix_start..];
+    let mut restored = message.to_string();
+    if !restored.is_empty() && !restored.ends_with('\n') {
+        restored.push('\n');
+    }
+    if !suffix.is_empty() && !restored.is_empty() && !restored.ends_with("\n\n") {
+        restored.push('\n');
+    }
+    restored.push_str(suffix);
+    restored.into_bytes()
+}
+
 fn message_is_empty_or_signedoff_only(message: &str) -> bool {
     let mut saw_signoff = false;
     for line in message.lines() {
@@ -3680,6 +3716,58 @@ pub(crate) fn comment_line_prefix_full(config: &ConfigSet) -> Cow<'_, str> {
     } else {
         Cow::Owned(t.to_string())
     }
+}
+
+fn has_auto_comment_char(config: &ConfigSet) -> bool {
+    config.entries().iter().any(|entry| {
+        entry.key == "core.commentchar"
+            && entry
+                .value
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("auto"))
+    })
+}
+
+fn auto_comment_prefix_for_message(message: &str) -> Option<String> {
+    const CANDIDATES: &[char] = &['#', ';', '@', '!', '$', '%', '^', '&', '|', ':'];
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|candidate| !message.lines().any(|line| line.starts_with(*candidate)))
+        .map(|c| c.to_string())
+}
+
+fn warn_auto_comment_char_deprecated() {
+    eprintln!(
+        "warning: Support for 'core.commentChar=auto' is deprecated and will be removed in Git 3.0"
+    );
+    eprintln!("hint:");
+    eprintln!("hint: To use the default comment string (#) please run");
+    eprintln!("hint:");
+    eprintln!("hint:     git config unset core.commentChar");
+    eprintln!("hint:     git config unset --file ~/config-include --all core.commentString");
+    eprintln!("hint:     git config unset --file ~/config-include core.commentChar");
+    eprintln!("hint:");
+    eprintln!("hint: To set a custom comment string please run");
+    eprintln!("hint:");
+    eprintln!("hint:     git config set --file ~/config-include core.commentChar <comment string>");
+    eprintln!("hint:");
+    eprintln!("hint: where '<comment string>' is the string you wish to use.");
+}
+
+fn comment_line_prefix_for_message(
+    config: &ConfigSet,
+    message: &str,
+    warn: bool,
+) -> Result<String> {
+    if has_auto_comment_char(config) {
+        if warn {
+            warn_auto_comment_char_deprecated();
+        }
+        return auto_comment_prefix_for_message(message)
+            .ok_or_else(|| anyhow::anyhow!("fatal: unable to select a comment character"));
+    }
+    Ok(comment_line_prefix_full(config).into_owned())
 }
 
 /// Git `commit.verbose`: bool or integer; `-1` when unset (inherit default 0).
@@ -3985,7 +4073,17 @@ fn commit_template_status_append(
     buf: &mut String,
 ) -> Result<()> {
     let cp = comment_line_prefix_full(config);
-    let p = cp.as_ref();
+    commit_template_status_append_with_prefix(args, repo, head, config, cp.as_ref(), buf)
+}
+
+fn commit_template_status_append_with_prefix(
+    args: &Args,
+    repo: &Repository,
+    head: &HeadState,
+    config: &ConfigSet,
+    p: &str,
+    buf: &mut String,
+) -> Result<()> {
     buf.push('\n');
     if args.allow_empty_message {
         append_commented_line(
@@ -4386,8 +4484,17 @@ fn prepare_commit_message(
     if use_editor {
         let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
         let mut file_body = initial;
+        let selected_comment = comment_line_prefix_for_message(config, &file_body, true)?;
+        let comment_prefix = selected_comment.as_str();
         if commit_template_includes_status(args, config) {
-            commit_template_status_append(args, repo, head, config, &mut file_body)?;
+            commit_template_status_append_with_prefix(
+                args,
+                repo,
+                head,
+                config,
+                comment_prefix,
+                &mut file_body,
+            )?;
         }
         if verbose_level > 0 {
             append_commit_verbose_diffs(
@@ -4855,6 +4962,31 @@ fn resolve_committer(config: &ConfigSet, now: OffsetDateTime) -> Result<String> 
     Ok(format!("{name} <{email}> {timestamp}"))
 }
 
+fn validate_explicit_committer_identity(config: &ConfigSet) -> Result<()> {
+    let has_name = std::env::var("GIT_COMMITTER_NAME")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .get("committer.name")
+            .or_else(|| config.get("user.name"))
+            .is_some_and(|value| !value.trim().is_empty());
+    let has_email = std::env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || std::env::var("EMAIL")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .get("committer.email")
+            .or_else(|| config.get("user.email"))
+            .is_some_and(|value| !value.trim().is_empty());
+    if has_name && has_email {
+        Ok(())
+    } else {
+        bail!("unable to auto-detect committer identity")
+    }
+}
+
 /// Parse a date string (like "2006-06-26 00:04:00 +0000") into git's
 /// `<epoch> <offset>` format. Returns None if already in epoch format.
 pub fn parse_date_to_git_timestamp(date_str: &str) -> Option<String> {
@@ -5072,7 +5204,7 @@ fn cleanup_merge_state(git_dir: &Path) {
 
 /// Ensure a string ends with a newline.
 fn ensure_trailing_newline(s: &str) -> String {
-    if s.ends_with('\n') {
+    if s.is_empty() || s.ends_with('\n') {
         s.to_owned()
     } else {
         format!("{s}\n")

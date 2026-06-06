@@ -2434,14 +2434,14 @@ pub(crate) fn apply_format_string(
                 }
                 Some('s') => {
                     chars.next();
-                    let subj = info.message.lines().next().unwrap_or("");
+                    let subj = pretty_subject(info.message);
                     if expand_tabs_in_log > 0 {
                         result.push_str(&grit_lib::tab_expand::expand_tabs_in_line(
-                            subj,
+                            &subj,
                             expand_tabs_in_log,
                         ));
                     } else {
-                        result.push_str(subj);
+                        result.push_str(&subj);
                     }
                 }
                 Some('B') => {
@@ -2463,7 +2463,7 @@ pub(crate) fn apply_format_string(
                 }
                 Some('b') => {
                     chars.next();
-                    let raw_body = info.message.lines().skip(2).collect::<Vec<_>>().join("\n");
+                    let raw_body = extract_body(info.message);
                     let body = if expand_tabs_in_log > 0 {
                         grit_lib::tab_expand::expand_tabs_in_multiline_message(
                             &raw_body,
@@ -2568,6 +2568,35 @@ pub(crate) fn apply_format_string(
     }
 
     result
+}
+
+fn pretty_subject(message: &str) -> String {
+    message
+        .trim_end_matches('\n')
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn extract_body(message: &str) -> String {
+    let msg = message.trim_end_matches('\n');
+    let mut seen_separator = false;
+    let mut body = Vec::new();
+    for line in msg.lines() {
+        if seen_separator {
+            body.push(line);
+        } else if line.is_empty() {
+            seen_separator = true;
+        }
+    }
+    if !seen_separator || body.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", body.join("\n"))
+    }
 }
 
 /// Extract the name portion from a Git ident string (e.g. "Name <email> ts offset").
