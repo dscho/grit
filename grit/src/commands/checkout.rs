@@ -6578,6 +6578,20 @@ pub(crate) fn refuse_populated_submodule_tree_replacement(
     new_index: &Index,
     work_tree: &std::path::Path,
 ) -> Result<()> {
+    refuse_populated_submodule_tree_replacement_inner(old_index, new_index, work_tree, false)
+}
+
+/// Like [`refuse_populated_submodule_tree_replacement`], but when `require_populated_on_disk` is
+/// true only refuse for submodules whose work tree is actually populated on disk (has non-`.git`
+/// content). A plain `git checkout` that switches a branch which turns a submodule into a tracked
+/// directory/file must fail when the submodule is checked out (its untracked work-tree files would
+/// be overwritten; t6041), but must still be allowed when the submodule directory is empty/absent.
+fn refuse_populated_submodule_tree_replacement_inner(
+    old_index: &Index,
+    new_index: &Index,
+    work_tree: &std::path::Path,
+    require_populated_on_disk: bool,
+) -> Result<()> {
     let old_gitlinks: Vec<&[u8]> = old_index
         .entries
         .iter()
@@ -6588,6 +6602,14 @@ pub(crate) fn refuse_populated_submodule_tree_replacement(
     for gpath in &old_gitlinks {
         let g = *gpath;
         let rel = String::from_utf8_lossy(g);
+        if require_populated_on_disk {
+            let abs = work_tree.join(rel.as_ref());
+            if !abs.join(".git").exists() && !submodule_dir_has_non_dotgit_content(&abs) {
+                // Empty or absent submodule work tree: replacing it cannot clobber any
+                // local content, so allow the transition (matches Git's verify_clean_submodule).
+                continue;
+            }
+        }
         for ne in new_index.entries.iter().filter(|e| e.stage() == 0) {
             if ne.path == g {
                 if ne.mode != MODE_GITLINK {
@@ -6824,8 +6846,20 @@ fn checkout_index_to_worktree_inner(
         .map(|e| (e.path.as_slice(), e))
         .collect();
 
-    if refuse_submodule_replacement && preserve_dropped_gitlink_dirs && !populate_gitlinks {
-        refuse_populated_submodule_tree_replacement(old_index, new_index, work_tree)?;
+    if refuse_submodule_replacement && preserve_dropped_gitlink_dirs {
+        if populate_gitlinks {
+            // Plain `git checkout`/`git switch` of a branch that turns a submodule into a tracked
+            // directory or file: refuse only when the submodule is populated on disk so its
+            // untracked work-tree files would be clobbered (t6041), allowing the transition when
+            // the submodule is empty/absent.
+            refuse_populated_submodule_tree_replacement_inner(
+                old_index, new_index, work_tree, true,
+            )?;
+        } else {
+            // Rebase-style application (empty placeholder dir, no `.git`): refuse unconditionally
+            // so a recorded submodule is never silently replaced (t3426/t6042).
+            refuse_populated_submodule_tree_replacement(old_index, new_index, work_tree)?;
+        }
     }
 
     // Remove paths that are no longer present in the new index.
