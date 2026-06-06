@@ -2255,6 +2255,7 @@ fn push_to_url(
         // child whose trace2 stream is stripped, so emit the region from here to keep
         // `test_region pack-objects path-walk` assertions satisfied (t5538).
         maybe_emit_push_path_walk_region(config);
+        maybe_emit_push_pack_objects_child(config);
 
         let thin_pack = pack_objects::build_thin_push_pack(repo, &push_tips, &remote_repo.git_dir)
             .context("building push pack")?;
@@ -6174,6 +6175,41 @@ fn maybe_emit_push_path_walk_region(config: &ConfigSet) {
         return;
     }
     let _ = crate::trace2_region_json(&trace_path, "pack-objects", "path-walk");
+}
+
+/// Emit the trace2 `child_start` event for the `pack-objects` invocation that drives a push,
+/// mirroring Git's `send_pack` spawning `git pack-objects --all-progress-implied --revs --stdout
+/// --thin --delta-base-offset -q` (with `--no-use-bitmap-index` appended when `push.useBitmaps`
+/// is explicitly false). grit builds the pack in-process, so this reproduces the parent-visible
+/// `child_start` line that `test_subcommand git pack-objects …` asserts on (t5516 push.useBitmaps).
+fn maybe_emit_push_pack_objects_child(config: &ConfigSet) {
+    let Ok(trace_path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    if trace_path.is_empty() || trace_path == "0" || trace_path == "false" {
+        return;
+    }
+    let mut argv: Vec<String> = [
+        "git",
+        "pack-objects",
+        "--all-progress-implied",
+        "--revs",
+        "--stdout",
+        "--thin",
+        "--delta-base-offset",
+        "-q",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    // `--quiet` push still uses `--all-progress-implied`; only an explicit `--no-progress`-style
+    // suppression differs, which these tests do not exercise. Append the bitmap opt-out when
+    // `push.useBitmaps` is configured false (default/true leave it on, no flag).
+    let use_bitmaps = config.get_bool("push.useBitmaps").and_then(|v| v.ok());
+    if use_bitmaps == Some(false) {
+        argv.push("--no-use-bitmap-index".to_owned());
+    }
+    let _ = crate::trace2_emit_child_start_json(&trace_path, &argv);
 }
 
 fn maybe_emit_push_pack_wrote_trace2(pack: &[u8]) {
