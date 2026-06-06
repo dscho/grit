@@ -1194,12 +1194,31 @@ fn push_to_url(
             });
         }
     } else if args.delete {
-        // Delete mode: refspecs are remote ref names to delete
+        // Delete mode: each refspec is a plain remote ref name to delete (Git `set_refspecs`).
         if args.refspecs.is_empty() {
-            bail!("--delete requires at least one refspec");
+            bail!("--delete doesn't make sense without any refs");
         }
-        for spec in &args.refspecs {
-            let remote_ref = normalize_ref(spec);
+        // Resolve `tag <name>` shorthand and reject src:dest / empty refspecs, mirroring
+        // git/builtin/push.c `set_refspecs`: `--delete only accepts plain target ref names`.
+        let mut delete_targets: Vec<String> = Vec::new();
+        let mut i = 0usize;
+        while i < args.refspecs.len() {
+            let spec = &args.refspecs[i];
+            if spec == "tag" {
+                i += 1;
+                let Some(name) = args.refspecs.get(i) else {
+                    bail!("tag shorthand without <tag>");
+                };
+                delete_targets.push(format!("refs/tags/{name}"));
+            } else if spec.contains(':') || spec.is_empty() {
+                bail!("--delete only accepts plain target ref names");
+            } else {
+                delete_targets.push(spec.clone());
+            }
+            i += 1;
+        }
+        for target in &delete_targets {
+            let remote_ref = normalize_ref(target);
             let old_oid = refs::resolve_ref(&remote_repo.git_dir, &remote_ref).ok();
             if old_oid.is_none() {
                 // Git skips delete refspecs when the remote ref is already absent
@@ -1210,7 +1229,7 @@ fn push_to_url(
                 &args.force_with_lease,
                 &repo.git_dir,
                 remote_name,
-                spec,
+                target,
             );
             updates.push(RefUpdate {
                 local_ref: None,
