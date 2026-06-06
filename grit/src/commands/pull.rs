@@ -753,11 +753,25 @@ pub fn run(args: Args) -> Result<()> {
                 // object closure (Git's pack-objects ignores `S_ISGITLINK` entries). Walking
                 // them would error with "missing object" when pulling a branch that adds a
                 // submodule (t5572 git_pull cases).
-                super::fetch::copy_reachable_objects_skipping_gitlinks(
-                    &remote_repo.git_dir,
-                    &repo.git_dir,
-                    &copy_roots,
-                )?;
+                //
+                // When this repository is itself a partial clone (and so is the local-path source),
+                // the source legitimately omits its own promisor objects (they live on its
+                // lazy-fetch remote). Use the promisor-tolerant copy so a missing source object is
+                // recorded for later lazy-fetch instead of aborting the pull (t5710 subsequent
+                // fetch from a partial-clone server).
+                if grit_lib::promisor::repo_treats_promisor_packs(&repo.git_dir, &config) {
+                    super::fetch::copy_reachable_objects_skipping_missing_promisor(
+                        &remote_repo.git_dir,
+                        &repo.git_dir,
+                        &copy_roots,
+                    )?;
+                } else {
+                    super::fetch::copy_reachable_objects_skipping_gitlinks(
+                        &remote_repo.git_dir,
+                        &repo.git_dir,
+                        &copy_roots,
+                    )?;
+                }
                 super::fetch::prune_loose_objects_available_from_alternates(&repo.git_dir)?;
             }
 
