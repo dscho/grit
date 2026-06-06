@@ -986,6 +986,7 @@ fn revert_one_commit(repo: &Repository, spec: &str, args: &Args) -> Result<()> {
         parent_tree_oid,
         favor,
         ws_opts,
+        None,
         TreeMergeConflictPresentation {
             label_ours: "HEAD",
             label_theirs: TheirsConflictLabel::Fixed(label_theirs.as_str()),

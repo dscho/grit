@@ -1628,6 +1628,23 @@ fn apply_rewrite_copy(
     }
 }
 
+pub(crate) fn copy_notes_for_rewrite(
+    repo: &Repository,
+    cmd: &str,
+    from_oid: &ObjectId,
+    to_oid: &ObjectId,
+) -> Result<()> {
+    let Some(rcfg) = load_rewrite_cfg(repo, cmd)? else {
+        return Ok(());
+    };
+    for refname in &rcfg.refs {
+        let mut entries = read_notes_tree(repo, refname).unwrap_or_default();
+        apply_rewrite_copy(repo, &mut entries, from_oid, to_oid, true, rcfg.combine)?;
+        write_notes_commit(repo, refname, &entries, "Notes added by 'git notes copy'")?;
+    }
+    Ok(())
+}
+
 fn copy_notes(
     repo: &Repository,
     notes_ref: &str,

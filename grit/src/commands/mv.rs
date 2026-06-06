@@ -340,8 +340,13 @@ pub fn run(args: Args) -> Result<()> {
                     // Must match the collision rules used for normal renames. Without this,
                     // `git mv <submodule-dir> <existing-file>` could update `.gitmodules` /
                     // `.git/modules/` and then fail `rename(2)`, leaving the repo dirty (t7001).
-                    let dst_fs_collides = dst_abs.exists()
-                        && !(ignore_case && index_src_rel.eq_ignore_ascii_case(&dst_rel));
+                    let dst_fs_collides = destination_fs_collides(
+                        &src_abs,
+                        &dst_abs,
+                        ignore_case,
+                        &index_src_rel,
+                        &dst_rel,
+                    )?;
                     if dst_fs_collides
                         && !(args.force
                             && (dst_abs.is_file() || dst_abs.is_symlink())
@@ -569,7 +574,7 @@ pub fn run(args: Args) -> Result<()> {
         // only differs by case from the source is not a separate destination — `exists()` would
         // still be true for the same inode.
         let dst_fs_collides =
-            dst_abs.exists() && !(ignore_case && index_src_rel.eq_ignore_ascii_case(&dst_rel));
+            destination_fs_collides(&src_abs, &dst_abs, ignore_case, &index_src_rel, &dst_rel)?;
 
         if dst_fs_collides
             && !(args.force && (dst_abs.is_file() || dst_abs.is_symlink()) && !dst_abs.is_dir())
@@ -662,22 +667,18 @@ pub fn run(args: Args) -> Result<()> {
             continue;
         }
 
-        if !row.index_only {
-            if let Some(e) = index.get(row.src.as_bytes(), 0) {
-                if e.mode == MODE_GITLINK {
-                    let gm = work_tree.join(".gitmodules");
-                    let old_name = if gm.is_file() {
-                        let c = fs::read_to_string(&gm)?;
-                        submodule_logical_name_for_path_in_gitmodules(&c, &row.src)?
-                    } else {
-                        None
-                    };
-                    update_gitmodules_submodule_path(
-                        &repo, work_tree, &mut index, &row.src, &row.dst,
-                    )?;
-                    if old_name.is_none() {
-                        rename_submodule_modules_dir(&repo.git_dir, &index, &row.src, &row.dst)?;
-                    }
+        if let Some(e) = index.get(row.src.as_bytes(), 0) {
+            if e.mode == MODE_GITLINK {
+                let gm = work_tree.join(".gitmodules");
+                let old_name = if gm.is_file() {
+                    let c = fs::read_to_string(&gm)?;
+                    submodule_logical_name_for_path_in_gitmodules(&c, &row.src)?
+                } else {
+                    None
+                };
+                update_gitmodules_submodule_path(&repo, work_tree, &mut index, &row.src, &row.dst)?;
+                if old_name.is_none() {
+                    rename_submodule_modules_dir(&repo.git_dir, &index, &row.src, &row.dst)?;
                 }
             }
         }
@@ -748,6 +749,26 @@ pub fn run(args: Args) -> Result<()> {
 
         index.remove(row.src.as_bytes());
         index.add_or_replace(new_entry);
+
+        if row_is_gitlink && row.index_only {
+            let gm = work_tree.join(".gitmodules");
+            let name_opt = if gm.is_file() {
+                let c = fs::read_to_string(&gm)?;
+                submodule_logical_name_for_path_in_gitmodules(&c, &row.dst)?
+            } else {
+                None
+            };
+            if let Some(name) = name_opt {
+                rewrite_submodule_worktree_gitfile_for_name(
+                    &repo.git_dir,
+                    work_tree,
+                    &row.dst,
+                    &name,
+                )?;
+            } else {
+                rewrite_submodule_worktree_gitfile(&repo.git_dir, work_tree, &row.dst)?;
+            }
+        }
 
         if args.sparse && sparse_enabled && cone_cfg {
             let dst_in = path_in_sparse_checkout_patterns(&row.dst, &sparse_patterns, cone_cfg);
@@ -1269,6 +1290,28 @@ fn rename_worktree_path(
     } else {
         fs::rename(src, dst)
     }
+}
+
+fn destination_fs_collides(
+    src: &Path,
+    dst: &Path,
+    ignore_case_config: bool,
+    src_rel: &str,
+    dst_rel: &str,
+) -> std::io::Result<bool> {
+    if !dst.exists() {
+        return Ok(false);
+    }
+    if src_rel == dst_rel {
+        return Ok(false);
+    }
+    if !src_rel.eq_ignore_ascii_case(dst_rel) {
+        return Ok(true);
+    }
+    if ignore_case_config {
+        return Ok(false);
+    }
+    same_filesystem_identity(src, dst).map(|same| !same)
 }
 
 fn needs_case_only_two_step_rename(

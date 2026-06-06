@@ -7,7 +7,8 @@ use clap::Args as ClapArgs;
 use grit_lib::config::ConfigSet;
 use grit_lib::diff::{
     detect_renames, diff_index_to_tree, diff_index_to_worktree_with_options, head_path_states,
-    submodule_porcelain_flags, DiffEntry, DiffIndexToWorktreeOptions, DiffStatus,
+    status_apply_rename_copy_detection, submodule_porcelain_flags, DiffEntry,
+    DiffIndexToWorktreeOptions, DiffStatus,
 };
 use grit_lib::error::Error;
 use grit_lib::ignore::IgnoreMatcher;
@@ -78,6 +79,19 @@ fn index_file_mtime_pair(index_path: &Path) -> (u32, u32) {
         }
     }
     (0, 0)
+}
+
+fn has_racy_timestamp(index: &Index, index_mtime_sec: u32, index_mtime_nsec: u32) -> bool {
+    if index_mtime_sec == 0 {
+        return false;
+    }
+    index.entries.iter().any(|entry| {
+        if entry.stage() != 0 || entry.mode == MODE_GITLINK {
+            return false;
+        }
+        index_mtime_sec < entry.mtime_sec
+            || (index_mtime_sec == entry.mtime_sec && index_mtime_nsec <= entry.mtime_nsec)
+    })
 }
 
 /// Arguments for `grit status`.
@@ -191,7 +205,6 @@ pub struct Args {
     pub no_renames: bool,
 
     /// Pathspec arguments.
-    #[arg(last = true)]
     pub pathspec: Vec<String>,
 }
 
@@ -289,7 +302,7 @@ fn is_fsmonitor_disabled_in_cli(config: &ConfigSet) -> bool {
 /// Run the configured fsmonitor hook (`core.fsmonitor`) and return `(new_token, reported_paths)`.
 ///
 /// The hook is invoked with Git-compatible argv shape: `hook 2 <last_update_token>`.
-fn query_status_fsmonitor_paths(
+pub(crate) fn query_status_fsmonitor_paths(
     work_tree: &Path,
     config: &ConfigSet,
     last_update_token: Option<&str>,
@@ -330,7 +343,10 @@ fn query_status_fsmonitor_paths(
     parse_fsmonitor_payload(&output.stdout)
 }
 
-fn fsmonitor_reported_path_matches(path: &str, reported: &BTreeSet<Vec<u8>>) -> bool {
+pub(crate) fn fsmonitor_reported_path_matches(path: &str, reported: &BTreeSet<Vec<u8>>) -> bool {
+    if reported.contains(b"/".as_slice()) {
+        return true;
+    }
     let path_bytes = path.as_bytes();
     if reported.contains(path_bytes) {
         return true;
@@ -610,18 +626,22 @@ pub fn run(mut args: Args) -> Result<()> {
         );
     }
 
+    let mut write_index_for_untracked_cache = false;
     match config
         .get("core.untrackedCache")
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
         Some("false") | Some("0") | Some("no") | Some("off") => {
-            index.untracked_cache = None;
+            if index.untracked_cache.take().is_some() {
+                write_index_for_untracked_cache = true;
+            }
         }
         Some("true") | Some("1") | Some("yes") | Some("on") if index.untracked_cache.is_none() => {
             let flags = untracked_cache::dir_flags_from_config(&config);
             let ident = untracked_cache::untracked_cache_ident(work_tree);
             index.untracked_cache = Some(UntrackedCache::new_shell(flags, ident));
+            write_index_for_untracked_cache = true;
         }
         _ => {}
     }
@@ -644,8 +664,8 @@ pub fn run(mut args: Args) -> Result<()> {
         .cloned()
         .collect();
 
-    // Resolve rename detection settings for status.
-    let status_rename_threshold = resolve_status_rename_threshold(&args, &config);
+    // Resolve rename/copy detection settings for status.
+    let status_rename_settings = resolve_status_rename_settings(&args, &config);
 
     let fsmonitor_query =
         query_status_fsmonitor_paths(work_tree, &config, index.fsmonitor_last_update.as_deref());
@@ -670,8 +690,8 @@ pub fn run(mut args: Args) -> Result<()> {
         .filter(|entry| status_path_matches(entry.path(), &user_pathspecs))
         .collect();
     // Detect renames among staged entries when enabled.
-    let staged = if let Some(threshold) = status_rename_threshold {
-        detect_renames_for_status(&repo.odb, staged_raw.clone(), threshold)
+    let staged = if let Some(settings) = status_rename_settings {
+        detect_renames_for_status(&repo.odb, staged_raw.clone(), settings, head_tree.as_ref())?
     } else {
         staged_raw.clone()
     };
@@ -696,8 +716,13 @@ pub fn run(mut args: Args) -> Result<()> {
                 .is_none_or(|(_, reported)| fsmonitor_reported_path_matches(entry.path(), reported))
         })
         .collect();
-    let unstaged = if let Some(threshold) = status_rename_threshold {
-        detect_renames_for_status(&repo.odb, unstaged_raw.clone(), threshold)
+    let unstaged = if let Some(settings) = status_rename_settings {
+        detect_renames_for_status(
+            &repo.odb,
+            unstaged_raw.clone(),
+            settings,
+            head_tree.as_ref(),
+        )?
     } else {
         unstaged_raw.clone()
     };
@@ -751,6 +776,9 @@ pub fn run(mut args: Args) -> Result<()> {
                         uc_mode,
                     )
                     .is_ok();
+                    if refresh_ok {
+                        write_index_for_untracked_cache = true;
+                    }
                     if refresh_ok && ignored_mode == IgnoredMode::No {
                         untracked_from_cache = Some(
                             untracked_cache::collect_untracked_from_cache(uc)
@@ -926,6 +954,7 @@ directory contents. Running 'git clean' may assist in this cleanup."
             cwd_rel_short,
             &relativize,
             quote_path_cfg,
+            &pathspecs,
         )?;
         if show_stash {
             let n = count_stash_reflog_entries(&repo.git_dir);
@@ -1007,11 +1036,19 @@ directory contents. Running 'git clean' may assist in this cleanup."
         let refreshed = grit_lib::diff::refresh_index_stat_content_verified(
             &mut index,
             work_tree,
-            Some(index_file_mtime_pair(&index_path)),
+            Some(index_mtime),
         );
-        // Opportunistic write, like Git: only persist when the refresh changed an entry.
+        let (index_mtime_sec, index_mtime_nsec) = index_mtime;
+        let racy = has_racy_timestamp(&index, index_mtime_sec, index_mtime_nsec);
+        // Opportunistic write, like Git: persist when refresh changed an entry or when the
+        // index itself is stale/racy enough that rewriting advances its mtime.
         // Best-effort: status must succeed even when `.git/` is read-only (t7508).
-        if refreshed || force_full_index_write || force_sparse_index_write {
+        if refreshed
+            || racy
+            || force_full_index_write
+            || force_sparse_index_write
+            || write_index_for_untracked_cache
+        {
             if force_sparse_index_write {
                 if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
                     if !trace2_event.trim().is_empty() {
@@ -1303,7 +1340,18 @@ fn visit_untracked_directory(
         return Ok(());
     }
 
-    if ignored_mode == IgnoredMode::Traditional && !show_all {
+    if ignored_mode != IgnoredMode::No
+        && dir_is_nested_submodule_worktree(&repo.git_dir, abs)
+        && matcher.check_path(repo, Some(index), rel, true)?.0
+    {
+        ignored_out.push(format!("{rel}/"));
+        return Ok(());
+    }
+
+    if ignored_mode == IgnoredMode::Traditional
+        && !show_all
+        && directory_pathspec_matches_self(rel, pathspecs)
+    {
         if let Some(dir_line) = traditional_normal_directory_only(
             repo, index, work_tree, tracked, gitlinks, matcher, rel, abs, pathspecs,
         )? {
@@ -1338,7 +1386,11 @@ fn visit_untracked_directory(
 
     // `--untracked-files=normal`: collapse subtrees like Git's `walk_for_untracked`.
     if !sub_untracked.is_empty() && !sub_ignored.is_empty() {
-        untracked_out.append(&mut sub_untracked);
+        if !rel.is_empty() && directory_pathspec_matches_self(rel, pathspecs) {
+            untracked_out.push(format!("{rel}/"));
+        } else {
+            untracked_out.append(&mut sub_untracked);
+        }
         ignored_out.append(&mut sub_ignored);
         return Ok(());
     }
@@ -1346,7 +1398,8 @@ fn visit_untracked_directory(
     if sub_untracked.is_empty() && !sub_ignored.is_empty() {
         let dir_excluded = matcher.check_path(repo, Some(index), rel, true)?.0;
         let collapse_matching = ignored_mode == IgnoredMode::Matching && dir_excluded;
-        let collapse_traditional = ignored_mode == IgnoredMode::Traditional;
+        let collapse_traditional = ignored_mode == IgnoredMode::Traditional
+            && directory_pathspec_matches_self(rel, pathspecs);
         if collapse_matching || collapse_traditional {
             ignored_out.push(format!("{rel}/"));
         } else {
@@ -1356,7 +1409,7 @@ fn visit_untracked_directory(
     }
 
     if !sub_untracked.is_empty() && sub_ignored.is_empty() {
-        if rel.is_empty() {
+        if rel.is_empty() || !directory_pathspec_matches_self(rel, pathspecs) {
             untracked_out.append(&mut sub_untracked);
         } else {
             untracked_out.push(format!("{rel}/"));
@@ -2056,6 +2109,7 @@ fn format_short(
     cwd_relative_short: bool,
     relativize: &dyn Fn(&str) -> String,
     quote_path_cfg: bool,
+    pathspecs: &[String],
 ) -> Result<()> {
     let disp = |p: &str| -> String {
         if cwd_relative_short {
@@ -2142,6 +2196,9 @@ fn format_short(
     }
 
     for (path, mask) in &unmerged {
+        if !status_path_matches(path, pathspecs) {
+            continue;
+        }
         let key = unmerged_v2_key(*mask);
         let mut chars = key.chars();
         staged_map.insert(path.clone(), chars.next().unwrap_or('U'));
@@ -2154,6 +2211,9 @@ fn format_short(
             continue;
         }
         let path = String::from_utf8_lossy(&ie.path).into_owned();
+        if !status_path_matches(&path, pathspecs) {
+            continue;
+        }
         if submodule_suppressed(&path, ie.oid) {
             continue;
         }
@@ -2608,8 +2668,7 @@ fn long_status_print_rebase_information(
             cpw(out, cp, &format!("   {line}"))?;
         }
         if n > NR_SHOW && show_hints {
-            let path = git_dir.join("rebase-merge/done");
-            cpw(out, cp, &format!("  (see more in file {})", path.display()))?;
+            cpw(out, cp, "  (see more in file .git/rebase-merge/done)")?;
         }
     }
     if yet_to_do.is_empty() {
@@ -2637,6 +2696,17 @@ fn long_status_print_rebase_information(
         }
     }
     Ok(())
+}
+
+fn long_status_rebase_has_started(git_dir: &Path) -> bool {
+    fs::read_to_string(git_dir.join("rebase-merge/done"))
+        .ok()
+        .is_some_and(|content| {
+            content.lines().any(|line| {
+                let t = line.trim();
+                !t.is_empty() && !t.starts_with('#')
+            })
+        })
 }
 
 pub(crate) fn parse_submodule_summary_limit(config: &ConfigSet) -> Option<i32> {
@@ -2938,6 +3008,9 @@ fn format_long(
         .ok()
         .and_then(|v| parse_bool_str(&v))
         .unwrap_or(config_hints);
+    let git_dir = &repo.git_dir;
+    let interactive_rebase_started =
+        state.rebase_interactive_in_progress && long_status_rebase_has_started(git_dir);
 
     match head {
         HeadState::Branch {
@@ -2945,22 +3018,33 @@ fn format_long(
             oid: Some(_),
             ..
         } => {
-            cpw(out, cp, &format!("On branch {short_name}"))?;
-            let tracking = format_tracking_info(
-                repo,
-                short_name,
-                if effective_no_ahead_behind {
-                    AheadBehindMode::Quick
-                } else {
-                    AheadBehindMode::Full
-                },
-                show_hints,
-            )?;
-            if !tracking.is_empty() {
-                for line in tracking.trim_end_matches('\n').lines() {
-                    cpw(out, cp, line)?;
+            if interactive_rebase_started
+                && state.rebase_branch.as_deref() == Some(short_name.as_str())
+            {
+                let onto = state.rebase_onto.as_deref().unwrap_or("");
+                cpw(
+                    out,
+                    cp,
+                    &format!("interactive rebase in progress; onto {onto}"),
+                )?;
+            } else {
+                cpw(out, cp, &format!("On branch {short_name}"))?;
+                let tracking = format_tracking_info(
+                    repo,
+                    short_name,
+                    if effective_no_ahead_behind {
+                        AheadBehindMode::Quick
+                    } else {
+                        AheadBehindMode::Full
+                    },
+                    show_hints,
+                )?;
+                if !tracking.is_empty() {
+                    for line in tracking.trim_end_matches('\n').lines() {
+                        cpw(out, cp, line)?;
+                    }
+                    cpw(out, cp, "")?;
                 }
-                cpw(out, cp, "")?;
             }
         }
         HeadState::Branch {
@@ -3000,7 +3084,6 @@ fn format_long(
         }
     }
 
-    let git_dir = &repo.git_dir;
     let merge_msg_exists = git_dir.join("MERGE_MSG").exists();
 
     if state.merge_in_progress {
@@ -3051,10 +3134,12 @@ fn format_long(
         }
         cpw(out, cp, "")?;
     } else if state.rebase_in_progress || state.rebase_interactive_in_progress {
-        long_status_print_rebase_information(out, cp, show_hints, repo, git_dir)?;
+        if state.rebase_interactive_in_progress {
+            long_status_print_rebase_information(out, cp, show_hints, repo, git_dir)?;
+        }
         let has_um = long_status_has_unmerged(expanded_index);
         if has_um {
-            long_status_print_rebase_state(out, cp, state)?;
+            long_status_print_rebase_state(out, cp, repo, git_dir, head, state)?;
             if show_hints {
                 cpw(
                     out,
@@ -3070,7 +3155,7 @@ fn format_long(
             }
             cpw(out, cp, "")?;
         } else if state.rebase_in_progress || merge_msg_exists {
-            long_status_print_rebase_state(out, cp, state)?;
+            long_status_print_rebase_state(out, cp, repo, git_dir, head, state)?;
             if show_hints {
                 cpw(
                     out,
@@ -3079,10 +3164,12 @@ fn format_long(
                 )?;
             }
             cpw(out, cp, "")?;
-        } else if split_commit_in_progress(git_dir, head) {
-            long_status_print_splitting(out, cp, show_hints, state)?;
+        } else if split_commit_in_progress(git_dir, head)
+            || long_status_split_commit_in_progress(git_dir, head, unstaged)
+        {
+            long_status_print_splitting(out, cp, show_hints, repo, git_dir, head, state)?;
         } else {
-            long_status_print_editing(out, cp, show_hints, state)?;
+            long_status_print_editing(out, cp, show_hints, repo, git_dir, head, state)?;
         }
     } else if state.cherry_pick_in_progress {
         if let Some(oid) = state.cherry_pick_head_oid {
@@ -3602,10 +3689,12 @@ fn long_status_has_unmerged(index: &Index) -> bool {
 fn long_status_print_rebase_state(
     out: &mut impl Write,
     cp: &str,
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
     state: &WtStatusState,
 ) -> Result<()> {
-    let branch = state.rebase_branch.as_deref().unwrap_or("");
-    let onto = state.rebase_onto.as_deref().unwrap_or("");
+    let (branch, onto) = long_status_rebase_display(repo, git_dir, head, state)?;
     cpw(
         out,
         cp,
@@ -3613,14 +3702,95 @@ fn long_status_print_rebase_state(
     )
 }
 
+fn long_status_rebase_display(
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
+    state: &WtStatusState,
+) -> Result<(String, String)> {
+    let branch = state
+        .rebase_branch
+        .clone()
+        .or_else(|| head.branch_name().map(str::to_owned))
+        .unwrap_or_default();
+    let onto = state
+        .rebase_onto
+        .clone()
+        .or_else(|| long_status_infer_onto_from_todo(repo, git_dir))
+        .unwrap_or_default();
+    Ok((branch, onto))
+}
+
+fn long_status_infer_onto_from_todo(repo: &Repository, git_dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(git_dir.join("rebase-merge/git-rebase-todo")).ok()?;
+    for line in content.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let mut parts = t.split_whitespace();
+        let cmd = parts.next()?;
+        if !matches!(
+            cmd,
+            "pick" | "p" | "edit" | "e" | "reword" | "r" | "squash" | "s" | "fixup" | "f"
+        ) {
+            continue;
+        }
+        let oid = long_status_resolve_todo_oid(repo, parts.next()?)?;
+        let obj = repo.odb.read(&oid).ok()?;
+        let commit = parse_commit(&obj.data).ok()?;
+        let parent = commit.parents.first()?;
+        return Some(status_unique_abbrev(repo, *parent));
+    }
+    None
+}
+
+fn long_status_resolve_todo_oid(repo: &Repository, token: &str) -> Option<ObjectId> {
+    if let Ok(oid) = ObjectId::from_hex(token) {
+        return Some(oid);
+    }
+    if token.len() < 4 || token.len() > 40 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let (dir, file_prefix) = token.split_at(2);
+    let object_dir = repo.git_dir.join("objects").join(dir);
+    let mut found = None;
+    for entry in fs::read_dir(object_dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(file_prefix) {
+            continue;
+        }
+        let hex = format!("{dir}{name}");
+        let oid = ObjectId::from_hex(&hex).ok()?;
+        if found.replace(oid).is_some() {
+            return None;
+        }
+    }
+    found
+}
+
+fn long_status_split_commit_in_progress(
+    git_dir: &Path,
+    head: &HeadState,
+    unstaged: &[grit_lib::diff::DiffEntry],
+) -> bool {
+    matches!(head, HeadState::Detached { .. })
+        && git_dir.join("rebase-merge").is_dir()
+        && !unstaged.is_empty()
+}
+
 fn long_status_print_splitting(
     out: &mut impl Write,
     cp: &str,
     show_hints: bool,
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
     state: &WtStatusState,
 ) -> Result<()> {
-    let branch = state.rebase_branch.as_deref().unwrap_or("");
-    let onto = state.rebase_onto.as_deref().unwrap_or("");
+    let (branch, onto) = long_status_rebase_display(repo, git_dir, head, state)?;
     cpw(
         out,
         cp,
@@ -3643,10 +3813,12 @@ fn long_status_print_editing(
     out: &mut impl Write,
     cp: &str,
     show_hints: bool,
+    repo: &Repository,
+    git_dir: &Path,
+    head: &HeadState,
     state: &WtStatusState,
 ) -> Result<()> {
-    let branch = state.rebase_branch.as_deref().unwrap_or("");
-    let onto = state.rebase_onto.as_deref().unwrap_or("");
+    let (branch, onto) = long_status_rebase_display(repo, git_dir, head, state)?;
     cpw(
         out,
         cp,
@@ -3678,41 +3850,84 @@ fn parse_bool_str(value: &str) -> Option<bool> {
     }
 }
 
-/// Resolve rename-detection threshold for `status`.
-///
-/// Returns `Some(threshold_percent)` when rename detection should run,
-/// or `None` when disabled.
-fn resolve_status_rename_threshold(args: &Args, config: &ConfigSet) -> Option<u32> {
+#[derive(Clone, Copy)]
+struct StatusRenameSettings {
+    threshold: u32,
+    copies: bool,
+}
+
+fn parse_rename_config_value(value: &str) -> Option<(bool, bool)> {
+    let lowered = value.trim().to_ascii_lowercase();
+    match lowered.as_str() {
+        "false" | "no" | "off" | "0" => Some((false, false)),
+        "true" | "yes" | "on" | "1" | "" => Some((true, false)),
+        "copies" | "copy" => Some((true, true)),
+        _ => None,
+    }
+}
+
+/// Resolve rename/copy detection settings for `status`.
+fn resolve_status_rename_settings(args: &Args, config: &ConfigSet) -> Option<StatusRenameSettings> {
     if args.no_renames || args.no_find_renames {
         return None;
     }
 
+    let config_copies = config
+        .get("status.renames")
+        .as_deref()
+        .and_then(|value| parse_rename_config_value(value).map(|(_, copies)| copies))
+        .or_else(|| {
+            config
+                .get("diff.renames")
+                .as_deref()
+                .and_then(|value| parse_rename_config_value(value).map(|(_, copies)| copies))
+        })
+        .unwrap_or(false);
+
     if let Some(value) = args.find_renames.as_deref() {
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            return Some(50);
+            return Some(StatusRenameSettings {
+                threshold: 50,
+                copies: config_copies,
+            });
         }
         if let Some(flag) = parse_bool_str(trimmed) {
-            return if flag { Some(50) } else { None };
+            return if flag {
+                Some(StatusRenameSettings {
+                    threshold: 50,
+                    copies: config_copies,
+                })
+            } else {
+                None
+            };
         }
         if let Some(percent) = trimmed.strip_suffix('%') {
-            return percent.parse::<u32>().ok().map(|n| n.min(100));
+            return percent.parse::<u32>().ok().map(|n| StatusRenameSettings {
+                threshold: n.min(100),
+                copies: config_copies,
+            });
         }
-        return trimmed.parse::<u32>().ok().map(|n| n.min(100));
+        return trimmed.parse::<u32>().ok().map(|n| StatusRenameSettings {
+            threshold: n.min(100),
+            copies: config_copies,
+        });
     }
 
-    match config.get("diff.renames") {
-        Some(val) => {
-            let lowered = val.to_lowercase();
-            match lowered.as_str() {
-                "false" | "no" | "off" | "0" => None,
-                "true" | "yes" | "on" | "1" | "" => Some(50),
-                "copies" | "copy" => Some(50),
-                _ => None,
+    for key in ["status.renames", "diff.renames"] {
+        if let Some(value) = config.get(key) {
+            if let Some((enabled, copies)) = parse_rename_config_value(&value) {
+                return enabled.then_some(StatusRenameSettings {
+                    threshold: 50,
+                    copies,
+                });
             }
         }
-        None => Some(50),
     }
+    Some(StatusRenameSettings {
+        threshold: 50,
+        copies: false,
+    })
 }
 
 /// Rename detection for `status` with a bounded candidate matrix.
@@ -3723,8 +3938,9 @@ fn resolve_status_rename_threshold(args: &Args, config: &ConfigSet) -> Option<u3
 fn detect_renames_for_status(
     odb: &grit_lib::odb::Odb,
     entries: Vec<DiffEntry>,
-    threshold: u32,
-) -> Vec<DiffEntry> {
+    settings: StatusRenameSettings,
+    head_tree: Option<&ObjectId>,
+) -> Result<Vec<DiffEntry>> {
     const STATUS_RENAME_MATRIX_BUDGET: usize = 50_000;
     const STATUS_RENAME_CANDIDATE_LIMIT: usize = 2_000;
 
@@ -3739,16 +3955,26 @@ fn detect_renames_for_status(
     }
 
     if deleted == 0 || added == 0 {
-        return entries;
+        return Ok(entries);
     }
 
     if deleted.saturating_add(added) > STATUS_RENAME_CANDIDATE_LIMIT
         || deleted.saturating_mul(added) > STATUS_RENAME_MATRIX_BUDGET
     {
-        return entries;
+        return Ok(entries);
     }
 
-    detect_renames(odb, None, entries, threshold)
+    if settings.copies {
+        return Ok(status_apply_rename_copy_detection(
+            odb,
+            entries,
+            settings.threshold,
+            true,
+            head_tree,
+        )?);
+    }
+
+    Ok(detect_renames(odb, None, entries, settings.threshold))
 }
 
 /// Find untracked files in the working tree (raw, before ignore filtering).
@@ -4087,6 +4313,11 @@ fn pathspec_may_match_directory(rel_dir: &str, pathspecs: &[String]) -> bool {
             || rel_dir.starts_with(&format!("{spec_norm}/"))
             || grit_lib::pathspec::pathspec_matches(spec, rel_dir)
     })
+}
+
+fn directory_pathspec_matches_self(rel_dir: &str, pathspecs: &[String]) -> bool {
+    pathspecs.is_empty()
+        || status_path_matches(&format!("{}/", rel_dir.trim_end_matches('/')), pathspecs)
 }
 
 fn status_pathspecs_contain_glob(pathspecs: &[String]) -> bool {

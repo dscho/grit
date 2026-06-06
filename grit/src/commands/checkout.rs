@@ -1178,6 +1178,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     RECURSE_SUBMODULES.with(|r| r.get()),
                 );
             }
+            write_noop_checkout_index(&repo)?;
         }
         return Ok(());
     }
@@ -1885,6 +1886,7 @@ fn merge_branch_working_tree(
         work_tree_oid,
         MergeFavor::None,
         WhitespaceMergeOptions::default(),
+        None,
         presentation,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1992,7 +1994,7 @@ fn merge_branch_working_tree(
     }
     let mut final_index = final_index;
     set_checkout_cache_tree(repo, &mut final_index)?;
-    repo.write_index_at(&index_path, &mut final_index)
+    repo.write_index_at_with_post_index_change(&index_path, &mut final_index, true, false)
         .context("writing index after merge checkout")?;
 
     if recurse_submodules {
@@ -2038,6 +2040,18 @@ fn remove_branch_state(git_dir: &Path) {
     let _ = std::fs::remove_file(git_dir.join("SQUASH_MSG"));
 }
 
+fn write_noop_checkout_index(repo: &Repository) -> Result<()> {
+    let index_path = repo
+        .index_path_for_env()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut index = repo
+        .load_index_at(&index_path)
+        .unwrap_or_else(|_| Index::new());
+    repo.write_index_at_with_post_index_change(&index_path, &mut index, true, false)
+        .context("writing index")?;
+    Ok(())
+}
+
 fn switch_branch(
     repo: &Repository,
     branch_name: &str,
@@ -2073,7 +2087,8 @@ fn switch_branch(
                 .load_index()
                 .map(|idx| idx.entries.is_empty())
                 .unwrap_or(true);
-            if index_empty {
+            let sparse_on = sparse_checkout_config_enabled(&repo.git_dir);
+            if index_empty || sparse_on {
                 switch_to_tree(
                     repo,
                     &head,
@@ -2081,6 +2096,8 @@ fn switch_branch(
                     false,
                     RECURSE_SUBMODULES.with(|r| r.get()),
                 )?;
+            } else {
+                write_noop_checkout_index(repo)?;
             }
             let tip = head
                 .oid()
@@ -2388,6 +2405,7 @@ fn create_and_switch_branch(
             RECURSE_SUBMODULES.with(|r| r.get()),
         )?;
     } else {
+        write_noop_checkout_index(repo)?;
         run_post_checkout_hook(repo, old_head_commit.as_ref(), &start_oid, true)?;
     }
 
@@ -2527,6 +2545,7 @@ fn force_create_and_switch_branch(
             RECURSE_SUBMODULES.with(|r| r.get()),
         )?;
     } else {
+        write_noop_checkout_index(repo)?;
         run_post_checkout_hook(repo, old_head_commit.as_ref(), &start_oid, true)?;
     }
 
@@ -2679,7 +2698,8 @@ fn create_orphan_branch(
         new_index.entries = new_entries;
         new_index.sort();
         checkout_index_to_worktree(repo, &old_index, &new_index, work_tree, true, true, true)?;
-        repo.write_index(&mut new_index).context("writing index")?;
+        repo.write_index_with_post_index_change(&mut new_index, true, false)
+            .context("writing index")?;
     } else {
         // No start point: match `git checkout --orphan` — HEAD becomes unborn but the index
         // and working tree stay as-is so the next `commit -a` can amend content from the
@@ -2736,7 +2756,8 @@ fn force_reset_to_tree(repo: &Repository, target_tree: &ObjectId) -> Result<()> 
         )?;
     }
 
-    repo.write_index(&mut new_index).context("writing index")?;
+    repo.write_index_with_post_index_change(&mut new_index, true, false)
+        .context("writing index")?;
 
     trace2_emit_checkout_parallel_workers(checkout_parallel_worker_spawns(repo, work_units));
     if RECURSE_SUBMODULES.with(|r| r.get()) {
@@ -2861,7 +2882,7 @@ fn force_reset_to_head(repo: &Repository) -> Result<()> {
         .index_path_for_env()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     set_checkout_cache_tree(repo, &mut new_index)?;
-    repo.write_index_at(&index_path, &mut new_index)
+    repo.write_index_at_with_post_index_change(&index_path, &mut new_index, true, false)
         .context("writing index")?;
 
     trace2_emit_checkout_parallel_workers(checkout_parallel_worker_spawns(repo, work_units));
@@ -2930,6 +2951,7 @@ fn detach_head_inner(
             RECURSE_SUBMODULES.with(|r| r.get()),
         )?;
     } else {
+        write_noop_checkout_index(repo)?;
         run_post_checkout_hook(repo, old_head_commit.as_ref(), oid, true)?;
     }
 
@@ -2944,7 +2966,9 @@ fn detach_head_inner(
         HeadState::Detached { oid } => oid.to_hex()[..7].to_string(),
         HeadState::Invalid => "unknown".to_string(),
     };
-    let to_desc = oid.to_hex()[..7].to_string();
+    let to_desc = label
+        .map(str::to_owned)
+        .unwrap_or_else(|| oid.to_hex()[..7].to_string());
     let msg = format!("checkout: moving from {} to {}", from_desc, to_desc);
     write_checkout_reflog(repo, &head, &old_oid, oid, &msg);
 
@@ -3245,7 +3269,7 @@ fn switch_to_tree(
 
     // Write the new index
     set_checkout_cache_tree(repo, &mut new_index)?;
-    repo.write_index_at(&index_path, &mut new_index)
+    repo.write_index_at_with_post_index_change(&index_path, &mut new_index, true, false)
         .context("writing index")?;
 
     trace2_emit_checkout_parallel_workers(checkout_parallel_worker_spawns(repo, work_units));
@@ -4784,7 +4808,7 @@ checking out of the index."
             if refresh_written_index_entries(&mut index, work_tree, &checkout_written_paths) {
                 index_modified = true;
             }
-            if index_modified {
+            if index_modified || !paths.is_empty() {
                 repo.write_index(&mut index).context("writing index")?;
             }
         }
@@ -6717,6 +6741,7 @@ fn checkout_index_to_worktree_inner(
                     }
                     let abs = work_tree.join(&rel);
                     if submodule_dir_has_non_dotgit_content(&abs) {
+                        remove_gitlink_dir_or_warn(&abs, &rel);
                         continue;
                     }
                 }
@@ -6758,7 +6783,10 @@ fn checkout_index_to_worktree_inner(
                     e.mode == MODE_GITLINK && submodule_dir_has_non_dotgit_content(&abs)
                 });
             if skip_populated_submodule {
-                // keep populated submodule dirs when checkout preserves dropped gitlinks
+                // Keep populated submodule dirs when checkout preserves dropped gitlinks, but
+                // still mirror Git's `remove_or_warn` behavior so callers know manual cleanup is
+                // needed after moving a submodule.
+                remove_gitlink_dir_or_warn(&abs, &rel);
             } else if !preserve_dropped_gitlink_dirs
                 && old_map
                     .get(old_path.as_slice())
@@ -6780,13 +6808,7 @@ fn checkout_index_to_worktree_inner(
                 e.mode == MODE_GITLINK && !git_dir_is_nested_modules_repo(&repo.git_dir)
             }) {
                 // Git `remove_or_warn` for gitlinks: `rmdir` only; warn if non-empty (t7001-mv).
-                match std::fs::remove_dir(&abs) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        eprintln!("warning: unable to rmdir '{rel}': {e}");
-                    }
-                }
+                remove_gitlink_dir_or_warn(&abs, &rel);
             } else {
                 let is_populated_submodule = old_map
                     .get(old_path.as_slice())
@@ -6937,7 +6959,7 @@ fn checkout_index_to_worktree_inner(
                     && abs_path.is_dir()
                     && abs_path.join(".git").exists()
                     && !submodule_dir_has_non_dotgit_content(&abs_path);
-                if !existing_gitlink || recurse_requested || empty_populated_gitlink {
+                if recurse_requested || empty_populated_gitlink {
                     let force_populate = match old_entry {
                         None => true,
                         Some(old) => {
@@ -7012,6 +7034,16 @@ fn submodule_dir_has_non_dotgit_content(path: &Path) -> bool {
         return false;
     };
     entries.flatten().any(|entry| entry.file_name() != ".git")
+}
+
+fn remove_gitlink_dir_or_warn(path: &Path, rel: &str) {
+    match std::fs::remove_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("warning: unable to rmdir '{rel}': {e}");
+        }
+    }
 }
 
 fn unset_nested_submodule_core_worktrees(modules_git: &Path) -> Result<()> {

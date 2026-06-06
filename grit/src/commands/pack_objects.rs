@@ -5,6 +5,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
+use filetime::FileTime;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use grit_lib::config::{parse_config_parameters, ConfigSet};
@@ -20,7 +21,8 @@ use grit_lib::pack_rev::{
     build_pack_rev_bytes_from_index_order_offsets_and_checksum, rev_path_for_index,
 };
 use grit_lib::rev_list::{
-    rev_list, shallow_boundary_oids, MissingAction, ObjectFilter, RevListOptions,
+    rev_list, shallow_boundary_oids, url_encode_object_filter_subspec, MissingAction, ObjectFilter,
+    RevListOptions,
 };
 use sha1::{Digest as Sha1Digest, Sha1};
 use sha2::{Digest as Sha256Digest, Sha256};
@@ -662,12 +664,28 @@ pub fn run(mut args: Args) -> Result<()> {
     let pack_hash_bytes = pack_trailer_bytes_for_repo(&repo.git_dir);
 
     validate_filter_specs()?;
+    let effective_filter = effective_filter_spec(args.filter.last().map(String::as_str))?;
     // Collect object IDs.
-    let mut pack_list = collect_oids(&repo, &args)?;
+    let mut pack_list = if args.all
+        && effective_filter
+            .as_deref()
+            .is_some_and(filter_needs_rev_list_walk)
+    {
+        PackObjectList {
+            oids: collect_filtered_all_objects_via_rev_list(
+                &repo,
+                effective_filter.as_deref().unwrap_or_default(),
+            )?,
+            force_include: Vec::new(),
+            thin_blob_deltas: Vec::new(),
+            rev_list_stdin: true,
+        }
+    } else {
+        collect_oids(&repo, &args)?
+    };
     if args.include_tag {
         include_annotated_tags_for_packed_commits(&repo, &mut pack_list.oids)?;
     }
-    let effective_filter = effective_filter_spec(args.filter.last().map(String::as_str))?;
     omit_prefiltered_blobs(&repo, &mut pack_list.oids, effective_filter.as_deref())?;
 
     // Git shows this progress title when progress is enabled. Tests set `GIT_PROGRESS_DELAY` and
@@ -713,6 +731,7 @@ pub fn run(mut args: Args) -> Result<()> {
                         &HashSet::new(),
                         &[],
                         args.honor_pack_keep,
+                        unpack_unreachable_threshold(args.unpack_unreachable.as_deref()),
                     )?;
                 }
                 return Ok(());
@@ -741,7 +760,13 @@ pub fn run(mut args: Args) -> Result<()> {
         // emit its trace even when no pack is written (Git runs
         // `loosen_unused_packed_objects` during object enumeration).
         if args.unpack_unreachable.is_some() {
-            loosen_unused_packed_objects(&repo, &HashSet::new(), &[], args.honor_pack_keep)?;
+            loosen_unused_packed_objects(
+                &repo,
+                &HashSet::new(),
+                &[],
+                args.honor_pack_keep,
+                unpack_unreachable_threshold(args.unpack_unreachable.as_deref()),
+            )?;
         }
         return Ok(());
     }
@@ -828,7 +853,13 @@ pub fn run(mut args: Args) -> Result<()> {
         // when the filtered object set turns out empty.
         if args.unpack_unreachable.is_some() {
             let packed: HashSet<ObjectId> = pack_list.oids.iter().copied().collect();
-            loosen_unused_packed_objects(&repo, &packed, &[], args.honor_pack_keep)?;
+            loosen_unused_packed_objects(
+                &repo,
+                &packed,
+                &[],
+                args.honor_pack_keep,
+                unpack_unreachable_threshold(args.unpack_unreachable.as_deref()),
+            )?;
         }
         return Ok(());
     }
@@ -1136,7 +1167,13 @@ pub fn run(mut args: Args) -> Result<()> {
                     PackWriteEntry::ReusedSlice { oid, .. } => *oid,
                 })
                 .collect();
-            loosen_unused_packed_objects(&repo, &packed, &pack_hashes, args.honor_pack_keep)?;
+            loosen_unused_packed_objects(
+                &repo,
+                &packed,
+                &pack_hashes,
+                args.honor_pack_keep,
+                unpack_unreachable_threshold(args.unpack_unreachable.as_deref()),
+            )?;
             prune_stale_loose_after_unpack_unreachable(
                 &repo,
                 &packed,
@@ -1185,10 +1222,10 @@ fn reachable_objects_for_full_repack(repo: &Repository, args: &Args) -> Result<V
     let mut opts = RevListOptions::default();
     opts.objects = true;
     opts.all_refs = true;
-    // `git pack-objects --all --reflog` still packs the ref closure only; `--reflog` does not add
-    // reflog-only commits as extra roots (see `git verify-pack` on the first pack vs grit before
-    // this fix — t6500 cruft relies on foo/bar commits staying out of the main pack).
-    opts.include_reflog_entries = false;
+    // Ordinary full repacks keep reflog-only commits out of the main pack; cruft handling relies on
+    // those objects being separated later. The `repack -A` path passes `--unpack-unreachable`,
+    // though, and Git includes reflog tips in the pack until reflog expiry makes them truly stale.
+    opts.include_reflog_entries = args.reflog && args.unpack_unreachable.is_some();
     opts.include_indexed_objects = args.indexed_objects;
     opts.missing_action = MissingAction::Allow;
     opts.exclude_promisor_objects = args.exclude_promisor_objects;
@@ -1471,6 +1508,44 @@ fn recent_objects_hook_oids(repo: &Repository) -> Result<Vec<ObjectId>> {
         }
     }
     Ok(out)
+}
+
+fn recent_objects_hook_closure(repo: &Repository) -> Result<HashSet<ObjectId>> {
+    let mut keep = HashSet::new();
+    let mut queue: VecDeque<ObjectId> = recent_objects_hook_oids(repo)?.into();
+    while let Some(oid) = queue.pop_front() {
+        if !keep.insert(oid) {
+            continue;
+        }
+        let Ok(obj) = read_object_from_repo(repo, &oid) else {
+            continue;
+        };
+        match obj.kind {
+            ObjectKind::Commit => {
+                if let Ok(commit) = parse_commit(&obj.data) {
+                    queue.push_back(commit.tree);
+                    queue.extend(commit.parents);
+                }
+            }
+            ObjectKind::Tree => {
+                if let Ok(entries) = parse_tree(&obj.data) {
+                    queue.extend(
+                        entries
+                            .into_iter()
+                            .filter(|entry| entry.mode != MODE_GITLINK)
+                            .map(|entry| entry.oid),
+                    );
+                }
+            }
+            ObjectKind::Tag => {
+                if let Ok(tag) = parse_tag(&obj.data) {
+                    queue.push_back(tag.object);
+                }
+            }
+            ObjectKind::Blob => {}
+        }
+    }
+    Ok(keep)
 }
 
 fn cruft_expiration_threshold(raw: Option<&str>) -> Option<u32> {
@@ -2231,20 +2306,18 @@ fn effective_filter_spec(default: Option<&str>) -> Result<Option<String>> {
     if specs.is_empty() {
         return Ok(None);
     }
-    let mut blob_limit: Option<u64> = None;
-    let mut chosen = None;
-    for spec in specs {
-        let parsed = ObjectFilter::parse(&spec).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if let ObjectFilter::BlobLimit(n) = parsed {
-            blob_limit = Some(blob_limit.map_or(n, |old| old.min(n)));
-        } else if matches!(parsed, ObjectFilter::BlobNone) {
-            chosen = Some(spec);
-        }
+    for spec in &specs {
+        ObjectFilter::parse(spec).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
-    if let Some(n) = blob_limit {
-        return Ok(Some(format!("blob:limit={n}")));
+    if specs.len() == 1 {
+        return Ok(Some(specs[0].clone()));
     }
-    Ok(chosen.or_else(|| default.map(str::to_string)))
+    let combined = specs
+        .iter()
+        .map(|spec| url_encode_object_filter_subspec(spec))
+        .collect::<Vec<_>>()
+        .join("+");
+    Ok(Some(format!("combine:{combined}")))
 }
 
 /// Whether `--filter=<spec>` needs the reachability-aware `rev-list` object walk rather than the
@@ -2288,6 +2361,34 @@ fn collect_filtered_objects_via_rev_list(
     opts.filter = Some(filter);
     let r = rev_list(repo, positive, negative, &opts)
         .map_err(|e| anyhow::anyhow!("rev-list for pack-objects --filter: {e}"))?;
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut out: Vec<ObjectId> = Vec::new();
+    for c in &r.commits {
+        if seen.insert(*c) {
+            out.push(*c);
+        }
+    }
+    for (o, _) in &r.objects {
+        if seen.insert(*o) {
+            out.push(*o);
+        }
+    }
+    Ok(out)
+}
+
+fn collect_filtered_all_objects_via_rev_list(
+    repo: &Repository,
+    filter_spec: &str,
+) -> Result<Vec<ObjectId>> {
+    let filter = ObjectFilter::parse(filter_spec)
+        .map_err(|e| anyhow::anyhow!("invalid filter spec '{filter_spec}': {e}"))?;
+    let mut opts = RevListOptions::default();
+    opts.objects = true;
+    opts.all_refs = true;
+    opts.missing_action = MissingAction::Allow;
+    opts.filter = Some(filter);
+    let r = rev_list(repo, &[], &[], &opts)
+        .map_err(|e| anyhow::anyhow!("rev-list for pack-objects --all --filter: {e}"))?;
     let mut seen: HashSet<ObjectId> = HashSet::new();
     let mut out: Vec<ObjectId> = Vec::new();
     for c in &r.commits {
@@ -3114,6 +3215,17 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
         return collect_incremental_repack_oids(repo, args);
     }
 
+    if args.pack_loose_unreachable {
+        let mut loose = BTreeSet::new();
+        collect_all_loose(&repo.odb, &mut loose)?;
+        return Ok(PackObjectList {
+            oids: loose.into_iter().collect(),
+            force_include: Vec::new(),
+            thin_blob_deltas: Vec::new(),
+            rev_list_stdin: false,
+        });
+    }
+
     if args.cruft && !args.incremental {
         return collect_cruft_pack_stdin_oids(repo, args);
     }
@@ -3169,7 +3281,9 @@ fn collect_oids(repo: &Repository, args: &Args) -> Result<PackObjectList> {
             // `--keep-unreachable` (Git `repack -k`) folds unreachable objects into
             // the same pack instead of leaving them loose / in a separate pack.
             if args.keep_unreachable {
-                let all = pack_objects_all_enumeration(repo, args)?;
+                let mut all = BTreeSet::new();
+                collect_all_loose(&repo.odb, &mut all)?;
+                all.extend(packed_object_ids(repo)?);
                 oids.extend(all);
             }
         } else {
@@ -3362,7 +3476,7 @@ fn collect_stdin_packs_oids(
                         if !exclude.contains(&oid) && seen_result.insert(oid) {
                             oids.push(oid);
                         }
-                    } else {
+                    } else if !exclude.contains(&oid) {
                         oids.push(oid);
                     }
                 }
@@ -3634,7 +3748,11 @@ fn prune_stale_loose_after_unpack_unreachable(
     enumeration: &[ObjectId],
     expire_before: Option<u32>,
 ) -> Result<()> {
-    let keep: HashSet<ObjectId> = enumeration.iter().copied().collect();
+    let Some(cutoff) = expire_before else {
+        return Ok(());
+    };
+    let mut keep: HashSet<ObjectId> = enumeration.iter().copied().collect();
+    keep.extend(recent_objects_hook_closure(repo)?);
     let mut loose = BTreeSet::new();
     collect_all_loose(&repo.odb, &mut loose)?;
     for oid in loose {
@@ -3642,13 +3760,11 @@ fn prune_stale_loose_after_unpack_unreachable(
             continue;
         }
         let path = repo.odb.object_path(&oid);
-        if let Some(cutoff) = expire_before {
-            if file_mtime_u32(&path)
-                .map(|mtime| mtime >= cutoff)
-                .unwrap_or(false)
-            {
-                continue;
-            }
+        if file_mtime_u32(&path)
+            .map(|mtime| mtime >= cutoff)
+            .unwrap_or(false)
+        {
+            continue;
         }
         if path.is_file() {
             let _ = std::fs::remove_file(path);
@@ -3666,6 +3782,7 @@ fn loosen_unused_packed_objects(
     packed: &HashSet<ObjectId>,
     new_pack_hashes: &[String],
     honor_pack_keep: bool,
+    expire_before: Option<u32>,
 ) -> Result<()> {
     let objects_dir = repo.git_dir.join("objects");
     let pack_dir = objects_dir.join("pack");
@@ -3676,6 +3793,11 @@ fn loosen_unused_packed_objects(
     };
     let indexes = grit_lib::pack::read_local_pack_indexes(&objects_dir)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let recent = if expire_before.is_some() {
+        recent_objects_hook_closure(repo)?
+    } else {
+        HashSet::new()
+    };
     let mut loosened_objects_nr: i64 = 0;
     for idx in indexes {
         let name = idx
@@ -3699,6 +3821,16 @@ fn loosen_unused_packed_objects(
         if honor_pack_keep && pack_dir.join(format!("{stem}.keep")).is_file() {
             continue;
         }
+        let source_pack_is_old = expire_before.is_some_and(|cutoff| {
+            file_mtime_u32(&idx.pack_path)
+                .map(|mtime| mtime < cutoff)
+                .unwrap_or(false)
+        });
+        let pack_mtime = idx
+            .pack_path
+            .metadata()
+            .ok()
+            .map(|meta| FileTime::from_last_modification_time(&meta));
         for e in &idx.entries {
             if e.oid.len() != 20 {
                 continue;
@@ -3712,11 +3844,17 @@ fn loosen_unused_packed_objects(
             if honor_pack_keep && kept_oids.contains(&oid) {
                 continue;
             }
-            if repo.odb.exists(&oid) {
+            if source_pack_is_old && !recent.contains(&oid) {
+                continue;
+            }
+            if repo.odb.object_path(&oid).is_file() {
                 continue;
             }
             let obj = read_object_from_repo(repo, &oid)?;
-            repo.odb.write(obj.kind, &obj.data)?;
+            repo.odb.write_loose_materialize(obj.kind, &obj.data)?;
+            if let Some(mtime) = pack_mtime {
+                let _ = filetime::set_file_mtime(repo.odb.object_path(&oid), mtime);
+            }
             loosened_objects_nr += 1;
         }
     }

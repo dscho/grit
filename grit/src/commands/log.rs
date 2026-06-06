@@ -10095,14 +10095,14 @@ fn apply_format_string(
                 }
                 Some('s') => {
                     chars.next();
-                    let subj = info.message.lines().next().unwrap_or("");
+                    let subj = pretty_subject(&info.message);
                     if expand_tabs_in_log > 0 {
                         result.push_str(&grit_lib::tab_expand::expand_tabs_in_line(
-                            subj,
+                            &subj,
                             expand_tabs_in_log,
                         ));
                     } else {
-                        result.push_str(subj);
+                        result.push_str(&subj);
                     }
                 }
                 Some('S') => {
@@ -10117,8 +10117,8 @@ fn apply_format_string(
                 Some('f') => {
                     chars.next();
                     // Sanitized subject line, suitable for a filename.
-                    let subj = info.message.lines().next().unwrap_or("");
-                    result.push_str(&crate::commands::format_patch::sanitize_subject(subj));
+                    let subj = pretty_subject(&info.message);
+                    result.push_str(&crate::commands::format_patch::sanitize_subject(&subj));
                 }
                 Some('b') => {
                     chars.next();
@@ -10532,28 +10532,31 @@ fn apply_format_string(
 /// Extract the message body (everything after the subject + blank line).
 fn extract_body(message: &str) -> String {
     let msg = message.trim_end_matches('\n');
-    let mut lines = msg.lines();
-    // Skip subject line
-    lines.next();
-    // Skip blank line separator if present
-    if let Some(line) = lines.next() {
-        if !line.is_empty() {
-            // No blank separator — include this line as body
-            let rest: Vec<&str> = lines.collect();
-            if rest.is_empty() {
-                return format!("{line}\n");
-            } else {
-                return format!("{}\n{}\n", line, rest.join("\n"));
-            }
+    let mut seen_separator = false;
+    let mut body = Vec::new();
+    for line in msg.lines() {
+        if seen_separator {
+            body.push(line);
+        } else if line.is_empty() {
+            seen_separator = true;
         }
     }
-    // Collect remaining lines as body
-    let body_lines: Vec<&str> = lines.collect();
-    if body_lines.is_empty() {
+    if !seen_separator || body.is_empty() {
         String::new()
     } else {
-        format!("{}\n", body_lines.join("\n"))
+        format!("{}\n", body.join("\n"))
     }
+}
+
+fn pretty_subject(message: &str) -> String {
+    message
+        .trim_end_matches('\n')
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Extract the name portion from a Git ident string.

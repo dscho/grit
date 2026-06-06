@@ -945,7 +945,10 @@ fn cherry_pick_one_commit(
         }
     }
 
-    let (favor, ws_opts) = parse_strategy_options(&args.strategy_option);
+    let (favor, ws_opts, mut diff_algorithm) = parse_strategy_options(&args.strategy_option);
+    if diff_algorithm.is_none() {
+        diff_algorithm = config.get("diff.algorithm");
+    }
     let ws_merge = WhitespaceMergeOptions {
         ignore_all_space: ws_opts.ignore_all_space,
         ignore_space_change: ws_opts.ignore_space_change,
@@ -987,6 +990,7 @@ fn cherry_pick_one_commit(
         commit_tree_oid,
         favor,
         ws_merge,
+        diff_algorithm.as_deref(),
         TreeMergeConflictPresentation {
             label_ours: "HEAD",
             label_theirs: TheirsConflictLabel::Fixed(label_theirs.as_str()),
@@ -1826,6 +1830,8 @@ pub(crate) fn abort_cherry_pick_or_revert() -> Result<()> {
             no_refresh: false,
             refresh: true,
             patch: false,
+            pathspec_from_file: None,
+            pathspec_file_nul: false,
             recurse_submodules: None,
             no_recurse_submodules: false,
             rest: vec![stored_oid.to_hex()],
@@ -1849,6 +1855,8 @@ pub(crate) fn abort_cherry_pick_or_revert() -> Result<()> {
         no_refresh: false,
         refresh: true,
         patch: false,
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
         recurse_submodules: None,
         no_recurse_submodules: false,
         rest: vec!["HEAD".to_owned()],
@@ -2821,11 +2829,19 @@ fn stage_entry(index: &mut Index, src: &IndexEntry, stage: u8) {
 }
 
 /// Parse strategy options into a merge favor and whitespace options.
-fn parse_strategy_options(strategy_options: &[String]) -> (MergeFavor, WhitespaceStrategyOptions) {
+fn parse_strategy_options(
+    strategy_options: &[String],
+) -> (MergeFavor, WhitespaceStrategyOptions, Option<String>) {
     let mut favor = MergeFavor::None;
     let mut ws = WhitespaceStrategyOptions::default();
+    let mut diff_algorithm = None;
     for opt in strategy_options {
+        if let Some(algo) = opt.strip_prefix("diff-algorithm=") {
+            diff_algorithm = Some(algo.to_string());
+            continue;
+        }
         match opt.as_str() {
+            "histogram" | "patience" => diff_algorithm = Some(opt.to_string()),
             "theirs" => favor = MergeFavor::Theirs,
             "ours" => favor = MergeFavor::Ours,
             "ignore-all-space" => ws.ignore_all_space = true,
@@ -2835,7 +2851,7 @@ fn parse_strategy_options(strategy_options: &[String]) -> (MergeFavor, Whitespac
             _ => {}
         }
     }
-    (favor, ws)
+    (favor, ws, diff_algorithm)
 }
 
 /// Three-way merge with content-level merging.

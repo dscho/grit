@@ -7,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -206,6 +207,15 @@ fn run_merge_commit_msg_hooks(
     // cleanup (upstream `read_merge_msg` + `cleanup_message`).
     let edited = fs::read_to_string(&merge_msg_path)?;
     Ok(cleanup_message(&edited, cleanup_mode))
+}
+
+fn merge_will_edit(args: &Args) -> bool {
+    match std::env::var("GIT_GRIT_MERGE_EXPLICIT_EDIT").as_deref() {
+        Ok("1") => return true,
+        Ok("0") => return false,
+        _ => {}
+    }
+    !args.no_edit && (args.edit || std::io::stdin().is_terminal())
 }
 
 /// Update `HEAD` (and branch ref when on a branch) then run `reference-transaction` with phase
@@ -1173,15 +1183,6 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
                 return do_strategy_ours(&repo, &head, head_oid, merge_oid, &args);
             }
-            "theirs" => {
-                if merge_oid == head_oid || is_ancestor(&repo, merge_oid, head_oid)? {
-                    if !args.quiet {
-                        eprintln!("Already up to date.");
-                    }
-                    return Ok(());
-                }
-                return do_strategy_theirs(&repo, &head, head_oid, merge_oid, &args);
-            }
             _ => {}
         }
     }
@@ -1239,16 +1240,6 @@ fn try_merge_strategies(
                     Ok(())
                 } else {
                     do_strategy_ours(repo, head, head_oid, merge_oid, &sub)
-                }
-            }
-            "theirs" => {
-                if merge_oid == head_oid || is_ancestor(repo, merge_oid, head_oid)? {
-                    if !args.quiet {
-                        eprintln!("Already up to date.");
-                    }
-                    Ok(())
-                } else {
-                    do_strategy_theirs(repo, head, head_oid, merge_oid, &sub)
                 }
             }
             "octopus" => do_octopus_merge(
@@ -2189,7 +2180,8 @@ Aborting"
         return Ok(());
     }
 
-    run_pre_merge_commit_hook(repo, args.no_verify, args.edit && !args.no_edit, &mut index)?;
+    let will_edit = merge_will_edit(args);
+    run_pre_merge_commit_hook(repo, args.no_verify, will_edit, &mut index)?;
     repo.write_index(&mut index)?;
 
     let config = ConfigSet::load(Some(&repo.git_dir), true)?;
@@ -2233,7 +2225,6 @@ Aborting"
     }
     // Run prepare-commit-msg, the editor when -e, and commit-msg on the merge message, matching
     // builtin/merge.c:prepare_to_commit. The index is re-read in case a hook updated it.
-    let will_edit = args.edit && !args.no_edit;
     let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
     msg = run_merge_commit_msg_hooks(
         repo,
@@ -2910,7 +2901,8 @@ Aborting"
         return Ok(());
     }
 
-    run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut merge_result.index)?;
+    let will_edit = merge_will_edit(args);
+    run_pre_merge_commit_hook(repo, args.no_verify, will_edit, &mut merge_result.index)?;
     set_merge_cache_tree(repo, &mut merge_result.index)?;
     repo.write_index(&mut merge_result.index)?;
 
@@ -2965,7 +2957,6 @@ Aborting"
 
     // Run prepare-commit-msg, the editor when -e, and commit-msg on the merge message
     // (upstream `prepare_to_commit`); these may rewrite the message and the index before commit.
-    let will_edit = args.edit && !args.no_edit;
     let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
     msg = run_merge_commit_msg_hooks(
         repo,
@@ -4418,7 +4409,8 @@ fn do_octopus_merge(
         return Ok(());
     }
 
-    run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut final_index)?;
+    let will_edit = merge_will_edit(args);
+    run_pre_merge_commit_hook(repo, args.no_verify, will_edit, &mut final_index)?;
     repo.write_index(&mut final_index)?;
 
     let tree_oid = write_tree_from_index(&repo.odb, &final_index, "")?;
@@ -4429,7 +4421,7 @@ fn do_octopus_merge(
     let msg = run_merge_commit_msg_hooks(
         repo,
         args.no_verify,
-        args.edit && !args.no_edit,
+        will_edit,
         msg,
         &mut final_index,
         hook_cleanup,
@@ -4479,6 +4471,18 @@ fn do_octopus_merge(
     }
 
     if !args.quiet {
+        if head_is_ancestor_of_all {
+            if let Some(first) = merge_names.first() {
+                println!("Fast-forwarding to: {first}");
+            }
+            for name in merge_names.iter().skip(1) {
+                println!("Trying simple merge with {name}");
+            }
+        } else {
+            for name in &merge_names {
+                println!("Trying simple merge with {name}");
+            }
+        }
         println!("Merge made by the '{strategy_name}' strategy.");
         let show_stat = args.stat || args.summary || !args.no_stat;
         if show_stat {
@@ -4665,18 +4669,13 @@ fn do_strategy_ours(
     }
 
     let mut idx = repo.load_index()?;
-    run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut idx)?;
+    let will_edit = merge_will_edit(args);
+    run_pre_merge_commit_hook(repo, args.no_verify, will_edit, &mut idx)?;
     repo.write_index(&mut idx)?;
 
     let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
-    let msg = run_merge_commit_msg_hooks(
-        repo,
-        args.no_verify,
-        args.edit && !args.no_edit,
-        msg,
-        &mut idx,
-        hook_cleanup,
-    )?;
+    let msg =
+        run_merge_commit_msg_hooks(repo, args.no_verify, will_edit, msg, &mut idx, hook_cleanup)?;
     idx.expand_sparse_directory_placeholders(&repo.odb)?;
     let tree_oid = write_tree_from_index(&repo.odb, &idx, "")?;
 
@@ -4703,103 +4702,6 @@ fn do_strategy_ours(
     }
     let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
     merge_update_head(repo, head, Some(head_oid), commit_oid)?;
-
-    if !args.quiet {
-        if show_merge_commit_summary() {
-            let short = &commit_oid.to_hex()[..7];
-            let branch = head.branch_name().unwrap_or("HEAD");
-            let first_line = commit_data.message.lines().next().unwrap_or("");
-            println!("[{branch} {short}] {first_line}");
-        }
-    }
-
-    run_post_merge_hook(repo, false);
-    Ok(())
-}
-
-fn do_strategy_theirs(
-    repo: &Repository,
-    head: &HeadState,
-    head_oid: ObjectId,
-    merge_oid: ObjectId,
-    args: &Args,
-) -> Result<()> {
-    bail_if_index_tree_differs_from_head(repo, head_oid, args.autostash)?;
-
-    // Save ORIG_HEAD
-    fs::write(
-        repo.git_dir.join("ORIG_HEAD"),
-        format!("{}\n", head_oid.to_hex()),
-    )?;
-
-    let msg = build_merge_message(head, &args.commits[0], args.message.as_deref(), repo);
-
-    let config = ConfigSet::load(Some(&repo.git_dir), true)?;
-    let now = OffsetDateTime::now_utc();
-    let author = resolve_ident(&config, "author", now)?;
-    let committer = resolve_ident(&config, "committer", now)?;
-
-    let mut idx = repo.load_index()?;
-    run_pre_merge_commit_hook(repo, args.no_verify, !args.no_edit, &mut idx)?;
-    repo.write_index(&mut idx)?;
-
-    let tree_oid = write_tree_from_index(&repo.odb, &idx, "")?;
-
-    let hook_cleanup = args.cleanup.as_deref().unwrap_or("whitespace");
-    let msg = run_merge_commit_msg_hooks(
-        repo,
-        args.no_verify,
-        args.edit && !args.no_edit,
-        msg,
-        &mut idx,
-        hook_cleanup,
-    )?;
-
-    let commit_data = CommitData {
-        tree: tree_oid,
-        parents: vec![head_oid, merge_oid],
-        author,
-        committer,
-        author_raw: Vec::new(),
-        committer_raw: Vec::new(),
-        encoding: None,
-        message: msg,
-        raw_message: None,
-    };
-
-    let mut commit_bytes = serialize_commit(&commit_data);
-    if should_sign_merge(args, &config) {
-        commit_bytes = sign_merge_commit_bytes(
-            &config,
-            &commit_data.committer,
-            args.gpg_sign.as_deref(),
-            commit_bytes,
-        )?;
-    }
-    let commit_oid = repo.odb.write(ObjectKind::Commit, &commit_bytes)?;
-    merge_update_head(repo, head, Some(head_oid), commit_oid)?;
-
-    // Update index and working tree to match theirs
-    let entries = tree_to_index_entries(repo, &tree_oid, "")?;
-    let mut new_index = Index::new();
-    new_index.entries = entries;
-    new_index.sort();
-    apply_sparse_checkout_skip_worktree(
-        &repo.git_dir,
-        repo.work_tree.as_deref(),
-        &mut new_index,
-        false,
-    );
-
-    if let Some(ref wt) = repo.work_tree {
-        let old_tree = commit_tree(repo, head_oid)?;
-        let old_entries = tree_to_map(tree_to_index_entries(repo, &old_tree, "")?);
-        let sparse_on = sparse_checkout_enabled(&repo.git_dir);
-        remove_deleted_files(wt, &old_entries, &new_index, sparse_on)?;
-        checkout_entries(repo, wt, &new_index, None, sparse_on)?;
-    }
-    refresh_index_stat_cache_from_worktree(repo, &mut new_index)?;
-    repo.write_index(&mut new_index)?;
 
     if !args.quiet {
         if show_merge_commit_summary() {
@@ -11230,8 +11132,11 @@ fn resolve_merge_target(repo: &Repository, spec: &str) -> Result<ObjectId> {
     // `merge main3` must merge the `main3` branch tip, not treat `main3` as a pathspec).
     if !spec.contains('/') && !spec.starts_with('.') {
         let branch_ref = format!("refs/heads/{spec}");
-        if let Ok(oid) = resolve_ref(&repo.git_dir, &branch_ref) {
-            return Ok(oid);
+        let (dwim_count, _) = grit_lib::refs::resolve_ref_dwim(&repo.git_dir, spec);
+        if dwim_count <= 1 {
+            if let Ok(oid) = resolve_ref(&repo.git_dir, &branch_ref) {
+                return Ok(oid);
+            }
         }
     }
     // Git resolves the merge argument with `get_merge_parent` (rev-parse / `dwim_ref`), which for

@@ -791,6 +791,7 @@ fn do_am(args: Args) -> Result<()> {
     // Read and parse all mbox/patch files
     let mut all_patches = Vec::new();
     let format_override = args.patch_format.as_deref();
+    let preserve_empty_inputs = args.mbox.len() > 1;
     for mbox_path in &args.mbox {
         let content = fs::read_to_string(mbox_path)
             .with_context(|| format!("cannot read mbox file '{mbox_path}'"))?;
@@ -809,6 +810,9 @@ fn do_am(args: Args) -> Result<()> {
                 keep_cr,
                 quoted_cr_action,
             )?;
+            if patches.is_empty() && preserve_empty_inputs && !content.trim().is_empty() {
+                patches.push(malformed_empty_patch(&config, mbox_path));
+            }
             all_patches.append(&mut patches);
         }
     }
@@ -1017,6 +1021,7 @@ fn apply_remaining(
                         subject
                     );
                     // Save message for --continue
+                    fs::write(state_dir.join("patch"), "")?;
                     fs::write(git_dir.join("MERGE_MSG"), &patch.message)?;
                     std::process::exit(1);
                 }
@@ -3033,6 +3038,26 @@ fn parse_patches(
             keep_cr,
             quoted_cr_action,
         ),
+    }
+}
+
+fn malformed_empty_patch(config: &ConfigSet, path: &str) -> MboxPatch {
+    let author = resolve_identity(config, "AUTHOR")
+        .or_else(|_| resolve_identity(config, "COMMITTER"))
+        .map(|(name, email)| format!("{name} <{email}>"))
+        .unwrap_or_else(|_| "unknown <unknown>".to_string());
+    let subject = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("empty patch");
+    MboxPatch {
+        author,
+        date: String::new(),
+        message: format!("{subject}\n"),
+        content_charset: None,
+        diff: String::new(),
+        message_id: String::new(),
+        format_patch_commit: None,
     }
 }
 

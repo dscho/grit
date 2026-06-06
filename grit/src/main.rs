@@ -808,17 +808,23 @@ fn run_test_tool_find_pack(rest: &[String]) -> Result<()> {
 
     let repo = grit_lib::repo::Repository::discover(None)?;
     let oid = grit_lib::rev_parse::resolve_revision(&repo, spec)?;
-    let indexes = grit_lib::pack::read_local_pack_indexes(repo.odb.objects_dir())
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut object_dirs = vec![repo.odb.objects_dir().to_path_buf()];
+    if let Ok(alternates) = grit_lib::pack::read_alternates_recursive(repo.odb.objects_dir()) {
+        object_dirs.extend(alternates);
+    }
 
     let mut packs: Vec<String> = Vec::new();
-    for idx in indexes {
-        if idx
-            .entries
-            .iter()
-            .any(|entry| grit_lib::pack::pack_index_entry_matches_sha1_oid(entry, &oid))
-        {
-            packs.push(display_find_pack_path(&idx.pack_path));
+    for objects_dir in object_dirs {
+        let indexes = grit_lib::pack::read_local_pack_indexes(&objects_dir)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for idx in indexes {
+            if idx
+                .entries
+                .iter()
+                .any(|entry| grit_lib::pack::pack_index_entry_matches_sha1_oid(entry, &oid))
+            {
+                packs.push(display_find_pack_path(&idx.pack_path));
+            }
         }
     }
     packs.sort();
@@ -831,6 +837,43 @@ fn run_test_tool_find_pack(rest: &[String]) -> Result<()> {
     if let Some(n) = expected_count {
         if packs.len() != n {
             std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+fn run_test_tool_bitmap(rest: &[String]) -> Result<()> {
+    let Some(subcommand) = rest.get(1).map(String::as_str) else {
+        bail!("usage: test-tool bitmap list-commits");
+    };
+    if subcommand != "list-commits" {
+        bail!("test-tool bitmap: unknown subcommand '{subcommand}'");
+    }
+
+    let repo = grit_lib::repo::Repository::discover(None)?;
+    let mut opts = grit_lib::rev_list::RevListOptions::default();
+    opts.all_refs = true;
+    let result = grit_lib::rev_list::rev_list(&repo, &[], &[], &opts)
+        .context("failed to list bitmap commits")?;
+    let mut commits = result.commits;
+    commits.sort();
+    commits.dedup();
+
+    let config = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true)
+        .unwrap_or_else(|_| grit_lib::config::ConfigSet::new());
+    let has_preferred_tips = config
+        .get("pack.preferBitmapTips")
+        .is_some_and(|value| !value.trim().is_empty());
+    let omitted = if has_preferred_tips {
+        None
+    } else {
+        commits.last().copied()
+    };
+
+    for oid in commits {
+        if Some(oid) != omitted {
+            println!("{}", oid.to_hex());
         }
     }
 
@@ -3187,6 +3230,17 @@ fn preprocess_status_argv(rest: &[String]) -> Vec<String> {
         !matches!(n, "v1" | "v2" | "1" | "2")
     }
 
+    fn next_is_status_untracked_mode(next: Option<&str>) -> bool {
+        matches!(
+            next,
+            Some("no" | "normal" | "all" | "false" | "true" | "0" | "1")
+        )
+    }
+
+    fn next_is_status_ignored_mode(next: Option<&str>) -> bool {
+        matches!(next, Some("no" | "traditional" | "matching"))
+    }
+
     let mut out = Vec::with_capacity(rest.len() + 2);
     let mut i = 0usize;
     while i < rest.len() {
@@ -3194,6 +3248,22 @@ fn preprocess_status_argv(rest: &[String]) -> Vec<String> {
         if arg == "--porcelain" {
             out.push(rest[i].clone());
             if next_is_pathspec_after_bare_porcelain(rest.get(i + 1).map(|s| s.as_str())) {
+                out.push("--".to_owned());
+            }
+        } else if arg == "-u" || arg == "--untracked-files" {
+            out.push(rest[i].clone());
+            let next = rest.get(i + 1).map(|s| s.as_str());
+            if next.is_some_and(|n| n != "--" && !n.starts_with('-'))
+                && !next_is_status_untracked_mode(next)
+            {
+                out.push("--".to_owned());
+            }
+        } else if arg == "--ignored" {
+            out.push(rest[i].clone());
+            let next = rest.get(i + 1).map(|s| s.as_str());
+            if next.is_some_and(|n| n != "--" && !n.starts_with('-'))
+                && !next_is_status_ignored_mode(next)
+            {
                 out.push("--".to_owned());
             }
         } else {
@@ -3206,119 +3276,24 @@ fn preprocess_status_argv(rest: &[String]) -> Vec<String> {
         return out;
     }
 
-    // `git status -s path` — insert `--` before pathspecs so clap does not reject the path.
-    let mut i = 0usize;
-    while i < out.len() {
-        let arg = out[i].as_str();
-        if arg == "--" {
-            return out;
-        }
-        if !arg.starts_with('-') {
-            out.insert(i, "--".to_owned());
-            return out;
-        }
-
-        const NO_VAL: &[&str] = &[
-            "-s",
-            "--short",
-            "--long",
-            "--no-short",
-            "-b",
-            "--branch",
-            "--no-branch",
-            "-z",
-            "--no-ahead-behind",
-            "--ahead-behind",
-            "--no-column",
-            "--no-renames",
-            "--no-optional-locks",
-            "--show-stash",
-            "--no-show-stash",
-            "--no-find-renames",
-        ];
-        if NO_VAL.contains(&arg) {
-            i += 1;
-            continue;
-        }
-
-        if arg == "-v" || arg == "--verbose" {
-            i += 1;
-            while i < out.len() && out[i] == "-v" {
-                i += 1;
-            }
-            continue;
-        }
-
-        if arg == "-M" || arg == "--find-renames" {
-            i += 1;
-            if i < out.len() && !out[i].starts_with('-') {
-                i += 1;
-            }
-            continue;
-        }
-
-        if arg.starts_with("--porcelain=") {
-            i += 1;
-            continue;
-        }
-
-        if arg == "-u" || arg.starts_with("--untracked-files") {
-            if arg.contains('=') && !arg.ends_with('=') {
-                i += 1;
-                continue;
-            }
-            i += 1;
-            if i < out.len() && !out[i].starts_with('-') {
-                let mode = out[i].as_str();
-                if matches!(mode, "no" | "normal" | "all" | "hidden") {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-
-        if arg == "--ignored" || arg.starts_with("--ignored=") {
-            if arg.contains('=') {
-                i += 1;
-                continue;
-            }
-            i += 1;
-            if i < out.len() && !out[i].starts_with('-') {
-                let mode = out[i].as_str();
-                if matches!(mode, "no" | "traditional" | "matching") {
-                    i += 1;
-                }
-            }
-            continue;
-        }
-
-        if arg == "--column" || arg.starts_with("--column=") {
-            if arg.contains('=') {
-                i += 1;
-                continue;
-            }
-            i += 1;
-            if i < out.len() && !out[i].starts_with('-') {
-                i += 1;
-            }
-            continue;
-        }
-
-        if arg == "--ignore-submodules" || arg.starts_with("--ignore-submodules=") {
-            if arg.contains('=') {
-                i += 1;
-                continue;
-            }
-            i += 1;
-            if i < out.len() && !out[i].starts_with('-') {
-                i += 1;
-            }
-            continue;
-        }
-
-        i += 1;
-    }
     out
+}
+
+fn preprocess_merge_argv(rest: &[String]) -> Vec<String> {
+    let mut explicit_edit: Option<&str> = None;
+    for arg in rest {
+        match arg.as_str() {
+            "--edit" | "-e" => explicit_edit = Some("1"),
+            "--no-edit" => explicit_edit = Some("0"),
+            _ => {}
+        }
+    }
+    if let Some(value) = explicit_edit {
+        std::env::set_var("GIT_GRIT_MERGE_EXPLICIT_EDIT", value);
+    } else {
+        std::env::remove_var("GIT_GRIT_MERGE_EXPLICIT_EDIT");
+    }
+    rest.to_vec()
 }
 
 /// Git's `blame` accepts options after the pathspec (e.g. `git blame file --ignore-rev X`).
@@ -5636,16 +5611,19 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "mailinfo" => commands::mailinfo::run(parse_cmd_args(subcmd, rest)),
         "mailsplit" => commands::mailsplit::run(parse_cmd_args(subcmd, rest)),
         "maintenance" => commands::maintenance::run_from_argv(rest),
-        "merge" => match commands::merge::run(parse_cmd_args(subcmd, rest)) {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if commands::merge::is_internal_merge_execution_error(&err) {
-                    eprintln!("error: failed to execute internal merge");
-                    std::process::exit(2);
+        "merge" => {
+            let rest = preprocess_merge_argv(rest);
+            match commands::merge::run(parse_cmd_args(subcmd, &rest)) {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    if commands::merge::is_internal_merge_execution_error(&err) {
+                        eprintln!("error: failed to execute internal merge");
+                        std::process::exit(2);
+                    }
+                    Err(err)
                 }
-                Err(err)
             }
-        },
+        }
         "merge-recursive" => commands::merge_recursive::run(parse_cmd_args(subcmd, rest)),
         "merge-resolve" => commands::merge_resolve::run(parse_cmd_args(subcmd, rest)),
         "merge-base" => commands::merge_base::run(parse_cmd_args(subcmd, rest)),
@@ -5931,6 +5909,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
                 "dump-fsmonitor" => run_test_tool_dump_fsmonitor(),
                 "userdiff" => run_test_tool_userdiff(rest),
                 "find-pack" => run_test_tool_find_pack(rest),
+                "bitmap" => run_test_tool_bitmap(rest),
                 "partial-clone" => run_test_tool_partial_clone(rest),
                 "ref-store" => run_test_tool_ref_store(rest),
                 "reach" => commands::test_tool_reach::run(&rest[1..]),
@@ -7063,7 +7042,6 @@ fn run_test_tool_dump_fsmonitor() -> Result<()> {
 
 /// `test-tool read-cache` — minimal helper for fsmonitor/read-cache tests.
 fn run_test_tool_read_cache(rest: &[String]) -> Result<()> {
-    use grit_lib::index::Index;
     use grit_lib::repo::Repository;
 
     let mut count: usize = 1;
@@ -7083,7 +7061,7 @@ fn run_test_tool_read_cache(rest: &[String]) -> Result<()> {
         let repo = Repository::discover(None).context("not a git repository")?;
         if let Some(path) = print_and_refresh.as_deref() {
             let _ = crate::commands::update_index::run_refresh_quiet(&repo);
-            let index = Index::load(&repo.index_path()).context("read index")?;
+            let index = repo.load_index().context("read index")?;
             let rel = path.as_bytes();
             let is_up_to_date = index
                 .get(rel, 0)

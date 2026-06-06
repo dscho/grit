@@ -17,13 +17,14 @@ use grit_lib::hooks::{
     HookResult,
 };
 use grit_lib::index::{Index, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
+use grit_lib::interpret_trailers::{NewTrailerArg, ProcessTrailerOptions};
 use grit_lib::mailmap::load_mailmap_table;
 use grit_lib::objects::{parse_commit, serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::reflog::read_reflog;
 use grit_lib::refs::{append_reflog, list_refs, should_autocreate_reflog, write_ref};
 use grit_lib::repo::Repository;
 use grit_lib::rev_list::{rev_list, RevListOptions};
-use grit_lib::rev_parse::resolve_revision;
+use grit_lib::rev_parse::resolve_revision_as_commit;
 use grit_lib::shared_repo::refresh_repository_shared_tree;
 use grit_lib::state::{detect_in_progress, resolve_head, HeadState};
 use regex::RegexBuilder;
@@ -396,6 +397,77 @@ fn peel_message_flags_from_pathspec(args: &mut Args) {
                 continue;
             }
         }
+        match a {
+            "-e" | "--edit" => {
+                args.edit = true;
+                i += 1;
+                continue;
+            }
+            "--no-edit" => {
+                args.no_edit = true;
+                i += 1;
+                continue;
+            }
+            "-a" | "--all" => {
+                args.all = true;
+                i += 1;
+                continue;
+            }
+            "-i" | "--include" => {
+                args.include = true;
+                i += 1;
+                continue;
+            }
+            "-o" | "--only" => {
+                args.only = true;
+                i += 1;
+                continue;
+            }
+            "--allow-empty" => {
+                args.allow_empty = true;
+                i += 1;
+                continue;
+            }
+            "--allow-empty-message" => {
+                args.allow_empty_message = true;
+                i += 1;
+                continue;
+            }
+            "--amend" => {
+                args.amend = true;
+                i += 1;
+                continue;
+            }
+            "--author" => {
+                if i + 1 < ps.len() {
+                    args.author = Some(ps[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            "--date" => {
+                if i + 1 < ps.len() {
+                    args.date = Some(ps[i + 1].clone());
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(rest) = a.strip_prefix("--author=") {
+            args.author = Some(rest.to_owned());
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = a.strip_prefix("--date=") {
+            args.date = Some(rest.to_owned());
+            i += 1;
+            continue;
+        }
         out.push(ps[i].clone());
         i += 1;
     }
@@ -512,7 +584,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // --include and --only don't mix
     if args.include && args.only {
-        bail!("--include and --only are mutually exclusive");
+        bail!("fatal: options '-i/--include' and '-o/--only' cannot be used together");
     }
 
     if args.include && (args.interactive || args.patch) {
@@ -604,7 +676,7 @@ pub fn run(mut args: Args) -> Result<()> {
     let had_rv_head = repo.git_dir.join("REVERT_HEAD").exists();
     let seq_todo_path = repo.git_dir.join("sequencer").join("todo");
     let resume_pick_after_cp = had_cp_head && seq_todo_path.exists();
-    let resume_revert_after_rv = had_rv_head && seq_todo_path.exists();
+    let _resume_revert_after_rv = had_rv_head && seq_todo_path.exists();
 
     if grit_lib::precompose_config::effective_core_precomposeunicode(Some(&repo.git_dir)) {
         for ps in &mut args.pathspec {
@@ -692,7 +764,12 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let index_path = resolved_index_path(&repo);
 
-    let index = if args.interactive || args.patch {
+    let index = if args.interactive && !args.patch {
+        let Some(wt) = work_tree else {
+            bail!("this operation must be run in a work tree");
+        };
+        run_commit_interactive_mode(&repo, wt, &args)?
+    } else if args.patch {
         let Some(wt) = work_tree else {
             bail!("this operation must be run in a work tree");
         };
@@ -735,9 +812,10 @@ pub fn run(mut args: Args) -> Result<()> {
         std::process::exit(128);
     }
 
-    // Write tree: pathspec commits record only matched paths (Git partial / initial pathspec commit)
+    // Write tree: pathspec commits record only matched paths, except `--include`,
+    // which stages named paths and commits the whole index.
     let tree_oid = match (&pathspec_matched, &parent_tree_oid) {
-        (Some(paths), Some(base)) if !paths.is_empty() => {
+        (Some(paths), Some(base)) if !paths.is_empty() && !args.include => {
             match write_tree_partial_from_index(&repo.odb, &index, base, paths) {
                 Ok(oid) => oid,
                 Err(err) => {
@@ -752,7 +830,7 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
         }
-        (Some(paths), None) if !paths.is_empty() => {
+        (Some(paths), None) if !paths.is_empty() && !args.include => {
             match write_tree_from_index_subset(&repo.odb, &index, paths) {
                 Ok(oid) => oid,
                 Err(err) => {
@@ -855,6 +933,12 @@ pub fn run(mut args: Args) -> Result<()> {
             tree_oid = t;
         }
     }
+    if args.only && args.pathspec.is_empty() && fixup_parsed.is_none() {
+        let Some(t) = head_tree else {
+            bail!("nothing to commit");
+        };
+        tree_oid = t;
+    }
 
     // For initial commits with empty tree (only ITA entries), fail
     if !args.allow_empty && parents.is_empty() {
@@ -897,6 +981,15 @@ pub fn run(mut args: Args) -> Result<()> {
         Vec::new()
     };
     let (rename_threshold, rename_copies) = commit_rename_settings(&config);
+    if let Some(th) = rename_threshold {
+        staged = status_apply_rename_copy_detection(
+            &repo.odb,
+            staged,
+            th,
+            rename_copies,
+            status_base_tree.as_ref(),
+        )?;
+    }
     let mut unstaged = if let Some(th) = rename_threshold {
         status_apply_rename_copy_detection(
             &repo.odb,
@@ -1032,6 +1125,10 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let template_path = resolve_commit_template_path(&args, &config)?;
     let use_editor_for_message = commit_uses_editor(&args, fixup_parsed.as_ref(), &repo.git_dir);
+    if use_editor_for_message {
+        validate_explicit_committer_identity(&config)?;
+        let _ = resolve_committer(&config, OffsetDateTime::now_utc())?;
+    }
 
     let verbose_level = resolve_commit_verbose_level(&args, &config);
     let commit_cleanup_mode = resolve_commit_cleanup_mode(&args, &config, use_editor_for_message);
@@ -1054,6 +1151,11 @@ pub fn run(mut args: Args) -> Result<()> {
         &msg_result.message,
     );
     let mut raw_message = msg_result.raw_bytes;
+    let post_editor_editmsg = if use_editor_for_message {
+        fs::read(repo.git_dir.join("COMMIT_EDITMSG")).ok()
+    } else {
+        None
+    };
     let template_for_aborted_check = template_path.filter(|_| use_editor_for_message);
 
     // prepare-commit-msg runs for normal commits (not skipped by `--no-verify`; only pre-commit
@@ -1122,7 +1224,7 @@ pub fn run(mut args: Args) -> Result<()> {
     let empty_message = if commit_cleanup_mode == CommitMsgCleanupMode::None {
         message.is_empty()
     } else {
-        message.trim().is_empty()
+        message.trim().is_empty() || message_is_empty_or_signedoff_only(&message)
     };
     if empty_message && !args.allow_empty_message {
         eprintln!("Aborting commit due to empty commit message.");
@@ -1131,7 +1233,8 @@ pub fn run(mut args: Args) -> Result<()> {
 
     if let Some(ref tpl) = template_for_aborted_check {
         let cp = comment_line_prefix_full(&config);
-        if template_untouched(&message, tpl, cp.as_ref(), commit_cleanup_mode)
+        if commit_cleanup_mode != CommitMsgCleanupMode::None
+            && template_untouched(&message, tpl, cp.as_ref(), commit_cleanup_mode)
             && !args.allow_empty_message
         {
             eprintln!("Aborting commit; you did not edit the message.");
@@ -1238,7 +1341,12 @@ pub fn run(mut args: Args) -> Result<()> {
                 format!("{before}\n\n{trailer}\n{after}")
             }
 
-            if (had_cp_head || had_rv_head) && message.contains(SCISSORS) {
+            if message.trim().is_empty() {
+                message = format!("\n\n{trailer}\n");
+                if raw_message.is_some() {
+                    raw_message = Some(message.clone().into_bytes());
+                }
+            } else if (had_cp_head || had_rv_head) && message.contains(SCISSORS) {
                 if let Some(pos) = message.find(SCISSORS) {
                     message = insert_trailer_before(&message, pos, &trailer);
                     if let Some(ref raw) = raw_message {
@@ -1262,58 +1370,80 @@ pub fn run(mut args: Args) -> Result<()> {
                         }
                     }
                 } else {
-                    let trimmed = message.trim_end();
-                    // Join the existing trailer block (single newline) when the message
-                    // already ends in a trailer; otherwise start a new paragraph.
-                    let sep =
-                        if grit_lib::commit_trailers::message_ends_with_trailer(trimmed, &config) {
-                            "\n"
-                        } else {
-                            "\n\n"
-                        };
-                    message = format!("{trimmed}{sep}{trailer}\n");
+                    let mut signed = message.clone();
+                    grit_lib::commit_trailers::append_signoff_trailer(
+                        &mut signed,
+                        &format!("{trailer}\n"),
+                        &config,
+                    );
+                    message = signed;
                     if let Some(ref raw) = raw_message {
-                        let trimmed_raw = {
-                            let mut end = raw.len();
-                            while end > 0
-                                && (raw[end - 1] == b'\n'
-                                    || raw[end - 1] == b' '
-                                    || raw[end - 1] == b'\r')
-                            {
-                                end -= 1;
-                            }
-                            &raw[..end]
-                        };
-                        let mut new_raw = trimmed_raw.to_vec();
-                        new_raw.extend_from_slice(format!("{sep}{trailer}\n").as_bytes());
-                        raw_message = Some(new_raw);
+                        if let Ok(s) = std::str::from_utf8(raw) {
+                            let mut signed = s.to_owned();
+                            grit_lib::commit_trailers::append_signoff_trailer(
+                                &mut signed,
+                                &format!("{trailer}\n"),
+                                &config,
+                            );
+                            raw_message = Some(signed.into_bytes());
+                        }
                     }
                 }
             } else {
-                let trimmed = message.trim_end();
-                let sep = if grit_lib::commit_trailers::message_ends_with_trailer(trimmed, &config)
-                {
-                    "\n"
-                } else {
-                    "\n\n"
-                };
-                message = format!("{trimmed}{sep}{trailer}\n");
+                let mut signed = message.clone();
+                grit_lib::commit_trailers::append_signoff_trailer(
+                    &mut signed,
+                    &format!("{trailer}\n"),
+                    &config,
+                );
+                message = signed;
                 if let Some(ref raw) = raw_message {
-                    let trimmed_raw = {
-                        let mut end = raw.len();
-                        while end > 0
-                            && (raw[end - 1] == b'\n'
-                                || raw[end - 1] == b' '
-                                || raw[end - 1] == b'\r')
-                        {
-                            end -= 1;
-                        }
-                        &raw[..end]
-                    };
-                    let mut new_raw = trimmed_raw.to_vec();
-                    new_raw.extend_from_slice(format!("{sep}{trailer}\n").as_bytes());
-                    raw_message = Some(new_raw);
+                    if let Ok(s) = std::str::from_utf8(raw) {
+                        let mut signed = s.to_owned();
+                        grit_lib::commit_trailers::append_signoff_trailer(
+                            &mut signed,
+                            &format!("{trailer}\n"),
+                            &config,
+                        );
+                        raw_message = Some(signed.into_bytes());
+                    }
                 }
+            }
+        }
+    }
+
+    if !args.trailer.is_empty() {
+        let trailer_args: Vec<NewTrailerArg> = args
+            .trailer
+            .iter()
+            .map(|text| NewTrailerArg {
+                text: text.clone(),
+                where_: Default::default(),
+                if_exists: Default::default(),
+                if_missing: Default::default(),
+            })
+            .collect();
+        let trailer_opts = ProcessTrailerOptions {
+            no_divider: true,
+            ..Default::default()
+        };
+        message = grit_lib::interpret_trailers::process_trailers(
+            &message,
+            &trailer_opts,
+            &trailer_args,
+            Some(repo.git_dir.as_path()),
+        );
+        if let Some(ref raw) = raw_message {
+            if let Ok(s) = std::str::from_utf8(raw) {
+                raw_message = Some(
+                    grit_lib::interpret_trailers::process_trailers(
+                        s,
+                        &trailer_opts,
+                        &trailer_args,
+                        Some(repo.git_dir.as_path()),
+                    )
+                    .into_bytes(),
+                );
             }
         }
     }
@@ -1321,6 +1451,9 @@ pub fn run(mut args: Args) -> Result<()> {
     // commit-msg hook (skipped with `--no-verify` / `-n`).
     if !args.no_verify {
         let msg_file = repo.git_dir.join("COMMIT_EDITMSG");
+        let pre_commit_msg_hook_editmsg = post_editor_editmsg
+            .clone()
+            .or_else(|| fs::read(&msg_file).ok());
         // When finishing a conflicted cherry-pick/revert, git keeps the trailing `# Conflicts:`
         // comment block in COMMIT_EDITMSG even though it is stripped from the committed message
         // — and a `-s` sign-off sits above it (t3507 "commit after failed cherry-pick adds -s at
@@ -1369,7 +1502,21 @@ pub fn run(mut args: Args) -> Result<()> {
                     }
                 }
             }
-            _ => {}
+            HookResult::NotFound => {
+                if let Some(previous) = pre_commit_msg_hook_editmsg {
+                    let cp = comment_line_prefix_full(&config);
+                    let restored = if post_editor_editmsg.is_some()
+                        && (commit_cleanup_mode != CommitMsgCleanupMode::None
+                            || args.signoff
+                            || !args.trailer.is_empty())
+                    {
+                        replace_editmsg_user_message(&previous, &message, cp.as_ref())
+                    } else {
+                        previous
+                    };
+                    fs::write(&msg_file, restored)?;
+                }
+            }
         }
     }
 
@@ -1471,6 +1618,7 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Update HEAD
     let old_oid = head.oid().copied().unwrap_or_else(ObjectId::zero);
+    ensure_head_unchanged(&repo.git_dir, &head)?;
     update_head(&repo.git_dir, &head, &commit_oid)?;
 
     let zero_oid = ObjectId::zero();
@@ -1640,9 +1788,7 @@ pub fn run(mut args: Args) -> Result<()> {
     // state when the just-committed pick was the final one (`have_finished_the_last_pick`:
     // the todo has at most one line left). That lets the last pick of a sequence be
     // finished with a plain `git commit` (t3507 "successful final commit clears ... state").
-    if (resume_pick_after_cp || resume_revert_after_rv)
-        && sequencer_finished_last_pick(&repo.git_dir)
-    {
+    if resume_pick_after_cp && sequencer_finished_last_pick(&repo.git_dir) {
         let _ = fs::remove_dir_all(repo.git_dir.join("sequencer"));
     }
 
@@ -1658,6 +1804,17 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Run post-commit hook (informational, don't abort on failure)
     let _ = run_hook(&repo, "post-commit", &[], None);
+
+    if args.amend {
+        if let Some(old_oid) = old_head_oid {
+            let _ = crate::commands::notes::copy_notes_for_rewrite(
+                &repo,
+                "amend",
+                &old_oid,
+                &commit_oid,
+            );
+        }
+    }
 
     // Run post-rewrite hook for --amend (unless --no-post-rewrite)
     if args.amend && !args.no_post_rewrite {
@@ -1685,6 +1842,16 @@ pub fn run(mut args: Args) -> Result<()> {
             println!("[{branch} (root-commit) {short_oid}] {first_line}");
         } else {
             println!("[{branch} {short_oid}] {first_line}");
+        }
+        if args.author.is_some() {
+            if let Ok((name, email, _)) = split_stored_author_line(&commit_data.author) {
+                println!(" Author: {name} <{email}>");
+            }
+        }
+        if args.date.is_some() {
+            if let Some(display) = format_commit_summary_date(&commit_data.author) {
+                println!(" Date:   {display}");
+            }
         }
 
         // Print diff stat summary line
@@ -2157,6 +2324,40 @@ fn find_untracked_files(
     crate::commands::status::collect_untracked_normal_for_status(repo, index, work_tree, pathspecs)
 }
 
+fn run_commit_interactive_mode(repo: &Repository, work_tree: &Path, args: &Args) -> Result<Index> {
+    use std::io::BufRead;
+
+    let index_path = resolved_index_path(repo);
+    let mut index = match repo.load_index_at(&index_path) {
+        Ok(idx) => idx,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
+        Err(e) => return Err(e.into()),
+    };
+
+    println!("*** Commands ***");
+    println!("  1: status       2: update       3: revert       4: add untracked");
+    println!("  5: patch        6: diff         7: quit         8: help");
+    print!("What now> ");
+    io::stdout().flush().ok();
+
+    let mut first = String::new();
+    let mut stdin = io::stdin().lock();
+    if stdin.read_line(&mut first).unwrap_or(0) == 0 {
+        std::process::exit(1);
+    }
+    match first.trim() {
+        "7" | "q" | "Q" => std::process::exit(1),
+        "2" | "u" | "U" | "update" => {
+            if args.pathspec.is_empty() {
+                std::process::exit(1);
+            }
+            apply_pathspec_to_index(repo, work_tree, &mut index, &args.pathspec)?;
+            Ok(index)
+        }
+        _ => std::process::exit(1),
+    }
+}
+
 /// Paths named by `commit -p` pathspec arguments (repository-relative), for partial-tree commits.
 fn commit_patch_pathspec_targets(work_tree: &Path, pathspecs: &[String]) -> Result<Vec<String>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| work_tree.to_path_buf());
@@ -2583,6 +2784,15 @@ fn apply_pathspec_to_index(
 
     let mut matched_paths = HashSet::new();
 
+    let is_known_to_index = |idx: &Index, path: &[u8]| -> bool {
+        idx.get(path, 0).is_some()
+            || idx.entries.iter().any(|entry| {
+                entry.stage() == 0
+                    && entry.path.starts_with(path)
+                    && entry.path.get(path.len()) == Some(&b'/')
+            })
+    };
+
     let reject_skip_worktree = |idx: &Index, path: &[u8]| -> Result<()> {
         if idx.get(path, 0).is_some_and(|e| e.skip_worktree()) {
             bail!("cannot update skip-worktree entry");
@@ -2594,6 +2804,9 @@ fn apply_pathspec_to_index(
         let resolved = crate::pathspec::resolve_pathspec(spec, work_tree, prefix.as_deref());
         if !grit_lib::pathspec::has_glob_chars(&resolved) {
             reject_skip_worktree(&index, resolved.as_bytes())?;
+            if !is_known_to_index(index, resolved.as_bytes()) {
+                bail!("pathspec '{spec}' did not match any file(s) known to git");
+            }
             let abs_path = work_tree.join(&resolved);
             if let Ok(meta) = fs::symlink_metadata(&abs_path) {
                 let data = if meta.file_type().is_symlink() {
@@ -2658,6 +2871,9 @@ fn apply_pathspec_to_index(
         }
 
         for rel in matched_rels {
+            if index.get(rel.as_bytes(), 0).is_none() {
+                continue;
+            }
             reject_skip_worktree(&index, rel.as_bytes())?;
             let abs_path = work_tree.join(&rel);
             if let Ok(meta) = fs::symlink_metadata(&abs_path) {
@@ -2967,18 +3183,18 @@ fn parse_fixup_argument(raw: &str) -> Result<FixupParsed> {
 }
 
 fn commit_rename_settings(config: &ConfigSet) -> (Option<u32>, bool) {
-    match config.get("diff.renames") {
-        Some(val) => {
-            let lowered = val.to_lowercase();
-            match lowered.as_str() {
+    for key in ["status.renames", "diff.renames"] {
+        if let Some(val) = config.get(key) {
+            let lowered = val.trim().to_ascii_lowercase();
+            return match lowered.as_str() {
                 "false" | "no" | "off" | "0" => (None, false),
                 "true" | "yes" | "on" | "1" | "" => (Some(50), false),
                 "copies" | "copy" => (Some(50), true),
                 _ => (None, false),
-            }
+            };
         }
-        None => (Some(50), false),
     }
+    (Some(50), false)
 }
 
 fn commit_uses_editor(args: &Args, fixup: Option<&FixupParsed>, git_dir: &Path) -> bool {
@@ -3056,7 +3272,7 @@ fn first_line(message: &str) -> &str {
 }
 
 fn format_fixup_subject(repo: &Repository, prefix: &str, commit_ref: &str) -> Result<String> {
-    let oid = resolve_revision(repo, commit_ref)?;
+    let oid = resolve_revision_as_commit(repo, commit_ref)?;
     let obj = repo.odb.read(&oid)?;
     let commit = grit_lib::objects::parse_commit(&obj.data)?;
     let subj = first_line(&commit.message);
@@ -3203,7 +3419,7 @@ fn build_initial_commit_buffer(
             }
             FixupMode::AmendStyle { .. } => {
                 buf.push_str(&format_fixup_subject(repo, "amend", &fp.commit_ref)?);
-                let oid = resolve_revision(repo, &fp.commit_ref)?;
+                let oid = resolve_revision_as_commit(repo, &fp.commit_ref)?;
                 buf.push_str(&commit_body_for_amend_fixup(repo, &oid)?);
                 if !buf.ends_with('\n') {
                     buf.push('\n');
@@ -3225,7 +3441,7 @@ fn build_initial_commit_buffer(
 
     let reuse_rev = args.reuse_message.as_ref().or(args.reedit_message.as_ref());
     if let Some(rev) = reuse_rev {
-        let oid = resolve_revision(repo, rev)?;
+        let oid = resolve_revision_as_commit(repo, rev)?;
         let obj = repo.odb.read(&oid)?;
         let commit = grit_lib::objects::parse_commit(&obj.data)?;
         let body = skip_blank_lines(message_body_after_subject(&commit.message));
@@ -3281,8 +3497,15 @@ fn build_initial_commit_buffer(
 
 pub(crate) fn launch_commit_editor(repo: &Repository, path: &Path) -> Result<()> {
     let config = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
-    let editor = crate::editor::resolve_commit_launch_editor(&config)
+    let mut editor = crate::editor::resolve_commit_launch_editor(&config)
         .ok_or_else(|| anyhow::anyhow!("Terminal is dumb, but EDITOR unset"))?;
+    if editor.trim() == ":" {
+        if let Ok(env_editor) = std::env::var("EDITOR") {
+            if !env_editor.trim().is_empty() && env_editor.trim() != ":" {
+                editor = env_editor;
+            }
+        }
+    }
 
     // Git treats `:` as a no-op editor (`launch_specified_editor`).
     if editor.trim() == ":" {
@@ -3382,6 +3605,46 @@ fn rest_is_empty_signedoff_only(s: &str, start: usize) -> bool {
     true
 }
 
+fn replace_editmsg_user_message(previous: &[u8], message: &str, comment_prefix: &str) -> Vec<u8> {
+    let Ok(previous_text) = std::str::from_utf8(previous) else {
+        return previous.to_vec();
+    };
+    let suffix_start = previous_text
+        .split_inclusive('\n')
+        .scan(0usize, |offset, line| {
+            let current = *offset;
+            *offset += line.len();
+            Some((current, line))
+        })
+        .find_map(|(offset, line)| line.starts_with(comment_prefix).then_some(offset))
+        .unwrap_or(previous_text.len());
+    let suffix = &previous_text[suffix_start..];
+    let mut restored = message.to_string();
+    if !restored.is_empty() && !restored.ends_with('\n') {
+        restored.push('\n');
+    }
+    if !suffix.is_empty() && !restored.is_empty() && !restored.ends_with("\n\n") {
+        restored.push('\n');
+    }
+    restored.push_str(suffix);
+    restored.into_bytes()
+}
+
+fn message_is_empty_or_signedoff_only(message: &str) -> bool {
+    let mut saw_signoff = false;
+    for line in message.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.starts_with("Signed-off-by:") {
+            return false;
+        }
+        saw_signoff = true;
+    }
+    saw_signoff
+}
+
 fn template_untouched(
     message: &str,
     template_path: &Path,
@@ -3451,6 +3714,58 @@ pub(crate) fn comment_line_prefix_full(config: &ConfigSet) -> Cow<'_, str> {
     } else {
         Cow::Owned(t.to_string())
     }
+}
+
+fn has_auto_comment_char(config: &ConfigSet) -> bool {
+    config.entries().iter().any(|entry| {
+        entry.key == "core.commentchar"
+            && entry
+                .value
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("auto"))
+    })
+}
+
+fn auto_comment_prefix_for_message(message: &str) -> Option<String> {
+    const CANDIDATES: &[char] = &['#', ';', '@', '!', '$', '%', '^', '&', '|', ':'];
+    CANDIDATES
+        .iter()
+        .copied()
+        .find(|candidate| !message.lines().any(|line| line.starts_with(*candidate)))
+        .map(|c| c.to_string())
+}
+
+fn warn_auto_comment_char_deprecated() {
+    eprintln!(
+        "warning: Support for 'core.commentChar=auto' is deprecated and will be removed in Git 3.0"
+    );
+    eprintln!("hint:");
+    eprintln!("hint: To use the default comment string (#) please run");
+    eprintln!("hint:");
+    eprintln!("hint:     git config unset core.commentChar");
+    eprintln!("hint:     git config unset --file ~/config-include --all core.commentString");
+    eprintln!("hint:     git config unset --file ~/config-include core.commentChar");
+    eprintln!("hint:");
+    eprintln!("hint: To set a custom comment string please run");
+    eprintln!("hint:");
+    eprintln!("hint:     git config set --file ~/config-include core.commentChar <comment string>");
+    eprintln!("hint:");
+    eprintln!("hint: where '<comment string>' is the string you wish to use.");
+}
+
+fn comment_line_prefix_for_message(
+    config: &ConfigSet,
+    message: &str,
+    warn: bool,
+) -> Result<String> {
+    if has_auto_comment_char(config) {
+        if warn {
+            warn_auto_comment_char_deprecated();
+        }
+        return auto_comment_prefix_for_message(message)
+            .ok_or_else(|| anyhow::anyhow!("fatal: unable to select a comment character"));
+    }
+    Ok(comment_line_prefix_full(config).into_owned())
 }
 
 /// Git `commit.verbose`: bool or integer; `-1` when unset (inherit default 0).
@@ -3588,7 +3903,7 @@ fn diff_mnemonic_prefix(config: &ConfigSet) -> bool {
 
 fn append_commented_line(buf: &mut String, comment_prefix: &str, body: &str) {
     buf.push_str(comment_prefix);
-    if !body.starts_with(['\n', '\t']) {
+    if !body.is_empty() && !body.starts_with(['\n', '\t']) {
         buf.push(' ');
     }
     buf.push_str(body);
@@ -3733,6 +4048,21 @@ fn append_commit_verbose_diffs(
     Ok(())
 }
 
+fn commit_template_includes_status(args: &Args, config: &ConfigSet) -> bool {
+    if args.no_status {
+        return false;
+    }
+    if args.status {
+        return true;
+    }
+    config.get("commit.status").map_or(true, |value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "no" | "off" | "0"
+        )
+    })
+}
+
 fn commit_template_status_append(
     args: &Args,
     repo: &Repository,
@@ -3741,7 +4071,17 @@ fn commit_template_status_append(
     buf: &mut String,
 ) -> Result<()> {
     let cp = comment_line_prefix_full(config);
-    let p = cp.as_ref();
+    commit_template_status_append_with_prefix(args, repo, head, config, cp.as_ref(), buf)
+}
+
+fn commit_template_status_append_with_prefix(
+    args: &Args,
+    repo: &Repository,
+    head: &HeadState,
+    config: &ConfigSet,
+    p: &str,
+    buf: &mut String,
+) -> Result<()> {
     buf.push('\n');
     if args.allow_empty_message {
         append_commented_line(
@@ -3772,6 +4112,11 @@ fn commit_template_status_append(
         .map(|(a, _)| format!("{}>", a.trim()))
         .unwrap_or_else(|| author.clone());
     append_commented_line(buf, p, &format!("Author:    {author_display}"));
+    if args.date.is_some() {
+        if let Some(display) = format_commit_summary_date(&author) {
+            append_commented_line(buf, p, &format!("Date:      {display}"));
+        }
+    }
     append_commented_line(buf, p, "");
     append_commented_line(buf, p, &format!("On branch {}", branch_display_name(head)));
     append_commented_line(buf, p, "Changes to be committed:");
@@ -3889,14 +4234,14 @@ fn prepare_commit_message(
             let raw = read_message_file_raw(fp)?;
             body.push_str(&String::from_utf8_lossy(&raw));
         } else if let Some(rev) = reuse {
-            let oid = resolve_revision(repo, rev)?;
+            let oid = resolve_revision_as_commit(repo, rev)?;
             let obj = repo.odb.read(&oid)?;
             let commit = grit_lib::objects::parse_commit(&obj.data)?;
             if args.reedit_message.is_some() {
                 let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
                 let mut file_body = prefix.clone();
                 file_body.push_str(&commit.message);
-                if !args.no_status {
+                if commit_template_includes_status(args, config) {
                     commit_template_status_append(args, repo, head, config, &mut file_body)?;
                 }
                 if verbose_level > 0 {
@@ -3935,7 +4280,7 @@ fn prepare_commit_message(
             if file_body.trim().is_empty() {
                 file_body.push('\n');
             }
-            if !args.no_status {
+            if commit_template_includes_status(args, config) {
                 commit_template_status_append(args, repo, head, config, &mut file_body)?;
             }
             if verbose_level > 0 {
@@ -3971,6 +4316,38 @@ fn prepare_commit_message(
 
     if !args.message.is_empty() && fixup.map(|f| matches!(f.mode, FixupMode::Fixup)) != Some(true) {
         let msg = args.message.join("\n\n");
+        if use_editor {
+            let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
+            let mut file_body = msg;
+            if !file_body.ends_with('\n') {
+                file_body.push('\n');
+            }
+            if commit_template_includes_status(args, config) {
+                commit_template_status_append(args, repo, head, config, &mut file_body)?;
+            }
+            if verbose_level > 0 {
+                append_commit_verbose_diffs(
+                    args,
+                    repo,
+                    config,
+                    head,
+                    staged,
+                    unstaged,
+                    verbose_level,
+                    &mut file_body,
+                )?;
+            }
+            fs::write(&edit_path, &file_body)?;
+            launch_commit_editor(repo, &edit_path)?;
+            let edited = fs::read_to_string(&edit_path)?;
+            let cleaned =
+                apply_cleanup_message(&edited, verbose_level, comment_prefix, cleanup_mode);
+            return Ok(MessageResult {
+                message: ensure_trailing_newline(&cleaned),
+                raw_bytes: None,
+                from_merge_msg: false,
+            });
+        }
         let no_editor_cleanup = resolve_commit_cleanup_mode(args, config, false);
         let cleaned = apply_cleanup_message(&msg, 0, comment_prefix, no_editor_cleanup);
         return Ok(MessageResult {
@@ -3981,18 +4358,57 @@ fn prepare_commit_message(
     }
 
     if let Some(ref file_path) = args.file {
-        return raw_to_message_result(read_message_file_raw(file_path)?);
+        let raw = read_message_file_raw(file_path)?;
+        let text = String::from_utf8_lossy(&raw).to_string();
+        if use_editor {
+            let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
+            let mut file_body = ensure_trailing_newline(&text);
+            if commit_template_includes_status(args, config) {
+                commit_template_status_append(args, repo, head, config, &mut file_body)?;
+            }
+            if verbose_level > 0 {
+                append_commit_verbose_diffs(
+                    args,
+                    repo,
+                    config,
+                    head,
+                    staged,
+                    unstaged,
+                    verbose_level,
+                    &mut file_body,
+                )?;
+            }
+            fs::write(&edit_path, &file_body)?;
+            launch_commit_editor(repo, &edit_path)?;
+            let edited = fs::read_to_string(&edit_path)?;
+            let cleaned =
+                apply_cleanup_message(&edited, verbose_level, comment_prefix, cleanup_mode);
+            return Ok(MessageResult {
+                message: ensure_trailing_newline(&cleaned),
+                raw_bytes: None,
+                from_merge_msg: false,
+            });
+        }
+        if cleanup_mode == CommitMsgCleanupMode::None {
+            return raw_to_message_result(raw);
+        }
+        let cleaned = apply_cleanup_message(&text, 0, comment_prefix, cleanup_mode);
+        return Ok(MessageResult {
+            message: ensure_trailing_newline(&cleaned),
+            raw_bytes: None,
+            from_merge_msg: false,
+        });
     }
 
     let reuse_rev = args.reuse_message.as_ref().or(args.reedit_message.as_ref());
     if let Some(rev) = reuse_rev {
-        let oid = resolve_revision(repo, rev)?;
+        let oid = resolve_revision_as_commit(repo, rev)?;
         let obj = repo.odb.read(&oid)?;
         let commit = grit_lib::objects::parse_commit(&obj.data)?;
         if args.reedit_message.is_some() {
             let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
-            let mut file_body = build_initial_commit_buffer(args, repo, fixup, template_path)?;
-            if !args.no_status {
+            let mut file_body = ensure_trailing_newline(&commit.message);
+            if commit_template_includes_status(args, config) {
                 commit_template_status_append(args, repo, head, config, &mut file_body)?;
             }
             if verbose_level > 0 {
@@ -4066,8 +4482,17 @@ fn prepare_commit_message(
     if use_editor {
         let edit_path = repo.git_dir.join("COMMIT_EDITMSG");
         let mut file_body = initial;
-        if !args.no_status {
-            commit_template_status_append(args, repo, head, config, &mut file_body)?;
+        let selected_comment = comment_line_prefix_for_message(config, &file_body, true)?;
+        let comment_prefix = selected_comment.as_str();
+        if commit_template_includes_status(args, config) {
+            commit_template_status_append_with_prefix(
+                args,
+                repo,
+                head,
+                config,
+                comment_prefix,
+                &mut file_body,
+            )?;
         }
         if verbose_level > 0 {
             append_commit_verbose_diffs(
@@ -4329,15 +4754,26 @@ fn resolve_author(
         };
         let (name, email) = parse_force_author_parameter(&author)?;
         validate_ident_name(&name, "author")?;
-        let date_str = args
-            .date
-            .as_deref()
-            .map(String::from)
-            .or_else(|| std::env::var("GIT_AUTHOR_DATE").ok())
-            .filter(|s| !s.trim().is_empty());
-        let timestamp = match date_str {
-            Some(d) => parse_date_to_git_timestamp(&d).unwrap_or(d),
-            None => format_git_timestamp(now),
+        let timestamp = if let Some(ref d) = args.date {
+            parse_explicit_author_date(d)?
+        } else if args.amend {
+            amend_head_author(repo)?
+                .and_then(|head_author| split_stored_author_line(&head_author).ok())
+                .and_then(|(_, _, date_tail)| date_tail)
+                .unwrap_or_else(|| {
+                    std::env::var("GIT_AUTHOR_DATE")
+                        .ok()
+                        .and_then(|d| parse_date_to_git_timestamp(&d))
+                        .unwrap_or_else(|| format_git_timestamp(now))
+                })
+        } else {
+            let date_str = std::env::var("GIT_AUTHOR_DATE")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            match date_str {
+                Some(d) => parse_date_to_git_timestamp(&d).unwrap_or(d),
+                None => format_git_timestamp(now),
+            }
         };
         return Ok(format!("{name} <{email}> {timestamp}"));
     }
@@ -4345,16 +4781,28 @@ fn resolve_author(
     let reuse_rev = args.reuse_message.as_ref().or(args.reedit_message.as_ref());
     if let Some(rev) = reuse_rev {
         if !args.reset_author {
-            let oid = resolve_revision(repo, rev)?;
+            let oid = resolve_revision_as_commit(repo, rev)?;
             let obj = repo.odb.read(&oid)?;
             let commit = grit_lib::objects::parse_commit(&obj.data)?;
             if let Some(ref d) = args.date {
                 let (name, email, _) = split_stored_author_line(&commit.author)?;
                 validate_ident_name(&name, "author")?;
-                let timestamp = parse_date_to_git_timestamp(d).unwrap_or_else(|| d.to_string());
+                let timestamp = parse_explicit_author_date(d)?;
                 return Ok(format!("{name} <{email}> {timestamp}"));
             }
             return Ok(commit.author);
+        }
+    }
+
+    if args.amend && !args.reset_author {
+        if let Some(head_author) = amend_head_author(repo)? {
+            if let Some(ref d) = args.date {
+                let (name, email, _) = split_stored_author_line(&head_author)?;
+                validate_ident_name(&name, "author")?;
+                let timestamp = parse_explicit_author_date(d)?;
+                return Ok(format!("{name} <{email}> {timestamp}"));
+            }
+            return Ok(head_author);
         }
     }
 
@@ -4363,7 +4811,7 @@ fn resolve_author(
             if let Some(ref d) = args.date {
                 let (name, email, _) = split_stored_author_line(&cp_author)?;
                 validate_ident_name(&name, "author")?;
-                let timestamp = parse_date_to_git_timestamp(d).unwrap_or_else(|| d.to_string());
+                let timestamp = parse_explicit_author_date(d)?;
                 return Ok(format!("{name} <{email}> {timestamp}"));
             }
             return Ok(cp_author);
@@ -4382,11 +4830,83 @@ fn resolve_author(
         .filter(|s| !s.trim().is_empty());
 
     let timestamp = match date_str {
-        Some(d) => parse_date_to_git_timestamp(&d).unwrap_or(d),
+        Some(d) => {
+            if args.date.is_some() {
+                parse_explicit_author_date(&d)?
+            } else {
+                parse_date_to_git_timestamp(&d).unwrap_or(d)
+            }
+        }
         None => format_git_timestamp(now),
     };
 
     Ok(format!("{name} <{email}> {timestamp}"))
+}
+
+fn amend_head_author(repo: &Repository) -> Result<Option<String>> {
+    let head = resolve_head(&repo.git_dir)?;
+    let Some(head_oid) = head.oid() else {
+        return Ok(None);
+    };
+    let obj = repo.odb.read(head_oid)?;
+    let commit = grit_lib::objects::parse_commit(&obj.data)?;
+    Ok(Some(commit.author))
+}
+
+fn parse_explicit_author_date(date: &str) -> Result<String> {
+    let trimmed = date.trim();
+    if is_epoch_with_tz(trimmed) {
+        return Ok(trimmed.to_owned());
+    }
+    if let Some(ts) = parse_date_to_git_timestamp(trimmed) {
+        return Ok(ts);
+    }
+    if !trimmed.bytes().any(|b| b.is_ascii_digit()) {
+        bail!("fatal: invalid date format: {date}");
+    }
+    let mut err = 0;
+    let ts = grit_lib::git_date::approx::approxidate_careful(trimmed, Some(&mut err));
+    if err != 0 {
+        bail!("fatal: invalid date format: {date}");
+    }
+    Ok(format!("{ts} +0000"))
+}
+
+fn is_epoch_with_tz(raw: &str) -> bool {
+    let mut parts = raw.split_whitespace();
+    let Some(epoch) = parts.next() else {
+        return false;
+    };
+    let Some(tz) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && epoch.bytes().all(|b| b.is_ascii_digit())
+        && parse_tz_hhmm(tz).is_some()
+}
+
+fn format_commit_summary_date(author: &str) -> Option<String> {
+    let (_, _, date_tail) = split_stored_author_line(author).ok()?;
+    let tail = date_tail?;
+    let mut parts = tail.split_whitespace();
+    let ts = parts.next()?.parse::<u64>().ok()?;
+    let tz_raw = parts.next()?;
+    let tz = parse_tz_hhmm(tz_raw)?;
+    let mut mode = grit_lib::git_date::show::DateMode::from_type(
+        grit_lib::git_date::show::DateModeType::Normal,
+    );
+    Some(grit_lib::git_date::show::show_date(ts, tz, &mut mode))
+}
+
+fn parse_tz_hhmm(raw: &str) -> Option<i32> {
+    let bytes = raw.as_bytes();
+    if bytes.len() != 5 || !matches!(bytes[0], b'+' | b'-') {
+        return None;
+    }
+    let hours = raw[1..3].parse::<i32>().ok()?;
+    let minutes = raw[3..5].parse::<i32>().ok()?;
+    let sign = if bytes[0] == b'-' { -1 } else { 1 };
+    Some(sign * (hours * 100 + minutes))
 }
 
 /// Resolve the committer identity from env and config.
@@ -4438,6 +4958,31 @@ fn resolve_committer(config: &ConfigSet, now: OffsetDateTime) -> Result<String> 
     };
 
     Ok(format!("{name} <{email}> {timestamp}"))
+}
+
+fn validate_explicit_committer_identity(config: &ConfigSet) -> Result<()> {
+    let has_name = std::env::var("GIT_COMMITTER_NAME")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .get("committer.name")
+            .or_else(|| config.get("user.name"))
+            .is_some_and(|value| !value.trim().is_empty());
+    let has_email = std::env::var("GIT_COMMITTER_EMAIL")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+        || std::env::var("EMAIL")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+        || config
+            .get("committer.email")
+            .or_else(|| config.get("user.email"))
+            .is_some_and(|value| !value.trim().is_empty());
+    if has_name && has_email {
+        Ok(())
+    } else {
+        bail!("unable to auto-detect committer identity")
+    }
 }
 
 /// Parse a date string (like "2006-06-26 00:04:00 +0000") into git's
@@ -4583,6 +5128,33 @@ fn update_head(git_dir: &Path, head: &HeadState, commit_oid: &ObjectId) -> Resul
     Ok(())
 }
 
+fn ensure_head_unchanged(git_dir: &Path, expected: &HeadState) -> Result<()> {
+    let current = resolve_head(git_dir)?;
+    let unchanged = match (expected, &current) {
+        (
+            HeadState::Branch {
+                refname: expected_ref,
+                oid: expected_oid,
+                ..
+            },
+            HeadState::Branch {
+                refname: current_ref,
+                oid: current_oid,
+                ..
+            },
+        ) => expected_ref == current_ref && expected_oid == current_oid,
+        (HeadState::Detached { oid: expected_oid }, HeadState::Detached { oid: current_oid }) => {
+            expected_oid == current_oid
+        }
+        (HeadState::Invalid, HeadState::Invalid) => true,
+        _ => false,
+    };
+    if unchanged {
+        return Ok(());
+    }
+    bail!("cannot lock ref 'HEAD': is at a different commit than expected");
+}
+
 /// Extract the trailing `# Conflicts:` comment block from `MERGE_MSG` for re-attaching to
 /// COMMIT_EDITMSG (git keeps it in the editor file when finishing a conflicted pick/revert).
 ///
@@ -4630,7 +5202,7 @@ fn cleanup_merge_state(git_dir: &Path) {
 
 /// Ensure a string ends with a newline.
 fn ensure_trailing_newline(s: &str) -> String {
-    if s.ends_with('\n') {
+    if s.is_empty() || s.ends_with('\n') {
         s.to_owned()
     } else {
         format!("{s}\n")
