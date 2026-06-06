@@ -608,9 +608,19 @@ pub fn run(mut args: Args) -> Result<()> {
     let mut rev_tokens: Vec<String> = positive_specs.iter().map(|s| (*s).clone()).collect();
     let max_count_flag = if args.last_one { Some(1) } else { None };
     let max_count_from_argv = strip_leading_neg_count(&mut rev_tokens);
+    // A leading `-N` count token placed after `--` (e.g. `format-patch -- -1`) is consumed by clap
+    // into the pathspec. When no revisions/count were given on the left, treat it as the commit
+    // count rather than a (non-matching) pathspec so `-N` works regardless of `--` placement.
+    let mut pathspec_tokens: Vec<String> = args.pathspec.clone();
+    let max_count_from_pathspec = if positive_specs.is_empty() && max_count_from_argv.is_none() {
+        strip_leading_neg_count(&mut pathspec_tokens)
+    } else {
+        None
+    };
     let max_count = max_count_flag
         .or(args.grit_format_patch_max_count)
-        .or(max_count_from_argv);
+        .or(max_count_from_argv)
+        .or(max_count_from_pathspec);
     let no_revs = positive_specs.is_empty() && exclude_specs.is_empty();
     // With no revision range and no count, git defaults to `@{upstream}..HEAD`. When the current
     // branch has a configured upstream, format the commits since it; otherwise there is nothing to
@@ -629,7 +639,7 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     // Pathspec after `--` limits which commits/diffs are shown.
-    let pathspec: Vec<String> = args.pathspec.clone();
+    let pathspec: Vec<String> = pathspec_tokens.clone();
 
     // Determine the list of commits to format.
     let mut commits = if default_no_upstream {
