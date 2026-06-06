@@ -1252,6 +1252,11 @@ fn commits_for_rebase_merge_walk(
     filter_cherry_equivalents: bool,
 ) -> Result<(Vec<ObjectId>, HashSet<ObjectId>)> {
     if filter_cherry_equivalents {
+        // Use `--cherry-mark` only (not `--cherry-pick`): the walk must retain every commit so the
+        // merge-script generator can decide per-commit. Cherry-equivalent commits are dropped there
+        // only when non-empty (`generate_rebase_merge_script`); empty commits are never dropped by
+        // cherry detection (all empty commits share the empty patch-id), so `--keep-empty` keeps
+        // them even when already in upstream (t3421 --rebase-merges --keep-empty).
         let bases = merge_bases_first_vs_rest(repo, upstream_oid, &[head_oid])?;
         let negative: Vec<String> = bases.iter().map(|b| b.to_hex()).collect();
         let result = rev_list(
@@ -1260,7 +1265,6 @@ fn commits_for_rebase_merge_walk(
             &negative,
             &RevListOptions {
                 cherry_mark: true,
-                cherry_pick: true,
                 right_only: true,
                 left_right: true,
                 symmetric_left: Some(upstream_oid),
@@ -1456,15 +1460,13 @@ fn generate_rebase_merge_script(
             if b == onto_oid {
                 out.push_str("reset onto\n");
             } else if !interesting.contains(&b) {
-                if b == onto_oid {
-                    out.push_str("reset onto\n");
-                } else {
-                    out.push_str(if rebase_cousins || root_with_onto {
-                        "reset onto\n"
-                    } else {
-                        "reset [new root]\n"
-                    });
-                }
+                // The first-parent walk stopped at a commit below the rebased set (an ancestor of
+                // `onto`/upstream that Git's limited symmetric walk collapses away). Git resets to
+                // `onto` here — e.g. rebasing a linear branch whose merge-base differs from `onto`
+                // (t3421 --rebase-merges --keep-empty: `reset onto`, not `reset [new root]`).
+                // A true `[new root]` only arises when the walk reaches an actual root commit
+                // (handled by `stopped_at_root` above).
+                out.push_str("reset onto\n");
             } else if let Some(lbl) = label_state.commit_to_label.get(&b) {
                 if lbl == "onto" {
                     out.push_str("reset onto\n");
@@ -4398,11 +4400,11 @@ Use '--' to separate paths from revisions, like this:\n\
     } else {
         args.keep_base > 0
     };
-    // Interactive rebase normally skips this filter (todo lists all commits); `--keep-base` with
-    // `--no-reapply-cherry-picks` must still omit patch-id duplicates like the merge backend.
-    // `--rebase-merges` also needs cherry filtering for the merge-replay todo generator.
-    let filter_cherry_equivalents =
-        !reapply_cherry_picks && (!args.interactive || args.keep_base > 0 || rebase_merges_on);
+    // Git's `sequencer_make_script` always drops clean cherry-picks of upstream commits as a
+    // preliminary step unless `--reapply-cherry-picks` (or `--keep-base`) is given — this holds for
+    // every backend, including interactive (`-i`) and `--rebase-merges`. Begin-empty commits are
+    // never dropped here (see `collect_rebase_todo_commits`); only true patch-equivalents are.
+    let filter_cherry_equivalents = !reapply_cherry_picks;
     // `--keep-base` commit selection: when reapplying cherry-picks, Git uses `onto` as upstream for
     // commit collection (`options.upstream = options.onto`). Otherwise default fork-point behavior
     // still uses the upstream *tip* for the replay list (t3431.4); explicit `--fork-point
@@ -4430,10 +4432,12 @@ Use '--' to separate paths from revisions, like this:\n\
         commits = filter_merge_commits(&repo, &commits)?;
     }
 
-    // Commits that start empty are kept by default. `--reset-author-date` / `--ignore-date` must
-    // still replay them even when the historical `--no-keep-empty` opt-out is used so author
-    // timestamps are rewritten (t3436). Merge-replay scripts may reference empty merge commits.
-    if args.no_keep_empty && !args.interactive && !rebase_merges_on && !args.reset_author_date {
+    // Commits that start empty are kept by default. `--no-keep-empty` drops them as a preliminary
+    // step for every backend (Git's `sequencer_make_script`: `if (is_empty && !keep_empty)
+    // continue;`), including interactive (`-i --no-keep-empty`, t3421). `--reset-author-date` /
+    // `--ignore-date` must still replay them even with `--no-keep-empty` so author timestamps are
+    // rewritten (t3436). Merge-replay scripts handle empty filtering in the script generator.
+    if args.no_keep_empty && !rebase_merges_on && !args.reset_author_date {
         commits.retain(|oid| !is_commit_tree_unchanged(&repo, oid).unwrap_or(false));
     }
 
@@ -4570,6 +4574,19 @@ Use '--' to separate paths from revisions, like this:\n\
                     }
                 }
                 bail!("nothing to do");
+            }
+            // The pick list is empty: either the branch is behind the upstream (a linear ancestor
+            // of `onto`) or every commit was dropped as a clean cherry-pick of the upstream. In
+            // both cases Git resets the branch to `onto` and reports "Successfully rebased"
+            // (t3421 "rebase -i fast-forwards from ancestor of upstream"; t3404 "do noop when there
+            // is nothing to cherry-pick"). Only when the branch already points at `onto` is this a
+            // true "up to date" no-op.
+            if !onto_oid.is_zero() && head_oid != onto_oid {
+                rebase_reset_to_onto_noop(&repo, &head, head_oid, onto_oid)?;
+                if let Some(ref oid) = autostash_oid {
+                    apply_autostash_after_ff(&repo, oid)?;
+                }
+                return Ok(());
             }
             print_branch_up_to_date(&head);
             if let Some(ref oid) = autostash_oid {
@@ -4979,6 +4996,91 @@ fn fast_forward_rebase(
     Ok(())
 }
 
+/// Reset HEAD (and the current branch ref) to `onto` for a rebase whose pick list is empty but
+/// where the branch is not already at `onto`. This happens when every commit was dropped as a
+/// clean cherry-pick of the upstream (and the branch diverges from `onto`), or when the branch is
+/// strictly behind `onto`. Git resets the branch to `onto` and reports "Successfully rebased and
+/// updated <ref>" in both cases (t3404 "do noop when there is nothing to cherry-pick", t3421
+/// "rebase -i fast-forwards from ancestor of upstream"). Output goes to stderr to match Git's
+/// interactive/merge backend finish message.
+fn rebase_reset_to_onto_noop(
+    repo: &Repository,
+    head: &HeadState,
+    head_oid: ObjectId,
+    onto_oid: ObjectId,
+) -> Result<()> {
+    let git_dir = &repo.git_dir;
+    let ident = reflog_identity(repo);
+    let ra = rebase_reflog_action();
+
+    let onto_obj = repo.odb.read(&onto_oid)?;
+    let onto_commit = parse_commit(&onto_obj.data)?;
+    let entries = tree_to_index_entries(repo, &onto_commit.tree, "")?;
+    let mut idx = Index::new();
+    idx.entries = entries;
+    idx.sort();
+    let old_index = load_index(repo)?;
+    if let Some(wt) = &repo.work_tree {
+        preflight_cherry_pick_cwd_obstruction(repo, wt, &idx, &BTreeMap::new(), None)?;
+        refuse_populated_submodule_tree_replacement(&old_index, &idx, wt)?;
+        checkout_merged_index(repo, wt, &old_index, &idx, true)?;
+        refresh_index_stat_cache_from_worktree(repo, &mut idx)?;
+    }
+
+    fs::write(
+        git_dir.join("ORIG_HEAD"),
+        format!("{}\n", head_oid.to_hex()),
+    )?;
+    repo.write_index(&mut idx)?;
+
+    let success_target = if let HeadState::Branch { refname, .. } = head {
+        let finish_branch = format!("{ra} (finish): {refname} onto {}", onto_oid.to_hex());
+        let finish_head = format!("{ra} (finish): returning to {refname}");
+        let _ = append_reflog(
+            git_dir,
+            refname,
+            &head_oid,
+            &onto_oid,
+            &ident,
+            &finish_branch,
+            false,
+        );
+        let _ = append_reflog(
+            git_dir,
+            "HEAD",
+            &onto_oid,
+            &onto_oid,
+            &ident,
+            &finish_head,
+            false,
+        );
+        let ref_path = git_dir.join(refname);
+        if let Some(parent) = ref_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&ref_path, format!("{}\n", onto_oid.to_hex()))?;
+        fs::write(git_dir.join("HEAD"), format!("ref: {refname}\n"))?;
+        refname.clone()
+    } else {
+        let finish_head = format!("{ra} (finish): returning to {}", onto_oid.to_hex());
+        let _ = append_reflog(
+            git_dir,
+            "HEAD",
+            &head_oid,
+            &onto_oid,
+            &ident,
+            &finish_head,
+            false,
+        );
+        fs::write(git_dir.join("HEAD"), format!("{}\n", onto_oid.to_hex()))?;
+        "HEAD".to_owned()
+    };
+
+    run_post_checkout_hook(repo, &head_oid, &onto_oid)?;
+    eprintln!("Successfully rebased and updated {success_target}.");
+    Ok(())
+}
+
 /// Resolve `A...B` in an `--onto` or synthesized `--keep-base` onto name to a single merge base.
 ///
 /// When `keep_base` is true, Git reports `'<upstream>': need exactly one merge base with branch`;
@@ -5030,6 +5132,11 @@ fn collect_rebase_todo_commits(
         return collect_commits_to_replay(repo, head, upstream);
     }
 
+    // Mirror Git's `sequencer_make_script`: walk `upstream..head` with `--cherry-mark`, then drop
+    // only commits that are patch-equivalent (`PATCHSAME`) *and not empty*. Commits that start
+    // empty must never be dropped by cherry detection — every empty commit has the same (empty)
+    // patch-id, so a plain `--cherry-pick` would wrongly drop begin-empty commits (t3421 -m/-i
+    // "keeps begin-empty commits"). Begin-empty handling is left to the keep-empty logic instead.
     let bases = merge_bases_first_vs_rest(repo, upstream, &[head])?;
     let negative: Vec<String> = bases.iter().map(|b| b.to_hex()).collect();
     let result = rev_list(
@@ -5037,7 +5144,7 @@ fn collect_rebase_todo_commits(
         &[upstream.to_hex(), head.to_hex()],
         &negative,
         &RevListOptions {
-            cherry_pick: true,
+            cherry_mark: true,
             right_only: true,
             left_right: true,
             symmetric_left: Some(upstream),
@@ -5047,7 +5154,15 @@ fn collect_rebase_todo_commits(
         },
     )?;
 
+    let cherry_equivalent = result.cherry_equivalent;
     let mut commits = result.commits;
+    commits.retain(|oid| {
+        if !cherry_equivalent.contains(oid) {
+            return true;
+        }
+        // Equivalent: drop unless the commit started empty.
+        is_commit_tree_unchanged(repo, oid).unwrap_or(false)
+    });
     commits.reverse();
     Ok(commits)
 }
@@ -5142,6 +5257,12 @@ fn filter_redundant_patch_commits(
         }
         let commit = parse_commit(&obj.data)?;
         if commit.parents.len() > 1 {
+            out.push(oid);
+            continue;
+        }
+        // Commits that start empty are never dropped by cherry-pick detection (all empty commits
+        // share the same empty patch-id); their fate is decided by keep-empty handling instead.
+        if is_commit_tree_unchanged(repo, &oid).unwrap_or(false) {
             out.push(oid);
             continue;
         }
@@ -6346,6 +6467,40 @@ fn cherry_pick_for_rebase(
     };
     let root_rebase = rb_dir.join("root").exists();
     let ws_fix_rule = load_ws_fix_rule_from_rebase_state(git_dir);
+
+    // Fast-forward a root-commit pick when HEAD is unborn (`rebase --root` without `--onto`, with
+    // fast-forward allowed). Git's sequencer fast-forwards picks where `!parent && unborn`
+    // (sequencer.c `do_pick_commit`), so a linear `rebase --root` reuses the original commits
+    // instead of rewriting them with fresh committer dates (t3421 "rebase --root on linear history
+    // is a no-op"). Forced rebases (`-f`/`--no-ff`/signoff/trailers) and whitespace fixups must
+    // still rewrite the root.
+    if todo_cmd == RebaseTodoCmd::Pick
+        && commit.parents.is_empty()
+        && head_at_empty_tree
+        && !force_rewrite_commits
+        && ws_fix_rule.is_none()
+        && !rebase_signoff(rb_dir)
+        && !rebase_has_explicit_trailers(rb_dir)
+    {
+        let old_index = load_index(repo)?;
+        let mut idx = Index::new();
+        idx.entries = tree_to_index_entries(repo, &commit_tree_oid, "")?;
+        idx.sort();
+        if let Some(wt) = &repo.work_tree {
+            preflight_cherry_pick_cwd_obstruction(repo, wt, &idx, &BTreeMap::new(), None)?;
+        }
+        repo.write_index(&mut idx)?;
+        if let Some(wt) = &repo.work_tree {
+            checkout_merged_index(repo, wt, &old_index, &idx, true)?;
+            refresh_index_stat_cache_from_worktree(repo, &mut idx)?;
+            repo.write_index(&mut idx)?;
+        }
+        fs::write(git_dir.join("HEAD"), format!("{}\n", commit_oid.to_hex()))?;
+        if record_rewrite {
+            record_rebase_in_rewritten_pending(git_dir, rb_dir, commit_oid, next_after_line)?;
+        }
+        return Ok(());
+    }
 
     // Already at the picked commit's parent tip — nothing to replay (matches Git's noop pick).
     // Fixup/squash must still run merge + message folding even when parent == HEAD.
