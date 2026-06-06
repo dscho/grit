@@ -7735,9 +7735,17 @@ fn merge_trees(
         if let Some(oe) = ours_entries.get(ours_new_path) {
             let clean_theirs_directory_side = criss_cross_outer_merge
                 && path_descendants_match(&base, &theirs_entries, ours_new_path);
+            // When the only thing theirs has under our rename destination is the rename
+            // *source* itself (e.g. ours renamed `sub/file` → `sub`, while theirs only
+            // modified `sub/file`), the directory `sub/` disappears once that one file is
+            // consumed by the rename. There is no real directory in the way, so let the
+            // rename handler content-merge the two versions (t6422 "disappearing dir").
+            let theirs_dir_is_only_rename_source =
+                only_tree_descendant_is(&theirs_entries, ours_new_path, base_path);
             if oe.mode != MODE_TREE
                 && path_has_tree_descendant(&theirs_entries, ours_new_path)
                 && !clean_theirs_directory_side
+                && !theirs_dir_is_only_rename_source
             {
                 // Their side has paths under our rename destination (e.g. `newfile/realfile`).
                 // A plain rename+content merge at `newfile` would clash with directory/file
@@ -8036,15 +8044,41 @@ fn merge_trees(
                                     | ContentMergeResult::BinaryConflict(content) => content,
                                 };
                                 conflict_files.push((new_path_str.clone(), conflict_content));
-                                conflict_descriptions.push(ConflictDescription {
-                                    kind: "rename/add",
-                                    body: format!("Merge conflict in {new_path_str}"),
-                                    subject_path: new_path_str.clone(),
-                                    remerge_anchor_path: Some(base_path_str),
-                                    rename_rr_ours_dest: None,
-                                    rename_rr_theirs_dest: None,
-                                    auto_merge_hint_path: None,
-                                });
+                                // If theirs' file at our rename destination is itself a rename
+                                // *target* (i.e. theirs renamed some other source → here), then
+                                // both sides renamed distinct sources to the same path: this is a
+                                // rename/rename(2to1), not a rename/add. With each side also
+                                // deleting the other's rename source, git reports it as
+                                // rename/rename + two rename/delete lines (t6422 rrdd #18).
+                                let theirs_src_to_dest = theirs_renames
+                                    .iter()
+                                    .find(|(_, dest)| dest.as_slice() == ours_new_path)
+                                    .map(|(src, _)| src.clone());
+                                if let Some(theirs_src) = theirs_src_to_dest {
+                                    let theirs_src_str =
+                                        String::from_utf8_lossy(&theirs_src).into_owned();
+                                    conflict_descriptions.push(ConflictDescription {
+                                        kind: "rename/rename",
+                                        body: format!(
+                                            "{base_path_str} renamed to {new_path_str} in {ours_label} and {theirs_src_str} renamed to {new_path_str} in {their_name}."
+                                        ),
+                                        subject_path: new_path_str.clone(),
+                                        remerge_anchor_path: Some(base_path_str),
+                                        rename_rr_ours_dest: None,
+                                        rename_rr_theirs_dest: None,
+                                        auto_merge_hint_path: None,
+                                    });
+                                } else {
+                                    conflict_descriptions.push(ConflictDescription {
+                                        kind: "rename/add",
+                                        body: format!("Merge conflict in {new_path_str}"),
+                                        subject_path: new_path_str.clone(),
+                                        remerge_anchor_path: Some(base_path_str),
+                                        rename_rr_ours_dest: None,
+                                        rename_rr_theirs_dest: None,
+                                        auto_merge_hint_path: None,
+                                    });
+                                }
                             }
                         } else {
                             let mut be_at_new = be.clone();
@@ -8361,6 +8395,11 @@ fn merge_trees(
                                 auto_merge_hint_path: None,
                             });
                         } else {
+                            // For a rename/rename(1to2) the source content is merged once and the
+                            // result placed at *both* destinations — EXCEPT for binary files, which
+                            // cannot be merged: each destination keeps its own side's version
+                            // (t6422 #25 "rename/rename(1to2) with a binary file").
+                            let mut binary_split: Option<(IndexEntry, IndexEntry)> = None;
                             let merged_entry = if let Some(be) = base.get(base_path) {
                                 let both_modified = oe.oid != be.oid && te.oid != be.oid;
                                 let merge_path = String::from_utf8_lossy(base_path).to_string();
@@ -8401,8 +8440,12 @@ fn merge_trees(
                                             e.mode = mode;
                                             e
                                         }
-                                        ContentMergeResult::Conflict(content)
-                                        | ContentMergeResult::BinaryConflict(content) => {
+                                        ContentMergeResult::BinaryConflict(_) => {
+                                            // Keep ours at ours_target, theirs at theirs_new_path.
+                                            binary_split = Some((oe.clone(), te.clone()));
+                                            oe.clone()
+                                        }
+                                        ContentMergeResult::Conflict(content) => {
                                             let oid = repo.odb.write(ObjectKind::Blob, &content)?;
                                             let mut e = oe.clone();
                                             e.oid = oid;
@@ -8413,12 +8456,24 @@ fn merge_trees(
                             } else {
                                 oe.clone()
                             };
-                            let mut ours_stage = merged_entry.clone();
+                            let (mut ours_stage, mut theirs_stage) =
+                                if let Some((ours_side, theirs_side)) = binary_split {
+                                    (ours_side, theirs_side)
+                                } else {
+                                    (merged_entry.clone(), merged_entry.clone())
+                                };
                             ours_stage.path = ours_target.clone();
-                            let mut theirs_stage = merged_entry.clone();
                             theirs_stage.path = theirs_new_path.clone();
                             stage_entry(&mut index, &ours_stage, 2);
                             stage_entry(&mut index, &theirs_stage, 3);
+                            // Working-tree content for each rename destination. By default this is
+                            // the once-merged source blob (the 1to2 renamed content). When the
+                            // *other* side additionally added a brand-new file at one of those
+                            // destinations (rename/rename(1to2) + add-dest, t6422 #16), the path is
+                            // also an add/add collision, so the working-tree file must hold the
+                            // two-way merge of the renamed content and the added file.
+                            let mut ours_target_content: Option<Vec<u8>> = None;
+                            let mut theirs_target_content: Option<Vec<u8>> = None;
                             if let Some(te_at_ours_target) = theirs_entries.get(ours_target) {
                                 if !base.contains_key(ours_target)
                                     && index.get(ours_target, 3).is_none()
@@ -8428,6 +8483,20 @@ fn merge_trees(
                                     stage_entry(&mut index, te_at_ours_target, 3);
                                     let ours_target_s =
                                         String::from_utf8_lossy(ours_target).into_owned();
+                                    ours_target_content = Some(two_way_conflict_blob(
+                                        repo,
+                                        &ours_target_s,
+                                        &ours_stage,
+                                        te_at_ours_target,
+                                        ours_label,
+                                        their_name,
+                                        diff_algorithm,
+                                        merge_renormalize,
+                                        ignore_all_space,
+                                        ignore_space_change,
+                                        ignore_space_at_eol,
+                                        ignore_cr_at_eol,
+                                    )?);
                                     conflict_descriptions.push(ConflictDescription {
                                         kind: "rename/add",
                                         body: format!("Merge conflict in {ours_target_s}"),
@@ -8441,14 +8510,60 @@ fn merge_trees(
                                     });
                                 }
                             }
-                            if let Ok(obj) = repo.odb.read(&merged_entry.oid) {
+                            // Symmetric add-dest: ours added a *new* file at theirs' rename
+                            // destination. Stage it at stage 2 of `theirs_new_path` so the index
+                            // records both the colliding add (ours) and the renamed content
+                            // (theirs) at that path.
+                            if let Some(oe_at_theirs_target) = ours_entries.get(theirs_new_path) {
+                                if !base.contains_key(theirs_new_path)
+                                    && index.get(theirs_new_path, 2).is_none()
+                                    && (oe_at_theirs_target.oid != te.oid
+                                        || oe_at_theirs_target.mode != te.mode)
+                                {
+                                    stage_entry(&mut index, oe_at_theirs_target, 2);
+                                    let theirs_target_s =
+                                        String::from_utf8_lossy(theirs_new_path).into_owned();
+                                    theirs_target_content = Some(two_way_conflict_blob(
+                                        repo,
+                                        &theirs_target_s,
+                                        oe_at_theirs_target,
+                                        &theirs_stage,
+                                        ours_label,
+                                        their_name,
+                                        diff_algorithm,
+                                        merge_renormalize,
+                                        ignore_all_space,
+                                        ignore_space_change,
+                                        ignore_space_at_eol,
+                                        ignore_cr_at_eol,
+                                    )?);
+                                    conflict_descriptions.push(ConflictDescription {
+                                        kind: "rename/add",
+                                        body: format!("Merge conflict in {theirs_target_s}"),
+                                        subject_path: theirs_target_s,
+                                        remerge_anchor_path: Some(
+                                            String::from_utf8_lossy(base_path).into_owned(),
+                                        ),
+                                        rename_rr_ours_dest: None,
+                                        rename_rr_theirs_dest: None,
+                                        auto_merge_hint_path: None,
+                                    });
+                                }
+                            }
+                            // Working-tree content per destination: for a binary split each side
+                            // keeps its own blob; otherwise both get the once-merged blob.
+                            let ours_data = repo.odb.read(&ours_stage.oid).ok().map(|o| o.data);
+                            let theirs_data = repo.odb.read(&theirs_stage.oid).ok().map(|o| o.data);
+                            if let Some(content) = ours_target_content.or(ours_data) {
                                 conflict_files.push((
                                     String::from_utf8_lossy(ours_target).to_string(),
-                                    obj.data.clone(),
+                                    content,
                                 ));
+                            }
+                            if let Some(content) = theirs_target_content.or(theirs_data) {
                                 conflict_files.push((
                                     String::from_utf8_lossy(theirs_new_path).to_string(),
-                                    obj.data,
+                                    content,
                                 ));
                             }
                         }
@@ -10215,6 +10330,50 @@ fn try_content_merge(
 }
 
 /// Try content merge for add/add conflicts (empty base).
+/// Two-way (empty-base) merge of `ours` and `theirs`, returning the working-tree blob bytes.
+///
+/// Used for add/add-style collisions where the working-tree file must hold the conflict-marked
+/// two-way merge of the two colliding versions (e.g. rename/rename(1to2) + add-dest). A clean
+/// merge returns the merged content; a conflict returns the conflict-marked content.
+#[allow(clippy::too_many_arguments)]
+fn two_way_conflict_blob(
+    repo: &Repository,
+    path_str: &str,
+    ours: &IndexEntry,
+    theirs: &IndexEntry,
+    ours_label: &str,
+    theirs_label: &str,
+    diff_algorithm: Option<&str>,
+    merge_renormalize: bool,
+    ignore_all_space: bool,
+    ignore_space_change: bool,
+    ignore_space_at_eol: bool,
+    ignore_cr_at_eol: bool,
+) -> Result<Vec<u8>> {
+    let content = match try_content_merge_add_add(
+        repo,
+        path_str,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        MergeFavor::None,
+        diff_algorithm,
+        merge_renormalize,
+        ignore_all_space,
+        ignore_space_change,
+        ignore_space_at_eol,
+        ignore_cr_at_eol,
+        None,
+    )? {
+        ContentMergeResult::Clean(oid, _) => repo.odb.read(&oid)?.data,
+        ContentMergeResult::Conflict(content) | ContentMergeResult::BinaryConflict(content) => {
+            content
+        }
+    };
+    Ok(content)
+}
+
 fn try_content_merge_add_add(
     repo: &Repository,
     path_str: &str,
@@ -10491,6 +10650,32 @@ fn path_has_unmerged_entries(index: &Index, path: &[u8]) -> bool {
 fn path_has_tree_descendant(map: &HashMap<Vec<u8>, IndexEntry>, path: &[u8]) -> bool {
     map.keys()
         .any(|k| k.len() > path.len() && k.starts_with(path) && k.get(path.len()) == Some(&b'/'))
+}
+
+/// Returns true when the only entry strictly under `path/` in `map` is exactly `expected`.
+///
+/// Used to detect the "disappearing directory" rename case: when ours renames
+/// `sub/file` → `sub` and theirs only touched `sub/file`, the directory `sub/` has no
+/// content other than the rename source, so it is not a genuine file/directory conflict.
+fn only_tree_descendant_is(
+    map: &HashMap<Vec<u8>, IndexEntry>,
+    path: &[u8],
+    expected: &[u8],
+) -> bool {
+    let mut found_expected = false;
+    for k in map.keys() {
+        let is_descendant =
+            k.len() > path.len() && k.starts_with(path) && k.get(path.len()) == Some(&b'/');
+        if !is_descendant {
+            continue;
+        }
+        if k.as_slice() == expected {
+            found_expected = true;
+        } else {
+            return false;
+        }
+    }
+    found_expected
 }
 
 fn path_descendants_match(
