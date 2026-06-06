@@ -4638,7 +4638,10 @@ Use '--' to separate paths from revisions, like this:\n\
     let (rebase_todo_lines, rebase_interactive) = if rebase_merges_on {
         // Do not use `collect_rebase_todo_commits` emptiness here: it walks first-parent chains only
         // and misses merge topology, which would incorrectly report "up to date" for `main` over `A`.
-        if head_oid == upstream_oid {
+        // For interactive rebases we must NOT short-circuit: git still opens the sequence editor so a
+        // script can add `merge`/`exec`/`label` lines even when there is nothing to pick (t3430
+        // `rebase -ir HEAD` with a `merge -C H G` script).
+        if head_oid == upstream_oid && !args.interactive {
             print_branch_up_to_date(&head);
             if let Some(ref oid) = autostash_oid {
                 apply_autostash_after_ff(&repo, oid)?;
@@ -5947,6 +5950,14 @@ fn replay_remaining(
                     let _ = fs::remove_file(rb_dir.join("current"));
                     let _ = fs::remove_file(rb_dir.join("current-cmd"));
                     let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
+                    // Consume the merge line into `done` before running it: git records the merge
+                    // command in `done` even when it fails (untracked-file block or conflict), while
+                    // a rescheduled failure also keeps it at the head of the todo (t3430 'failed
+                    // merge -C writes patch'). The commit being replayed is exposed as REBASE_HEAD.
+                    if rebase_interactive {
+                        append_interactive_rebase_done_line(rb_dir, todo[i])?;
+                    }
+                    let merge_head_commit = peel_to_commit_for_merge_base(repo, merge_oid)?;
                     let old_head = resolve_head(git_dir)?
                         .oid()
                         .cloned()
@@ -5992,6 +6003,9 @@ fn replay_remaining(
                             let _ = fs::remove_file(rb_dir.join("current"));
                             let _ = fs::remove_file(rb_dir.join("current-cmd"));
                             let _ = fs::remove_file(rb_dir.join("current-final-fixup"));
+                            // The conflicted merge stays at the head of the todo so the
+                            // `rebase --continue` merge path can commit it once resolved. Write a
+                            // `patch` for the conflicted merge and expose it as REBASE_HEAD (t3430).
                             let remaining_merge: Vec<&str> = todo[i..].to_vec();
                             let rem_body = remaining_merge.join("\n") + "\n";
                             let rem_n = count_rebase_todo_actionable_lines(&rem_body);
@@ -6005,6 +6019,11 @@ fn replay_remaining(
                             );
                             let merge_commit_oid_cf =
                                 peel_to_commit_for_merge_base(repo, merge_oid)?;
+                            fs::write(
+                                git_dir.join("REBASE_HEAD"),
+                                format!("{}\n", merge_commit_oid_cf.to_hex()),
+                            )?;
+                            let _ = write_rebase_patch_file(repo, rb_dir, &merge_commit_oid_cf);
                             let merge_obj_cf = repo.odb.read(&merge_commit_oid_cf)?;
                             let mc_cf = parse_commit(&merge_obj_cf.data)?;
                             let subj_cf = mc_cf.message.lines().next().unwrap_or("");
@@ -6020,6 +6039,9 @@ fn replay_remaining(
                             std::process::exit(1);
                         }
                         Ok(RebaseMergeReuseOutcome::Blocked) => {
+                            // Reschedule: keep the failed merge at the head of the todo so
+                            // `rebase --continue` retries it after the user fixes the worktree, and
+                            // expose the replayed merge commit as REBASE_HEAD (t3430).
                             let remaining_blk: Vec<&str> = todo[i..].to_vec();
                             let blk_body = remaining_blk.join("\n") + "\n";
                             let blk_n = count_rebase_todo_actionable_lines(&blk_body);
@@ -6027,6 +6049,10 @@ fn replay_remaining(
                             fs::write(rb_dir.join("git-rebase-todo"), &blk_body)?;
                             fs::write(rb_dir.join("msgnum"), "1")?;
                             fs::write(rb_dir.join("end"), blk_n.to_string())?;
+                            fs::write(
+                                git_dir.join("REBASE_HEAD"),
+                                format!("{}\n", merge_head_commit.to_hex()),
+                            )?;
                             std::process::exit(1);
                         }
                         Err(e) => {
@@ -8264,13 +8290,16 @@ fn do_continue() -> Result<()> {
     if interactive_continue && matches!(todo_cmd, RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash) {
         let head_tree = commit_tree_oid_for_rebase(&repo, head_oid)?;
         // A fixup/squash whose worktree matches HEAD's tree usually means its change is already
-        // folded in, so it is treated as a no-op and skipped. But a fixup/squash that *aborted* on
-        // an obstruction (its untracked file would be overwritten) was never applied and also leaves
+        // folded in, so it is treated as a no-op and skipped. But a fixup that *aborted* on an
+        // obstruction (its untracked file would be overwritten) was never applied and also leaves
         // the worktree equal to HEAD — yet re-applying it still amends the commit (t5407 "git rebase
         // with failed pick", whose trailing `fixup I` must map its old oid to the amended commit).
         // Only the obstruction sets the `obstructed-pick` marker, so fall through to re-apply only
-        // then; genuine empty fixups (no marker) keep the no-op shortcut.
-        if !rebase_pick_was_obstructed(&rb_dir, &current_oid)
+        // then; genuine empty fixups (no marker) keep the no-op shortcut. Squash is left on the
+        // baseline path: its editor-driven message folding does not re-run cleanly here.
+        let obstructed_fixup =
+            todo_cmd == RebaseTodoCmd::Fixup && rebase_pick_was_obstructed(&rb_dir, &current_oid);
+        if !obstructed_fixup
             && diff_index_to_tree(&repo.odb, &index, Some(&head_tree), false)
                 .map(|diffs| diffs.is_empty())
                 .unwrap_or(false)
@@ -8321,11 +8350,10 @@ fn do_continue() -> Result<()> {
         // Only the obstruction sets the `obstructed-pick` marker. When it matches, re-run the step so
         // it actually produces its commit and records the real old->new mapping for the post-rewrite
         // hook; otherwise the empty no-op record stands. `cherry_pick_for_rebase` reproduces picks
-        // and fixups/squashes (amending HEAD) alike.
-        let needs_reapply = matches!(
-            todo_cmd,
-            RebaseTodoCmd::Pick | RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash
-        ) && rebase_pick_was_obstructed(&rb_dir, &current_oid);
+        // and fixups (amending HEAD); squash keeps the baseline no-op path (its editor-driven message
+        // folding does not re-run cleanly here).
+        let needs_reapply = matches!(todo_cmd, RebaseTodoCmd::Pick | RebaseTodoCmd::Fixup)
+            && rebase_pick_was_obstructed(&rb_dir, &current_oid);
         if needs_reapply {
             // Consume the obstruction marker before re-running so a fresh obstruction on a later step
             // re-arms it cleanly and a stale value can never divert an unrelated continue.

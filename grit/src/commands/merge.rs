@@ -7611,14 +7611,18 @@ fn merge_trees(
                     e.path = od.clone();
                     e
                 } else {
-                    match try_content_merge(
+                    // This merged blob is placed at two colliding rename destinations and may be
+                    // further wrapped in an outer add/add conflict, so widen the conflict markers
+                    // by 1 (size 8) and use an empty base label, matching git's merge-ort
+                    // `handle_content_merge(..., 1 + 2*call_depth)` for the 1to2 collision cycle.
+                    match try_content_merge_ext(
                         repo,
                         &src_str,
                         be,
                         oe,
                         te,
                         &ours_marker,
-                        base_label,
+                        "",
                         &theirs_marker,
                         favor,
                         diff_algorithm,
@@ -7632,6 +7636,7 @@ fn merge_trees(
                         } else {
                             None
                         },
+                        1,
                     )? {
                         ContentMergeResult::Clean(oid, mode) => {
                             let mut e = oe.clone();
@@ -10155,6 +10160,7 @@ enum ContentMergeResult {
 }
 
 /// Try a content-level three-way merge for a single file.
+#[allow(clippy::too_many_arguments)]
 fn try_content_merge(
     repo: &Repository,
     path_str: &str,
@@ -10172,6 +10178,53 @@ fn try_content_merge(
     ignore_space_at_eol: bool,
     ignore_cr_at_eol: bool,
     auto_merge_paths: Option<&mut Vec<String>>,
+) -> Result<ContentMergeResult> {
+    try_content_merge_ext(
+        repo,
+        path_str,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        base_label,
+        theirs_label,
+        favor,
+        diff_algorithm,
+        merge_renormalize,
+        ignore_all_space,
+        ignore_space_change,
+        ignore_space_at_eol,
+        ignore_cr_at_eol,
+        auto_merge_paths,
+        0,
+    )
+}
+
+/// Three-way content merge with an optional `extra_marker_size` to widen conflict markers.
+///
+/// `extra_marker_size` matches git's `handle_content_merge` parameter: when a content merge
+/// feeds into a further content merge (rename/rename(1to2)/(2to1) collisions), the inner
+/// markers are widened by this amount so they nest unambiguously inside the outer conflict
+/// (t6422 mod6 #19, where the colliding-cycle merge uses size 8 instead of 7).
+#[allow(clippy::too_many_arguments)]
+fn try_content_merge_ext(
+    repo: &Repository,
+    path_str: &str,
+    base: &IndexEntry,
+    ours: &IndexEntry,
+    theirs: &IndexEntry,
+    ours_label: &str,
+    base_label: &str,
+    theirs_label: &str,
+    favor: MergeFavor,
+    diff_algorithm: Option<&str>,
+    merge_renormalize: bool,
+    ignore_all_space: bool,
+    ignore_space_change: bool,
+    ignore_space_at_eol: bool,
+    ignore_cr_at_eol: bool,
+    auto_merge_paths: Option<&mut Vec<String>>,
+    extra_marker_size: usize,
 ) -> Result<ContentMergeResult> {
     let base_obj = repo.odb.read(&base.oid)?;
     let ours_obj = repo.odb.read(&ours.oid)?;
@@ -10273,7 +10326,7 @@ fn try_content_merge(
         ours_label,
         theirs_label,
         &mut marker_warnings,
-    );
+    ) + extra_marker_size;
     for warning in marker_warnings {
         eprintln!("{warning}");
     }
