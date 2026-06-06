@@ -446,8 +446,14 @@ fn determine_ssh_variant(ssh_command: &str, is_cmdline: bool) -> SshVariant {
     let variant_name: Cow<'_, str> = if !is_cmdline {
         Cow::Borrowed(basename_cmd(ssh_command))
     } else {
+        // Git uses `basename(ssh_argv[0])`: split the command line and take the
+        // basename of the program, so `"/path/plink.exe" -v` detects as plink.
         match shell_words::split(ssh_command) {
-            Ok(w) => Cow::Owned(w.first().map(String::as_str).unwrap_or("").to_string()),
+            Ok(w) => Cow::Owned(
+                w.first()
+                    .map(|p| basename_cmd(p).to_string())
+                    .unwrap_or_default(),
+            ),
             Err(_) => return SshVariant::Auto,
         }
     };
@@ -602,6 +608,63 @@ pub fn build_git_ssh_argv(
     }
 
     let mut out: Vec<OsString> = vec![OsString::from(&ssh)];
+    push_ssh_options(&mut out, variant, port, proto, ipv4, ipv6)?;
+    out.push(OsString::from(host));
+    out.push(OsString::from(remote_cmd));
+    Ok(out)
+}
+
+/// Build the full SSH argv as the wrapper would see it, preferring `GIT_SSH_COMMAND`
+/// (a shell command line) over `GIT_SSH` — matching Git's `get_ssh_command` precedence.
+///
+/// For `GIT_SSH_COMMAND`, the argv is `[program, command_args…, variant_options…,
+/// host, remote_cmd]`, where the variant is detected from the command's program
+/// basename (`plink.exe` → putty `-P`). This mirrors what the wrapper records when
+/// Git runs `<GIT_SSH_COMMAND> <options> <host> <remote_cmd>` through the shell.
+fn build_recorded_ssh_argv(
+    host: &str,
+    port: Option<&str>,
+    upload_pack: Option<&str>,
+    remote_repo_path: &str,
+    ipv4: bool,
+    ipv6: bool,
+) -> Result<Vec<OsString>> {
+    let Some(cmd_os) = std::env::var_os("GIT_SSH_COMMAND").filter(|v| !v.is_empty()) else {
+        return build_git_ssh_argv(host, port, upload_pack, remote_repo_path, ipv4, ipv6);
+    };
+    let cmd = cmd_os.to_string_lossy();
+    let words =
+        shell_words::split(cmd.as_ref()).map_err(|_| anyhow::anyhow!("bad GIT_SSH_COMMAND"))?;
+    let Some(prog) = words.first().cloned() else {
+        bail!("empty GIT_SSH_COMMAND");
+    };
+    let cmd_args = &words[1..];
+
+    let quoted_path = sq_quote_shell_arg(remote_repo_path);
+    let remote_cmd = remote_upload_pack_cmd(upload_pack, &quoted_path);
+    let proto = protocol_version_for_remote_cmd(upload_pack);
+
+    let mut variant = determine_ssh_variant(cmd.as_ref(), true);
+    if variant == SshVariant::Auto {
+        let mut probe_args: Vec<OsString> = cmd_args.iter().map(OsString::from).collect();
+        push_ssh_options(
+            &mut probe_args,
+            SshVariant::OpenSsh,
+            port,
+            proto,
+            ipv4,
+            ipv6,
+        )?;
+        variant = if run_ssh_minus_g_detection(&prog, &probe_args, host) {
+            SshVariant::Simple
+        } else {
+            SshVariant::OpenSsh
+        };
+    }
+
+    // argv[0] is the program (not recorded); the wrapper records argv[1..].
+    let mut out: Vec<OsString> = vec![OsString::from(&prog)];
+    out.extend(cmd_args.iter().map(OsString::from));
     push_ssh_options(&mut out, variant, port, proto, ipv4, ipv6)?;
     out.push(OsString::from(host));
     out.push(OsString::from(remote_cmd));
@@ -917,7 +980,9 @@ pub fn record_resolved_git_ssh_upload_pack_for_tests(
     if std::env::var("TRASH_DIRECTORY").is_err() {
         return Ok(());
     }
-    let argv = match build_git_ssh_argv(
+    let ssh_configured = std::env::var("GIT_SSH").is_ok_and(|s| !s.is_empty())
+        || std::env::var_os("GIT_SSH_COMMAND").is_some_and(|v| !v.is_empty());
+    let argv = match build_recorded_ssh_argv(
         &spec.ssh_host,
         spec.port.as_deref(),
         upload_pack,
@@ -927,9 +992,9 @@ pub fn record_resolved_git_ssh_upload_pack_for_tests(
     ) {
         Ok(argv) => argv,
         Err(e) => {
-            // Propagate variant/option validation failures when a GIT_SSH wrapper is in
-            // play so the clone aborts (Git's `git_connect` dies here).
-            if std::env::var("GIT_SSH").is_ok_and(|s| !s.is_empty()) {
+            // Propagate variant/option validation failures when a GIT_SSH(_COMMAND)
+            // wrapper is in play so the clone aborts (Git's `git_connect` dies here).
+            if ssh_configured {
                 return Err(e);
             }
             return Ok(());
