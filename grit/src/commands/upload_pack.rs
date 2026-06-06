@@ -207,9 +207,12 @@ pub fn run(args: Args) -> Result<()> {
     let allow_reachable = config_bool(&config, "uploadpack.allowreachablesha1inwant");
     let allow_any = config_bool(&config, "uploadpack.allowanysha1inwant");
     if !allow_any {
-        let our_refs = our_ref_oids(&repo.git_dir);
+        // Advertised (non-hidden) tips are always fetchable. `allow_tip` additionally permits any
+        // ref tip including those hidden by `transfer.hideRefs` / `uploadpack.hideRefs`.
+        let advertised_tips = advertised_ref_oids(&repo.git_dir, &config);
+        let all_tips = our_ref_oids(&repo.git_dir);
         for w in &want_unique {
-            if our_refs.contains(w) {
+            if advertised_tips.contains(w) {
                 continue;
             }
             let exists = repo.odb.read(w).is_ok();
@@ -217,18 +220,20 @@ pub fn run(args: Args) -> Result<()> {
                 // Object not present at all — never our ref regardless of policy.
                 return reject_not_our_ref(&mut out, w);
             }
-            if allow_tip {
-                // Any existing object tip is acceptable.
+            if allow_tip && all_tips.contains(w) {
+                // `allow-tip-sha1-in-want`: a want for *any* ref tip (incl. hidden) is acceptable,
+                // but a non-tip object is not — it must still pass the reachable/reject checks
+                // below (t5516 'deny fetch unreachable SHA1, allowtipsha1inwant=true').
                 continue;
             }
-            if allow_reachable && is_reachable_from_our_refs(&repo, &our_refs, w) {
+            if allow_reachable && is_reachable_from_our_refs(&repo, &all_tips, w) {
                 continue;
             }
             // `check_non_tip`: without allow-reachable, a non-stateless client cannot legitimately
             // ask for a non-tip object, so reject immediately. A stateless client's choice may be
             // based on a stale advertisement, so it is given the benefit of a reachability check —
             // but with the default (deny) policy we still reject unreachable non-tips.
-            if !args.stateless_rpc || !is_reachable_from_our_refs(&repo, &our_refs, w) {
+            if !args.stateless_rpc || !is_reachable_from_our_refs(&repo, &all_tips, w) {
                 return reject_not_our_ref(&mut out, w);
             }
         }
@@ -635,6 +640,28 @@ fn our_ref_oids(git_dir: &Path) -> HashSet<ObjectId> {
     }
     if let Ok(entries) = refs::list_refs(git_dir, "refs/") {
         for (_name, oid) in entries {
+            set.insert(oid);
+        }
+    }
+    set
+}
+
+/// Collect the OIDs of tips that are actually *advertised* — every ref under `refs/` (plus HEAD)
+/// minus those hidden by `transfer.hideRefs` / `uploadpack.hideRefs`. These are the objects a
+/// default-policy client may `want` without any `allow-*-sha1-in-want` capability (mirrors
+/// upstream `mark_our_ref` over the advertised set).
+fn advertised_ref_oids(git_dir: &Path, config: &ConfigSet) -> HashSet<ObjectId> {
+    let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+    hidden.load_hidden_refs_from_config(config, "uploadpack");
+    let mut set: HashSet<ObjectId> = HashSet::new();
+    if let Ok(oid) = refs::resolve_ref(git_dir, "HEAD") {
+        set.insert(oid);
+    }
+    if let Ok(entries) = refs::list_refs(git_dir, "refs/") {
+        for (name, oid) in entries {
+            if hidden.ref_excluded(Some(&name), &name) {
+                continue;
+            }
             set.insert(oid);
         }
     }

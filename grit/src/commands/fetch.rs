@@ -1494,6 +1494,54 @@ fn append_tag_wants_for_cli_fetch(
 ///
 /// If `url_override` is Some, use it directly as the remote URL instead of
 /// looking it up in config.  This supports path-based remotes like `../one`.
+/// Client-side guard mirroring `fetch-pack.c`: refuse an explicit `want <oid>` for an unadvertised
+/// object *before* sending it, but ONLY when the server advertises none of the
+/// `allow{Tip,Reachable,Any}SHA1InWant` capabilities. When the server enables any of them the client
+/// sends the want and lets upload-pack validate it (so an unreachable/non-tip want is rejected
+/// server-side with `not our ref`, not pre-empted here) — see t5516 'deny fetch unreachable SHA1',
+/// whose final fetch with `allowReachableSHA1InWant=true` must surface `not our ref`.
+///
+/// `remote_all_refs` is the receiver's full ref list (all of `refs/`, unfiltered). An OID matching a
+/// *non-hidden* advertised tip (`transfer.hideRefs` / `uploadpack.hideRefs`) is always allowed.
+fn enforce_uploadpack_want_policy(
+    remote_repo: &Repository,
+    remote_all_refs: &[(String, ObjectId)],
+    oid: ObjectId,
+) -> Result<()> {
+    let remote_config =
+        ConfigSet::load(Some(&remote_repo.git_dir), false).unwrap_or_else(|_| ConfigSet::new());
+
+    // Non-hidden advertised tips are always fetchable.
+    let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+    hidden.load_hidden_refs_from_config(&remote_config, "uploadpack");
+    let is_advertised_tip = remote_all_refs
+        .iter()
+        .any(|(name, tip)| *tip == oid && !hidden.ref_excluded(Some(name), name));
+    if is_advertised_tip {
+        return Ok(());
+    }
+
+    let cfg_flag = |key: &str| -> bool {
+        remote_config
+            .get_bool(key)
+            .and_then(|r| r.ok())
+            .unwrap_or(false)
+    };
+    // If the server advertises any allow-*-sha1-in-want capability, defer to it: the client sends
+    // the want and upload-pack decides (and reports `not our ref` for a non-tip/unreachable OID).
+    if cfg_flag("uploadpack.allowAnySHA1InWant")
+        || cfg_flag("uploadpack.allowTipSHA1InWant")
+        || cfg_flag("uploadpack.allowReachableSHA1InWant")
+    {
+        return Ok(());
+    }
+
+    bail!(
+        "Server does not allow request for unadvertised object {}",
+        oid.to_hex()
+    );
+}
+
 fn fetch_remote(
     git_dir: &Path,
     config: &ConfigSet,
@@ -2097,10 +2145,32 @@ fn fetch_remote(
         let remote_nm = remote_name.to_owned();
         let has_cli_refspecs = !cli_owned.is_empty();
         let refetch = args.refetch;
+        let want_policy_proto_v0 = protocol_version < 2;
         let compute_wants = move |adv: &[(String, ObjectId)]| -> Result<Vec<ObjectId>> {
             if !cli_owned.is_empty() {
                 let mut wants =
                     crate::fetch_transport::collect_wants_cli(&remote_gd, adv, &cli_owned)?;
+                // Reject an explicit `want <oid>` for an unadvertised object up front (protocol v0/v1)
+                // unless the receiver enables `uploadpack.allow*SHA1InWant`. Doing this client-side
+                // (mirroring `fetch-pack.c`) avoids the upload-pack child rejecting mid-stream, which
+                // would otherwise surface as a broken-pipe abort (t5516 'fetch exact oid',
+                // 'peeled advertisements are not considered ref tips').
+                if want_policy_proto_v0 {
+                    if let Ok(rr) = open_repo(&remote_gd) {
+                        let all_refs = refs::list_refs(&remote_gd, "refs/").unwrap_or_default();
+                        for spec in &cli_owned {
+                            let src = spec
+                                .strip_prefix('+')
+                                .unwrap_or(spec)
+                                .split_once(':')
+                                .map(|(a, _)| a)
+                                .unwrap_or_else(|| spec.strip_prefix('+').unwrap_or(spec));
+                            if let Ok(oid) = ObjectId::from_hex(src) {
+                                enforce_uploadpack_want_policy(&rr, &all_refs, oid)?;
+                            }
+                        }
+                    }
+                }
                 if should_fetch_tags {
                     append_follow_tags_for_wants(&local_git, &remote_gd, &mut wants)?;
                 }
@@ -2684,6 +2754,17 @@ fn fetch_remote(
             // Resolve source: full OID, ref name, or short branch/tag (match `collect_wants_cli`).
             let (remote_oid, resolved_remote_ref): (ObjectId, Option<String>) =
                 if let Ok(oid) = ObjectId::from_hex(src.as_str()) {
+                    // An explicit `want <oid>` for an object that is not an advertised ref tip is
+                    // rejected by upload-pack unless the server enables one of the
+                    // `uploadpack.allow{Tip,Reachable,Any}SHA1InWant` policies. Protocol v2 always
+                    // allows fetching unadvertised objects, so only enforce this for v0/v1
+                    // (t5516 'fetch exact oid', 'shallow fetch reachable SHA1', 'deny ...',
+                    // 'peeled advertisements are not considered ref tips').
+                    if protocol_version < 2 {
+                        if let Some(rr) = remote_repo {
+                            enforce_uploadpack_want_policy(rr, &remote_all_refs, oid)?;
+                        }
+                    }
                     (oid, None)
                 } else {
                     let resolved_ref = resolve_advertised_ref_for_fetch_src(
