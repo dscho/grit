@@ -2026,6 +2026,46 @@ pub fn build_thin_push_pack(
     build_thin_push_pack_from_have_set(local_repo, push_tips, &have_roots)
 }
 
+/// Build a thin push pack whose negative (`--not`) boundary is restricted to the objects reachable
+/// from the receiver's *advertised* refs (i.e. excluding any ref hidden by
+/// `transfer.hideRefs` / `receive.hideRefs`).
+///
+/// Mirrors real Git's wire push: receive-pack advertises only non-hidden refs, so a non-negotiating
+/// pusher can only treat the advertised ref tips as "have". Objects that live in the receiver's
+/// object store but are reachable solely from a hidden ref are therefore *re-sent*. The
+/// direct-object-membership shortcut in [`build_thin_push_pack`] would wrongly exclude them
+/// (t5516 'push without negotiation').
+pub fn build_thin_push_pack_excluding_hidden(
+    local_repo: &Repository,
+    push_tips: &[ObjectId],
+    remote_git_dir: &Path,
+    hidden: &grit_lib::ref_exclusions::RefExclusions,
+) -> Result<Vec<u8>> {
+    if push_tips.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // The advertised ref tips define the negative boundary. Marking just these OIDs as `--not`
+    // roots makes pack-objects walk their reachable closure and exclude exactly those objects,
+    // which is what a real (non-negotiating) push computes from the advertisement.
+    let mut have_roots: BTreeSet<ObjectId> = BTreeSet::new();
+    if let Ok(empty_tree) = ObjectId::from_hex("4b825dc642cb6eb9a060e54bf8d69288fbee4904") {
+        have_roots.insert(empty_tree);
+    }
+    if let Ok(remote_refs) = refs::list_refs(remote_git_dir, "refs/") {
+        for (refname, oid) in remote_refs {
+            if hidden.ref_excluded(Some(&refname), &refname) {
+                continue;
+            }
+            // Only refs whose closure we actually have locally can serve as a thin-pack base.
+            if have_root_closure_is_local(local_repo, &oid) {
+                have_roots.insert(oid);
+            }
+        }
+    }
+    build_thin_push_pack_from_have_set(local_repo, push_tips, &have_roots)
+}
+
 /// Compute the set of object IDs the local-push receiver already has (the `--not`/negative side of
 /// a thin push pack), restricted to those whose closure is also present locally.
 ///

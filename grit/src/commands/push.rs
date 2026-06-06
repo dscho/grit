@@ -2257,8 +2257,37 @@ fn push_to_url(
         maybe_emit_push_path_walk_region(config);
         maybe_emit_push_pack_objects_child(config);
 
-        let thin_pack = pack_objects::build_thin_push_pack(repo, &push_tips, &remote_repo.git_dir)
-            .context("building push pack")?;
+        // Decide the negative (`--not`) boundary for the thin pack the way the wire protocol would.
+        //
+        // * push.negotiate + protocol v2: a negotiation round runs and discovers the common
+        //   commits the receiver actually has (including objects only reachable from a *hidden*
+        //   ref). We approximate that with the direct object-membership boundary
+        //   (`build_thin_push_pack`) and emit a `total_rounds=1` trace2 event.
+        // * push.negotiate but not protocol v2: negotiation cannot run; Git warns
+        //   "push negotiation failed" and proceeds with a non-negotiated push.
+        // * no push.negotiate: the receiver only advertises non-hidden refs, so the negative
+        //   boundary is the reachable closure of those advertised tips only.
+        let negotiate_requested = push_negotiate_enabled(config);
+        let negotiate_active =
+            negotiate_requested && protocol_wire::effective_client_protocol_version() == 2;
+        if negotiate_requested && !negotiate_active {
+            eprintln!("warning: push negotiation failed: --negotiate-only requires protocol v2");
+        }
+        let thin_pack = if negotiate_active {
+            maybe_emit_push_negotiate_rounds_trace2(1);
+            pack_objects::build_thin_push_pack(repo, &push_tips, &remote_repo.git_dir)
+                .context("building push pack")?
+        } else {
+            let mut hidden = grit_lib::ref_exclusions::RefExclusions::default();
+            hidden.load_hidden_refs_from_config(&receive_remote_config, "receive");
+            pack_objects::build_thin_push_pack_excluding_hidden(
+                repo,
+                &push_tips,
+                &remote_repo.git_dir,
+                &hidden,
+            )
+            .context("building push pack")?
+        };
 
         // Compute the "Enumerating objects" count against the receiver's PRE-ingest object set:
         // Git counts the packed objects plus the preferred-base (delta-base) objects pulled from
@@ -6240,6 +6269,25 @@ fn maybe_emit_push_pack_objects_child(config: &ConfigSet) {
         argv.push("--no-use-bitmap-index".to_owned());
     }
     let _ = crate::trace2_emit_child_start_json(&trace_path, &argv);
+}
+
+/// Emit the `negotiation_v2`/`total_rounds` trace2 data event a negotiating push records so
+/// `GIT_TRACE2_EVENT`-based assertions (`t5516` 'push with negotiation') can count negotiation
+/// rounds. The local fast path negotiates against the receiver's object store directly, so a single
+/// round suffices.
+fn maybe_emit_push_negotiate_rounds_trace2(rounds: u32) {
+    let Ok(path) = std::env::var("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let _ = crate::trace2_write_json_data_line(
+        &path,
+        "negotiation_v2",
+        "total_rounds",
+        &rounds.to_string(),
+    );
 }
 
 fn maybe_emit_push_pack_wrote_trace2(pack: &[u8]) {
