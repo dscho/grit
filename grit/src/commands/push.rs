@@ -473,10 +473,8 @@ fn effective_push_recurse_submodules(
     args: &Args,
     config: &ConfigSet,
 ) -> Result<PushRecurseSubmodules> {
+    // Config provides the baseline; command-line flags always override it.
     let mut mode = PushRecurseSubmodules::Off;
-    if args.no_recurse_submodules {
-        mode = PushRecurseSubmodules::Off;
-    }
     if let Some(v) = config
         .get("push.recurseSubmodules")
         .or_else(|| config.get("push.recursesubmodules"))
@@ -488,21 +486,38 @@ fn effective_push_recurse_submodules(
             mode = PushRecurseSubmodules::OnDemand;
         }
     }
-    if std::env::var("GRIT_PUSH_RECURSE_ONLY_IS_ON_DEMAND")
+
+    // Command-line `--recurse-submodules=<mode>` tokens override config (last wins).
+    //
+    // The special `only-is-on-demand` token (set by Git/grit when recursing from an `only`
+    // parent push) is NOT a recurse value: it leaves the current mode untouched *unless* that
+    // mode is `only`, in which case it becomes `on-demand` (matching Git's
+    // `option_parse_recurse_submodules`). This is also signalled via the
+    // `GRIT_PUSH_RECURSE_ONLY_IS_ON_DEMAND` env var so it survives the process boundary, and it
+    // must NOT force on-demand for a submodule whose own config does not request recursion.
+    let mut only_is_on_demand = std::env::var("GRIT_PUSH_RECURSE_ONLY_IS_ON_DEMAND")
         .ok()
         .as_deref()
-        == Some("1")
-    {
-        if mode == PushRecurseSubmodules::Only {
-            eprintln!(
-                "warning: recursing into submodule with push.recurseSubmodules=only; using on-demand instead"
-            );
-        }
-        mode = PushRecurseSubmodules::OnDemand;
-    }
+        == Some("1");
     for token in &args.recurse_submodules {
+        if token.trim() == "only-is-on-demand" {
+            only_is_on_demand = true;
+            continue;
+        }
         mode = parse_push_recurse_submodules_arg("--recurse-submodules", token)
             .map_err(|e| anyhow::anyhow!(e))?;
+    }
+    if only_is_on_demand && mode == PushRecurseSubmodules::Only {
+        eprintln!(
+            "warning: recursing into submodule with push.recurseSubmodules=only; using on-demand instead"
+        );
+        mode = PushRecurseSubmodules::OnDemand;
+    }
+
+    // `--no-recurse-submodules` is the command-line negation; it overrides config and any prior
+    // `--recurse-submodules` on the command line, so it must be applied last.
+    if args.no_recurse_submodules {
+        mode = PushRecurseSubmodules::Off;
     }
     Ok(mode)
 }
@@ -612,7 +627,6 @@ pub fn run(args: Args) -> Result<()> {
     let remote_name_owned: String;
     let remote_is_configured_name: bool;
     let urls: Vec<String>;
-    let path_style_remote: bool;
 
     if let Some(ref r) = args.remote {
         if r.is_empty() {
@@ -628,24 +642,22 @@ pub fn run(args: Args) -> Result<()> {
             // configured remote name (matches Git: t5507-remote-environment).
             remote_is_configured_name = false;
             let rewritten = grit_lib::url_rewrite::rewrite_push_url(&config, r);
-            path_style_remote = url_looks_like_local_path(&rewritten);
             remote_name_owned = r.clone();
             urls = vec![rewritten];
         } else {
             remote_is_configured_name = true;
             remote_name_owned = r.clone();
-            let (resolved_urls, looks_like_path) = resolve_remote_urls(&config, &remote_name_owned)
-                .with_context(|| format!("remote '{}' not found", remote_name_owned))?;
+            let (resolved_urls, _looks_like_path) =
+                resolve_remote_urls(&config, &remote_name_owned)
+                    .with_context(|| format!("remote '{}' not found", remote_name_owned))?;
             urls = resolved_urls;
-            path_style_remote = looks_like_path;
         }
     } else {
         remote_is_configured_name = true;
         remote_name_owned = infer_implicit_push_remote(&config, current_branch.as_deref());
-        let (resolved_urls, looks_like_path) = resolve_remote_urls(&config, &remote_name_owned)
+        let (resolved_urls, _looks_like_path) = resolve_remote_urls(&config, &remote_name_owned)
             .with_context(|| format!("remote '{}' not found", remote_name_owned))?;
         urls = resolved_urls;
-        path_style_remote = looks_like_path;
     };
     let remote_name = remote_name_owned.as_str();
     let remote_mirror = remote_is_configured_name
@@ -683,7 +695,7 @@ pub fn run(args: Args) -> Result<()> {
             push_all,
             effective_mirror,
             &push_refspecs_from_config,
-            path_style_remote,
+            remote_is_configured_name,
             cli_force_enabled,
         )?;
     }
@@ -966,7 +978,7 @@ fn push_to_url(
     push_all: bool,
     effective_mirror: bool,
     push_refspecs_from_config: &[String],
-    path_style_remote: bool,
+    remote_is_configured_name: bool,
     cli_force_enabled: bool,
 ) -> Result<()> {
     if url.starts_with("ext::") {
@@ -1654,10 +1666,11 @@ fn push_to_url(
             PushRecurseSubmodules::OnDemand | PushRecurseSubmodules::Only
         ) {
             let super_head_branch = head_ref_short_name(&repo.git_dir)?;
-            let nested_only = std::env::var("GRIT_PUSH_RECURSE_ONLY_IS_ON_DEMAND")
-                .ok()
-                .as_deref()
-                == Some("1");
+            // Git's `push_submodule` unconditionally passes `--recurse-submodules=only-is-on-demand`
+            // to every child push, so the submodule uses its OWN recurse config but a child whose
+            // config is `only` is treated as `on-demand` (a plain `only` child cannot push the
+            // superproject). We therefore always set this when recursing.
+            let nested_only = true;
             let to_push = find_unpushed_submodule_paths(
                 repo,
                 &tips,
@@ -1686,7 +1699,12 @@ fn push_to_url(
                     &super_head_branch,
                     detached,
                 );
-                if !path_style_remote {
+                // Git only validates and propagates the remote name + refspec to the submodule
+                // push when the superproject's remote is a *configured* remote (not an anonymous
+                // URL): `push_unpushed_submodules` gates both on `remote->origin !=
+                // REMOTE_UNCONFIGURED`. For an anonymous URL push the submodule relies on its own
+                // configured upstream instead.
+                if remote_is_configured_name {
                     validate_submodule_push_refspecs(
                         &sub_repo.git_dir,
                         &super_head_branch,
@@ -1697,10 +1715,10 @@ fn push_to_url(
                 if !args.quiet {
                     eprintln!("Pushing submodule '{sub_path}'");
                 }
-                let remote_specs = if path_style_remote {
-                    None
-                } else {
+                let remote_specs = if remote_is_configured_name {
                     Some((remote_name, sub_refspecs_effective.as_slice()))
+                } else {
+                    None
                 };
                 run_nested_submodule_push(
                     &wd,
@@ -2396,8 +2414,6 @@ fn push_to_url(
                     PushRefStatus::RejectAlreadyExists
                 } else if msg.contains("remote contains work that you do not") {
                     PushRefStatus::RejectNonFastForward
-                } else if msg == "shallow update not allowed" {
-                    PushRefStatus::RemoteRejected
                 } else {
                     PushRefStatus::RemoteRejected
                 };
