@@ -635,14 +635,321 @@ fn rev_list_bisect_candidates(
 ) -> Result<(Vec<ObjectId>, bool)> {
     let positive = vec![bad.to_string()];
     let negative: Vec<String> = goods.iter().map(|g| g.to_string()).collect();
+    // Git's bisect builds a topo-limited revision walk; the candidate order does not affect
+    // weight-based selection, and topo ordering sidesteps the path-limited date-order walk.
     let opts = RevListOptions {
         first_parent,
         paths: pathspecs.to_vec(),
-        ordering: OrderingMode::Default,
+        ordering: OrderingMode::Topo,
         ..Default::default()
     };
     let result = rev_list(repo, &positive, &negative, &opts)?;
     Ok((result.commits, true))
+}
+
+/// One bisection candidate ranked by weight, mirroring Git's `commit_dist`.
+#[derive(Clone, Copy)]
+struct BisectRank {
+    oid: ObjectId,
+    /// Number of candidates reachable from `oid` (Git's `weight`, including `oid`).
+    reaches: usize,
+    /// Bisection distance `min(reaches, all - reaches)`.
+    distance: usize,
+}
+
+/// Parents of `oid`, restricted by `first_parent`.
+fn commit_parents(repo: &Repository, oid: ObjectId, first_parent: bool) -> Result<Vec<ObjectId>> {
+    let object = repo.odb.read(&oid)?;
+    if object.kind != ObjectKind::Commit {
+        return Ok(Vec::new());
+    }
+    let commit = parse_commit(&object.data)?;
+    if first_parent {
+        Ok(commit.parents.into_iter().take(1).collect())
+    } else {
+        Ok(commit.parents)
+    }
+}
+
+/// Number of candidates reachable from `oid` (the commit's bisection weight), walking the full
+/// ancestry and counting only commits in `candidate_set` (Git's `count_distance`). Intermediate
+/// commits that are `TREESAME` to a parent are walked through but absent from the set and so not
+/// counted.
+fn count_reaches(
+    repo: &Repository,
+    oid: ObjectId,
+    candidate_set: &HashSet<ObjectId>,
+    first_parent: bool,
+) -> Result<usize> {
+    let mut stack = vec![oid];
+    let mut visited = HashSet::new();
+    let mut reaches = 0usize;
+    while let Some(current) = stack.pop() {
+        if !visited.insert(current) {
+            continue;
+        }
+        if candidate_set.contains(&current) {
+            reaches += 1;
+        }
+        for parent in commit_parents(repo, current, first_parent)? {
+            stack.push(parent);
+        }
+    }
+    Ok(reaches)
+}
+
+/// Git's `approx_halfway`: is `weight` within one of the exact halfway point of `nr`?
+fn approx_halfway(weight: usize, nr: usize) -> bool {
+    let diff = 2 * weight as i64 - nr as i64;
+    if (-1..=1).contains(&diff) {
+        return true;
+    }
+    nr >= 1024 && diff.unsigned_abs() < (nr as u64) / 1024
+}
+
+/// Outcome of [`find_bisection`]: the per-candidate ranks plus the single best revision chosen by
+/// Git's non-`FIND_BISECTION_ALL` walk.
+struct Bisection {
+    /// Per-candidate ranks, sorted as Git's `best_bisection_sorted` (distance desc, oid asc).
+    ranks: Vec<BisectRank>,
+    /// Best revision chosen by the non-`ALL` `best_bisection`/`approx_halfway` walk.
+    best: Option<ObjectId>,
+    /// Weight (reaches) of `best`.
+    best_reaches: usize,
+}
+
+/// Port of Git's `find_bisection` + `do_find_bisection` (`bisect.c`).
+///
+/// `candidates` is the testable commit set in rev-list (newest-first) order. Weights are computed
+/// over the full ancestry. The non-`ALL` best is found via the same ordered `approx_halfway`
+/// early-out and `best_bisection` fallback that Git uses, so the chosen midpoint matches
+/// `git rev-list --bisect`. The returned `ranks` are sorted like `--bisect-all` for skip handling.
+fn find_bisection(
+    repo: &Repository,
+    candidates: &[ObjectId],
+    first_parent: bool,
+) -> Result<Bisection> {
+    let nr = candidates.len();
+    let candidate_set: HashSet<ObjectId> = candidates.iter().copied().collect();
+
+    // Git reverses the (newest-first) rev-list into oldest-first before the weight walk.
+    let list: Vec<ObjectId> = candidates.iter().rev().copied().collect();
+
+    // weight: 0+ known, -1 single-parent unknown, -2 merge unknown.
+    let mut weight: std::collections::HashMap<ObjectId, i64> = std::collections::HashMap::new();
+    let mut interesting_parents: std::collections::HashMap<ObjectId, Vec<ObjectId>> =
+        std::collections::HashMap::new();
+    for &oid in &list {
+        let parents: Vec<ObjectId> = commit_parents(repo, oid, first_parent)?
+            .into_iter()
+            .filter(|p| candidate_set.contains(p))
+            .collect();
+        let w = match parents.len() {
+            0 => 1,
+            1 => -1,
+            _ => -2,
+        };
+        weight.insert(oid, w);
+        interesting_parents.insert(oid, parents);
+    }
+
+    let mut best: Option<ObjectId> = None;
+
+    // Resolve merge (-2) weights via count_distance, with the non-ALL halfway early-out.
+    for &oid in &list {
+        if weight[&oid] != -2 {
+            continue;
+        }
+        let w = count_reaches(repo, oid, &candidate_set, first_parent)? as i64;
+        weight.insert(oid, w);
+        if best.is_none() && approx_halfway(w as usize, nr) {
+            best = Some(oid);
+        }
+    }
+
+    // Propagate single-parent (-1) weights, again with the halfway early-out.
+    let mut counted = list.iter().filter(|o| weight[o] >= 0).count();
+    while counted < nr {
+        let mut progressed = false;
+        for &oid in &list {
+            if weight[&oid] >= 0 {
+                continue;
+            }
+            let parent = interesting_parents[&oid]
+                .iter()
+                .copied()
+                .find(|p| weight.get(p).copied().unwrap_or(-1) >= 0);
+            let Some(parent) = parent else {
+                continue;
+            };
+            let pw = weight[&parent];
+            weight.insert(oid, pw + 1);
+            counted += 1;
+            progressed = true;
+            if best.is_none() && approx_halfway((pw + 1) as usize, nr) {
+                best = Some(oid);
+            }
+        }
+        if !progressed {
+            break;
+        }
+    }
+
+    // Build ranks (distance desc, oid asc) for skip handling.
+    let mut ranks: Vec<BisectRank> = list
+        .iter()
+        .map(|&oid| {
+            let reaches = weight[&oid].max(0) as usize;
+            BisectRank {
+                oid,
+                reaches,
+                distance: reaches.min(nr.saturating_sub(reaches)),
+            }
+        })
+        .collect();
+    ranks.sort_by(|a, b| b.distance.cmp(&a.distance).then_with(|| a.oid.cmp(&b.oid)));
+
+    // No early-out: Git's `best_bisection` keeps the first list (oldest-first) commit with strictly
+    // greater distance.
+    if best.is_none() {
+        let mut best_distance: i64 = -1;
+        for &oid in &list {
+            let reaches = weight[&oid].max(0) as usize;
+            let distance = reaches.min(nr.saturating_sub(reaches)) as i64;
+            if distance > best_distance {
+                best = Some(oid);
+                best_distance = distance;
+            }
+        }
+    }
+
+    let best_reaches = best.map(|o| weight[&o].max(0) as usize).unwrap_or(0);
+    Ok(Bisection {
+        ranks,
+        best,
+        best_reaches,
+    })
+}
+
+/// Pseudo-random generator from Git's `bisect.c` (`get_prn`); wrapping `u32` arithmetic.
+fn get_prn(count: u32) -> u32 {
+    let count = count.wrapping_mul(1103515245).wrapping_add(12345);
+    (count / 65536) % 32768
+}
+
+/// Integer square root via Newton's method, matching Git's `sqrti` in `bisect.c`.
+fn sqrti(val: i32) -> i32 {
+    if val == 0 {
+        return 0;
+    }
+    let mut x = val as f32;
+    loop {
+        let y = (x + val as f32 / x) / 2.0;
+        let d = if y > x { y - x } else { x - y };
+        x = y;
+        if d < 0.5 {
+            break;
+        }
+    }
+    x as i32
+}
+
+/// Port of Git's `skip_away` (`bisect.c`): pick a candidate away from the (skipped) head of the
+/// weight-sorted, skip-filtered list, deterministically based on the number of remaining commits.
+fn skip_away(list: &[ObjectId], count: usize, current_bad: ObjectId) -> ObjectId {
+    if list.is_empty() {
+        return current_bad;
+    }
+    let prn = get_prn(count as u32);
+    let index =
+        ((count as u64 * prn as u64 / 32768) as i32 * sqrti(prn as i32) / sqrti(32768)) as usize;
+
+    let mut result = 0usize;
+    let mut previous: Option<usize> = None;
+    for (i, &oid) in list.iter().enumerate() {
+        if i == index {
+            if oid != current_bad {
+                result = i;
+            } else if let Some(prev) = previous {
+                result = prev;
+            } else {
+                result = 0;
+            }
+            break;
+        }
+        previous = Some(i);
+    }
+    list[result]
+}
+
+/// Result of applying `managed_skipped` to a weight-sorted candidate list.
+struct ManagedSkipped {
+    /// Commit to test next (best non-skipped, possibly chosen via `skip_away`), or `None` if
+    /// every candidate is skipped.
+    next: Option<ObjectId>,
+    /// Skipped commits collected from the front of the list (Git's `tried`).
+    tried: Vec<ObjectId>,
+}
+
+/// Port of Git's `managed_skipped` + `filter_skipped` (`bisect.c`).
+///
+/// `sorted` is the full weight-sorted candidate list (best first, as produced with
+/// `FIND_BISECTION_ALL`). When the best candidate is not skipped it is returned directly with an
+/// empty `tried`. Otherwise every skipped commit is collected into `tried`, the non-skipped
+/// commits are gathered, and `skip_away` chooses one to test (or `next` is `None` when none remain).
+fn managed_skipped(
+    sorted: &[ObjectId],
+    skip_oids: &HashSet<ObjectId>,
+    current_bad: ObjectId,
+) -> ManagedSkipped {
+    if skip_oids.is_empty() {
+        return ManagedSkipped {
+            next: sorted.first().copied(),
+            tried: Vec::new(),
+        };
+    }
+
+    // filter_skipped(list, &tried, show_all=0, &count, &skipped_first)
+    let mut tried = Vec::new();
+    let mut filtered = Vec::new();
+    let mut skipped_first = false;
+    let mut seen_any = false;
+    for &oid in sorted {
+        if skip_oids.contains(&oid) {
+            if !seen_any {
+                skipped_first = true;
+            }
+            tried.push(oid);
+        } else {
+            if !skipped_first {
+                // Shortcut: first (best) commit is not skipped — return it directly.
+                return ManagedSkipped {
+                    next: Some(oid),
+                    tried: Vec::new(),
+                };
+            }
+            filtered.push(oid);
+        }
+        seen_any = true;
+    }
+
+    if !skipped_first {
+        // No commit was skipped at the front; behave like the non-skip path.
+        return ManagedSkipped {
+            next: filtered
+                .first()
+                .copied()
+                .or_else(|| sorted.first().copied()),
+            tried,
+        };
+    }
+
+    let next = if filtered.is_empty() {
+        None
+    } else {
+        Some(skip_away(&filtered, filtered.len(), current_bad))
+    };
+    ManagedSkipped { next, tried }
 }
 
 fn bisect_skipped_commits_log(
@@ -652,6 +959,9 @@ fn bisect_skipped_commits_log(
     candidates: &[ObjectId],
     bad: ObjectId,
 ) -> Result<()> {
+    // Git's `bisect_skipped_commits` re-runs the `bad ^good` rev-walk and lists every commit it
+    // yields (the candidate set already includes `bad`); it does not print `bad` separately.
+    let _ = bad;
     append_bisect_log_raw(git_dir, "# only skipped commits left to test")?;
     for oid in candidates {
         let subject = commit_subject_line(repo, *oid)?;
@@ -663,14 +973,6 @@ fn bisect_skipped_commits_log(
             ),
         )?;
     }
-    append_bisect_log_raw(
-        git_dir,
-        &format!(
-            "# possible first {} commit: [{bad}] {}",
-            terms.term_bad,
-            commit_subject_line(repo, bad)?
-        ),
-    )?;
     Ok(())
 }
 
@@ -734,43 +1036,54 @@ fn bisect_next_all(repo: &Repository, git_dir: &Path, terms: &BisectTerms) -> Re
         .join("BISECT_FIRST_PARENT")
         .exists();
     let pathspecs = read_bisect_pathspecs(git_dir)?;
-    let (candidates, from_rev_list) =
+    let (candidates, _) =
         rev_list_bisect_candidates(repo, git_dir, bad, &goods, &pathspecs, first_parent)?;
     let skip_oids = read_bisect_skip_refs(git_dir)?;
 
-    let bad_is_skip = skip_oids.contains(&bad);
-    let unskipped: Vec<ObjectId> = candidates
-        .iter()
-        .copied()
-        .filter(|o| !skip_oids.contains(o))
-        .collect();
+    // Git's find_bisection: `all` counts the testable commits and ranks them by bisection distance.
+    // Without skips it returns a single best (non-`ALL` `best_bisection`); with skips it returns the
+    // full `best_bisection_sorted` list (distance desc, oid asc) so `managed_skipped` can pick a
+    // commit away from skipped ones. `reaches` is the weight of that best candidate.
+    let bisection = find_bisection(repo, &candidates, first_parent)?;
+    let all = candidates.len();
+    let sorted: Vec<ObjectId> = bisection.ranks.iter().map(|e| e.oid).collect();
 
-    if candidates.is_empty() {
-        if !pathspecs.is_empty() {
+    let (managed, reaches) = if skip_oids.is_empty() {
+        (
+            ManagedSkipped {
+                next: bisection.best,
+                tried: Vec::new(),
+            },
+            bisection.best_reaches,
+        )
+    } else {
+        // ALL mode: `reaches` is the weight of the head of the sorted list (Git's `best`).
+        let reaches = bisection.ranks.first().map(|r| r.reaches).unwrap_or(0);
+        (managed_skipped(&sorted, &skip_oids, bad), reaches)
+    };
+
+    // With pathspecs, Git's `revs.commits` still contains the in-range commits even when none of
+    // them touch the paths (they are `TREESAME`, so `all` is 0). Our path-filtered candidate list
+    // is empty in that case, so distinguish "no testable commit" (range non-empty, paths match
+    // nothing) from "was both good and bad" (range genuinely empty) by re-checking the unfiltered
+    // range. This mirrors Git emitting BISECT_NO_TESTABLE_COMMIT before the `!revs.commits` path.
+    if !pathspecs.is_empty() && candidates.is_empty() {
+        let (unfiltered, _) =
+            rev_list_bisect_candidates(repo, git_dir, bad, &goods, &[], first_parent)?;
+        if !unfiltered.is_empty() {
             eprintln!(
                 "No testable commit found.\n\
                  Maybe you started with bad path arguments?\n"
             );
             return Ok(4);
         }
-        println!("{} is the first {} commit", bad, terms.term_bad);
-        run_show_stat(repo, bad)?;
-        bisect_successful_log(repo, git_dir, terms)?;
-        return Ok(10);
     }
 
-    if unskipped.is_empty() {
-        if bad_is_skip {
-            if let Ok(head) = read_head_oid(repo, git_dir) {
-                if head != bad
-                    && !skip_oids.contains(&head)
-                    && is_ancestor(repo, head, bad)?
-                    && error_if_skipped_commits(repo, terms, &[head], Some(bad))?
-                {
-                    return Ok(2);
-                }
-            }
-            let _ = error_if_skipped_commits(repo, terms, &[], Some(bad))?;
+    if managed.next.is_none() {
+        // revs.commits empty after managed_skipped: only return BISECT_ONLY_SKIPPED if "bad" is
+        // also "skip"ped (tried non-empty), otherwise "was both good and bad".
+        if error_if_skipped_commits(repo, terms, &managed.tried, None)? {
+            return Ok(2);
         }
         println!(
             "{} was both {} and {}",
@@ -779,24 +1092,17 @@ fn bisect_next_all(repo: &Repository, git_dir: &Path, terms: &BisectTerms) -> Re
         return Ok(1);
     }
 
-    let total = unskipped.len();
-    let mid_idx = (total - 1) / 2;
-    let mid_oid = if from_rev_list {
-        unskipped[total - 1 - mid_idx]
-    } else {
-        unskipped[mid_idx]
-    };
+    if all == 0 {
+        println!("{} is the first {} commit", bad, terms.term_bad);
+        run_show_stat(repo, bad)?;
+        bisect_successful_log(repo, git_dir, terms)?;
+        return Ok(10);
+    }
 
-    if mid_oid == bad {
-        let mut tried: Vec<ObjectId> = candidates
-            .iter()
-            .copied()
-            .filter(|o| skip_oids.contains(o))
-            .collect();
-        if bad_is_skip {
-            tried.push(bad);
-        }
-        if error_if_skipped_commits(repo, terms, &tried, Some(bad))? {
+    let bisect_rev = managed.next.expect("checked is_none above");
+
+    if bisect_rev == bad {
+        if error_if_skipped_commits(repo, terms, &managed.tried, Some(bad))? {
             return Ok(2);
         }
         println!("{} is the first {} commit", bad, terms.term_bad);
@@ -805,13 +1111,8 @@ fn bisect_next_all(repo: &Repository, git_dir: &Path, terms: &BisectTerms) -> Re
         return Ok(10);
     }
 
-    let reaches = if from_rev_list {
-        total - 1 - mid_idx
-    } else {
-        mid_idx
-    };
-    let nr = total.saturating_sub(reaches + 1);
-    let steps = estimate_bisect_steps(total);
+    let nr = all.saturating_sub(reaches).saturating_sub(1);
+    let steps = estimate_bisect_steps(all);
     let steps_msg = if steps == 1 {
         "(roughly 1 step)".to_owned()
     } else {
@@ -825,16 +1126,16 @@ fn bisect_next_all(repo: &Repository, git_dir: &Path, terms: &BisectTerms) -> Re
 
     fs::write(
         bisect_state_dir(git_dir).join("BISECT_EXPECTED_REV"),
-        format!("{mid_oid}\n"),
+        format!("{bisect_rev}\n"),
     )?;
     if no_checkout {
-        refs::write_ref(git_dir, "BISECT_HEAD", &mid_oid)?;
+        refs::write_ref(git_dir, "BISECT_HEAD", &bisect_rev)?;
     } else {
-        verify_commit_tree_fully_readable(repo, mid_oid)?;
-        detach_head(repo, &mid_oid, false)
-            .with_context(|| format!("checkout {}", mid_oid.to_hex()))?;
+        verify_commit_tree_fully_readable(repo, bisect_rev)?;
+        detach_head(repo, &bisect_rev, false)
+            .with_context(|| format!("checkout {}", bisect_rev.to_hex()))?;
     }
-    bisect_checkout_show_commit(repo, mid_oid)?;
+    bisect_checkout_show_commit(repo, bisect_rev)?;
     Ok(0)
 }
 
