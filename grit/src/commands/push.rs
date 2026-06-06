@@ -173,6 +173,14 @@ pub struct Args {
     /// Accepted for Git compatibility; forwarded when delegating to system `git push`.
     #[arg(long = "upload-pack", value_name = "PATH")]
     pub upload_pack: Option<String>,
+
+    /// Use (or, with `--no-thin`, do not use) a thin pack when sending objects. `git push`
+    /// defaults to `--thin`; `--no-thin` forces a self-contained pack (the receiver may require it,
+    /// e.g. `receive-pack --reject-thin-pack-for-testing`).
+    #[arg(long = "thin", overrides_with = "no_thin", default_value_t = true)]
+    pub thin: bool,
+    #[arg(long = "no-thin", overrides_with = "thin")]
+    pub no_thin: bool,
 }
 
 /// A single ref update to perform on the remote.
@@ -3127,6 +3135,8 @@ fn delegate_local_push_to_send_pack(
         dry_run: args.dry_run,
         receive_pack: args.receive_pack.clone(),
         exec: None,
+        thin: args.thin,
+        no_thin: args.no_thin,
     };
     crate::commands::send_pack::run(send_args).map_err(|e| {
         // `send-pack` signals ref rejections / remote failure via a quiet non-zero exit; surface
@@ -4604,10 +4614,16 @@ fn push_to_http_url(
         .iter()
         .filter(|u| u.is_pushable())
         .all(|u| u.new_oid.is_none());
+    let use_thin = args.thin && !args.no_thin;
     let pack_data = if delete_only {
         Vec::new()
     } else {
-        pack_objects::build_thin_push_pack_from_remote_oids(repo, &push_tips, &remote_have_vec)?
+        pack_objects::build_push_pack_from_remote_oids(
+            repo,
+            &push_tips,
+            &remote_have_vec,
+            use_thin,
+        )?
     };
     maybe_emit_push_pack_wrote_trace2(&pack_data);
     if push_show_object_progress(args) && !delete_only {
@@ -5142,10 +5158,16 @@ fn push_over_receive_pack_child(
     let push_tips: Vec<ObjectId> = updates.iter().filter_map(|u| u.new_oid).collect();
     let remote_have_vec: Vec<ObjectId> = remote_have.into_iter().collect();
     let delete_only = updates.iter().all(|u| u.new_oid.is_none());
+    let use_thin = args.thin && !args.no_thin;
     let pack_data = if delete_only {
         Vec::new()
     } else {
-        pack_objects::build_thin_push_pack_from_remote_oids(repo, &push_tips, &remote_have_vec)?
+        pack_objects::build_push_pack_from_remote_oids(
+            repo,
+            &push_tips,
+            &remote_have_vec,
+            use_thin,
+        )?
     };
     if push_show_object_progress(args) && !delete_only {
         let written_objects = grit_lib::receive_pack::pack_object_count(&pack_data)

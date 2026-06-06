@@ -2167,18 +2167,41 @@ pub fn build_thin_push_pack_from_remote_oids(
     push_tips: &[ObjectId],
     remote_have_oids: &[ObjectId],
 ) -> Result<Vec<u8>> {
+    build_push_pack_from_remote_oids(local_repo, push_tips, remote_have_oids, true)
+}
+
+/// Like [`build_thin_push_pack_from_remote_oids`] but lets the caller request a self-contained
+/// (non-thin) pack for `git push --no-thin` (t5516 'push --no-thin must produce non-thin pack').
+pub fn build_push_pack_from_remote_oids(
+    local_repo: &Repository,
+    push_tips: &[ObjectId],
+    remote_have_oids: &[ObjectId],
+    thin: bool,
+) -> Result<Vec<u8>> {
     let have_roots: BTreeSet<ObjectId> = remote_have_oids
         .iter()
         .copied()
         .filter(|oid| local_repo.odb.read(oid).is_ok())
         .collect();
-    build_thin_push_pack_from_have_set(local_repo, push_tips, &have_roots)
+    build_push_pack_from_have_set(local_repo, push_tips, &have_roots, thin)
 }
 
 fn build_thin_push_pack_from_have_set(
     local_repo: &Repository,
     push_tips: &[ObjectId],
     have_roots: &BTreeSet<ObjectId>,
+) -> Result<Vec<u8>> {
+    build_push_pack_from_have_set(local_repo, push_tips, have_roots, true)
+}
+
+/// Like [`build_thin_push_pack_from_have_set`] but lets the caller choose a thin or self-contained
+/// pack. `git push --no-thin` (and a receiver that rejects thin packs) requires `thin = false`,
+/// which omits `--thin` so every delta base is included in the pack (t5516 'push --no-thin').
+fn build_push_pack_from_have_set(
+    local_repo: &Repository,
+    push_tips: &[ObjectId],
+    have_roots: &BTreeSet<ObjectId>,
+    thin: bool,
 ) -> Result<Vec<u8>> {
     if push_tips.is_empty() {
         return Ok(Vec::new());
@@ -2205,9 +2228,11 @@ fn build_thin_push_pack_from_have_set(
         .stderr(Stdio::inherit())
         .arg("pack-objects")
         .arg("--revs")
-        .arg("--thin")
         .arg("--stdout")
         .arg("-q");
+    if thin {
+        cmd.arg("--thin");
+    }
     let mut child = cmd.spawn().context("spawn pack-objects for local push")?;
     {
         let mut stdin = child.stdin.take().context("pack-objects stdin")?;
