@@ -2093,6 +2093,51 @@ fn rewrite_merge_head_for_replay_opts(
     Ok(())
 }
 
+/// If a `merge -C <orig>` would reproduce the original merge commit exactly, return that original
+/// commit so the caller can fast-forward to it (git `do_merge` can_fast_forward). The conditions:
+/// current HEAD equals `orig`'s first parent, and the `merge_args` heads equal `orig`'s remaining
+/// parents in order with the same count.
+fn rebase_merge_fast_forward_target(
+    repo: &Repository,
+    git_dir: &Path,
+    merge_oid: &ObjectId,
+    merge_args: &str,
+) -> Result<Option<ObjectId>> {
+    let orig_commit_oid = peel_to_commit_for_merge_base(repo, *merge_oid)?;
+    let orig_obj = repo.odb.read(&orig_commit_oid)?;
+    let orig = parse_commit(&orig_obj.data)?;
+    if orig.parents.len() < 2 {
+        return Ok(None);
+    }
+    let head_oid = match resolve_head(git_dir)?.oid().cloned() {
+        Some(oid) => oid,
+        None => return Ok(None),
+    };
+    if orig.parents[0] != head_oid {
+        return Ok(None);
+    }
+    let (heads, _oneline) = parse_merge_todo_arg_list(merge_args);
+    if heads.len() != orig.parents.len() - 1 {
+        return Ok(None);
+    }
+    for (tok, &parent) in heads.iter().zip(orig.parents.iter().skip(1)) {
+        let head_commit = match resolve_merge_head_token(repo, tok) {
+            Ok(oid) => oid,
+            Err(_) => return Ok(None),
+        };
+        if head_commit != parent {
+            return Ok(None);
+        }
+    }
+    Ok(Some(orig_commit_oid))
+}
+
+/// Point HEAD at `target` and sync the index/worktree to its tree (a fast-forward during rebase).
+fn reset_rebase_head_to_commit(repo: &Repository, git_dir: &Path, target: &ObjectId) -> Result<()> {
+    let head_state = resolve_head(git_dir)?;
+    reset_worktree_to_commit(repo, git_dir, &head_state, *target, "merge")
+}
+
 fn rebase_merge_reuse_message(
     repo: &Repository,
     git_dir: &Path,
@@ -2101,7 +2146,21 @@ fn rebase_merge_reuse_message(
     merge_args: &str,
     edit_message: bool,
     next_after_line: Option<RebaseTodoCmd>,
+    allow_ff: bool,
 ) -> Result<RebaseMergeReuseOutcome> {
+    // Git `do_merge` fast-forward: if `allow_ff` (no `--force-rebase`/`--no-ff`) and the original
+    // merge's first parent already equals HEAD and every merge head equals the original merge's
+    // remaining parents (in order, same count), reuse the ORIGINAL merge commit instead of building
+    // a new one. This keeps unchanged merges stable (t3430 'do not rebase cousins', config tests).
+    if allow_ff && !edit_message {
+        if let Some(orig_oid) =
+            rebase_merge_fast_forward_target(repo, git_dir, merge_oid, merge_args)?
+        {
+            reset_rebase_head_to_commit(repo, git_dir, &orig_oid)?;
+            record_rebase_in_rewritten_pending(git_dir, rb_dir, merge_oid, next_after_line)?;
+            return Ok(RebaseMergeReuseOutcome::Completed);
+        }
+    }
     fs::write(
         rb_dir.join("rebase-merge-source"),
         format!("{}\n", merge_oid.to_hex()),
@@ -5972,6 +6031,7 @@ fn replay_remaining(
                         merge_args.as_str(),
                         edit_message,
                         next_after,
+                        !force_rewrite_commits,
                     ) {
                         Ok(RebaseMergeReuseOutcome::Completed) => {
                             let head = resolve_head(git_dir)?;
