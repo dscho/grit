@@ -4177,6 +4177,62 @@ fn refresh_written_index_entries(
     changed
 }
 
+/// Verify that every gitlink whose target commit changes can actually be checked out in its
+/// submodule, *before* the superproject work tree is modified.
+///
+/// Mirrors Git's dry-run `check_submodule_move_head` in unpack-trees: when `--recurse-submodules`
+/// is in effect, a submodule whose recorded commit is missing from the submodule's object store
+/// must abort the entire checkout atomically. Only initialized submodules (those with a local
+/// `.git/modules/<path>/HEAD`) are checked — uninitialized gitlinks are left as empty placeholders
+/// and never moved, so they cannot fail. Submodules whose target commit is unchanged from the old
+/// index are skipped (no move happens).
+///
+/// # Errors
+/// Returns an error naming the submodule path when its target commit is not present in the
+/// submodule object store.
+fn check_submodule_targets_available(
+    repo: &Repository,
+    old_index: &Index,
+    new_index: &Index,
+    work_tree: &Path,
+) -> Result<()> {
+    let old_gitlinks: HashMap<&[u8], &ObjectId> = old_index
+        .entries
+        .iter()
+        .filter(|e| e.stage() == 0 && e.mode == MODE_GITLINK)
+        .map(|e| (e.path.as_slice(), &e.oid))
+        .collect();
+
+    for entry in &new_index.entries {
+        if entry.stage() != 0 || entry.mode != MODE_GITLINK {
+            continue;
+        }
+        // Unchanged gitlink: the submodule worktree is not moved, so nothing can fail.
+        if old_gitlinks
+            .get(entry.path.as_slice())
+            .is_some_and(|old_oid| **old_oid == entry.oid)
+        {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(&entry.path).into_owned();
+        let Ok(modules_git) = submodule_modules_git_dir_for_checkout(repo, work_tree, &rel) else {
+            continue;
+        };
+        // Only initialized submodules are populated/moved; an uninitialized gitlink stays an empty
+        // placeholder directory and is never checked out, so it cannot fail.
+        if !modules_git.join("HEAD").exists() {
+            continue;
+        }
+        let odb = Odb::new(&modules_git.join("objects"));
+        if !odb.exists(&entry.oid) {
+            bail!(
+                "Submodule '{rel}' could not be updated.\nerror: Submodule '{rel}' cannot checkout new HEAD."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Populate a submodule worktree for a single gitlink index entry (path + commit OID).
 ///
 /// Used by full-tree checkout and by `git checkout -- <paths>` when paths include gitlinks.
@@ -6860,6 +6916,16 @@ fn checkout_index_to_worktree_inner(
             // so a recorded submodule is never silently replaced (t3426/t6042).
             refuse_populated_submodule_tree_replacement(old_index, new_index, work_tree)?;
         }
+    }
+
+    // Preflight: when recursing into submodules, verify every gitlink target commit is available
+    // in its submodule object store *before* touching the work tree. Git's unpack-trees runs a
+    // dry-run `check_submodule_move_head` so a missing submodule commit aborts the whole checkout
+    // atomically (t2013 "updating to a missing submodule commit fails"). Without this, a forced
+    // checkout rewrites every regular file (bumping mtimes) and only then fails on the gitlink,
+    // leaving the work tree stat out of sync with the unchanged index.
+    if populate_gitlinks && RECURSE_SUBMODULES.with(|r| r.get()) {
+        check_submodule_targets_available(repo, old_index, new_index, work_tree)?;
     }
 
     // Remove paths that are no longer present in the new index.
