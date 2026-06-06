@@ -3434,23 +3434,15 @@ pub(crate) fn resolve_submodule_super_url(
         return Ok(raw_url.to_string());
     }
 
-    // Use this repository's git dir for `remote.*.url` (matches Git's `resolve_relative_url`: it
-    // reads `the_repository`, not the outer superproject). Nested sync runs with `git_dir` under
-    // `.git/modules/<name>/` and must use that config—using only the top-level `.git` breaks
-    // recursive sync (t7403).
-    let outer_git = superproject_git_dir_for_nested_modules(repo_git_dir)
-        .unwrap_or_else(|| repo_git_dir.to_path_buf());
-    let outer_wt = outer_git
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| work_tree.to_path_buf());
-
-    let base = if superproject_git_dir_for_nested_modules(repo_git_dir).is_some() {
-        work_tree.to_string_lossy().into_owned()
-    } else {
-        default_remote_url_raw(repo_git_dir)
-            .unwrap_or_else(|| outer_wt.to_string_lossy().into_owned())
-    };
+    // Match Git's `resolve_relative_url(url, NULL)`: resolve against this repository's
+    // `remote.<default>.url` (read from `the_repository`'s config — which during a recursive
+    // `submodule update` is the submodule's own config under `.git/modules/<name>/`). Git only
+    // falls back to the process cwd (the submodule worktree during recursion) when no remote URL
+    // is configured. Using the worktree path unconditionally for nested repos is wrong: e.g. a
+    // submodule cloned with `remote.origin.url = <super>/super` must resolve its own `../merging`
+    // against `<super>/super`, not against `<recursivesuper>/super` (t7406 recursive update).
+    let base = default_remote_url_raw(repo_git_dir)
+        .unwrap_or_else(|| work_tree.to_string_lossy().into_owned());
     git_relative_url(&base, raw_url, None)
 }
 
