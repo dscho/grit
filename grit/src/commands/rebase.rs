@@ -165,9 +165,13 @@ pub struct Args {
     /// Rebase merge commits (`-r` / optional mode: `rebase-cousins`, `no-rebase-cousins`).
     /// Optional mode only as `--rebase-merges=rebase-cousins` (must use `=` so `A` in
     /// `rebase -i --rebase-merges A main` is not consumed as the mode).
+    ///
+    /// `--rebase-merges` and `--no-rebase-merges` are NOT mutually exclusive: git treats them as a
+    /// negatable option where the later flag wins, and `--no-rebase-merges` countermands an earlier
+    /// `--rebase-merges` (t3430). Precedence is resolved in `effective_rebase_merges_settings`,
+    /// which gives `--no-rebase-merges` priority, so they must not `conflicts_with` each other.
     #[arg(
         long = "rebase-merges",
-        conflicts_with = "no_rebase_merges",
         value_name = "MODE",
         num_args = 0..=1,
         default_missing_value = "true",
@@ -176,7 +180,7 @@ pub struct Args {
     pub rebase_merges: Option<String>,
 
     /// Disable rebasing merges even when `rebase.rebaseMerges` is true.
-    #[arg(long = "no-rebase-merges", conflicts_with = "rebase_merges")]
+    #[arg(long = "no-rebase-merges")]
     pub no_rebase_merges: bool,
 
     /// Force rebase even if the current branch is up to date
@@ -1003,48 +1007,24 @@ fn is_commit_tree_unchanged(repo: &Repository, oid: &ObjectId) -> Result<bool> {
     Ok(commit.tree == parent_tree)
 }
 
-/// True when cherry-picking `commit_oid` onto `head_oid` would change the tree.
+/// Read (without consuming) the `obstructed-pick` marker and report whether it names `current_oid`.
 ///
-/// Used to tell an *obstructed* pick (one that aborted because materializing it would overwrite an
-/// untracked working tree file, so the worktree still equals HEAD and the commit was never applied)
-/// apart from a conflict the user resolved to *nothing*. Both leave the worktree equal to HEAD, but
-/// only the obstructed pick still introduces a change when replayed and so must be re-applied rather
-/// than recorded as an empty no-op (t5407 "git rebase with failed pick"). The 3-way merge mirrors
-/// `cherry_pick_for_rebase` (base = picked commit's parent tree, ours = HEAD tree, theirs = picked
-/// commit's tree); a conflicted merge counts as a change. Returns `false` on any read error so the
-/// caller keeps the safe, pre-existing no-op behavior.
-fn rebase_pick_reapply_would_change_tree(
-    repo: &Repository,
-    commit_oid: &ObjectId,
-    head_oid: &ObjectId,
-) -> Result<bool> {
-    const GIT_EMPTY_TREE_HEX: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-    let empty_tree = ObjectId::from_hex(GIT_EMPTY_TREE_HEX).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let commit = parse_commit(&repo.odb.read(commit_oid)?.data)?;
-    let parent_tree = match commit.parents.first() {
-        Some(parent) => parse_commit(&repo.odb.read(parent)?.data)?.tree,
-        None => empty_tree,
-    };
-    let head_tree = parse_commit(&repo.odb.read(head_oid)?.data)?.tree;
-
-    let base = tree_to_map(tree_to_index_entries(repo, &parent_tree, "")?);
-    let ours = tree_to_map(tree_to_index_entries(repo, &head_tree, "")?);
-    let theirs = tree_to_map(tree_to_index_entries(repo, &commit.tree, "")?);
-
-    let short = commit_oid.to_hex()[..7].to_string();
-    let ctx = RebaseConflictContext {
-        backend: RebaseBackend::Merge,
-        picked_short_oid: &short,
-        picked_subject: commit.message.lines().next().unwrap_or("replayed commit"),
-        ignore_space_change: false,
-    };
-    let merged = three_way_merge_with_content(repo, &base, &ours, &theirs, &ctx, MergeFavor::None)?;
-    if !merged.conflict_files.is_empty() || merged.index.entries.iter().any(|e| e.stage() != 0) {
-        return Ok(true);
-    }
-    let merged_tree = write_tree_from_index(&repo.odb, &merged.index, "")?;
-    Ok(merged_tree != head_tree)
+/// `cherry_pick_for_rebase` writes this marker when a step aborts because materializing it would
+/// overwrite an untracked working tree file: the step is never applied, so the worktree still equals
+/// HEAD and a later `--continue` would otherwise mistake it for an empty no-op. A matching marker
+/// means the step must instead be re-run so it actually produces its commit and records the real
+/// old->new mapping for the post-rewrite hook (t5407 "git rebase with failed pick"). Because only
+/// obstructions write the marker, resolved-conflict, empty-pick and submodule paths never match.
+fn rebase_pick_was_obstructed(rb_dir: &Path, current_oid: &ObjectId) -> bool {
+    fs::read_to_string(rb_dir.join("obstructed-pick"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .next()
+                .map(str::trim)
+                .and_then(|h| ObjectId::from_hex(h).ok())
+        })
+        .is_some_and(|oid| &oid == current_oid)
 }
 
 /// Git creates a synthetic empty root commit when `rebase --root` runs without `--onto`
@@ -3103,11 +3083,16 @@ fn parse_merge_todo_arg_list(arg: &str) -> (Vec<String>, Option<String>) {
 }
 
 fn resolve_rebase_merge_label(repo: &Repository, label: &str) -> Result<ObjectId> {
+    // Mirror git `lookup_label`: try `refs/rewritten/<label>` first, then fall back to a plain
+    // ref/commit-ish resolution. On failure git reports `could not resolve '<label>'`, NOT the
+    // rev-parse "ambiguous argument" path-vs-revision hint (t3430 `reset` only looks under
+    // refs/rewritten). We still allow full revision syntax for the fallback so `A^{tree}` resolves
+    // to a tree object (t3430 `reset` rejects trees).
     let rewritten = format!("refs/rewritten/{label}");
     if let Ok(oid) = grit_lib::refs::resolve_ref(&repo.git_dir, &rewritten) {
         return Ok(oid);
     }
-    resolve_revision(repo, label).with_context(|| format!("could not resolve '{label}'"))
+    resolve_revision(repo, label).map_err(|_| anyhow::anyhow!("could not resolve '{label}'"))
 }
 
 fn commit_oid_for_rebase_label(repo: &Repository, label: &str) -> Result<ObjectId> {
@@ -7346,14 +7331,30 @@ fn cherry_pick_for_rebase(
         // when an added entry would overwrite an untracked file (`t5407` `git rebase with failed
         // pick`: an `exec >G` creates an untracked `G`, then `pick G` must abort). The cwd/submodule
         // preflight below does not cover this case, so mirror the standalone cherry-pick check.
-        super::reset::check_untracked_cherry_pick_obstruction(wt, &old_index, &merged_index)?;
-        preflight_cherry_pick_cwd_obstruction(
-            repo,
-            wt,
-            &merged_index,
-            &BTreeMap::new(),
-            Some(&rebase_conflict_paths),
-        )?;
+        let obstruction =
+            super::reset::check_untracked_cherry_pick_obstruction(wt, &old_index, &merged_index)
+                .and_then(|()| {
+                    preflight_cherry_pick_cwd_obstruction(
+                        repo,
+                        wt,
+                        &merged_index,
+                        &BTreeMap::new(),
+                        Some(&rebase_conflict_paths),
+                    )
+                });
+        if let Err(e) = obstruction {
+            // The step was not applied (the worktree is untouched), so a later `--continue` would
+            // otherwise see worktree == HEAD and mistake it for an empty no-op. Record which commit
+            // was obstructed so the continue path re-runs it once the obstruction is cleared, and
+            // records the real old->new mapping for the post-rewrite hook (t5407 "git rebase with
+            // failed pick"). This does NOT alter the halt state Git leaves, so resolved-conflict and
+            // submodule paths are unaffected.
+            let _ = fs::write(
+                rb_dir.join("obstructed-pick"),
+                format!("{}\n", commit_oid.to_hex()),
+            );
+            return Err(e);
+        }
     }
     repo.write_index(&mut merged_index)?;
 
@@ -8262,9 +8263,17 @@ fn do_continue() -> Result<()> {
 
     if interactive_continue && matches!(todo_cmd, RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash) {
         let head_tree = commit_tree_oid_for_rebase(&repo, head_oid)?;
-        if diff_index_to_tree(&repo.odb, &index, Some(&head_tree), false)
-            .map(|diffs| diffs.is_empty())
-            .unwrap_or(false)
+        // A fixup/squash whose worktree matches HEAD's tree usually means its change is already
+        // folded in, so it is treated as a no-op and skipped. But a fixup/squash that *aborted* on
+        // an obstruction (its untracked file would be overwritten) was never applied and also leaves
+        // the worktree equal to HEAD — yet re-applying it still amends the commit (t5407 "git rebase
+        // with failed pick", whose trailing `fixup I` must map its old oid to the amended commit).
+        // Only the obstruction sets the `obstructed-pick` marker, so fall through to re-apply only
+        // then; genuine empty fixups (no marker) keep the no-op shortcut.
+        if !rebase_pick_was_obstructed(&rb_dir, &current_oid)
+            && diff_index_to_tree(&repo.odb, &index, Some(&head_tree), false)
+                .map(|diffs| diffs.is_empty())
+                .unwrap_or(false)
         {
             let _ = drop_last_squash_message_section(&rb_dir);
             if todo_lines_continue
@@ -8307,24 +8316,20 @@ fn do_continue() -> Result<()> {
     if stopped_oid.is_some() && worktree_matches_head(&repo, git_dir)? {
         // The worktree equals HEAD here for two very different reasons:
         //   * a conflict the user resolved to *nothing* (the commit's change is already present), or
-        //   * a plain pick that aborted on an obstruction (untracked file would be overwritten) and
-        //     so was never applied at all (t5407 "git rebase with failed pick").
-        // In the first case the commit is a genuine no-op and is recorded old->HEAD; in the second
-        // it still has to be created. The two are told apart by re-running the pick: if it would
-        // change the tree the commit was merely obstructed and must be reproduced (recording the
-        // real old->new mapping for the post-rewrite hook), otherwise the no-op record stands.
-        // Only plain picks reach this branch as obstructions — fixup/squash are handled above.
-        let needs_reapply = matches!(todo_cmd, RebaseTodoCmd::Pick)
-            && rebase_pick_reapply_would_change_tree(&repo, &current_oid, &head_oid)?;
-        if std::env::var("GRIT_DEBUG_OBSTRUCT").is_ok() {
-            eprintln!(
-                "DEBUG noop-block: current={} todo_cmd={:?} needs_reapply={}",
-                current_oid.to_hex(),
-                todo_cmd,
-                needs_reapply
-            );
-        }
+        //   * a pick/fixup/squash that aborted on an obstruction (untracked file would be
+        //     overwritten) and so was never applied at all (t5407 "git rebase with failed pick").
+        // Only the obstruction sets the `obstructed-pick` marker. When it matches, re-run the step so
+        // it actually produces its commit and records the real old->new mapping for the post-rewrite
+        // hook; otherwise the empty no-op record stands. `cherry_pick_for_rebase` reproduces picks
+        // and fixups/squashes (amending HEAD) alike.
+        let needs_reapply = matches!(
+            todo_cmd,
+            RebaseTodoCmd::Pick | RebaseTodoCmd::Fixup | RebaseTodoCmd::Squash
+        ) && rebase_pick_was_obstructed(&rb_dir, &current_oid);
         if needs_reapply {
+            // Consume the obstruction marker before re-running so a fresh obstruction on a later step
+            // re-arms it cleanly and a stale value can never divert an unrelated continue.
+            let _ = fs::remove_file(rb_dir.join("obstructed-pick"));
             let next_after_continue =
                 peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 0, interactive_continue);
             let _ = fs::remove_file(git_dir.join("REBASE_HEAD"));
@@ -8353,6 +8358,7 @@ fn do_continue() -> Result<()> {
                 force_rewrite_continue,
             );
         }
+        let _ = fs::remove_file(rb_dir.join("obstructed-pick"));
         let oid_for_rewrite = stopped_oid.as_ref().unwrap_or(&current_oid);
         let next_after_continue =
             peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 0, interactive_continue);
