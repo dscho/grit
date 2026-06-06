@@ -1401,6 +1401,24 @@ fn tag_target_is_implicit_include_tag(
     })
 }
 
+/// Resolve a (possibly nested) tag OID to the non-tag object it ultimately points at, using the
+/// objects available in `repo`. Returns the original OID when it is not a tag or cannot be read.
+fn peel_tag_target(repo: &Repository, mut oid: ObjectId) -> ObjectId {
+    for _ in 0..32 {
+        let Ok(obj) = repo.odb.read(&oid) else {
+            return oid;
+        };
+        if obj.kind != ObjectKind::Tag {
+            return oid;
+        }
+        let Ok(tag) = parse_tag(&obj.data) else {
+            return oid;
+        };
+        oid = tag.object;
+    }
+    oid
+}
+
 fn append_follow_tags_for_wants(
     local_git_dir: &Path,
     remote_git_dir: &Path,
@@ -1873,6 +1891,18 @@ fn fetch_remote(
             _ => true,
         }
     };
+    // `--tags` / `tagopt = --tags` (`TAGS_SET`) follows *every* advertised tag. The default
+    // (`TAGS_DEFAULT`) only auto-follows tags whose target object is reachable from the refs being
+    // fetched — a dangling tag like `foobar-tag` (left over after `git reset --hard HEAD~1` on the
+    // remote) must NOT be pulled (t5505 "add with reachable tags (default)").
+    let follow_all_tags = should_fetch_tags && {
+        if args.tags {
+            true
+        } else {
+            let tagopt_key = format!("remote.{tagopt_remote}.tagopt");
+            config.get(&tagopt_key).as_deref() == Some("--tags")
+        }
+    };
 
     let upload_pack_cmd = args.upload_pack.clone().or_else(|| {
         let key = format!("remote.{remote_name}.uploadpack");
@@ -2219,6 +2249,27 @@ fn fetch_remote(
         );
     }
     remote_tags.retain(|(_, oid)| local_repo_for_tag_filter.odb.read(oid).is_ok());
+    // Default tag auto-following (`TAGS_DEFAULT`) only keeps tags whose target is reachable from a
+    // fetched head. `--tags`/`tagopt = --tags` (`follow_all_tags`) keeps every advertised tag.
+    // Explicit refspec tag fetches (`refs/tags/*:...`) are handled elsewhere and must not be pruned
+    // here, so restrict this reachability gate to opportunistic auto-follow.
+    if should_fetch_tags && !follow_all_tags {
+        let head_tips: Vec<ObjectId> = remote_heads.iter().map(|(_, o)| *o).collect();
+        if !head_tips.is_empty() {
+            // Existing local tags of the same name are always kept (they were not auto-followed).
+            remote_tags.retain(|(refname, tag_oid)| {
+                if refs::resolve_ref(git_dir, refname).is_ok() {
+                    return true;
+                }
+                let target = peel_tag_target(&local_repo_for_tag_filter, *tag_oid);
+                head_tips.iter().any(|tip| {
+                    target == *tip
+                        || merge_base::is_ancestor(&local_repo_for_tag_filter, target, *tip)
+                            .unwrap_or(false)
+                })
+            });
+        }
+    }
     maybe_lazy_fetch_parent_tree_blobs_for_promisor_trace(
         &local_repo_for_tag_filter,
         &config,
