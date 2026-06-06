@@ -5037,7 +5037,7 @@ fn sign_commit_bytes(
     ))
 }
 
-fn resolve_committer(config: &ConfigSet, now: OffsetDateTime) -> Result<String> {
+pub(crate) fn resolve_committer(config: &ConfigSet, now: OffsetDateTime) -> Result<String> {
     let name = resolve_name(config, IdentRole::Committer)?;
 
     let email = resolve_email(config, IdentRole::Committer)?;

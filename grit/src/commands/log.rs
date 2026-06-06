@@ -1458,18 +1458,26 @@ fn run_line_log(
     Ok(())
 }
 
-/// Extract epoch timestamp from a Git ident string.
+/// Order `--branches`/`--tags`/… tip specs by committer date, newest first.
+///
+/// `git log --branches` seeds every branch tip into a date-ordered priority queue. Refs are
+/// expanded in ref-name order (e.g. `main` before `unrelated`), and Git's `prio_queue` breaks
+/// equal-date ties by *insertion order* (FIFO). We therefore use a **stable** sort keyed only on
+/// the committer epoch so tips that share a timestamp keep their ref-name order, instead of
+/// re-breaking the tie by object id. This matters when `git history split` recreates commits with
+/// the same `GIT_COMMITTER_DATE` as a sibling branch tip: the leftmost graph column must follow the
+/// alphabetically-first branch, not the smallest object id (t3452-history-split tests 8, 10, 11).
 fn sort_revision_specs_by_committer_desc(repo: &Repository, specs: &mut Vec<String>) -> Result<()> {
-    use std::cmp::Reverse;
-    let mut metas: Vec<(Reverse<i64>, String)> = Vec::with_capacity(specs.len());
+    let mut metas: Vec<(i64, String)> = Vec::with_capacity(specs.len());
     for s in specs.drain(..) {
         let oid = resolve_revision_as_commit(repo, &s)?;
         let obj = repo.odb.read(&oid)?;
         let c = parse_commit(&obj.data)?;
         let e = extract_epoch_from_ident(&c.committer);
-        metas.push((Reverse(e), s));
+        metas.push((e, s));
     }
-    metas.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // Stable sort: newest committer epoch first, equal epochs keep their (ref-name) input order.
+    metas.sort_by(|a, b| b.0.cmp(&a.0));
     specs.extend(metas.into_iter().map(|(_, s)| s));
     Ok(())
 }
@@ -9917,29 +9925,55 @@ fn run_describe_for_format(
 /// parentheses, with the parens already stripped). Mirrors Git's `strtoul`-based parse: an empty
 /// string is `(0, 0, 0)`; otherwise up to three comma-separated decimal values, where any trailing
 /// non-digit / non-comma junk makes the whole directive invalid (`None` => emit literally).
+/// Mimic C `strtoul(s, &next, 10)` over a byte slice: skip leading ASCII whitespace,
+/// consume leading decimal digits (saturating), and return `(value, rest)` where `rest`
+/// is the slice starting at the first unconsumed byte. With no digits, value is 0 and
+/// `rest` is the slice after any skipped whitespace (matching glibc behavior).
+fn strtoul_prefix(s: &str) -> (i64, &str) {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let mut val: i64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        val = val
+            .saturating_mul(10)
+            .saturating_add((bytes[i] - b'0') as i64);
+        i += 1;
+    }
+    (val, &s[i..])
+}
+
+/// Faithful port of git pretty.c `%w(width,indent1,indent2)` argument parsing (case 'w').
+/// Uses `strtoul` semantics: an empty or non-numeric leading segment yields 0 and the
+/// parse continues only as long as the next unconsumed byte is `,` (advance to next field).
+/// Anything other than `,`/end terminates a successful parse; leftover non-`)` => invalid.
 fn parse_wrap_spec(inner: &str) -> Option<(i64, i64, i64)> {
+    // Empty `%w()` => all zero (wrapping off).
     if inner.is_empty() {
         return Some((0, 0, 0));
     }
-    let mut parts = inner.split(',');
-    let mut vals = [0i64; 3];
-    for slot in &mut vals {
-        let Some(part) = parts.next() else {
-            // Fewer than 3 values is fine; remaining stay 0.
-            return Some((vals[0], vals[1], vals[2]));
-        };
-        // Git's strtoul accepts only leading digits; a segment must be entirely digits and
-        // non-empty here. Saturate to keep the FORMATTING_LIMIT guard meaningful.
-        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
+    let (width, rest) = strtoul_prefix(inner);
+    let mut indent1 = 0i64;
+    let mut indent2 = 0i64;
+    let mut rest = rest;
+    if let Some(after) = rest.strip_prefix(',') {
+        let (i1, r) = strtoul_prefix(after);
+        indent1 = i1;
+        rest = r;
+        if let Some(after2) = rest.strip_prefix(',') {
+            let (i2, r2) = strtoul_prefix(after2);
+            indent2 = i2;
+            rest = r2;
         }
-        *slot = part.parse::<i64>().unwrap_or(i64::MAX);
     }
-    // More than three comma-separated fields => trailing junk => invalid.
-    if parts.next().is_some() {
+    // After parsing, git requires the next byte to be `)` (handled by the caller, which
+    // already stripped the closing paren). Here `rest` must be fully consumed.
+    if !rest.is_empty() {
         return None;
     }
-    Some((vals[0], vals[1], vals[2]))
+    Some((width, indent1, indent2))
 }
 
 thread_local! {
