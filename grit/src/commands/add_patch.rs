@@ -22,6 +22,258 @@ use crate::commands::checkout::{patch_path_filter_matches, resolve_pathspec};
 use crate::commands::stash::{partial_unified_for_op_range, split_hunk_at_first_gap};
 use grit_lib::index::entry_from_metadata;
 
+const COLOR_RESET: &str = "\x1b[m";
+
+/// Resolve a color slot: `cfg.get(key)` parsed via `parse_color`, else the provided default ANSI
+/// escape. Empty config or parse failure falls back to the default.
+fn color_slot(cfg: &ConfigSet, key: &str, default_esc: &str) -> String {
+    match cfg.get(key) {
+        Some(v) if !v.trim().is_empty() => {
+            grit_lib::config::parse_color(&v).unwrap_or_else(|_| default_esc.to_owned())
+        }
+        _ => default_esc.to_owned(),
+    }
+}
+
+/// Whether a Git colorbool config value means "always on", "off", or "auto".
+/// `None` for unset/auto.
+fn colorbool_explicit(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "always" => Some(true),
+        "never" | "false" | "off" | "0" => Some(false),
+        "true" | "on" | "1" => Some(true),
+        _ => None, // "auto" or unrecognized: let auto-detection decide
+    }
+}
+
+/// Auto color decision: colors when stdout is a tty OR `GIT_PAGER_IN_USE` is set, and the
+/// terminal is not dumb. `force_color` in t3701 exports `GIT_PAGER_IN_USE=true TERM=vt100`.
+fn color_auto() -> bool {
+    if crate::editor::is_terminal_dumb() {
+        return false;
+    }
+    std::io::stdout().is_terminal() || std::env::var_os("GIT_PAGER_IN_USE").is_some()
+}
+
+/// Resolve whether a given color domain (`color.interactive` / `color.diff`) is active, mirroring
+/// git's `check_color_config` + fallback to `color.ui`. An explicit value on the specific key
+/// wins; otherwise fall back to `color.ui`; otherwise auto.
+fn want_color_domain(cfg: &ConfigSet, key: &str) -> bool {
+    if let Some(v) = cfg.get(key) {
+        if let Some(explicit) = colorbool_explicit(&v) {
+            return explicit;
+        }
+        // "auto" on the specific key: fall through to auto detection.
+        return color_auto();
+    }
+    if let Some(v) = cfg.get("color.ui") {
+        if let Some(explicit) = colorbool_explicit(&v) {
+            return explicit;
+        }
+    }
+    color_auto()
+}
+
+/// Diff/interactive color slots resolved once per `add -p`/`add -i` invocation.
+struct ColorCtx {
+    use_interactive: bool,
+    use_diff: bool,
+    /// `interactive.diffFilter` shell command, if any (applied to the colored diff text).
+    diff_filter: Option<String>,
+    // diff colors
+    meta: String,
+    frag: String,
+    context: String,
+    old: String,
+    new: String,
+    // interactive colors
+    prompt: String,
+    header: String,
+    help: String,
+    error: String,
+    reset: String,
+}
+
+impl ColorCtx {
+    fn from_config(cfg: &ConfigSet) -> Self {
+        let use_interactive = want_color_domain(cfg, "color.interactive");
+        let use_diff = want_color_domain(cfg, "color.diff");
+        let diff_filter = cfg
+            .get("interactive.diffFilter")
+            .filter(|s| !s.trim().is_empty());
+        let on = use_diff;
+        let ion = use_interactive;
+        ColorCtx {
+            use_interactive,
+            use_diff,
+            diff_filter,
+            meta: if on {
+                color_slot(cfg, "color.diff.meta", "\x1b[1m")
+            } else {
+                String::new()
+            },
+            frag: if on {
+                color_slot(cfg, "color.diff.frag", "\x1b[36m")
+            } else {
+                String::new()
+            },
+            context: if on {
+                color_slot(cfg, "color.diff.context", "")
+            } else {
+                String::new()
+            },
+            old: if on {
+                color_slot(cfg, "color.diff.old", "\x1b[31m")
+            } else {
+                String::new()
+            },
+            new: if on {
+                color_slot(cfg, "color.diff.new", "\x1b[32m")
+            } else {
+                String::new()
+            },
+            prompt: if ion {
+                color_slot(cfg, "color.interactive.prompt", "\x1b[1;34m")
+            } else {
+                String::new()
+            },
+            header: if ion {
+                color_slot(cfg, "color.interactive.header", "\x1b[1m")
+            } else {
+                String::new()
+            },
+            help: if ion {
+                color_slot(cfg, "color.interactive.help", "\x1b[1;31m")
+            } else {
+                String::new()
+            },
+            error: if ion {
+                color_slot(cfg, "color.interactive.error", "\x1b[1;31m")
+            } else {
+                String::new()
+            },
+            reset: if on || ion {
+                COLOR_RESET.to_owned()
+            } else {
+                String::new()
+            },
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.use_diff || self.use_interactive
+    }
+
+    /// Wrap `text` in `color` + reset if coloring is active and `color` is non-empty.
+    fn wrap(&self, color: &str, text: &str) -> String {
+        if color.is_empty() {
+            text.to_owned()
+        } else {
+            format!("{color}{text}{}", self.reset)
+        }
+    }
+
+    /// Colorize a multi-line diff body (file header lines, `@@` frag lines, and `+`/`-`/` ` body
+    /// lines) the way `git diff --color` would, then run it through `interactive.diffFilter` if set.
+    /// `text` must end with a newline per line.
+    fn colorize_diff(&self, text: &str, ws_highlight_all: bool) -> String {
+        let colored = if self.use_diff {
+            let mut out = String::new();
+            for line in text.split_inclusive('\n') {
+                let (body, nl) = match line.strip_suffix('\n') {
+                    Some(b) => (b, "\n"),
+                    None => (line, ""),
+                };
+                let colored_line = self.colorize_diff_line(body, ws_highlight_all);
+                out.push_str(&colored_line);
+                out.push_str(nl);
+            }
+            out
+        } else {
+            text.to_owned()
+        };
+        match &self.diff_filter {
+            Some(cmd) => run_diff_filter(cmd, &colored).unwrap_or(colored),
+            None => colored,
+        }
+    }
+
+    fn colorize_diff_line(&self, body: &str, ws_highlight_all: bool) -> String {
+        if body.is_empty() {
+            return String::new();
+        }
+        let first = body.as_bytes()[0];
+        let (color, is_add) = match first {
+            b'@' if body.starts_with("@@") => (&self.frag, false),
+            b'+' => (&self.new, true),
+            b'-' => (&self.old, false),
+            b' ' => (&self.context, false),
+            _ if body.starts_with("diff --git")
+                || body.starts_with("index ")
+                || body.starts_with("--- ")
+                || body.starts_with("+++ ")
+                || body.starts_with("old mode")
+                || body.starts_with("new mode")
+                || body.starts_with("new file")
+                || body.starts_with("deleted file")
+                || body.starts_with("rename ")
+                || body.starts_with("copy ")
+                || body.starts_with("similarity")
+                || body.starts_with("dissimilarity") =>
+            {
+                (&self.meta, false)
+            }
+            _ => (&self.context, false),
+        };
+        // Whitespace-error highlight: trailing whitespace on `+` lines (or all sides when
+        // wsErrorHighlight=all) is shown with GIT_COLOR_BG_RED on top of the line color.
+        let want_ws = ws_highlight_all && (is_add || first == b'-' || first == b' ');
+        if want_ws {
+            if let Some(ws_start) = body.rfind(|c: char| !c.is_whitespace()) {
+                let split = ws_start + body[ws_start..].chars().next().map_or(1, |c| c.len_utf8());
+                if split < body.len() {
+                    let head = &body[..split];
+                    let tail = &body[split..];
+                    let mut s = String::new();
+                    if !color.is_empty() {
+                        s.push_str(color);
+                    }
+                    s.push_str(head);
+                    s.push_str("\x1b[41m");
+                    s.push_str(tail);
+                    s.push_str(&self.reset);
+                    return s;
+                }
+            }
+        }
+        if color.is_empty() {
+            body.to_owned()
+        } else {
+            format!("{color}{body}{}", self.reset)
+        }
+    }
+}
+
+/// Run the `interactive.diffFilter` shell command, piping `input` on stdin and capturing stdout.
+fn run_diff_filter(cmd: &str, input: &str) -> Result<String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("spawning interactive.diffFilter")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.as_bytes()).ok();
+    }
+    let out = child.wait_with_output().context("running diffFilter")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+use std::io::IsTerminal as _;
+
 /// Blend index and worktree bytes for **staging** (`git add -p`).
 ///
 /// [`checkout::blend_line_diff_by_hunk_ranges`] uses `accepted` with **revert/checkout** semantics
@@ -636,6 +888,19 @@ pub(crate) fn run_add_patch_with_reader(
     let conv = &add_cfg.conv;
     let attrs = &add_cfg.attrs;
 
+    // Color/diffFilter context (color.diff / color.interactive / interactive.diffFilter), resolved
+    // once. In t3701 `force_color` exports GIT_PAGER_IN_USE=true TERM=vt100 to force `auto` on.
+    let cctx = ColorCtx::from_config(&add_cfg.config);
+    // diff.wsErrorHighlight: whether to highlight whitespace errors in the colored diff.
+    let ws_highlight_all = add_cfg
+        .config
+        .get("diff.wsErrorHighlight")
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            v.split(',').any(|t| t.trim() == "all")
+        })
+        .unwrap_or(false);
+
     // Track how many candidate files turned out to be binary; if every one did, Git prints
     // "Only binary files changed." (add-patch.c) instead of silently doing nothing.
     let total_entries = entries.len();
@@ -820,20 +1085,28 @@ pub(crate) fn run_add_patch_with_reader(
             let mut rendered_hunk_index: isize = -1;
 
             // Render the file diff header once per file (git: `render_diff_header`).
-            writeln!(out, "diff --git a/{path_str} b/{path_str}").ok();
+            let mut header = String::new();
+            header.push_str(&format!("diff --git a/{path_str} b/{path_str}\n"));
             if is_addition {
                 let short = short_oid_of(odb, &cur_work);
                 let new_mode = mode_from_metadata(&meta);
-                writeln!(out, "new file mode {new_mode:06o}").ok();
-                writeln!(out, "index 0000000..{short}").ok();
-                write!(out, "--- /dev/null\n+++ b/{path_str}\n").ok();
+                header.push_str(&format!("new file mode {new_mode:06o}\n"));
+                header.push_str(&format!("index 0000000..{short}\n"));
+                header.push_str(&format!("--- /dev/null\n+++ b/{path_str}\n"));
             } else if is_deletion {
                 let short = short_oid_of(odb, &index_side_bytes);
-                writeln!(out, "deleted file mode {:06o}", ie.mode).ok();
-                writeln!(out, "index {short}..0000000").ok();
-                write!(out, "--- a/{path_str}\n+++ /dev/null\n").ok();
+                header.push_str(&format!("deleted file mode {:06o}\n", ie.mode));
+                header.push_str(&format!("index {short}..0000000\n"));
+                header.push_str(&format!("--- a/{path_str}\n+++ /dev/null\n"));
             } else {
-                write!(out, "--- a/{path_str}\n+++ b/{path_str}\n").ok();
+                header.push_str(&format!("--- a/{path_str}\n+++ b/{path_str}\n"));
+            }
+            // Colorize the header (and run it through interactive.diffFilter) when color is active.
+            // The diffFilter is applied per-block; the test cases (65/67) match on individual lines.
+            if cctx.any() {
+                write!(out, "{}", cctx.colorize_diff(&header, ws_highlight_all)).ok();
+            } else {
+                write!(out, "{header}").ok();
             }
 
             // Render the hunk body text for hunk `i` (header `@@ ... @@` + body lines) with the
@@ -849,8 +1122,52 @@ pub(crate) fn run_add_patch_with_reader(
                 }
                 let work_str = String::from_utf8_lossy(work).into_owned();
                 let new_lines: Vec<&str> = work_str.lines().collect();
-                render_hunk_with_offsets(&old_lines, &new_lines, &ops, s, e, context)
+                let plain = render_hunk_with_offsets(&old_lines, &new_lines, &ops, s, e, context);
+                if cctx.any() {
+                    cctx.colorize_diff(&plain, ws_highlight_all)
+                } else {
+                    plain
+                }
             };
+
+            // `interactive.diffFilter` mismatch check (git's parse_diff): the filter must preserve
+            // the diff's line structure. Build the full plain diff (header + every hunk body),
+            // colorize it, run the filter, and if the filtered output has fewer lines than the
+            // plain diff, abort with "mismatched output" (t3701 "detect bogus diffFilter output").
+            if let Some(filter) = &cctx.diff_filter {
+                let mut full_plain = header.clone();
+                for i in 0..hunk_ranges.len() {
+                    full_plain.push_str(&{
+                        let (s, e) = hunk_ranges[i];
+                        if (s, e) == MODE_HUNK {
+                            String::new()
+                        } else {
+                            let work_str = String::from_utf8_lossy(&cur_work).into_owned();
+                            let new_lines: Vec<&str> = work_str.lines().collect();
+                            render_hunk_with_offsets(&old_lines, &new_lines, &ops, s, e, context)
+                        }
+                    });
+                }
+                let colored_full = {
+                    let mut out = String::new();
+                    for line in full_plain.split_inclusive('\n') {
+                        let (body, nl) = match line.strip_suffix('\n') {
+                            Some(b) => (b, "\n"),
+                            None => (line, ""),
+                        };
+                        out.push_str(&cctx.colorize_diff_line(body, ws_highlight_all));
+                        out.push_str(nl);
+                    }
+                    out
+                };
+                if let Ok(filtered) = run_diff_filter(filter, &colored_full) {
+                    let plain_lines = full_plain.lines().count();
+                    let filtered_lines = filtered.lines().count();
+                    if filtered_lines < plain_lines {
+                        bail!("mismatched output from interactive.diffFilter\nPlease make sure that the filter correctly indicates all lines, and that no lines are added or removed.");
+                    }
+                }
+            }
 
             'hunk_loop: loop {
                 let n_hunks = hunk_ranges.len();
@@ -954,11 +1271,13 @@ pub(crate) fn run_add_patch_with_reader(
                     Decision::Skip => " (was: n)",
                     Decision::Undecided => "",
                 };
-                write!(
-                    out,
-                    "({display_idx}/{n_hunks}) {verb}{was} [y,n,q,a,d{nav},?]? "
-                )
-                .ok();
+                let prompt_text =
+                    format!("({display_idx}/{n_hunks}) {verb}{was} [y,n,q,a,d{nav},?]? ");
+                if cctx.use_interactive && !cctx.prompt.is_empty() {
+                    write!(out, "{}", cctx.wrap(&cctx.prompt, &prompt_text)).ok();
+                } else {
+                    write!(out, "{prompt_text}").ok();
+                }
                 out.flush().ok();
 
                 // `soft_increment`: after y/n/e move to the next undecided hunk, or off the end.
