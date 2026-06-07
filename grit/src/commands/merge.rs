@@ -3735,7 +3735,11 @@ fn record_submodule_merge_conflict(
     }
     submodule_merge_advice.push((path_str.to_owned(), advice_abbrev));
     *has_conflicts = true;
-    stage_entry(index, be, 1);
+    // A null base (no common merge base for the submodule path) is not recorded at
+    // stage 1 — git leaves only the stage-2/stage-3 unmerged entries in that case.
+    if be.oid != zero_oid() {
+        stage_entry(index, be, 1);
+    }
     stage_entry(index, oe, 2);
     stage_entry(index, te, 3);
     conflict_descriptions.push(ConflictDescription {
@@ -9438,6 +9442,7 @@ fn merge_trees(
                         3,
                         2,
                         merge_ours_oid_hex,
+                        false,
                         &mut index,
                         &mut has_conflicts,
                         &mut conflict_descriptions,
@@ -9486,7 +9491,13 @@ fn merge_trees(
                     && te.mode != MODE_TREE =>
             {
                 let path_str = String::from_utf8_lossy(path).to_string();
+                let relocate_file = !criss_cross_outer_merge;
                 if oe.mode == MODE_GITLINK {
+                    let suffix = if relocate_file {
+                        their_name
+                    } else {
+                        merge_theirs_oid_hex
+                    };
                     conflict_submodule_vs_non_gitlink(
                         repo,
                         &path_str,
@@ -9495,13 +9506,19 @@ fn merge_trees(
                         te,
                         2,
                         3,
-                        merge_theirs_oid_hex,
+                        suffix,
+                        relocate_file,
                         &mut index,
                         &mut has_conflicts,
                         &mut conflict_descriptions,
                         &mut conflict_files,
                     )?;
                 } else {
+                    let suffix = if relocate_file {
+                        ours_label
+                    } else {
+                        merge_ours_oid_hex
+                    };
                     conflict_submodule_vs_non_gitlink(
                         repo,
                         &path_str,
@@ -9510,7 +9527,8 @@ fn merge_trees(
                         oe,
                         3,
                         2,
-                        merge_ours_oid_hex,
+                        suffix,
+                        relocate_file,
                         &mut index,
                         &mut has_conflicts,
                         &mut conflict_descriptions,
@@ -9548,6 +9566,7 @@ fn merge_trees(
                             2,
                             3,
                             merge_theirs_oid_hex,
+                            false,
                             &mut index,
                             &mut has_conflicts,
                             &mut conflict_descriptions,
@@ -9563,6 +9582,7 @@ fn merge_trees(
                             3,
                             2,
                             merge_ours_oid_hex,
+                            false,
                             &mut index,
                             &mut has_conflicts,
                             &mut conflict_descriptions,
@@ -9793,8 +9813,29 @@ fn merge_trees(
             (None, Some(oe), Some(te)) => {
                 let path_str = String::from_utf8_lossy(path).to_string();
                 if oe.mode == MODE_GITLINK && te.mode == MODE_GITLINK {
-                    has_conflicts = true;
                     remove_stage_zero_entry(&mut index, path);
+                    // Submodule add/add with no common merge base (each superproject branch
+                    // introduced the submodule independently). Run the gitlink merge with a
+                    // null base so the "go to submodule" advice referencing the submodule's
+                    // HEAD^1 is emitted, matching git merge-ort's merge_submodule().
+                    let mut null_base = oe.clone();
+                    null_base.oid = zero_oid();
+                    if try_merge_gitlink_entries(
+                        repo,
+                        &path_str,
+                        &null_base,
+                        oe,
+                        te,
+                        favor,
+                        &mut index,
+                        &mut has_conflicts,
+                        &mut conflict_descriptions,
+                        &mut submodule_merge_stdout,
+                        &mut submodule_merge_advice,
+                    )? {
+                        continue;
+                    }
+                    has_conflicts = true;
                     stage_entry(&mut index, oe, 2);
                     stage_entry(&mut index, te, 3);
                     conflict_descriptions.push(ConflictDescription {
@@ -11117,25 +11158,54 @@ fn conflict_submodule_vs_non_gitlink(
     gitlink_entry: &IndexEntry,
     other: &IndexEntry,
     gitlink_stage: u8,
-    _other_stage: u8,
+    other_stage: u8,
     file_conflict_suffix: &str,
+    relocate_file: bool,
     index: &mut Index,
     has_conflicts: &mut bool,
     conflict_descriptions: &mut Vec<ConflictDescription>,
     conflict_files: &mut Vec<(String, Vec<u8>)>,
 ) -> Result<()> {
     *has_conflicts = true;
+    let relocated = format!("{path_str}~{file_conflict_suffix}");
     let mut gl = gitlink_entry.clone();
     gl.path = path.to_vec();
+    if relocate_file {
+        // git merge-ort handles a submodule-vs-file "distinct types" clash for a normal merge by
+        // keeping the gitlink at `path` and *renaming* the non-gitlink side to `path~<label>`,
+        // staging it there. Recording the relocated file in the index (rather than leaving an
+        // untracked working-tree copy) is what lets `git reset --hard` clean it up afterward
+        // (t6437 file/submodule conflict; merge --abort works afterward).
+        let mut ot = other.clone();
+        ot.path = relocated.as_bytes().to_vec();
+        stage_entry(index, &gl, gitlink_stage);
+        stage_entry(index, &ot, other_stage);
+        conflict_descriptions.push(ConflictDescription {
+            kind: "distinct types",
+            body: format!(
+                "{path_str} had different types on each side; renamed one of them so each can be recorded somewhere."
+            ),
+            subject_path: relocated.clone(),
+            remerge_anchor_path: Some(path_str.to_owned()),
+            rename_rr_ours_dest: None,
+            rename_rr_theirs_dest: None,
+            auto_merge_hint_path: None,
+        });
+        if matches!(other.mode, MODE_REGULAR | MODE_EXECUTABLE) {
+            if let Ok(obj) = repo.odb.read(&other.oid) {
+                conflict_files.push((relocated, obj.data));
+            }
+        }
+        return Ok(());
+    }
+    // Virtual-base / criss-cross computation: stage both unmerged entries at the original
+    // `path` so the recursive virtual-base builder still detects the submodule add/add and
+    // omits the path (t6416 submodule vs symlink). The conflicting file is materialized as an
+    // untracked working-tree copy at `path~<suffix>`.
     let mut ot = other.clone();
     ot.path = path.to_vec();
-    if gitlink_stage == 2 {
-        stage_entry(index, &gl, 2);
-        stage_entry(index, &ot, 3);
-    } else {
-        stage_entry(index, &ot, 2);
-        stage_entry(index, &gl, 3);
-    }
+    stage_entry(index, &gl, gitlink_stage);
+    stage_entry(index, &ot, other_stage);
     conflict_descriptions.push(ConflictDescription {
         kind: "submodule",
         body: format!("Merge conflict in {path_str}"),
@@ -11147,8 +11217,7 @@ fn conflict_submodule_vs_non_gitlink(
     });
     if matches!(other.mode, MODE_REGULAR | MODE_EXECUTABLE) {
         if let Ok(obj) = repo.odb.read(&other.oid) {
-            let conflict_path = format!("{path_str}~{file_conflict_suffix}");
-            conflict_files.push((conflict_path, obj.data));
+            conflict_files.push((relocated, obj.data));
         }
     }
     Ok(())
