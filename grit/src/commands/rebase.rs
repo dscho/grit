@@ -10,7 +10,7 @@
 //!
 //! This three-way merge produces the replayed commit.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::Args as ClapArgs;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -20,28 +20,28 @@ use std::path::{Path, PathBuf};
 
 use grit_lib::commit_trailers::{append_signoff_trailer, format_signoff_line};
 use grit_lib::config::ConfigSet;
-use grit_lib::diff::{self, DiffEntry, count_changes, diff_index_to_tree, diff_index_to_worktree};
-use grit_lib::hooks::{CommitHookEnv, HookResult, run_commit_hook, run_hook};
+use grit_lib::diff::{self, count_changes, diff_index_to_tree, diff_index_to_worktree, DiffEntry};
+use grit_lib::hooks::{run_commit_hook, run_hook, CommitHookEnv, HookResult};
 use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
 use grit_lib::interpret_trailers::{
-    NewTrailerArg, ProcessTrailerOptions, complete_line, process_trailers,
+    complete_line, process_trailers, NewTrailerArg, ProcessTrailerOptions,
 };
 use grit_lib::merge_base::{ancestor_closure, fork_point, is_ancestor, merge_bases_first_vs_rest};
-use grit_lib::merge_file::{ConflictStyle, MergeFavor, MergeInput, merge};
+use grit_lib::merge_file::{merge, ConflictStyle, MergeFavor, MergeInput};
 use grit_lib::objects::{
-    CommitData, ObjectId, ObjectKind, parse_commit, parse_tree, serialize_commit,
+    parse_commit, parse_tree, serialize_commit, CommitData, ObjectId, ObjectKind,
 };
 use grit_lib::patch_ids::compute_patch_id;
 use grit_lib::refs::{append_reflog, delete_ref, list_refs, resolve_ref, write_ref};
 use grit_lib::repo::Repository;
-use grit_lib::rev_list::{OrderingMode, RevListOptions, rev_list, split_revision_token};
+use grit_lib::rev_list::{rev_list, split_revision_token, OrderingMode, RevListOptions};
 use grit_lib::rev_parse::{
     abbreviate_object_id, peel_to_commit_for_merge_base, resolve_revision,
     resolve_revision_as_commit_without_index_dwim, resolve_revision_for_range_end,
     split_triple_dot_range, upstream_suffix_info,
 };
-use grit_lib::state::{HeadState, resolve_head};
-use grit_lib::whitespace_rule::{WS_DEFAULT_RULE, fix_blob_bytes, parse_whitespace_rule};
+use grit_lib::state::{resolve_head, HeadState};
+use grit_lib::whitespace_rule::{fix_blob_bytes, parse_whitespace_rule, WS_DEFAULT_RULE};
 use grit_lib::write_tree::write_tree_from_index;
 
 use super::checkout::{
@@ -57,7 +57,7 @@ use super::merge::refresh_index_stat_cache_from_worktree;
 use super::replay::merge_trees_for_single_cherry_pick;
 use super::stash;
 use crate::explicit_exit::ExplicitExit;
-use crate::ident::{IdentRole, resolve_email, resolve_name};
+use crate::ident::{resolve_email, resolve_name, IdentRole};
 
 #[derive(Clone, Copy, Debug)]
 struct RebaseReplayCommitOpts {
@@ -5184,7 +5184,7 @@ fn todo_command_is_fixup(word: &str) -> bool {
 /// # Returns
 /// `Some(message)` describing the violation, or `None` when the argument is valid.
 fn check_label_or_ref_arg(word: &str, arg: &str) -> Option<String> {
-    use grit_lib::check_ref_format::{RefNameOptions, check_refname_format};
+    use grit_lib::check_ref_format::{check_refname_format, RefNameOptions};
     let onelevel = RefNameOptions {
         allow_onelevel: true,
         refspec_pattern: false,
@@ -6163,7 +6163,20 @@ Use '--' to separate paths from revisions, like this:\n\
         upstream_oid
     };
     let mut commits = if args.root {
-        collect_commits_for_root_rebase(&repo, head_oid, onto_oid, args.onto.is_some())?
+        // Upstream `sequencer_make_script` sets `revs.max_parents = 1` unless `--rebase-merges`,
+        // so a plain `rebase -i --root` (or any non-merge backend that would build a pick list)
+        // excludes merge commits from the todo rather than emitting `pick <merge>` lines, which
+        // `pick` rejects. The sequential/apply root backend keeps merges and flattens them via the
+        // first-parent walk (`message_for_root_replayed_commit`), so only exclude merges for the
+        // interactive, non-rebase-merges case (t3412 `rebase -i --root with conflict`).
+        let exclude_merges = args.interactive && !rebase_merges_on;
+        collect_commits_for_root_rebase(
+            &repo,
+            head_oid,
+            onto_oid,
+            args.onto.is_some(),
+            exclude_merges,
+        )?
     } else {
         collect_rebase_todo_commits(&repo, head_oid, commits_upstream, filter_cherry_equivalents)?
     };
@@ -7026,17 +7039,32 @@ fn collect_commits_to_replay(
 
 /// Commits to replay for `rebase --root --onto <onto>`: same set as `git rev-list <onto>..<head>`.
 ///
-/// Order matches `git rev-list` default output reversed (oldest first), including merge topology.
+/// When `exclude_merges` is false (the default, sequential/apply backend), the walk follows
+/// first-parent and *includes* merge commits, which are later flattened by recording the second
+/// parent's message ([`message_for_root_replayed_commit`]). When `exclude_merges` is true
+/// (interactive `-i` without `--rebase-merges`), it mirrors upstream `sequencer_make_script`, which
+/// sets `revs.max_parents = 1`: the full topological history is walked but merge commits are
+/// omitted entirely (their non-merge ancestors on every side are still picked individually). This
+/// keeps `git rebase -i --root` from emitting `pick <merge>` lines, which `pick` rejects
+/// (t3412 `rebase -i --root with conflict`).
+///
+/// Order matches `git rev-list` default output reversed (oldest first).
 fn collect_commits_for_root_rebase(
     repo: &Repository,
     head: ObjectId,
     onto: ObjectId,
     filter_redundant: bool,
+    exclude_merges: bool,
 ) -> Result<Vec<ObjectId>> {
     let mut opts = RevListOptions::default();
-    opts.first_parent = true;
-    opts.ordering = OrderingMode::Default;
     opts.reverse = true;
+    if exclude_merges {
+        opts.max_parents = Some(1);
+        opts.ordering = OrderingMode::Topo;
+    } else {
+        opts.first_parent = true;
+        opts.ordering = OrderingMode::Default;
+    }
     let listed = if onto.is_zero() {
         // `rebase --root` without `--onto`: replay the full first-parent chain from the branch tip
         // (Git uses an empty lower bound; we cannot pass the null OID through rev-list).
