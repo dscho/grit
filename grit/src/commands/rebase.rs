@@ -4621,6 +4621,23 @@ fn run_commit_editor_for_reword(
     run_commit_editor_for_template(repo, git_dir, &edit_template, "commit", Some("HEAD"))
 }
 
+/// Opens the editor for a `git rebase --continue` after an `edit` stop.
+///
+/// Git's `commit_staged_changes` amends the edited commit with
+/// `run_git_commit(rebase_path_message(), …, AMEND_MSG | EDIT_MSG)`, i.e. `git commit --amend -e -F
+/// <message>`. Because the message is supplied via `-F`, the `prepare-commit-msg` hook receives
+/// arg1="message" (`builtin/commit.c` precedence), unlike `reword` which passes "commit"/"HEAD".
+fn run_edit_continue_editor(repo: &Repository, git_dir: &Path, template: &str) -> Result<String> {
+    let mut edit_template = template.to_owned();
+    if !edit_template.ends_with("\n\n") {
+        if !edit_template.ends_with('\n') {
+            edit_template.push('\n');
+        }
+        edit_template.push('\n');
+    }
+    run_commit_editor_for_template(repo, git_dir, &edit_template, "message", None)
+}
+
 fn worktree_matches_head(repo: &Repository, git_dir: &Path) -> Result<bool> {
     let Some(wt) = repo.work_tree.as_deref() else {
         return Ok(true);
@@ -9564,7 +9581,12 @@ fn do_continue() -> Result<()> {
                 run_commit_editor_for_template(&repo, git_dir, &template, "message", Some(":"))?;
             apply_commit_msg_cleanup(&raw_msg, rebase_commit_msg_cleanup(&config))
         } else if edit_continue {
-            let after_editor = run_commit_editor_for_reword(&repo, git_dir, msg_src.trim())?;
+            // Git's `commit_staged_changes` continues an `edit` stop via
+            // `run_git_commit(rebase_path_message(), …, AMEND_MSG | EDIT_MSG)`, i.e.
+            // `git commit --amend -e -F <message>`. Because `-F` supplies the message, the
+            // `prepare-commit-msg` hook receives arg1="message" (builtin/commit.c precedence),
+            // not the "commit"/"HEAD" pair used by `reword` (which has no `-F`).
+            let after_editor = run_edit_continue_editor(&repo, git_dir, msg_src.trim())?;
             message_from_reword_editor(&after_editor, rebase_commit_msg_cleanup(&config), &config)?
         } else {
             let raw_msg = commit_message_after_prepare_hook(
@@ -9600,8 +9622,14 @@ fn do_continue() -> Result<()> {
             replay_opts_continue,
             now_continue,
         )?;
+        // Record the amend on HEAD's reflog. Git's `commit_staged_changes` continues via
+        // `git commit --amend` with `GIT_REFLOG_ACTION="<action> (continue)"`, so the amended
+        // commit gets its own reflog entry `<action> (continue): <subject>` before the rebase
+        // "finish" entry. Without this, an `edit` continue would leave HEAD pointing at the
+        // amended commit but the previous reflog line still showing the un-amended pick
+        // (t7505 `message [edit rebase-13]` at HEAD@{1}).
         fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
-        if user_made_own_commit {
+        {
             let ra = load_rebase_reflog_action(&rb_dir);
             let ident = reflog_identity(&repo);
             let msg = format!("{ra} (continue): {message_subject}");

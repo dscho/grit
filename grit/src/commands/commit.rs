@@ -1168,7 +1168,7 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     let template_path = resolve_commit_template_path(&args, &config)?;
-    let use_editor_for_message = commit_uses_editor(&args, fixup_parsed.as_ref(), &repo.git_dir);
+    let use_editor_for_message = commit_uses_editor(&args, fixup_parsed.as_ref());
     if use_editor_for_message {
         validate_explicit_committer_identity(&config)?;
         let _ = resolve_committer(&config, OffsetDateTime::now_utc())?;
@@ -3327,10 +3327,10 @@ fn commit_rename_settings(config: &ConfigSet) -> (Option<u32>, bool) {
     (Some(50), false)
 }
 
-fn commit_uses_editor(args: &Args, fixup: Option<&FixupParsed>, git_dir: &Path) -> bool {
+fn commit_uses_editor(args: &Args, fixup: Option<&FixupParsed>) -> bool {
     // Mirror `builtin/commit.c`: first derive a default `use_editor` from the message source,
     // then let an explicit `-e`/`--no-edit` override it (upstream `edit_flag` tri-state).
-    let base = commit_uses_editor_default(args, fixup, git_dir);
+    let base = commit_uses_editor_default(args, fixup);
     if args.edit {
         return true;
     }
@@ -3341,7 +3341,7 @@ fn commit_uses_editor(args: &Args, fixup: Option<&FixupParsed>, git_dir: &Path) 
 }
 
 /// Default `use_editor` before applying an explicit `-e`/`--no-edit` override.
-fn commit_uses_editor_default(args: &Args, fixup: Option<&FixupParsed>, git_dir: &Path) -> bool {
+fn commit_uses_editor_default(args: &Args, fixup: Option<&FixupParsed>) -> bool {
     // `-c`/`-C` (reuse), `-m`, and `-F` all disable the editor by default.
     if args.reuse_message.is_some() && args.reedit_message.is_none() {
         return false;
@@ -3349,9 +3349,12 @@ fn commit_uses_editor_default(args: &Args, fixup: Option<&FixupParsed>, git_dir:
     if !args.message.is_empty() || args.file.is_some() {
         return false;
     }
-    if git_dir.join("MERGE_MSG").exists() || git_dir.join("SQUASH_MSG").exists() {
-        return false;
-    }
+    // Note: the presence of MERGE_MSG / SQUASH_MSG does NOT disable the editor. Git
+    // (`builtin/commit.c`) only clears `use_editor` for `-m`/`-F`/`-c`/`-C`; a plain
+    // `git commit` after a merge (or a manual commit while resolving a rebase conflict)
+    // still opens the editor, seeded with MERGE_MSG. Tests pass `EDITOR=:` to make that a
+    // no-op. Skipping the editor here would mislabel such commits to prepare-commit-msg
+    // hooks as non-interactive (t7505 `merge [pick rebase-b]`).
     if let Some(f) = fixup {
         match f.mode {
             // Plain `--fixup` uses a generated message (no editor) by default.
