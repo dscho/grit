@@ -3280,13 +3280,22 @@ fn update_squash_message_file(
         let head_commit = parse_commit(&hobj.data)?;
         let hsubj = head_commit.message.lines().next().unwrap_or("");
         let hbody = message_body_after_subject(&head_commit.message);
+        // `is_fixup_flag` mirrors Git's `is_fixup_flag(command, flag)`: only the
+        // `fixup -C` / `fixup -c` amend modes (a fixup with a message mode set) replace and
+        // skip the prior accumulated message. A *plain* `fixup` keeps the 1st commit message
+        // uncommented, exactly like a squash; only the fixup commit's own message (#2) is
+        // skipped (handled below). Earlier this branch gated on `cmd == Fixup` alone, which
+        // wrongly commented out the pick target's message for plain fixups (t3404 #35).
+        let is_fixup_flag = cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some();
         let mut buf = String::new();
         buf.push_str("# This is a combination of 2 commits.\n");
-        if cmd == RebaseTodoCmd::Fixup {
+        if is_fixup_flag {
             buf.push_str("# The 1st commit message will be skipped:\n\n");
         } else {
             buf.push_str("# This is the 1st commit message:\n\n");
         }
+        // A plain `fixup` records the accumulated message to FIXUP_MSG (Git writes HEAD's body
+        // there for `command == TODO_FIXUP && !flag`).
         if cmd == RebaseTodoCmd::Fixup {
             write_fixup_message_mode(rb_dir, fixup_message_mode)?;
             let fixup_msg = if fixup_message_mode.is_some() {
@@ -3306,6 +3315,8 @@ fn update_squash_message_file(
                 fixup_msg
             };
             fs::write(&fixup_path, fixup_msg)?;
+        }
+        if is_fixup_flag {
             append_commented(&mut buf, hsubj);
             if !hbody.is_empty() {
                 append_commented(&mut buf, hbody.trim_end_matches('\n'));
