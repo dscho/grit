@@ -4836,7 +4836,10 @@ fn validate_edited_interactive_todo(
             continue;
         }
         reported.insert(oid);
-        let abbrev = abbreviate_object_id(repo, oid, 7).unwrap_or_else(|_| oid.to_hex());
+        // Honour `core.abbrev` for the dropped-commit short hashes (Git uses `%h` semantics);
+        // tests compute the expectation with `git log --format=%h`, which respects the config.
+        let abbrev = abbreviate_object_id(repo, oid, rebase_core_abbrev_len(config))
+            .unwrap_or_else(|_| oid.to_hex());
         let subject = commit_subject_for_oid(repo, oid);
         missing.push_str(&format!(" - {abbrev} # {subject}\n"));
     }
@@ -4948,6 +4951,9 @@ fn run_interactive_rebase(
     let todo_with_help = append_rebase_todo_help(&todo, command_count, revs_onto, config);
     fs::write(&todo_path, todo_with_help.as_bytes())?;
     let editor = sequence_editor_cmd(config)?;
+    if std::env::var("GRIT_DEBUG_T3415").is_ok() {
+        eprintln!("DEBUG run_interactive_rebase editor=[{editor}]");
+    }
     let status = run_shell_editor(&editor, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
     let _ = fs::remove_dir_all(&rb_merge);
