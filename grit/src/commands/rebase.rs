@@ -2420,6 +2420,74 @@ fn reset_rebase_head_to_commit(repo: &Repository, git_dir: &Path, target: &Objec
     reset_worktree_to_commit(repo, git_dir, &head_state, *target, "merge")
 }
 
+/// Reword a merge commit that was just fast-forwarded into (`merge -c` with `fast_forward_edit`).
+/// Opens the commit-message editor seeded with the original merge message, then rewrites the merge
+/// commit in place (same tree and parents, edited message) and advances HEAD. Mirrors Git's
+/// `do_merge` `fast_forward_edit` (run_git_commit with AMEND_MSG|EDIT_MSG).
+fn reword_fast_forwarded_merge(
+    repo: &Repository,
+    git_dir: &Path,
+    rb_dir: &Path,
+    ff_oid: &ObjectId,
+    author_template_oid: Option<&ObjectId>,
+) -> Result<()> {
+    let config = ConfigSet::load(Some(git_dir), true)?;
+    let ff_commit_oid = peel_to_commit_for_merge_base(repo, *ff_oid)?;
+    let obj = repo.odb.read(&ff_commit_oid)?;
+    let merge_commit = parse_commit(&obj.data)?;
+    // Author for the reworded merge. For a fast-forward reword the fast-forwarded commit *is* the
+    // original merge, so its author line is already correct. For a non-fast-forward `merge -c`, the
+    // merge was produced by a child `grit merge` (with GIT_AUTHOR_* stripped), so its author can be
+    // wrong; replay the ORIGINAL merge commit's author instead (Git keeps the rebased merge's
+    // author). t3430 'merge -c ... reloads todo-list' compares author lines.
+    let author = match author_template_oid {
+        Some(oid) => {
+            let aoid = peel_to_commit_for_merge_base(repo, *oid)?;
+            let aobj = repo.odb.read(&aoid)?;
+            parse_commit(&aobj.data)?.author
+        }
+        None => merge_commit.author.clone(),
+    };
+    let template = merge_commit.message.clone();
+    let after_editor = run_commit_editor_for_reword(repo, git_dir, &template)?;
+    let cleaned =
+        message_from_reword_editor(&after_editor, rebase_commit_msg_cleanup(&config), &config)?;
+    let cleaned = run_reword_commit_msg_hook(repo, git_dir, cleaned, &config)?;
+    let (message, encoding, raw_message) = finalize_message_for_commit_encoding(cleaned, &config);
+    let now = time::OffsetDateTime::now_utc();
+    let opts = load_rebase_replay_commit_opts(rb_dir);
+    let author = rebase_replayed_author_line(&author, opts, now)?;
+    let committer = rebase_replayed_committer_line(&config, &author, opts, now)?;
+    let (author_raw, committer_raw_final) =
+        grit_lib::commit_encoding::identity_raw_for_serialized_commit(
+            &encoding, &author, &committer,
+        );
+    let commit_data = CommitData {
+        tree: merge_commit.tree,
+        parents: merge_commit.parents.clone(),
+        author,
+        committer,
+        author_raw,
+        committer_raw: committer_raw_final,
+        encoding,
+        message: message.clone(),
+        raw_message,
+    };
+    let head_before = resolve_head(git_dir)?
+        .oid()
+        .cloned()
+        .unwrap_or_else(diff::zero_oid);
+    let bytes = serialize_commit(&commit_data);
+    let new_oid = write_replayed_commit(repo, rb_dir, &config, &commit_data.committer, bytes)?;
+    fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
+    let ra = load_rebase_reflog_action(rb_dir);
+    let ident = reflog_identity(repo);
+    let subject = message.lines().next().unwrap_or("");
+    let msg = format!("{ra} (reword): {subject}");
+    let _ = append_reflog(git_dir, "HEAD", &head_before, &new_oid, &ident, &msg, false);
+    Ok(())
+}
+
 fn rebase_merge_reuse_message(
     repo: &Repository,
     git_dir: &Path,
@@ -2434,11 +2502,19 @@ fn rebase_merge_reuse_message(
     // merge's first parent already equals HEAD and every merge head equals the original merge's
     // remaining parents (in order, same count), reuse the ORIGINAL merge commit instead of building
     // a new one. This keeps unchanged merges stable (t3430 'do not rebase cousins', config tests).
-    if allow_ff && !edit_message {
+    if allow_ff {
         if let Some(orig_oid) =
             rebase_merge_fast_forward_target(repo, git_dir, merge_oid, merge_args)?
         {
             reset_rebase_head_to_commit(repo, git_dir, &orig_oid)?;
+            if edit_message {
+                // Git's `do_merge` `fast_forward_edit`: a `merge -c <commit>` that fast-forwards
+                // still opens the editor to reword the message (and re-reads the todo afterwards).
+                // Amend the fast-forwarded merge commit with the edited message, keeping its tree
+                // and parents (t3430 'merge -c ... reloads todo-list', 'reword fast-forwarded empty
+                // merge commit').
+                reword_fast_forwarded_merge(repo, git_dir, rb_dir, &orig_oid, None)?;
+            }
             record_rebase_in_rewritten_pending(git_dir, rb_dir, merge_oid, next_after_line)?;
             return Ok(RebaseMergeReuseOutcome::Completed);
         }
@@ -2452,7 +2528,13 @@ fn rebase_merge_reuse_message(
         rb_dir.join("rebase-merge-edit-msg"),
         if edit_message { "1\n" } else { "0\n" },
     )?;
-    let status = run_rebase_merge_subprocess(repo, git_dir, merge_oid, merge_args, edit_message)?;
+    // Run the merge itself with the original message (`--no-edit`). For a `merge -c` reword we open
+    // the editor *after* the merge commit lands, not inside the merge subprocess: passing `--edit`
+    // would launch the editor while MERGE_HEAD is still live, and a reword editor that runs
+    // `git rebase --edit-todo` then trips over the in-progress merge (t3430 'merge -c ... reloads
+    // todo-list'). Rewording afterwards mirrors Git's `do_merge` committing then re-running the
+    // commit with EDIT_MSG.
+    let status = run_rebase_merge_subprocess(repo, git_dir, merge_oid, merge_args, false)?;
     if !status.success() {
         if git_dir.join("MERGE_HEAD").exists() {
             return Ok(RebaseMergeReuseOutcome::Conflict);
@@ -2460,6 +2542,13 @@ fn rebase_merge_reuse_message(
         return Ok(RebaseMergeReuseOutcome::Blocked);
     }
     rewrite_merge_head_for_replay_opts(repo, git_dir, rb_dir, merge_oid)?;
+    if edit_message {
+        let merged_head = resolve_head(git_dir)?
+            .oid()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("HEAD has no OID after merge"))?;
+        reword_fast_forwarded_merge(repo, git_dir, rb_dir, &merged_head, Some(merge_oid))?;
+    }
     let _ = fs::remove_file(rb_dir.join("rebase-merge-source"));
     let _ = fs::remove_file(rb_dir.join("rebase-merge-args"));
     record_rebase_in_rewritten_pending(git_dir, rb_dir, merge_oid, next_after_line)?;
@@ -7048,6 +7137,16 @@ fn replay_remaining(
                     if rebase_interactive {
                         append_interactive_rebase_done_line(rb_dir, todo[i])?;
                     }
+                    // A `merge -c` (reword) opens the commit editor, and the test/user editor may run
+                    // `git rebase --edit-todo` to reload the remaining list. Write the remaining todo
+                    // (`todo[i+1..]`) to disk *before* the merge so the editor sees the correct list;
+                    // the Completed arm then re-reads the (possibly edited) file rather than
+                    // clobbering it with this stale in-memory slice (t3430 'merge -c ... reloads
+                    // todo-list').
+                    if edit_message {
+                        let rest_before: Vec<&str> = todo[i + 1..].to_vec();
+                        write_rebase_todo_slice(rb_dir, &rest_before)?;
+                    }
                     let merge_head_commit = peel_to_commit_for_merge_base(repo, merge_oid)?;
                     let old_head = resolve_head(git_dir)?
                         .oid()
@@ -7087,8 +7186,15 @@ fn replay_remaining(
                             let _ = append_reflog(
                                 git_dir, "HEAD", &old_head, &new_oid, &ident, &msg, false,
                             );
-                            let rest: Vec<&str> = todo[i + 1..].to_vec();
-                            write_rebase_todo_slice(rb_dir, &rest)?;
+                            // For `merge -c` (reword) the remaining todo was written before the
+                            // merge and possibly re-edited by the editor's `git rebase --edit-todo`;
+                            // leave the on-disk file alone and let the loop re-read it. For a plain
+                            // `merge -C` (no reword) drop the just-completed merge from the in-memory
+                            // slice as before.
+                            if !edit_message {
+                                let rest: Vec<&str> = todo[i + 1..].to_vec();
+                                write_rebase_todo_slice(rb_dir, &rest)?;
+                            }
                             continue 'rebase_loop;
                         }
                         Ok(RebaseMergeReuseOutcome::Conflict) => {
@@ -9344,6 +9450,7 @@ fn do_continue() -> Result<()> {
                     next_peek_amend,
                 )?;
                 let _ = fs::remove_file(rb_dir.join("stopped-sha"));
+                let _ = fs::remove_file(rb_dir.join("amend"));
                 let _ = fs::remove_file(rb_dir.join("rebase-amend-continue"));
                 let _ = fs::remove_file(rb_dir.join("rebase-edit-continue"));
                 return replay_remaining(
@@ -9428,7 +9535,7 @@ fn do_continue() -> Result<()> {
             now_continue,
         )?;
         fs::write(git_dir.join("HEAD"), format!("{}\n", new_oid.to_hex()))?;
-        if edit_continue && head_oid != amend_old_oid {
+        if user_made_own_commit {
             let ra = load_rebase_reflog_action(&rb_dir);
             let ident = reflog_identity(&repo);
             let msg = format!("{ra} (continue): {message_subject}");
@@ -10358,7 +10465,15 @@ fn cleanup_rebase_state(git_dir: &Path) {
     }
     let _ = fs::remove_dir_all(rebase_apply_dir(git_dir));
     let _ = fs::remove_dir_all(rb_merge);
+    // Git's `remove_branch_state` clears the in-progress-merge sentinels too. A `merge`/`merge -C`
+    // step that conflicted leaves `MERGE_HEAD`/`MERGE_MODE`/`AUTO_MERGE`; without removing them on
+    // abort/quit/finish they leak into the *next* rebase and make its first `grit merge` die with
+    // "You have not concluded your merge (MERGE_HEAD exists)" (t3430 cascade: test 8 abort →
+    // test 9 `merge -c`).
     let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
+    let _ = fs::remove_file(git_dir.join("MERGE_HEAD"));
+    let _ = fs::remove_file(git_dir.join("MERGE_MODE"));
+    let _ = fs::remove_file(git_dir.join("AUTO_MERGE"));
     let _ = fs::remove_file(git_dir.join("SQUASH_MSG"));
     let _ = fs::remove_file(git_dir.join("REBASE_HEAD"));
     // Git clears CHERRY_PICK_HEAD when a rebase finishes/aborts (the sequencer's
