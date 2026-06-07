@@ -1759,6 +1759,17 @@ fn log_uses_blank_separator(args: &Args) -> bool {
     }
 }
 
+/// Whether the `--name-only`/`--name-status` block must be preceded by one
+/// newline. Git always prints exactly one newline between the commit message and
+/// the name list — except for `oneline`, which prints none. With `format:`
+/// (separator semantics) that newline terminates the otherwise-unterminated
+/// subject (so no visible blank); for every other format the message line is
+/// already terminated, so the newline shows up as a blank separator (matching
+/// git log-tree.c).
+fn log_name_list_needs_separator(args: &Args) -> bool {
+    !log_uses_builtin_oneline(args)
+}
+
 /// Whether a `--pretty=format:` template references the decoration placeholders (`%d`, `%D`,
 /// `%(decorate...`), so the log machinery knows to load ref decorations. The `%d`/`%D` forms may be
 /// preceded by an add/space/del magic char (`%+d`, `%-d`, `% d`), which must still trigger loading
@@ -2837,6 +2848,7 @@ fn run_rev_list_log(
                 &mut notes_cache,
                 patch_context,
                 blank_separator,
+                None,
             )?;
         }
         shown += 1;
@@ -3282,6 +3294,7 @@ fn run_graph_log(
                 &mut notes_cache,
                 patch_context,
                 false,
+                None,
             )?;
 
             // Normalize the diff body: the non-graph renderer brackets it with a leading blank
@@ -5942,6 +5955,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &mut notes_cache,
                     patch_context,
                     blank_separator,
+                    None,
                 )?;
             }
             if flush_each {
@@ -5978,9 +5992,17 @@ pub fn run(mut args: Args) -> Result<()> {
             args.author_date_order,
         )?;
 
-        // Apply --follow: filter commits and track renames
+        // Apply --follow: filter commits and track renames/copies. `follow_display`
+        // maps each kept commit to the path the followed file had there (the copy/
+        // rename destination) and the detected diff entry, so the per-commit diff
+        // output retargets and shows `C100 <src> <dst>` like Git.
+        let mut follow_display: std::collections::HashMap<ObjectId, FollowDisplay> =
+            std::collections::HashMap::new();
         let commits = if args.follow && !combined_pathspecs.is_empty() {
-            follow_filter(&repo.odb, commits, &combined_pathspecs[0], args.max_count)?
+            let (filtered, display_map) =
+                follow_filter(&repo.odb, commits, &combined_pathspecs[0], args.max_count)?;
+            follow_display = display_map;
+            filtered
         } else {
             commits
         };
@@ -6162,6 +6184,11 @@ pub fn run(mut args: Args) -> Result<()> {
                     &mut notes_cache,
                     patch_context,
                     blank_separator,
+                    if args.follow {
+                        follow_display.get(oid)
+                    } else {
+                        None
+                    },
                 )?;
             }
         }
@@ -6634,6 +6661,7 @@ pub fn run_no_walk(
                 &mut notes_cache,
                 patch_context,
                 blank_separator,
+                None,
             )?;
         }
     }
@@ -7557,6 +7585,7 @@ fn run_reflog_walk(
                 &mut notes_cache,
                 patch_context,
                 diff_leading_blank,
+                None,
             )?;
             if j > 0 {
                 writeln!(out)?;
@@ -12502,11 +12531,22 @@ fn write_commit_diff(
     notes_cache: &mut NotesMapCache<'_>,
     patch_context: usize,
     leading_blank: bool,
+    follow_override: Option<&FollowDisplay>,
 ) -> Result<()> {
     let odb = &repo.odb;
     let git_dir = &repo.git_dir;
     let log_config = ConfigSet::load(Some(git_dir), true).unwrap_or_default();
     let indent_heuristic = indent_heuristic_from_config(&log_config);
+    // Under `--follow`, restrict the displayed diff to the path the followed file
+    // had in this commit (the copy/rename destination), not the original pathspec.
+    let follow_pathspecs: Vec<String> = follow_override
+        .map(|f| vec![f.display_path.clone()])
+        .unwrap_or_default();
+    let pathspecs: &[String] = if follow_override.is_some() {
+        &follow_pathspecs
+    } else {
+        pathspecs
+    };
     let is_merge = info.parents.len() > 1;
 
     if !log_commit_needs_diff_output(args, info, git_dir)? {
@@ -12615,6 +12655,17 @@ fn write_commit_diff(
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(50);
         entries = grit_lib::diff::detect_renames(odb, None, entries, threshold);
+    }
+    // Under `--follow`, the commit that introduced the followed file as a copy or
+    // rename of another path was detected up front (`follow_filter`). Replace the
+    // plain add/modify entry for the destination with that copy/rename entry so the
+    // displayed diff shows `C100 <src> <dst>` and the source blob is the patch base.
+    if let Some(detected) = follow_override.and_then(|f| f.display_entry.as_ref()) {
+        if matches!(detected.status, DiffStatus::Renamed | DiffStatus::Copied) {
+            let dest = detected.new_path.as_deref();
+            entries.retain(|e| e.new_path.as_deref() != dest);
+            entries.push(detected.clone());
+        }
     }
     if entries.is_empty() {
         return Ok(());
@@ -12833,7 +12884,7 @@ fn write_commit_diff_body(
     }
 
     if args.name_only {
-        if !list_raw_name.is_empty() {
+        if !list_raw_name.is_empty() && log_name_list_needs_separator(args) {
             writeln!(out)?;
         }
         for entry in list_raw_name {
@@ -12842,10 +12893,37 @@ fn write_commit_diff_body(
     }
 
     if args.name_status {
-        for entry in list_raw_name {
-            writeln!(out, "{}\t{}", entry.status.letter(), entry.path())?;
+        // Like `--name-only`, emit a single separator before the status block: in
+        // builtin multi-line pretty formats this is the blank line between the message
+        // and the diff body; with `format:` (whose subject line is left unterminated)
+        // it is the subject's terminating newline; `oneline`/`tformat:` already
+        // terminate the line, so nothing is added there. The inter-commit blank line is
+        // supplied by the caller's separator, so no trailing blank is printed here.
+        if !list_raw_name.is_empty() && log_name_list_needs_separator(args) {
+            writeln!(out)?;
         }
-        writeln!(out)?;
+        for entry in list_raw_name {
+            match entry.status {
+                // Renames and copies print the similarity score and both the source
+                // and destination paths (`R100\told\tnew`), matching diff-tree's
+                // name-status output. This is reached e.g. for `log --follow`, where
+                // the copy/rename that introduced the followed file is shown.
+                DiffStatus::Renamed | DiffStatus::Copied => {
+                    let score = entry.score.unwrap_or(100);
+                    writeln!(
+                        out,
+                        "{}{:03}\t{}\t{}",
+                        entry.status.letter(),
+                        score,
+                        entry.old_path.as_deref().unwrap_or(""),
+                        entry.new_path.as_deref().unwrap_or(""),
+                    )?;
+                }
+                _ => {
+                    writeln!(out, "{}\t{}", entry.status.letter(), entry.path())?;
+                }
+            }
+        }
     }
 
     if show_patch {
@@ -13699,19 +13777,37 @@ fn commit_has_object(
     Ok(false)
 }
 
-/// Filter commits by following a file across renames.
-/// Returns only commits that touch the tracked file, updating the path
-/// when renames are detected.
+/// What `--follow` should display for a kept commit: the path the followed file
+/// had in that commit (`display_path`, the destination of any copy/rename) and
+/// the already copy/rename-detected diff entry to render for it
+/// (`display_entry`).
+#[derive(Clone)]
+struct FollowDisplay {
+    display_path: String,
+    display_entry: Option<DiffEntry>,
+}
+
+/// Filter commits by following a file across renames and copies.
+/// Returns only commits that touch the tracked file, plus a per-commit map
+/// describing what to display. The display info mirrors Git's
+/// `try_to_follow_renames`: the commit that first introduces the file as a copy
+/// of a still-existing source shows `C100 <source> <dest>`, and older commits
+/// show the file under its earlier name.
 fn follow_filter(
     odb: &Odb,
     commits: Vec<(ObjectId, CommitInfo)>,
     initial_path: &str,
     max_count: Option<usize>,
-) -> Result<Vec<(ObjectId, CommitInfo)>> {
+) -> Result<(
+    Vec<(ObjectId, CommitInfo)>,
+    std::collections::HashMap<ObjectId, FollowDisplay>,
+)> {
     use grit_lib::diff::detect_copies;
 
     let mut tracked_path = initial_path.to_string();
     let mut result = Vec::new();
+    let mut display_map: std::collections::HashMap<ObjectId, FollowDisplay> =
+        std::collections::HashMap::new();
 
     for (oid, info) in commits {
         let parent_tree = if let Some(parent) = info.parents.first() {
@@ -13735,12 +13831,17 @@ fn follow_filter(
 
         let mut touches = false;
         let mut retarget: Option<String> = None;
+        // The path the followed file has in *this* commit is the current
+        // `tracked_path` (a copy/rename only retargets for older commits).
+        let display_path = tracked_path.clone();
+        let mut display_entry: Option<DiffEntry> = None;
         for entry in &entries {
             match entry.status {
                 DiffStatus::Renamed | DiffStatus::Copied => {
                     // The new path is the copy/rename destination; follow it back to the source.
                     if entry.new_path.as_deref() == Some(tracked_path.as_str()) {
                         touches = true;
+                        display_entry = Some(entry.clone());
                         if let Some(old_path) = entry.old_path.as_deref() {
                             retarget = Some(old_path.to_string());
                         }
@@ -13757,12 +13858,22 @@ fn follow_filter(
                 _ => {
                     if entry.path() == tracked_path {
                         touches = true;
+                        if display_entry.is_none() {
+                            display_entry = Some(entry.clone());
+                        }
                     }
                 }
             }
         }
 
         if touches {
+            display_map.insert(
+                oid,
+                FollowDisplay {
+                    display_path,
+                    display_entry,
+                },
+            );
             result.push((oid, info));
             if let Some(new_target) = retarget {
                 tracked_path = new_target;
@@ -13775,7 +13886,7 @@ fn follow_filter(
         }
     }
 
-    Ok(result)
+    Ok((result, display_map))
 }
 
 /// Build a map from commit OID → source name for the `%S` placeholder, seeded
