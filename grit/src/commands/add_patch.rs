@@ -75,7 +75,7 @@ fn want_color_domain(cfg: &ConfigSet, key: &str) -> bool {
 }
 
 /// Diff/interactive color slots resolved once per `add -p`/`add -i` invocation.
-struct ColorCtx {
+pub(crate) struct ColorCtx {
     use_interactive: bool,
     use_diff: bool,
     /// `interactive.diffFilter` shell command, if any (applied to the colored diff text).
@@ -87,15 +87,15 @@ struct ColorCtx {
     old: String,
     new: String,
     // interactive colors
-    prompt: String,
-    header: String,
-    help: String,
-    error: String,
-    reset: String,
+    pub(crate) prompt: String,
+    pub(crate) header: String,
+    pub(crate) help: String,
+    pub(crate) error: String,
+    pub(crate) reset: String,
 }
 
 impl ColorCtx {
-    fn from_config(cfg: &ConfigSet) -> Self {
+    pub(crate) fn from_config(cfg: &ConfigSet) -> Self {
         let use_interactive = want_color_domain(cfg, "color.interactive");
         let use_diff = want_color_domain(cfg, "color.diff");
         let diff_filter = cfg
@@ -164,8 +164,13 @@ impl ColorCtx {
         self.use_diff || self.use_interactive
     }
 
+    /// Whether interactive (menu/prompt/help) coloring is active.
+    pub(crate) fn use_interactive(&self) -> bool {
+        self.use_interactive
+    }
+
     /// Wrap `text` in `color` + reset if coloring is active and `color` is non-empty.
-    fn wrap(&self, color: &str, text: &str) -> String {
+    pub(crate) fn wrap(&self, color: &str, text: &str) -> String {
         if color.is_empty() {
             text.to_owned()
         } else {
@@ -396,6 +401,7 @@ const MODE_HUNK: (usize, usize) = (usize::MAX, usize::MAX);
 /// **absolute** line offsets from `old_lines`/`new_lines`. Leading/trailing equal runs in the range
 /// are capped to `context` lines of surrounding context, matching `git diff`'s hunk headers — which
 /// the simpler [`partial_unified_for_op_range`] cannot because it rebuilds offsets from 1.
+#[allow(clippy::too_many_arguments)]
 fn render_hunk_with_offsets(
     old_lines: &[&str],
     new_lines: &[&str],
@@ -403,10 +409,16 @@ fn render_hunk_with_offsets(
     start: usize,
     end: usize,
     context: usize,
+    old_no_nl: bool,
+    new_no_nl: bool,
 ) -> String {
     use similar::DiffOp;
-    // Collect body lines as (marker, text) and track absolute old/new starts and counts.
-    let mut body: Vec<(char, String)> = Vec::new();
+    // Track whether a body entry is the final line of its old/new file so we can emit
+    // `\ No newline at end of file` right after it (mirroring git's diff output).
+    let old_last = old_lines.len().checked_sub(1);
+    let new_last = new_lines.len().checked_sub(1);
+    // Collect body lines as (marker, text, no_nl) and track absolute old/new starts and counts.
+    let mut body: Vec<(char, String, bool)> = Vec::new();
     let mut old_start: Option<usize> = None; // 0-based
     let mut new_start: Option<usize> = None;
     let mut old_count = 0usize;
@@ -441,7 +453,10 @@ fn render_hunk_with_offsets(
                         old_start = Some(old_index + j);
                         new_start = Some(new_index + j);
                     }
-                    body.push((' ', old_lines[old_index + j].to_string()));
+                    // A context line is the file's last line only when it is last on both sides.
+                    let no_nl = (old_last == Some(old_index + j) && old_no_nl)
+                        && (new_last == Some(new_index + j) && new_no_nl);
+                    body.push((' ', old_lines[old_index + j].to_string(), no_nl));
                     old_count += 1;
                     new_count += 1;
                 }
@@ -456,7 +471,8 @@ fn render_hunk_with_offsets(
                         old_start = Some(old_index + j);
                         new_start = Some(new_index);
                     }
-                    body.push(('-', old_lines[old_index + j].to_string()));
+                    let no_nl = old_last == Some(old_index + j) && old_no_nl;
+                    body.push(('-', old_lines[old_index + j].to_string(), no_nl));
                     old_count += 1;
                 }
             }
@@ -470,7 +486,8 @@ fn render_hunk_with_offsets(
                         old_start = Some(old_index);
                         new_start = Some(new_index + j);
                     }
-                    body.push(('+', new_lines[new_index + j].to_string()));
+                    let no_nl = new_last == Some(new_index + j) && new_no_nl;
+                    body.push(('+', new_lines[new_index + j].to_string(), no_nl));
                     new_count += 1;
                 }
             }
@@ -485,7 +502,8 @@ fn render_hunk_with_offsets(
                         old_start = Some(old_index + j);
                         new_start = Some(new_index);
                     }
-                    body.push(('-', old_lines[old_index + j].to_string()));
+                    let no_nl = old_last == Some(old_index + j) && old_no_nl;
+                    body.push(('-', old_lines[old_index + j].to_string(), no_nl));
                     old_count += 1;
                 }
                 for j in 0..new_len {
@@ -493,7 +511,8 @@ fn render_hunk_with_offsets(
                         old_start = Some(old_index);
                         new_start = Some(new_index + j);
                     }
-                    body.push(('+', new_lines[new_index + j].to_string()));
+                    let no_nl = new_last == Some(new_index + j) && new_no_nl;
+                    body.push(('+', new_lines[new_index + j].to_string(), no_nl));
                     new_count += 1;
                 }
             }
@@ -523,10 +542,13 @@ fn render_hunk_with_offsets(
         format!("{n_off},{new_count}")
     };
     let mut s = format!("@@ -{o_hdr} +{n_hdr} @@\n");
-    for (m, line) in body {
+    for (m, line, no_nl) in body {
         s.push(m);
         s.push_str(&line);
         s.push('\n');
+        if no_nl {
+            s.push_str("\\ No newline at end of file\n");
+        }
     }
     s
 }
@@ -1114,6 +1136,7 @@ pub(crate) fn run_add_patch_with_reader(
             // re-diffs, so the ops/lines for that path are recomputed by the caller on `rediff`.
             let index_side_str = String::from_utf8_lossy(&index_side_bytes).into_owned();
             let old_lines: Vec<&str> = index_side_str.lines().collect();
+            let old_no_nl = !index_side_bytes.is_empty() && !index_side_bytes.ends_with(b"\n");
             let render_hunk = |i: usize, ranges: &[(usize, usize)], work: &[u8]| -> String {
                 let (s, e) = ranges[i];
                 if (s, e) == MODE_HUNK {
@@ -1122,7 +1145,10 @@ pub(crate) fn run_add_patch_with_reader(
                 }
                 let work_str = String::from_utf8_lossy(work).into_owned();
                 let new_lines: Vec<&str> = work_str.lines().collect();
-                let plain = render_hunk_with_offsets(&old_lines, &new_lines, &ops, s, e, context);
+                let new_no_nl = !work.is_empty() && !work.ends_with(b"\n");
+                let plain = render_hunk_with_offsets(
+                    &old_lines, &new_lines, &ops, s, e, context, old_no_nl, new_no_nl,
+                );
                 if cctx.any() {
                     cctx.colorize_diff(&plain, ws_highlight_all)
                 } else {
@@ -1144,7 +1170,10 @@ pub(crate) fn run_add_patch_with_reader(
                         } else {
                             let work_str = String::from_utf8_lossy(&cur_work).into_owned();
                             let new_lines: Vec<&str> = work_str.lines().collect();
-                            render_hunk_with_offsets(&old_lines, &new_lines, &ops, s, e, context)
+                            let new_no_nl = !cur_work.is_empty() && !cur_work.ends_with(b"\n");
+                            render_hunk_with_offsets(
+                                &old_lines, &new_lines, &ops, s, e, context, old_no_nl, new_no_nl,
+                            )
                         }
                     });
                 }

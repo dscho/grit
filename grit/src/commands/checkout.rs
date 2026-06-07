@@ -3118,28 +3118,39 @@ fn detach_head_with_merge(
     Ok(())
 }
 
-/// True if a staged path cannot coexist with the target tree's paths (D/F mismatch).
-///
-/// Git drops the carry-over of a staged entry when it would imply both a file and a
-/// descendant path (e.g. staged blob `d` while the target tree has `d/e`).
-fn staged_path_conflicts_with_tree_paths(staged: &[u8], tree_paths: &HashSet<Vec<u8>>) -> bool {
-    staged_path_tree_conflict_ancestor(staged, tree_paths).is_some()
+/// Describes how a staged path collides with the target tree's paths.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StagedTreeConflict {
+    /// A tree-path *file* replaces a directory that the staged path lived under
+    /// (e.g. staged `folder1/larger-content` while the target has file `folder1`).
+    /// This is the case Git reports with its `D <dir>` / `A <surviving-file>` oddity.
+    StagedUnderTreeFile,
+    /// The staged path itself becomes a directory in the target tree
+    /// (e.g. staged file `folder1/0/0` while the target has `folder1/0/0/0`).
+    /// Git drops the staged entry silently here (no special D/A report).
+    TreeUnderStaged,
 }
 
-fn staged_path_tree_conflict_ancestor(
+/// Returns the conflicting ancestor path together with the kind of D/F collision,
+/// or `None` if the staged path coexists with every target tree path.
+fn staged_path_tree_conflict(
     staged: &[u8],
     tree_paths: &HashSet<Vec<u8>>,
-) -> Option<Vec<u8>> {
+) -> Option<(Vec<u8>, StagedTreeConflict)> {
     for tp in tree_paths {
         let b = tp.as_slice();
         if staged == b {
             continue;
         }
+        // staged is a descendant of a target file `tp`: the directory the staged
+        // path lived under was replaced by a file (df-conflict oddity).
         if staged.len() > b.len() && staged.starts_with(b) && staged[b.len()] == b'/' {
-            return Some(b.to_vec());
+            return Some((b.to_vec(), StagedTreeConflict::StagedUnderTreeFile));
         }
+        // A target path lives under the staged path: the staged file's name is now
+        // a directory in the target tree. Git just drops the staged entry.
         if b.len() > staged.len() && b.starts_with(staged) && b[staged.len()] == b'/' {
-            return Some(staged.to_vec());
+            return Some((staged.to_vec(), StagedTreeConflict::TreeUnderStaged));
         }
     }
     None
@@ -3290,10 +3301,17 @@ fn switch_to_tree(
             } else {
                 // File not in target tree: preserve staged change unless it would
                 // collide with a different shape under the same path prefix (D/F).
-                if let Some(ancestor) =
-                    staged_path_tree_conflict_ancestor(&old_entry.path, &new_paths)
+                if let Some((ancestor, kind)) =
+                    staged_path_tree_conflict(&old_entry.path, &new_paths)
                 {
-                    let report_git_df_oddity = !raw_index_had_sparse_dirs
+                    // Git only emits its `D <dir>` / `A <surviving-file>` oddity when a
+                    // target *file* replaces the directory the staged path lived under
+                    // (StagedUnderTreeFile). When the staged path itself becomes a
+                    // directory in the target (TreeUnderStaged), Git drops the entry
+                    // silently and reports nothing here — matching full-checkout and
+                    // sparse-index, which produce no output for that case.
+                    let report_git_df_oddity = kind == StagedTreeConflict::StagedUnderTreeFile
+                        && !raw_index_had_sparse_dirs
                         && (sparse_checkout_enabled
                             || tree_path_has_same_prefix_sibling(&ancestor, &new_paths));
                     if report_git_df_oddity {
@@ -5926,13 +5944,32 @@ pub(crate) fn blend_line_diff_by_hunk_ranges(
         None
     }
 
+    // Track which side (and how many lines) produced the *last* emitted line, so we can
+    // reproduce git's "\ No newline at end of file" behavior: the blended result keeps a trailing
+    // newline only when the side that contributed the final line ended with one.
+    #[derive(Clone, Copy)]
+    enum LastSide {
+        Source,
+        Worktree,
+    }
+    let source_has_final_nl = source_data.ends_with(b"\n");
+    let worktree_has_final_nl = worktree_data.ends_with(b"\n");
+    let source_is_last_line =
+        |old_index: usize, count: usize| count > 0 && old_index + count == source_lines.len();
+    let worktree_is_last_line =
+        |new_index: usize, count: usize| count > 0 && new_index + count == worktree_lines.len();
+
     let mut output = String::new();
+    let mut last_side: Option<LastSide> = None;
     for (i, op) in ops.iter().enumerate() {
         match op {
             similar::DiffOp::Equal { old_index, len, .. } => {
                 for j in 0..*len {
                     output.push_str(source_lines[old_index + j]);
                     output.push('\n');
+                }
+                if source_is_last_line(*old_index, *len) {
+                    last_side = Some(LastSide::Source);
                 }
             }
             similar::DiffOp::Delete {
@@ -5945,6 +5982,9 @@ pub(crate) fn blend_line_diff_by_hunk_ranges(
                         output.push_str(source_lines[old_index + j]);
                         output.push('\n');
                     }
+                    if source_is_last_line(*old_index, *old_len) {
+                        last_side = Some(LastSide::Source);
+                    }
                 }
             }
             similar::DiffOp::Insert {
@@ -5956,6 +5996,9 @@ pub(crate) fn blend_line_diff_by_hunk_ranges(
                     for j in 0..*new_len {
                         output.push_str(worktree_lines[new_index + j]);
                         output.push('\n');
+                    }
+                    if worktree_is_last_line(*new_index, *new_len) {
+                        last_side = Some(LastSide::Worktree);
                     }
                 }
             }
@@ -5972,13 +6015,31 @@ pub(crate) fn blend_line_diff_by_hunk_ranges(
                         output.push_str(source_lines[old_index + j]);
                         output.push('\n');
                     }
+                    if source_is_last_line(*old_index, *old_len) {
+                        last_side = Some(LastSide::Source);
+                    }
                 } else {
                     for j in 0..*new_len {
                         output.push_str(worktree_lines[new_index + j]);
                         output.push('\n');
                     }
+                    if worktree_is_last_line(*new_index, *new_len) {
+                        last_side = Some(LastSide::Worktree);
+                    }
                 }
             }
+        }
+    }
+
+    // Drop the synthetic trailing newline when the side that produced the final line had none.
+    if output.ends_with('\n') {
+        let keep_nl = match last_side {
+            Some(LastSide::Source) => source_has_final_nl,
+            Some(LastSide::Worktree) => worktree_has_final_nl,
+            None => true,
+        };
+        if !keep_nl {
+            output.pop();
         }
     }
 

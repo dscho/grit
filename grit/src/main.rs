@@ -5789,6 +5789,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             commands::imap_send::run_from_argv(rest)
         }
         "index-pack" => {
+            commands::upstream_synopsis_help::try_print_upstream_help_and_exit(subcmd, rest);
             let args = commands::index_pack::parse_argv(rest.to_vec())?;
             commands::index_pack::run(args)
         }
@@ -5963,7 +5964,10 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "sh-i18n--envsubst" => commands::sh_i18n_envsubst::run_from_argv(rest),
         "sh-setup" => commands::sh_setup::run(parse_cmd_args(subcmd, rest)),
         "shell" => commands::shell::run(parse_cmd_args(subcmd, rest)),
-        "shortlog" => commands::shortlog::run_with_raw_args(rest),
+        "shortlog" => {
+            commands::upstream_synopsis_help::try_print_upstream_help_and_exit(subcmd, rest);
+            commands::shortlog::run_with_raw_args(rest)
+        }
         "show" => {
             let rest = preprocess_expand_tabs_for_rev_cmd(rest);
             let rest = preprocess_show_argv(&rest);
@@ -6054,7 +6058,10 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "verify-tag" => commands::verify_tag::run(parse_cmd_args(subcmd, rest)),
         "version" => commands::version::run(parse_cmd_args(subcmd, rest)),
         "web--browse" => commands::web_browse::run(parse_cmd_args(subcmd, rest)),
-        "whatchanged" => commands::whatchanged::run(rest),
+        "whatchanged" => {
+            commands::upstream_synopsis_help::try_print_upstream_help_and_exit(subcmd, rest);
+            commands::whatchanged::run(rest)
+        }
         "worktree" => commands::worktree::run(parse_cmd_args(subcmd, rest)),
         "write-tree" => commands::write_tree::run(parse_cmd_args(subcmd, rest)),
         "test-tool" => {
