@@ -7223,6 +7223,14 @@ fn replay_remaining(
                                 rb_dir.join("stopped-sha"),
                                 format!("{}\n", commit_oid.to_hex()),
                             );
+                            // Git's `intend_to_amend()` records the *current* HEAD (the commit just
+                            // replayed for this `edit`) in `rebase-merge/amend`. On `--continue`,
+                            // `commit_staged_changes` amends only when HEAD still equals that OID;
+                            // if the user committed their own work (HEAD moved), the staged changes
+                            // are folded into a fresh commit instead. The original commit OID lives
+                            // in `stopped-sha`, so the two must be tracked separately.
+                            let _ =
+                                fs::write(rb_dir.join("amend"), format!("{}\n", new_oid.to_hex()));
                             let _ = write_rebase_patch_file(&repo, &rb_dir, &commit_oid);
                             let _ = fs::write(rb_dir.join("rebase-amend-continue"), "1\n");
                             let _ = fs::write(rb_dir.join("rebase-edit-continue"), "1\n");
@@ -9309,7 +9317,17 @@ fn do_continue() -> Result<()> {
             head_oid
         };
         let edit_continue = rb_dir.join("rebase-edit-continue").exists();
-        if edit_continue && head_oid != amend_old_oid {
+        // Git's `commit_staged_changes` compares HEAD against the OID written by `intend_to_amend()`
+        // (the commit replayed when `edit` stopped), recorded in `rebase-merge/amend`. After an
+        // `edit`, the replayed commit's OID differs from the original commit (`stopped-sha`), so the
+        // amend check must use the recorded HEAD-at-stop, not the original commit OID. When `amend`
+        // is absent (older state, or non-edit amend flows), fall back to the original OID.
+        let head_at_stop = fs::read_to_string(rb_dir.join("amend"))
+            .ok()
+            .and_then(|s| ObjectId::from_hex(s.trim()).ok())
+            .unwrap_or(amend_old_oid);
+        let user_made_own_commit = edit_continue && head_oid != head_at_stop;
+        if user_made_own_commit {
             // The user already made their own commit after `edit` stopped (HEAD moved), so the edit
             // commit must NOT be auto-amended.
             if worktree_matches_head(&repo, git_dir)? {
@@ -9356,7 +9374,7 @@ fn do_continue() -> Result<()> {
         } else {
             hc.message.clone()
         };
-        let mut message = if edit_continue && head_oid != amend_old_oid {
+        let mut message = if user_made_own_commit {
             let raw_msg = commit_message_after_prepare_hook(
                 &repo,
                 git_dir,
@@ -9420,6 +9438,7 @@ fn do_continue() -> Result<()> {
             peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 0, interactive_continue);
         record_rebase_in_rewritten_pending(git_dir, &rb_dir, &amend_old_oid, next_peek_amend)?;
         let _ = fs::remove_file(rb_dir.join("stopped-sha"));
+        let _ = fs::remove_file(rb_dir.join("amend"));
         let _ = fs::remove_file(rb_dir.join("rebase-amend-continue"));
         let _ = fs::remove_file(rb_dir.join("rebase-edit-continue"));
         let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
@@ -10429,16 +10448,20 @@ fn read_rebase_continue_message(
     config: &ConfigSet,
 ) -> Result<(String, Option<String>, Option<Vec<u8>>)> {
     let rb = rebase_dir(git_dir);
+    // During a conflicted `pick` in the merge backend, Git writes the bare commit message to
+    // `rebase-merge/message` *and* the same message with an `append_conflicts_hint()` footer
+    // (the `# Conflicts:` block) to `MERGE_MSG`. On `--continue`, `git commit` uses `MERGE_MSG`
+    // as the editor template, so the user sees (and `commit.cleanup` strips) that block (t3428
+    // 'rebase -m --signoff'). Prefer `MERGE_MSG` when present; it carries the conflicts hint and
+    // is removed after each successful commit, so a stale copy never leaks into a later pick.
+    let merge_msg = git_dir.join("MERGE_MSG");
     let from_state = rb.join("message");
-    let bytes = if from_state.exists() {
+    let bytes = if merge_msg.exists() {
+        fs::read(&merge_msg)?
+    } else if from_state.exists() {
         fs::read(&from_state)?
     } else {
-        let merge_msg = git_dir.join("MERGE_MSG");
-        if merge_msg.exists() {
-            fs::read(&merge_msg)?
-        } else {
-            return Ok(transcoded_replayed_message(original, config));
-        }
+        return Ok(transcoded_replayed_message(original, config));
     };
     let enc_name = config
         .get("i18n.commitEncoding")
