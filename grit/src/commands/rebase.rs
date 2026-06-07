@@ -1141,7 +1141,8 @@ fn format_rebase_todo_line(
     let commit = parse_commit(&obj.data)?;
     let subj = commit.message.lines().next().unwrap_or("");
     let empty = is_commit_tree_unchanged(repo, oid).unwrap_or(false);
-    let cmd_word = rebase_todo_command_for_display(cmd, &commit);
+    let abbrev_cmds = rebase_abbreviate_commands(config);
+    let cmd_word = rebase_todo_command_for_display_abbrev(cmd, &commit, abbrev_cmds);
     let oid_field = if short_oid_field {
         // Honour `core.abbrev` for the minimum length; `abbreviate_object_id` still extends further
         // on collision (t3404 "respect core.abbrev" / "short commit ID collide").
@@ -1180,6 +1181,51 @@ fn rebase_todo_command_for_display(cmd: RebaseTodoCmd, commit: &CommitData) -> &
         "fixup -C"
     } else {
         cmd.as_str()
+    }
+}
+
+/// `rebase.abbreviateCommands` (Git `TODO_LIST_ABBREVIATE_CMDS`): when true the generated todo uses
+/// single-letter command keywords (`p`/`f`/`s`/`r`/`x`/…). Default false.
+fn rebase_abbreviate_commands(config: &ConfigSet) -> bool {
+    config
+        .get_bool("rebase.abbreviateCommands")
+        .and_then(|r| r.ok())
+        .unwrap_or(false)
+}
+
+/// Abbreviation-aware variant of [`rebase_todo_command_for_display`]. With `abbrev` set, mirrors
+/// Git's `command_to_char` (`pick`→`p`, `fixup`→`f`, `squash`→`s`, `reword`→`r`), keeping the
+/// `-C`/`-c` suffix for amend-fixup (`f -C`).
+fn rebase_todo_command_for_display_abbrev(
+    cmd: RebaseTodoCmd,
+    commit: &CommitData,
+    abbrev: bool,
+) -> String {
+    let is_amend_fixup = cmd == RebaseTodoCmd::Fixup
+        && commit
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim_start()
+            .starts_with("amend! ");
+    if !abbrev {
+        return if is_amend_fixup {
+            "fixup -C".to_owned()
+        } else {
+            cmd.as_str().to_owned()
+        };
+    }
+    let ch = match cmd {
+        RebaseTodoCmd::Pick => "p",
+        RebaseTodoCmd::Reword => "r",
+        RebaseTodoCmd::Fixup => "f",
+        RebaseTodoCmd::Squash => "s",
+    };
+    if is_amend_fixup {
+        format!("{ch} -C")
+    } else {
+        ch.to_owned()
     }
 }
 
