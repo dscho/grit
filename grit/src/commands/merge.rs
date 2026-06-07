@@ -8194,17 +8194,52 @@ fn merge_trees(
                                 if let Some(theirs_src) = theirs_src_to_dest {
                                     let theirs_src_str =
                                         String::from_utf8_lossy(&theirs_src).into_owned();
-                                    conflict_descriptions.push(ConflictDescription {
-                                        kind: "rename/rename",
-                                        body: format!(
-                                            "{base_path_str} renamed to {new_path_str} in {ours_label} and {theirs_src_str} renamed to {new_path_str} in {their_name}."
-                                        ),
-                                        subject_path: new_path_str.clone(),
-                                        remerge_anchor_path: Some(base_path_str),
-                                        rename_rr_ours_dest: None,
-                                        rename_rr_theirs_dest: None,
-                                        auto_merge_hint_path: None,
-                                    });
+                                    // Both sides renamed distinct sources to the same path
+                                    // (rename/rename(2to1)). When the other side ALSO deleted
+                                    // each rename's source (so neither source survives on the
+                                    // opposite branch), merge-ort treats this as
+                                    // rename/rename(2to1)/delete/delete: it reports a
+                                    // `rename/delete` for EACH renamed source and leaves the two
+                                    // renamed blobs as add/add stages 2/3 at the shared
+                                    // destination (no stage 1), described as add/add. See
+                                    // git/merge-ort.c handle_rename_via_dir's
+                                    // `collision && source_deleted` branch (t4301 rrdd #17).
+                                    let theirs_src_deleted_on_ours =
+                                        ours_entries.get(&theirs_src).is_none();
+                                    if theirs_src_deleted_on_ours {
+                                        conflict_descriptions.push(ConflictDescription {
+                                            kind: "rename/delete",
+                                            body: format!(
+                                                "{theirs_src_str} renamed to {new_path_str} in {their_name}, but deleted in {ours_label}."
+                                            ),
+                                            subject_path: new_path_str.clone(),
+                                            remerge_anchor_path: Some(theirs_src_str),
+                                            rename_rr_ours_dest: None,
+                                            rename_rr_theirs_dest: None,
+                                            auto_merge_hint_path: None,
+                                        });
+                                        conflict_descriptions.push(ConflictDescription {
+                                            kind: "add/add",
+                                            body: format!("Merge conflict in {new_path_str}"),
+                                            subject_path: new_path_str.clone(),
+                                            remerge_anchor_path: Some(base_path_str),
+                                            rename_rr_ours_dest: None,
+                                            rename_rr_theirs_dest: None,
+                                            auto_merge_hint_path: None,
+                                        });
+                                    } else {
+                                        conflict_descriptions.push(ConflictDescription {
+                                            kind: "rename/rename",
+                                            body: format!(
+                                                "{base_path_str} renamed to {new_path_str} in {ours_label} and {theirs_src_str} renamed to {new_path_str} in {their_name}."
+                                            ),
+                                            subject_path: new_path_str.clone(),
+                                            remerge_anchor_path: Some(base_path_str),
+                                            rename_rr_ours_dest: None,
+                                            rename_rr_theirs_dest: None,
+                                            auto_merge_hint_path: None,
+                                        });
+                                    }
                                 } else {
                                     conflict_descriptions.push(ConflictDescription {
                                         kind: "rename/add",
@@ -11101,6 +11136,32 @@ fn apply_directory_file_conflicts(
         } else {
             format!("{path_display}~{branch_desc}")
         };
+
+        // When the file that lands in `path/` got there by a rename whose source the
+        // *other* side deleted (and did not itself rename away), this is a rename/delete
+        // that merge-ort reports in addition to the file/directory relocation. The C
+        // rename machinery emits the rename/delete during rename collection, before the
+        // directory/file pass relocates the blob; reproduce that message here so the bare
+        // `path` (the directory-rename-adjusted destination) carries it (t4301 4-stacked).
+        if let Some(source) = rename_source {
+            let other_deleted_source =
+                other_entries.get(source).is_none() && base.contains_key(source);
+            if other_deleted_source && !opposite_renames.contains_key(source) {
+                let source_str = String::from_utf8_lossy(source).into_owned();
+                let delete_branch = if file_is_ours { their_name } else { ours_label };
+                conflict_descriptions.push(ConflictDescription {
+                    kind: "rename/delete",
+                    body: format!(
+                        "{source_str} renamed to {path_display} in {branch_desc}, but deleted in {delete_branch}."
+                    ),
+                    subject_path: path_display.clone(),
+                    remerge_anchor_path: Some(source_str),
+                    rename_rr_ours_dest: None,
+                    rename_rr_theirs_dest: None,
+                    auto_merge_hint_path: None,
+                });
+            }
+        }
 
         if !clean_directory_side {
             let body = format!(
