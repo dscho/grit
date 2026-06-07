@@ -3296,45 +3296,97 @@ fn append_commented(buf: &mut String, text: &str) {
     }
 }
 
-fn comment_block(text: &str) -> String {
+/// Comment out any un-commented commit messages in the squash buffer and rewrite their headers
+/// from "This is the Nth commit message:" to "The Nth commit message will be skipped:", leaving
+/// already-skipped sections untouched.
+///
+/// This is a faithful port of Git's `update_squash_message_for_fixup` (`sequencer.c`): it is run
+/// when a `fixup -C`/`fixup -c` step replaces the accumulated message (`is_fixup_flag && !seen_squash`)
+/// so every section accumulated so far is dropped from the final message. Unlike a single-section
+/// marker, it walks the whole buffer, so a chain such as `pick, fixup, fixup -C` correctly skips
+/// both the pick target's message and the plain fixup's section (t3437 #8/#12).
+fn update_squash_message_for_fixup(buf: &mut String) {
+    // `comment_line_str` is "#"; the commented header forms Git compares against.
+    let mut buf1 = String::from("# This is the 1st commit message:\n");
+    let mut buf2 = String::from("# The 1st commit message will be skipped:\n");
+    let update_comment_bufs = |b1: &mut String, b2: &mut String, n: usize| {
+        *b1 = format!("# This is the commit message #{n}:\n");
+        *b2 = format!("# The commit message #{n} will be skipped:\n");
+    };
+
+    let orig = std::mem::take(buf);
+    let bytes = orig.as_bytes();
     let mut out = String::new();
-    append_commented(&mut out, text.trim_end_matches('\n'));
-    out
+    // `start` marks the beginning of the not-yet-copied region; `comment_mode` selects whether the
+    // copied body is passed through verbatim or commented out (matching Git's `copy_lines` switch).
+    let mut start = 0usize;
+    let mut comment_mode = false;
+    let mut i = 1usize;
+    let mut s = 0usize;
+    while s < orig.len() {
+        if orig[s..].starts_with(buf1.as_str()) {
+            // An un-skipped header: copy the preceding section, drop the blank line that precedes
+            // this header, emit the "skipped" header, comment the following body.
+            let off = usize::from(s > start + 1 && bytes[s - 2] == b'\n');
+            copy_section(&mut out, &orig[start..s - off], comment_mode);
+            if off == 1 {
+                out.push('\n');
+            }
+            out.push_str(&buf2);
+            let mut next = s + buf1.len();
+            if next < orig.len() && bytes[next] == b'\n' {
+                out.push('\n');
+                next += 1;
+            }
+            start = next;
+            s = next;
+            comment_mode = true;
+            i += 1;
+            update_comment_bufs(&mut buf1, &mut buf2, i);
+        } else if orig[s..].starts_with(buf2.as_str()) {
+            // An already-skipped header: copy the preceding section verbatim (the body that follows
+            // is already commented), then continue in verbatim mode.
+            let off = usize::from(s > start + 1 && bytes[s - 2] == b'\n');
+            copy_section(&mut out, &orig[start..s - off], comment_mode);
+            start = s - off;
+            s += buf2.len();
+            comment_mode = false;
+            i += 1;
+            update_comment_bufs(&mut buf1, &mut buf2, i);
+        } else {
+            match orig[s..].find('\n') {
+                Some(rel) => s += rel + 1,
+                None => break,
+            }
+        }
+    }
+    copy_section(&mut out, &orig[start..], comment_mode);
+    *buf = out;
 }
 
-fn comment_block_preserving_comments(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.trim_end_matches('\n').lines() {
-        if line.starts_with('#') {
+/// Copy `text` into `out`, commenting it out (Git's `add_commented_lines`, which avoids
+/// double-commenting already-commented lines) when `comment_mode` is set.
+///
+/// Already-commented lines (starting with `#`) are passed through verbatim; every other line —
+/// including empty ones, which become a bare `#` — is prefixed, matching Git's
+/// `strbuf_add_commented_lines`.
+fn copy_section(out: &mut String, text: &str, comment_mode: bool) {
+    if !comment_mode || text.is_empty() {
+        out.push_str(text);
+        return;
+    }
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if content.starts_with('#') {
             out.push_str(line);
-            out.push('\n');
-        } else if line.is_empty() {
-            out.push_str("#\n");
+        } else if content.is_empty() {
+            out.push('#');
+            out.push_str(line);
         } else {
             out.push_str("# ");
             out.push_str(line);
-            out.push('\n');
         }
     }
-    out
-}
-
-fn mark_squash_section_skipped(buf: &mut String, section: usize) {
-    let header = format!("# This is the commit message #{section}:\n\n");
-    let Some(start) = buf.find(&header) else {
-        return;
-    };
-    let body_start = start + header.len();
-    let tail = &buf[body_start..];
-    let next_rel = tail.find("\n# This is the commit message #");
-    let next_rel = next_rel.or_else(|| tail.find("\n# The commit message #"));
-    let body_end = next_rel.map_or(buf.len(), |pos| body_start + pos + 1);
-    let body = buf[body_start..body_end].to_string();
-    let replacement = format!(
-        "# The commit message #{section} will be skipped:\n\n{}",
-        comment_block_preserving_comments(&body)
-    );
-    buf.replace_range(start..body_end, &replacement);
 }
 
 fn append_skipped_squash_message(buf: &mut String, body: &str, n: usize) {
@@ -3749,25 +3801,13 @@ fn update_squash_message_file(
         } else {
             append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, 2);
         }
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() {
-            fs::write(rb_dir.join("message-fixup-active-section"), "2\n")?;
-        }
         fs::write(&squash_path, buf)?;
     } else {
         let mut buf = fs::read_to_string(&squash_path)?;
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() {
-            if !ctx.seen_squash {
-                if let Ok(section) = fs::read_to_string(rb_dir.join("message-fixup-active-section"))
-                {
-                    if let Ok(section) = section.trim().parse::<usize>() {
-                        mark_squash_section_skipped(&mut buf, section);
-                    }
-                }
-            }
-            write_fixup_message_mode(rb_dir, fixup_message_mode)?;
-            fs::write(&fixup_path, fixup_replacement_message(&picked.message))?;
-        }
+        let is_fixup_flag = cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some();
         let n = ctx.count + 2;
+        // Splice the combination-count header first (Git rewrites the leading line in place),
+        // matching `update_squash_messages`' `strbuf_splice` of `combined_commit_msg_fmt`.
         if let Some(pos) = buf.find('\n') {
             if buf.starts_with("# This is a combination of") {
                 buf.replace_range(
@@ -3776,16 +3816,20 @@ fn update_squash_message_file(
                 );
             }
         }
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_none() {
-            append_skipped_squash_message(&mut buf, body, ctx.count + 2);
-        } else {
-            append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, ctx.count + 2);
+        // A `fixup -C`/`fixup -c` that replaces the message (and is not after a squash) drops every
+        // section accumulated so far by commenting them out and flipping their headers to
+        // "will be skipped" — Git's `update_squash_message_for_fixup`.
+        if is_fixup_flag && !ctx.seen_squash {
+            update_squash_message_for_fixup(&mut buf);
         }
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() && !ctx.seen_squash {
-            fs::write(
-                rb_dir.join("message-fixup-active-section"),
-                format!("{}\n", ctx.count + 2),
-            )?;
+        if is_fixup_flag {
+            write_fixup_message_mode(rb_dir, fixup_message_mode)?;
+            fs::write(&fixup_path, fixup_replacement_message(&picked.message))?;
+        }
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_none() {
+            append_skipped_squash_message(&mut buf, body, n);
+        } else {
+            append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, n);
         }
         fs::write(&squash_path, buf)?;
     }
