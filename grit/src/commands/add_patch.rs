@@ -568,6 +568,23 @@ pub(crate) fn run_add_patch_with_reader(
     let inter_hunk_context = opts.inter_hunk_context;
     let auto_advance = opts.auto_advance;
     let context = opts.context;
+
+    // `git add -p` shells out to `git diff-files`, which validates `diff.algorithm`. A bogus value
+    // (e.g. `-c diff.algorithm=bogus`) aborts before any prompt (t3701 "diff.algorithm is passed").
+    if let Some(algo) = add_cfg.config.get("diff.algorithm") {
+        let a = algo.trim();
+        if !a.is_empty()
+            && !matches!(
+                a.to_ascii_lowercase().as_str(),
+                "myers" | "default" | "minimal" | "patience" | "histogram"
+            )
+        {
+            bail!(
+                "option diff-algorithm accepts \"myers\", \"minimal\", \"patience\" and \"histogram\""
+            );
+        }
+    }
+
     let work_tree = repo
         .work_tree
         .as_deref()
