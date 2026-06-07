@@ -358,6 +358,20 @@ pub fn resolve_push_full_ref_for_branch(repo: &Repository, branch_short: &str) -
         });
     };
 
+    // When the push remote has any configured `push` refspecs, they take priority
+    // over `push.default` entirely (matching git's branch_get_push_1: the
+    // `if (remote->push.nr)` block returns before the push.default switch). This
+    // means an explicit push refspec overrides even `push.default = nothing`.
+    if remote_has_push_refspec(&config_content, &push_remote_name) {
+        return match push_refspec_mapped_tracking(&config_content, &push_remote_name, branch_short)
+        {
+            Some(mapped) => Ok(mapped),
+            None => Err(Error::Message(format!(
+                "fatal: push refspecs for '{push_remote_name}' do not include '{branch_short}'"
+            ))),
+        };
+    }
+
     let push_default = parse_config_value(&config_content, "push", "default");
     let push_default = push_default.as_deref().unwrap_or("simple");
 
@@ -365,14 +379,6 @@ pub fn resolve_push_full_ref_for_branch(repo: &Repository, branch_short: &str) -
         return Err(Error::Message(
             "fatal: push.default is nothing; no push destination".to_owned(),
         ));
-    }
-
-    if let Some(mapped) =
-        push_refspec_mapped_tracking(&config_content, &push_remote_name, branch_short)
-    {
-        if refs::resolve_ref(&repo.git_dir, &mapped).is_ok() {
-            return Ok(mapped);
-        }
     }
 
     let current_tracking = format!("refs/remotes/{push_remote_name}/{branch_short}");
@@ -409,14 +415,106 @@ pub fn resolve_push_full_ref_for_branch(repo: &Repository, branch_short: &str) -
     }
 }
 
+/// Collect the values of all `push = <refspec>` entries in `[remote "<name>"]`.
+fn remote_push_refspecs(config_content: &str, remote_name: &str) -> Vec<String> {
+    let section = format!("[remote \"{remote_name}\"]");
+    let mut in_section = false;
+    let mut out = Vec::new();
+    for line in config_content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = trimmed == section;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if let Some(val) = trimmed
+            .strip_prefix("push = ")
+            .or_else(|| trimmed.strip_prefix("push="))
+        {
+            if let Some(spec) = val.split_whitespace().next() {
+                out.push(spec.trim().to_owned());
+            }
+        }
+    }
+    out
+}
+
+/// True when the remote has at least one `push` refspec configured.
+fn remote_has_push_refspec(config_content: &str, remote_name: &str) -> bool {
+    !remote_push_refspecs(config_content, remote_name).is_empty()
+}
+
+/// Match `refname` against a refspec `pattern` (`prefix*suffix`), substituting the
+/// matched glob portion into `replacement` (also `prefix*suffix`). Mirrors git's
+/// `match_refname_with_pattern`. For non-pattern refspecs, both sides are exact.
+fn match_refname_with_pattern(pattern: &str, refname: &str, replacement: &str) -> Option<String> {
+    match (pattern.find('*'), replacement.find('*')) {
+        (Some(pstar), Some(vstar)) => {
+            let kprefix = &pattern[..pstar];
+            let ksuffix = &pattern[pstar + 1..];
+            if !refname.starts_with(kprefix) || !refname.ends_with(ksuffix) {
+                return None;
+            }
+            if refname.len() < kprefix.len() + ksuffix.len() {
+                return None;
+            }
+            let middle = &refname[kprefix.len()..refname.len() - ksuffix.len()];
+            Some(format!(
+                "{}{}{}",
+                &replacement[..vstar],
+                middle,
+                &replacement[vstar + 1..]
+            ))
+        }
+        (None, None) => {
+            if pattern == refname {
+                Some(replacement.to_owned())
+            } else {
+                None
+            }
+        }
+        // A pattern on one side but not the other is invalid in git; treat as no match.
+        _ => None,
+    }
+}
+
+/// Apply the remote's configured `push` refspecs to `refs/heads/<branch_short>`, then
+/// map the resulting push destination to a local remote-tracking ref via the remote's
+/// `fetch` refspecs. Mirrors git's `apply_refspecs(&remote->push, ...)` followed by
+/// `tracking_for_push_dest` (which applies `&remote->fetch`).
 fn push_refspec_mapped_tracking(
     config_content: &str,
     remote_name: &str,
     branch_short: &str,
 ) -> Option<String> {
+    let src = format!("refs/heads/{branch_short}");
+
+    // First, map the branch through a push refspec to the push destination on the remote.
+    let mut dst = None;
+    for spec in remote_push_refspecs(config_content, remote_name) {
+        let spec = spec.strip_prefix('+').unwrap_or(&spec);
+        let Some((left, right)) = spec.split_once(':') else {
+            continue;
+        };
+        if let Some(mapped) = match_refname_with_pattern(left.trim(), &src, right.trim()) {
+            dst = Some(mapped);
+            break;
+        }
+    }
+    let dst = dst?;
+
+    // Then map the push destination to a local tracking ref via the fetch refspecs.
+    map_dest_to_tracking(config_content, remote_name, &dst)
+}
+
+/// Map a push destination ref (e.g. `refs/heads/magic/topic`) on `remote_name` to the
+/// local remote-tracking ref using that remote's `fetch` refspecs. Falls back to the
+/// conventional `refs/remotes/<remote>/<rest>` mapping when no fetch refspec matches.
+fn map_dest_to_tracking(config_content: &str, remote_name: &str, dst: &str) -> Option<String> {
     let section = format!("[remote \"{remote_name}\"]");
     let mut in_section = false;
-    let src_want = format!("refs/heads/{branch_short}");
     for line in config_content.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
@@ -427,29 +525,25 @@ fn push_refspec_mapped_tracking(
             continue;
         }
         let Some(val) = trimmed
-            .strip_prefix("push = ")
-            .or_else(|| trimmed.strip_prefix("push="))
+            .strip_prefix("fetch = ")
+            .or_else(|| trimmed.strip_prefix("fetch="))
         else {
             continue;
         };
         let Some(spec) = val.split_whitespace().next() else {
             continue;
         };
-        let spec = spec.trim().strip_prefix('+').unwrap_or(spec);
+        let spec = spec.trim().strip_prefix('+').unwrap_or(spec.trim());
         let Some((left, right)) = spec.split_once(':') else {
             continue;
         };
-        let left = left.trim();
-        let right = right.trim();
-        if left != src_want {
-            continue;
+        if let Some(mapped) = match_refname_with_pattern(left.trim(), dst, right.trim()) {
+            return Some(mapped);
         }
-        let Some(dest_branch) = right.strip_prefix("refs/heads/") else {
-            continue;
-        };
-        return Some(format!("refs/remotes/{remote_name}/{dest_branch}"));
     }
-    None
+    // Conventional fallback: refs/heads/<x> -> refs/remotes/<remote>/<x>.
+    dst.strip_prefix("refs/heads/")
+        .map(|rest| format!("refs/remotes/{remote_name}/{rest}"))
 }
 
 fn resolve_push_ref_name(repo: &Repository, base: &str) -> Result<String> {
