@@ -677,6 +677,10 @@ pub fn run(mut args: Args) -> Result<()> {
     let seq_todo_path = repo.git_dir.join("sequencer").join("todo");
     let resume_pick_after_cp = had_cp_head && seq_todo_path.exists();
     let _resume_revert_after_rv = had_rv_head && seq_todo_path.exists();
+    // Git's `sequencer_determine_whence`: a stopped interactive `pick` leaves CHERRY_PICK_HEAD
+    // *and* a rebase state dir with REBASE_HEAD == CHERRY_PICK_HEAD. In that case `commit` reports
+    // a rebase (not a cherry-pick) for partial-commit / amend errors (t3404 118/119).
+    let from_rebase_pick = had_cp_head && commit_is_rebase_pick_whence(&repo.git_dir);
 
     if grit_lib::precompose_config::effective_core_precomposeunicode(Some(&repo.git_dir)) {
         for ps in &mut args.pathspec {
@@ -875,7 +879,11 @@ pub fn run(mut args: Args) -> Result<()> {
     let old_head_oid = head.oid().cloned();
 
     if had_cp_head && args.amend {
-        eprintln!("fatal: You are in the middle of a cherry-pick -- cannot amend.");
+        if from_rebase_pick {
+            eprintln!("fatal: You are in the middle of a rebase -- cannot amend.");
+        } else {
+            eprintln!("fatal: You are in the middle of a cherry-pick -- cannot amend.");
+        }
         std::process::exit(128);
     }
     if had_rv_head && args.amend {
@@ -884,7 +892,11 @@ pub fn run(mut args: Args) -> Result<()> {
     }
 
     if had_cp_head && !args.pathspec.is_empty() {
-        eprintln!("fatal: cannot do a partial commit during a cherry-pick.");
+        if from_rebase_pick {
+            eprintln!("fatal: cannot do a partial commit during a rebase.");
+        } else {
+            eprintln!("fatal: cannot do a partial commit during a cherry-pick.");
+        }
         std::process::exit(128);
     }
     if had_rv_head && !args.pathspec.is_empty() {
@@ -3234,6 +3246,31 @@ fn resolved_index_path(repo: &Repository) -> PathBuf {
         }
     } else {
         repo.index_path()
+    }
+}
+
+/// Whether a stopped commit corresponds to an interactive-rebase `pick` (Git `FROM_REBASE_PICK`).
+///
+/// True when an interactive rebase state dir is present and `REBASE_HEAD` equals
+/// `CHERRY_PICK_HEAD` (the in-progress pick that halted). Used to choose rebase-specific
+/// "cannot do a partial commit" / "cannot amend" error messages.
+///
+/// # Parameters
+/// - `git_dir`: the repository git directory.
+fn commit_is_rebase_pick_whence(git_dir: &Path) -> bool {
+    let rebase_dir_exists =
+        git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists();
+    if !rebase_dir_exists {
+        return false;
+    }
+    let read = |name: &str| -> Option<String> {
+        fs::read_to_string(git_dir.join(name))
+            .ok()
+            .map(|s| s.trim().to_owned())
+    };
+    match (read("REBASE_HEAD"), read("CHERRY_PICK_HEAD")) {
+        (Some(rh), Some(ch)) => !rh.is_empty() && rh == ch,
+        _ => false,
     }
 }
 
