@@ -444,8 +444,10 @@ fn display_hunk_list(
 }
 
 /// `?` help during the hunk loop. Git prints the always-available lines, then only the remainder
-/// lines whose command character is present in the current `nav` suffix.
-fn write_patch_help(out: &mut impl Write, nav: &str) {
+/// lines whose command character is present in the current `nav` suffix. When every hunk in the
+/// file has been decided (only possible under `--no-auto-advance`), it also appends the
+/// `HUNKS SUMMARY` line with `Some((total, use, skip))`.
+fn write_patch_help(out: &mut impl Write, nav: &str, summary: Option<(usize, usize, usize)>) {
     let base = "y - stage this hunk\n\
                 n - do not stage this hunk\n\
                 q - quit; do not stage this hunk or any of the remaining ones\n\
@@ -476,6 +478,13 @@ fn write_patch_help(out: &mut impl Write, nav: &str) {
         }
     }
     writeln!(out, "? - print help").ok();
+    if let Some((total, used, skipped)) = summary {
+        writeln!(
+            out,
+            "HUNKS SUMMARY - Hunks: {total}, USE: {used}, SKIP: {skipped}"
+        )
+        .ok();
+    }
 }
 
 /// 7-character abbreviated blob OID for `data` (Git's default short hash in patch headers).
@@ -854,12 +863,12 @@ pub(crate) fn run_add_patch_with_reader(
                     }
                 }
 
-                // Everything decided? Without auto-advance we stop advancing; with it we move on.
-                if undecided_previous.is_none()
+                // Everything decided? Without auto-advance we keep showing the (last) hunk and the
+                // `?` help gains the HUNKS SUMMARY line; with auto-advance we move past the file.
+                let all_decided = undecided_previous.is_none()
                     && undecided_next.is_none()
-                    && decisions[hunk_index] != Decision::Undecided
-                    && auto_advance
-                {
+                    && decisions[hunk_index] != Decision::Undecided;
+                if all_decided && auto_advance {
                     break 'hunk_loop;
                 }
 
@@ -1239,7 +1248,15 @@ pub(crate) fn run_add_patch_with_reader(
                         rendered_hunk_index = -1;
                     }
                     '?' => {
-                        write_patch_help(&mut out, &nav);
+                        let summary = if all_decided {
+                            let used = decisions.iter().filter(|d| **d == Decision::Use).count();
+                            let skipped =
+                                decisions.iter().filter(|d| **d == Decision::Skip).count();
+                            Some((decisions.len(), used, skipped))
+                        } else {
+                            None
+                        };
+                        write_patch_help(&mut out, &nav, summary);
                     }
                     ' ' => {}
                     _ => {
