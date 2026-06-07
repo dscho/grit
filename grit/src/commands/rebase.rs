@@ -2289,8 +2289,34 @@ fn run_rebase_merge_subprocess(
     fs::write(&msg_path, &merge_commit.message)?;
     let self_exe = std::env::current_exe().context("cannot determine grit binary path")?;
     let mut cmd = std::process::Command::new(&self_exe);
-    cmd.args(["merge", "--no-ff", "-F"])
+    // `--allow-unrelated-histories`: a `merge` step may join independent root commits (Git's
+    // `do_merge` performs an in-process recursive merge with no unrelated-histories guard), e.g.
+    // `merge first-branch` into a `[new root]` (t3430 'root commits').
+    cmd.args(["merge", "--no-ff", "--allow-unrelated-histories", "-F"])
         .arg(msg_path.as_os_str());
+    // Forward the rebase's merge strategy and strategy options to the child merge so a
+    // `merge`/`merge -C`/`merge -c` honours `git rebase -s <strategy> -X<opt>` (t3430
+    // 'merge -c rewords when a strategy is given', '--rebase-merges with strategies').
+    let rb_dir = active_rebase_dir(git_dir);
+    if let Some(rb_dir) = rb_dir.as_deref() {
+        if let Ok(strategy_raw) = fs::read_to_string(rb_dir.join("strategy")) {
+            let strategy = strategy_raw.trim();
+            if !strategy.is_empty() {
+                cmd.arg("-s").arg(strategy);
+            }
+        }
+        if let Ok(opts) = fs::read_to_string(rb_dir.join("strategy-opts")) {
+            for encoded in opts.lines() {
+                if encoded.is_empty() {
+                    continue;
+                }
+                if let Some(opt) = hex_decode_string(encoded) {
+                    let opt = opt.strip_prefix("--").unwrap_or(&opt);
+                    cmd.arg(format!("-X{opt}"));
+                }
+            }
+        }
+    }
     for tok in merge_args.split_whitespace() {
         let oid = resolve_merge_head_token(repo, tok)?;
         cmd.arg(oid.to_hex());
@@ -3828,7 +3854,16 @@ fn run_plain_merge_for_rebase(
     });
     let self_exe = std::env::current_exe().context("cannot determine grit binary path")?;
     let mut cmd = std::process::Command::new(&self_exe);
-    cmd.args(["merge", "--no-ff", "--no-edit", "-m"]).arg(&msg);
+    // `--allow-unrelated-histories`: a plain `merge <label>` step may join independent roots
+    // (Git's in-process `do_merge` has no unrelated-histories guard; t3430 'root commits').
+    cmd.args([
+        "merge",
+        "--no-ff",
+        "--allow-unrelated-histories",
+        "--no-edit",
+        "-m",
+    ])
+    .arg(&msg);
     for o in &oids {
         cmd.arg(o.to_hex());
     }
@@ -7898,6 +7933,15 @@ fn cherry_pick_for_rebase(
     let empty_tree_oid = ObjectId::from_hex(GIT_EMPTY_TREE_HEX)
         .map_err(|e| anyhow::anyhow!("invalid empty tree oid: {e}"))?;
     let head_at_empty_tree = head_oid.is_zero();
+    // After `reset [new root]`, HEAD points at the squash-onto sentinel (a fake empty-tree root).
+    // A pick on top of it must become a *root* commit (no parent), not carry the sentinel as a
+    // parent — otherwise the graph gains a spurious commit below it (t3430 'root commits').
+    let head_is_squash_onto = !head_at_empty_tree
+        && fs::read_to_string(rb_dir.join("squash-onto"))
+            .ok()
+            .and_then(|s| ObjectId::from_hex(s.trim()).ok())
+            == Some(head_oid);
+    let pick_is_root = head_at_empty_tree || head_is_squash_onto;
 
     if keep_start_empty
         && todo_cmd == RebaseTodoCmd::Pick
@@ -8874,7 +8918,7 @@ fn cherry_pick_for_rebase(
                 );
             let mut pick_data = CommitData {
                 tree: tree_oid,
-                parents: if head_at_empty_tree {
+                parents: if pick_is_root {
                     Vec::new()
                 } else {
                     vec![head_oid]
@@ -8923,7 +8967,7 @@ fn cherry_pick_for_rebase(
             );
         let mut commit_data = CommitData {
             tree: tree_oid,
-            parents: if head_at_empty_tree {
+            parents: if pick_is_root {
                 Vec::new()
             } else {
                 vec![head_oid]
@@ -8972,7 +9016,7 @@ fn cherry_pick_for_rebase(
     );
     let mut commit_data = CommitData {
         tree: tree_oid,
-        parents: if head_at_empty_tree {
+        parents: if pick_is_root {
             Vec::new()
         } else {
             vec![head_oid]
