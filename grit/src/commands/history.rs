@@ -757,7 +757,7 @@ fn commit_split_out(
         body.push('\n');
     }
 
-    let committer = resolve_committer_for_split(repo)?;
+    let committer = resolve_committer_for_split(repo, OffsetDateTime::now_utc())?;
 
     let commit = CommitData {
         tree: *new_tree,

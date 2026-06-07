@@ -94,7 +94,6 @@ fn has_racy_timestamp(index: &Index, index_mtime_sec: u32, index_mtime_nsec: u32
     })
 }
 
-
 /// Arguments for `grit status`.
 #[derive(Debug, ClapArgs)]
 #[command(about = "Show the working tree status")]
