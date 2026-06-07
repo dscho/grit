@@ -2904,8 +2904,20 @@ fn resolve_specs_with_options(
 ) -> Result<Vec<ObjectId>> {
     let mut out = Vec::with_capacity(specs.len());
     for spec in specs {
-        match resolve_revision_for_range_end(repo, spec).and_then(|oid| peel_to_commit(repo, oid)) {
+        let oid = match resolve_revision_for_range_end(repo, spec) {
+            Ok(oid) => oid,
+            Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => continue,
+            Err(err) => return Err(err),
+        };
+        match peel_to_commit(repo, oid) {
             Ok(commit_oid) => out.push(commit_oid),
+            // `git rev-list <obj>` accepts a positive tip that is (or peels to) a non-commit
+            // object such as a blob or a tag-of-blob: it simply contributes no commits and exits
+            // 0 (verified against git: `git rev-list tag-of-blob` prints nothing, exit 0). Mirror
+            // that here so callers that feed all freshly-fetched ref tips into a commit walk
+            // (e.g. submodule-change detection over a remote carrying a tag-of-blob, t5516
+            // "refuse fetch to current branch of worktree") do not abort.
+            Err(Error::CorruptObject(_)) if object_peels_to_non_commit(repo, oid) => {}
             Err(Error::ObjectNotFound(_) | Error::InvalidRef(_)) if ignore_missing => {}
             Err(err) => return Err(err),
         }
@@ -3090,6 +3102,25 @@ fn resolve_specs_for_objects_with_options(
     }
 
     Ok((commits, roots, tip_annotated_tag_by_commit))
+}
+
+/// Returns `true` when `oid` is a readable object that peels (through any tag chain) to a blob or
+/// tree rather than a commit. Used to mirror `git rev-list`'s tolerance of a non-commit positive
+/// tip: such a tip is silently ignored, whereas a genuinely missing/corrupt object is an error.
+fn object_peels_to_non_commit(repo: &Repository, mut oid: ObjectId) -> bool {
+    loop {
+        let Ok(object) = repo.odb.read(&oid) else {
+            return false;
+        };
+        match object.kind {
+            ObjectKind::Commit => return false,
+            ObjectKind::Blob | ObjectKind::Tree => return true,
+            ObjectKind::Tag => match parse_tag(&object.data) {
+                Ok(tag) => oid = tag.object,
+                Err(_) => return false,
+            },
+        }
+    }
 }
 
 /// Peel an object (possibly a tag) to the underlying commit.

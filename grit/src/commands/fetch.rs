@@ -4199,13 +4199,26 @@ fn maybe_run_auto_maintenance_after_fetch(git_dir: &Path, args: &Args) -> Result
     // a detached child's discarded output (t5510 "fetching with auto-gc does not
     // lock up"). `maintenance.autoDetach` takes precedence over `gc.autoDetach`,
     // matching git's `gc_config` (`builtin/gc.c`).
+    //
+    // `GIT_TEST_MAINT_AUTO_DETACH=false` forces foreground maintenance the same
+    // way it does in upstream's `maintenance_run` (git/builtin/gc.c) and grit's
+    // post-commit `run_auto_after_commit`. Upstream's test harness sets this so
+    // tests cannot race a detached maintenance child against a `test_when_finished`
+    // `rm -rf` of the just-fetched repo (t5516 "refuse fetch to current branch of
+    // bare repository worktree" cleans up `bare.git` immediately after fetching
+    // into it). Honour the env override unless config explicitly opts back in.
+    let env_disables_detach = std::env::var("GIT_TEST_MAINT_AUTO_DETACH")
+        .ok()
+        .map(|v| v == "0" || v.eq_ignore_ascii_case("false"))
+        .unwrap_or(false);
     let auto_detach_disabled = cfg
         .get_bool("maintenance.autoDetach")
         .or_else(|| cfg.get_bool("maintenance.autodetach"))
         .or_else(|| cfg.get_bool("gc.autoDetach"))
         .or_else(|| cfg.get_bool("gc.autodetach"))
         .and_then(|r| r.ok())
-        == Some(false);
+        .map(|detach| !detach)
+        .unwrap_or(env_disables_detach);
     let foreground_maintenance =
         args.refetch || repo_treats_promisor_packs(git_dir, &cfg) || auto_detach_disabled;
     let detach_arg = if foreground_maintenance {
