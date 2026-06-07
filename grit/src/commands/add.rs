@@ -1903,9 +1903,19 @@ fn pathspecs_are_all_exclude(pathspecs: &[String]) -> bool {
 }
 
 fn pathspecs_need_match_walk(pathspecs: &[String]) -> bool {
-    pathspecs
-        .iter()
-        .any(|s| pathspec_uses_long_magic(s) && !grit_lib::pathspec::pathspec_is_exclude(s))
+    pathspecs.iter().any(|s| {
+        if grit_lib::pathspec::pathspec_is_exclude(s) {
+            return false;
+        }
+        if pathspec_uses_long_magic(s) {
+            return true;
+        }
+        // A wildcard pathspec like `*.c` matches at any directory depth (git uses wildmatch without
+        // `WM_PATHNAME`, so `*` crosses `/`). The shallow `expand_glob_pathspec` only reads one
+        // directory level, so route any wildcard spec through the recursive worktree walk +
+        // `matches_pathspec_list` matcher instead (t3701 "add -p handles globs").
+        grit_lib::pathspec::has_glob_chars(s)
+    })
 }
 
 fn pathspecs_use_attr_magic(pathspecs: &[String]) -> bool {
