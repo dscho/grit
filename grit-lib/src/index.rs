@@ -1232,6 +1232,16 @@ impl Index {
             return false;
         };
         self.install_unmerged_from_resolve_undo(path, &record);
+        // Git's `unmerge_index_entry` swaps the resolved stage-0 entry for unmerged
+        // stages 1/2/3 via `remove_index_entry_at` + `add_index_entry`, both of which
+        // call `cache_tree_invalidate_path`. After committing the resolution the index
+        // carries a valid TREE extension whose stage-0 entry for `path` no longer
+        // matches; without invalidating it, the next write-tree trips
+        // `verify_cache_tree` ("corrupted cache-tree has entries not present in index").
+        if let Ok(p) = std::str::from_utf8(path) {
+            self.invalidate_untracked_cache_for_path(p);
+        }
+        self.invalidate_cache_tree_for_path(path);
         true
     }
 
