@@ -2027,6 +2027,15 @@ pub fn diff_index_to_worktree_with_options(
                 }
                 continue;
             }
+            // A populated submodule whose HEAD points at a commit object that is missing from its
+            // own object store is corrupt. Git's `is_submodule_modified` shells `git status` into
+            // the submodule, which fails, and Git aborts the surrounding status/diff. Mirror that:
+            // a broken submodule is a hard error rather than a silently-clean gitlink (t5526 #38).
+            if sub_head_oid.is_some() && submodule_head_object_broken(&sub_dir) {
+                return Err(Error::ConfigError(format!(
+                    "'git status --porcelain=2' failed in submodule {path_str_ref}"
+                )));
+            }
             let mut flags = submodule_porcelain_flags(work_tree, path_str_ref, ie.oid);
             if ignore_submodule_untracked {
                 flags.untracked = false;
@@ -5752,6 +5761,34 @@ pub fn read_submodule_head_oid(sub_dir: &Path) -> Option<ObjectId> {
         }
     } else {
         ObjectId::from_hex(head_trimmed).ok()
+    }
+}
+
+/// True when a populated submodule checkout is *broken*: its `HEAD` resolves to a commit OID, but
+/// that commit object cannot be read from the submodule's own object database.
+///
+/// This mirrors Git's [`is_submodule_modified`], which shells out to `git status --porcelain=2`
+/// inside the submodule; when the submodule's object store is corrupt (e.g. `rm -r .git/objects`),
+/// that inner status fails and Git aborts the surrounding `status`/`diff`/`fetch`. We detect the
+/// same condition in-process so the superproject operation can return a fatal error rather than
+/// silently treating the submodule as clean (t5526 "fetching submodule into a broken repository").
+///
+/// Returns `false` when the submodule is not checked out, has no embedded git dir, or has an
+/// unresolvable HEAD (those are handled separately by the unpopulated/placeholder logic).
+#[must_use]
+pub fn submodule_head_object_broken(sub_dir: &Path) -> bool {
+    let Some(sub_git_dir) = submodule_embedded_git_dir(sub_dir) else {
+        return false;
+    };
+    let Some(head_oid) = read_submodule_head_oid(sub_dir) else {
+        return false;
+    };
+    let odb = Odb::new(&sub_git_dir.join("objects"));
+    match odb.read(&head_oid) {
+        // HEAD object present but not a commit would be a different kind of corruption; only the
+        // missing-object case is the broken-repo scenario Git guards against here.
+        Ok(obj) => parse_commit(&obj.data).is_err(),
+        Err(_) => true,
     }
 }
 
