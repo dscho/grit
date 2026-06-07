@@ -1001,6 +1001,16 @@ fn reset_patch(repo: &Repository, rest: &[String]) -> Result<()> {
         }
     }
     for path in target_map.keys() {
+        // An unmerged path (conflict stages 1/2/3, no stage 0) is a no-op for `reset -p`: git skips
+        // it entirely rather than offering to unstage the tree side (t3701 "reset -p with unmerged
+        // files"). Without this guard such a path is re-added below because it has no stage-0 entry.
+        let is_unmerged = index
+            .entries
+            .iter()
+            .any(|e| e.path == *path && e.stage() != 0);
+        if is_unmerged {
+            continue;
+        }
         if !index
             .entries
             .iter()
