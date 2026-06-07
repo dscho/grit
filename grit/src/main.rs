@@ -1005,6 +1005,16 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 );
                 return Ok(());
             }
+            // Without REF_SKIP_OID_VERIFICATION, `refs_update_ref` (REF_STORE_WRITE) requires the
+            // new value to name an existing object; reject dangling OIDs so a non-skipping
+            // update of an invalid OID fails (t0610 "can skip object ID verification").
+            if !new_oid.starts_with("0000000000000000000000000000000000000000") {
+                if let Ok(oid) = grit_lib::objects::ObjectId::from_hex(new_oid) {
+                    if !repo.odb.exists(&oid) {
+                        bail!("update_ref failed for ref '{refname}': cannot update ref '{refname}': trying to write ref '{refname}' with nonexistent object {new_oid}");
+                    }
+                }
+            }
             dispatch("update-ref", &args, &GlobalOpts::default())
         }
         "for-each-ref" => {
@@ -1053,7 +1063,10 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 } else {
                     oid.as_str()
                 };
-                println!("{display_oid} {name} {flags}");
+                // The C helper sets `trim_prefix = strlen(prefix)`, so the prefix is stripped
+                // from the emitted refname (e.g. `refs/heads/main` -> `main`).
+                let display = name.strip_prefix(prefix).unwrap_or(&name);
+                println!("{display_oid} {display} {flags}");
             }
             Ok(())
         }
@@ -1142,11 +1155,122 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             std::fs::rename(lock_path, path)?;
             Ok(())
         }
-        "resolve-ref" => commands::test_tool_ref_store::run(&rest[2..]),
+        "rename-ref" => {
+            // rename-ref <oldref> <newref> [logmsg]
+            if rest.len() < 5 {
+                bail!("usage: test-tool ref-store main rename-ref <oldref> <newref> [logmsg]");
+            }
+            let oldref = &rest[3];
+            let newref = &rest[4];
+            let logmsg = rest.get(5).cloned().unwrap_or_default();
+            run_ref_store_rename(&repo, &git_dir, oldref, newref, &logmsg)
+        }
+        "verify-ref" => {
+            // verify-ref <refname>: succeeds iff creating <refname> would not hit a D/F
+            // conflict with another ref (matches refs_verify_refname_available).
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main verify-ref <refname>")
+            })?;
+            match grit_lib::refs::verify_refname_available_for_create(
+                &git_dir,
+                refname,
+                &std::collections::BTreeSet::new(),
+                &std::collections::HashSet::new(),
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    println!("{}", e.lock_message_suffix());
+                    std::process::exit(1);
+                }
+            }
+        }
+        "delete-ref" => {
+            // delete-ref <msg> <refname> <old-sha1> <flags>
+            if rest.len() < 6 {
+                bail!("usage: test-tool ref-store main delete-ref <msg> <ref> <old-sha1> <flags>");
+            }
+            let _msg = &rest[3];
+            let refname = &rest[4];
+            let old_sha1 = &rest[5];
+            // Honor the old-sha1 precondition (REF_NO_DEREF/flags don't change this test's path).
+            if old_sha1 != "0000000000000000000000000000000000000000" {
+                let expected = grit_lib::objects::ObjectId::from_hex(old_sha1)
+                    .with_context(|| format!("cannot parse {old_sha1} as object id"))?;
+                match grit_lib::refs::resolve_ref(&git_dir, refname) {
+                    Ok(current) if current == expected => {}
+                    Ok(current) => bail!(
+                        "ref {refname} is at {} but expected {}",
+                        current.to_hex(),
+                        expected.to_hex()
+                    ),
+                    Err(e) => bail!("cannot lock ref '{refname}': {e}"),
+                }
+            }
+            grit_lib::refs::delete_ref(&git_dir, refname).map_err(|e| anyhow::anyhow!("{e}"))
+        }
         // The module entry point expects `<store> <function> ...`, so pass the backend too.
+        "resolve-ref" => commands::test_tool_ref_store::run(&rest[1..]),
         "for-each-reflog" => commands::test_tool_ref_store::run(&rest[1..]),
         other => bail!("test-tool ref-store: unsupported subcommand '{other}'"),
     }
+}
+
+/// Low-level ref rename for `test-tool ref-store main rename-ref`, mirroring the files-backend
+/// `files_copy_or_rename_ref`: resolve the old ref without dereferencing (symrefs are rejected),
+/// migrate its reflog, delete the old ref, write the new ref, and append the rename reflog entry.
+fn run_ref_store_rename(
+    repo: &grit_lib::repo::Repository,
+    git_dir: &std::path::Path,
+    oldref: &str,
+    newref: &str,
+    logmsg: &str,
+) -> Result<()> {
+    // Renaming a symbolic ref is not supported (matches the C backend).
+    if matches!(
+        grit_lib::refs::read_symbolic_ref(git_dir, oldref),
+        Ok(Some(_))
+    ) {
+        bail!("refname {oldref} is a symbolic ref, renaming it is not supported");
+    }
+
+    let old_oid = grit_lib::refs::resolve_ref(git_dir, oldref)
+        .map_err(|_| anyhow::anyhow!("refname {oldref} not found"))?;
+
+    // Capture the old reflog bytes before deleting the ref (delete_ref removes logs/<ref> too).
+    let logs_dir = git_dir.join("logs");
+    let old_log_path = logs_dir.join(oldref);
+    let old_reflog_bytes = if old_log_path.is_file() {
+        std::fs::read(&old_log_path).ok()
+    } else {
+        None
+    };
+
+    // Delete the old ref first to avoid d/f conflicts when old/new share a path prefix.
+    grit_lib::refs::delete_ref(git_dir, oldref).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Remove any pre-existing destination ref so the write lands cleanly.
+    let _ = grit_lib::refs::delete_ref(git_dir, newref);
+
+    grit_lib::refs::write_ref(git_dir, newref, &old_oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Migrate the reflog content to the new ref's reflog path.
+    if let Some(log_bytes) = old_reflog_bytes {
+        let new_log = logs_dir.join(newref);
+        if let Some(parent) = new_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&new_log, log_bytes)?;
+    }
+
+    // Append a reflog entry for the rename when a log message was supplied (an empty logmsg
+    // leaves the migrated reflog untouched, matching commit_ref_update with a NULL message).
+    if !logmsg.is_empty() {
+        let identity = commands::update_ref::resolve_reflog_identity(repo);
+        let _ = grit_lib::refs::append_reflog(
+            git_dir, newref, &old_oid, &old_oid, &identity, logmsg, true,
+        );
+    }
+
+    Ok(())
 }
 
 fn dir_iterator_error_name(kind: std::io::ErrorKind) -> &'static str {
