@@ -4,6 +4,7 @@
 //! mode, then writes blended blob content and updated modes into the index.
 
 use anyhow::{bail, Context, Result};
+use grit_lib::config::ConfigSet;
 use grit_lib::crlf::{self, ConvertToGitOpts};
 use grit_lib::diff::{diff_index_to_worktree, mode_from_metadata, DiffStatus};
 use grit_lib::index::{Index, IndexEntry, MODE_TREE};
@@ -1222,6 +1223,9 @@ pub(crate) fn run_add_patch_with_reader(
                             writeln!(out, "Sorry, cannot edit this hunk").ok();
                         } else {
                             match edit_hunk_and_apply(
+                                &repo.git_dir,
+                                repo.work_tree.as_deref(),
+                                &add_cfg.config,
                                 &mut out,
                                 path_str.as_str(),
                                 &index_side_bytes,
@@ -1544,28 +1548,66 @@ fn emit_index_trace_region(label: &str) {
     }
 }
 
-/// Open `content` in the user's editor (`GIT_EDITOR`/`VISUAL`/`EDITOR`), returning the edited bytes.
-fn run_editor_on_text(content: &[u8]) -> Result<Vec<u8>> {
+/// Open `content` in the user's editor, returning the edited bytes.
+///
+/// Editor resolution goes through [`crate::editor::resolve_commit_launch_editor`], matching git's
+/// `git_editor()` (`GIT_EDITOR` → `core.editor` → `VISUAL` (only when not a dumb terminal) →
+/// `EDITOR`). Crucially this treats the harness placeholders `VISUAL=:` / a bare `EDITOR=:` the way
+/// git does, so `test_set_editor`'s `EDITOR='"$FAKE_EDITOR"'` wins (t3701 edit tests).
+///
+/// The edit file lives at `$GIT_DIR/addp-hunk-edit.diff` (matching git's
+/// `strbuf_edit_interactively(..., "addp-hunk-edit.diff", ...)`). Putting it inside the repository
+/// — rather than `$TMPDIR` — is load-bearing: some editors (and t3701's fake editor, which does a
+/// relative `mv -f patch "$1"`) assume the edit file shares the working directory's filesystem.
+fn run_editor_on_text(
+    git_dir: &Path,
+    work_tree: Option<&Path>,
+    config: &ConfigSet,
+    content: &[u8],
+) -> Result<Vec<u8>> {
     use std::io::Write;
-    let mut f = tempfile::NamedTempFile::new().context("temp file for add -p edit")?;
-    f.as_file_mut().write_all(content)?;
-    f.flush()?;
-    let path = f.path().to_owned();
-    let editor = std::env::var("GIT_EDITOR")
-        .or_else(|_| std::env::var("VISUAL"))
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".to_string());
-    let status = std::process::Command::new("sh")
-        .arg("-c")
+    let path = git_dir.join("addp-hunk-edit.diff");
+    {
+        let mut f = fs::File::create(&path).context("creating add -p edit file")?;
+        f.write_all(content)?;
+        f.flush()?;
+    }
+    let mut editor = crate::editor::resolve_commit_launch_editor(config)
+        .ok_or_else(|| anyhow::anyhow!("Terminal is dumb, but EDITOR unset"))?;
+    // Mirror `launch_commit_editor`: an explicit `EDITOR=...` still wins over a `:` placeholder.
+    if editor.trim() == ":" {
+        if let Ok(env_editor) = std::env::var("EDITOR") {
+            if !env_editor.trim().is_empty() && env_editor.trim() != ":" {
+                editor = env_editor;
+            }
+        }
+    }
+    // Git treats `:` as a no-op editor (`launch_specified_editor`): leave the file untouched.
+    if editor.trim() == ":" {
+        let edited = fs::read(&path).context("reading edited file")?;
+        let _ = fs::remove_file(&path);
+        return Ok(edited);
+    }
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg("-c")
         .arg(format!("{editor} \"$1\""))
         .arg("sh")
-        .arg(&path)
-        .status()
-        .context("running editor")?;
+        .arg(&path);
+    // Run the editor from the work tree so scripts using relative paths (t3701's fake editor does a
+    // relative `mv -f patch "$1"`) see the same cwd as `git add -p`.
+    if let Some(wt) = work_tree {
+        cmd.current_dir(wt);
+    } else {
+        cmd.current_dir(git_dir);
+    }
+    let status = cmd.status().context("running editor")?;
     if !status.success() {
+        let _ = fs::remove_file(&path);
         bail!("editor failed");
     }
-    fs::read(&path).context("reading edited file")
+    let edited = fs::read(&path).context("reading edited file")?;
+    let _ = fs::remove_file(&path);
+    Ok(edited)
 }
 
 /// Compute the inclusive index(old)-side line span `[old_start, old_end)` covered by `op_slice`.
@@ -1619,6 +1661,9 @@ enum EditResult {
 }
 
 fn edit_hunk_and_apply(
+    git_dir: &Path,
+    work_tree: Option<&Path>,
+    config: &ConfigSet,
     out: &mut impl Write,
     path: &str,
     index_bytes: &[u8],
@@ -1644,7 +1689,7 @@ fn edit_hunk_and_apply(
          # aborted and the hunk is left unchanged.\n",
     );
 
-    let edited = run_editor_on_text(buf.as_bytes())?;
+    let edited = run_editor_on_text(git_dir, work_tree, config, buf.as_bytes())?;
     let edited = String::from_utf8_lossy(&edited).into_owned();
 
     // If the editor left the presented buffer unchanged (e.g. EDITOR=: / touch), git stages the
@@ -1656,25 +1701,34 @@ fn edit_hunk_and_apply(
     // Strip comment lines.
     let body: Vec<&str> = edited.lines().filter(|l| !l.starts_with('#')).collect();
 
-    // Drop the @@ header line(s); keep ` `/`+`/`-`/`\` body lines.
+    // Mirror git's `recount_edited_hunk` + reassemble: if a `@@` header is present git re-parses it
+    // (and skips it) and anchors the body there; otherwise (e.g. a totally garbled patch) it keeps
+    // the original header and still treats every body line. Lines starting with ` `/`+`/`-` are
+    // context/del/add; a `\` line is the no-newline marker; any other line is treated as a context
+    // line whose whole text must match the index — so a garbage patch with no real context (t3701
+    // "garbage edit rejected") fails to locate and prints "patch does not apply".
+    let has_header = body.iter().any(|l| l.starts_with("@@"));
     let mut old_lines: Vec<String> = Vec::new();
     let mut new_lines: Vec<String> = Vec::new();
-    let mut saw_body = false;
+    let mut saw_body = !has_header;
+    let mut any_body = false;
     for line in &body {
         if line.starts_with("@@") {
             saw_body = true;
             continue;
         }
         if !saw_body {
-            // Lines before the header (shouldn't happen) are ignored.
+            // Lines before the header are ignored (git anchors the body at the header).
             continue;
         }
+        any_body = true;
         if line.starts_with('\\') {
             continue; // "\ No newline at end of file"
         }
         let (marker, rest) = match line.chars().next() {
             Some(c @ (' ' | '+' | '-')) => (c, &line[1..]),
-            // A line with no leading marker is treated as context (Git strips a single space).
+            // A line with no recognized marker is treated as a context line (git strips one leading
+            // space when present; a bare line keeps its full text).
             _ => (' ', *line),
         };
         match marker {
@@ -1688,8 +1742,8 @@ fn edit_hunk_and_apply(
         }
     }
 
-    if old_lines.is_empty() && new_lines.is_empty() {
-        // All lines removed: abandon the edit.
+    if !any_body {
+        // All lines removed (or nothing but a header): abandon the edit, leave the hunk unchanged.
         return Ok(EditResult::Aborted);
     }
 
@@ -1700,6 +1754,9 @@ fn edit_hunk_and_apply(
     let index_str = String::from_utf8_lossy(index_bytes);
     let index_lines: Vec<&str> = index_str.lines().collect();
 
+    // An old side that does not match the index content makes the reassembled patch fail
+    // `git apply --check`. Git then prints the apply error and offers to edit again. We emit the
+    // same diagnostics; the caller's `e n d` path consumes the `n` answer.
     let match_at = locate_hunk(&index_lines, &old_lines, orig_old_start);
     let Some(pos) = match_at else {
         writeln!(out, "error: patch failed: {path}:{}", orig_old_start + 1).ok();
