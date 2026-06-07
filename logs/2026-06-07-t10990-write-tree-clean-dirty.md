@@ -68,3 +68,16 @@ Per the working rules I may NOT edit the test assertion (only
 `test_expect_failure` -> `test_expect_success` flips are permitted, and this
 subtest is already `test_expect_success`). grit is already correct. Marking the
 ticket blocked with this proof; no Rust change is warranted.
+
+## Re-verification (second pass, 2026-06-07)
+
+Re-ran the file fresh: 36/37 (unchanged). Independently confirmed the prior
+analysis with a direct A/B test: built the exact subtest-21 state (ui.txt added
+via `git add`, present on disk and tracked) in two parallel repos and ran
+`update-index --remove ui.txt` with grit and with real git 2.52.0 side by side.
+Both exit 0 and BOTH keep `ui.txt` in `ls-files` — byte-identical behavior. Also
+re-read `builtin/update-index.c` process_path (line 380-413): with the entry
+present and lstat succeeding it calls `add_one_path(ce,...)` (keep/update), never
+`remove_one_path`; the latter is only reached from `process_lstat_error` when the
+file is missing. grit/src/commands/update_index.rs:844-865 mirrors this exactly.
+Confirmed: test bug, no grit change warranted. Staying blocked.
