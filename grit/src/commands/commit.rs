@@ -1176,6 +1176,19 @@ pub fn run(mut args: Args) -> Result<()> {
 
     let verbose_level = resolve_commit_verbose_level(&args, &config);
     let commit_cleanup_mode = resolve_commit_cleanup_mode(&args, &config, use_editor_for_message);
+    // For editor commits, `prepare-commit-msg` must run on the full template buffer *before*
+    // the editor opens (Git `prepare_to_commit`: hook then editor). This closure is invoked at
+    // each editor-launch site inside `prepare_commit_message`. Non-editor commits run the hook
+    // afterwards (below) on the assembled message instead.
+    let prepare_hook = |msg_file: &Path| -> Result<()> {
+        run_prepare_commit_msg_hook_on(
+            &repo,
+            &args,
+            index_path.as_path(),
+            use_editor_for_message,
+            msg_file,
+        )
+    };
     let msg_result = prepare_commit_message(
         &args,
         &repo,
@@ -1187,6 +1200,7 @@ pub fn run(mut args: Args) -> Result<()> {
         &staged,
         &unstaged,
         verbose_level,
+        &prepare_hook,
     )?;
     let mut message = normalize_autosquash_editor_message(
         &args,
@@ -1203,46 +1217,18 @@ pub fn run(mut args: Args) -> Result<()> {
     let template_for_aborted_check = template_path.filter(|_| use_editor_for_message);
 
     // prepare-commit-msg runs for normal commits (not skipped by `--no-verify`; only pre-commit
-    // and commit-msg are). Writes COMMIT_EDITMSG then lets the hook edit it in place.
-    {
+    // and commit-msg are). For editor commits the hook already ran on the full template before the
+    // editor opened (inside `prepare_commit_message`), matching Git's `prepare_to_commit` order;
+    // running it again here would operate on the post-editor, comment-stripped buffer. So only the
+    // non-editor path writes COMMIT_EDITMSG and lets the hook edit it in place.
+    if !use_editor_for_message {
         let msg_file = repo.git_dir.join("COMMIT_EDITMSG");
         if let Some(ref raw) = raw_message {
             fs::write(&msg_file, raw)?;
         } else {
             fs::write(&msg_file, message.as_bytes())?;
         }
-        let msg_path_str = msg_file.to_string_lossy().to_string();
-        let (hook_arg1, hook_arg2) = prepare_commit_msg_hook_args(&args, &repo.git_dir);
-        let mut hook_args: Vec<&str> = vec![msg_path_str.as_str()];
-        if let Some(a1) = hook_arg1 {
-            hook_args.push(a1);
-            if let Some(ref a2) = hook_arg2 {
-                hook_args.push(a2.as_str());
-            }
-        }
-        // Match `run_commit_hook` upstream: when no editor is used, export GIT_EDITOR=:
-        // so hooks can detect a non-interactive commit. Also export GIT_INDEX_FILE.
-        let prepare_hook_env = CommitHookEnv {
-            index_file: Some(index_path.as_path()),
-            git_editor: if use_editor_for_message {
-                None
-            } else {
-                Some(":")
-            },
-            git_prefix: None,
-            extra_env: &[],
-        };
-        let r = run_commit_hook(
-            &repo,
-            "prepare-commit-msg",
-            &hook_args,
-            None,
-            &prepare_hook_env,
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
-        if let HookResult::Failed(code) = r {
-            bail!("prepare-commit-msg hook exited with status {code}");
-        }
+        run_prepare_commit_msg_hook_on(&repo, &args, index_path.as_path(), false, &msg_file)?;
         let new_raw = fs::read(&msg_file)?;
         // Preserve the verbatim bytes when the source message carried raw bytes
         // (a `-F` file or non-UTF-8 content); the commit body must be stored as-is
@@ -4416,6 +4402,11 @@ fn prepare_commit_message(
     staged: &[DiffEntry],
     unstaged: &[DiffEntry],
     verbose_level: i64,
+    // Runs the `prepare-commit-msg` hook on the editor template file (the full message
+    // buffer including status comments) immediately before launching the editor, matching
+    // Git's `prepare_to_commit` order: hook first, editor second. For non-editor commits
+    // the caller runs the hook itself after the message is assembled.
+    run_prepare_hook: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<MessageResult> {
     let comment_owned = comment_line_prefix_full(config);
     let comment_prefix = comment_owned.as_ref();
@@ -4457,6 +4448,7 @@ fn prepare_commit_message(
                     )?;
                 }
                 fs::write(&edit_path, &file_body)?;
+                run_prepare_hook(&edit_path)?;
                 launch_commit_editor(repo, &edit_path)?;
                 let edited = fs::read_to_string(&edit_path)?;
                 let cleaned =
@@ -4496,6 +4488,7 @@ fn prepare_commit_message(
                 )?;
             }
             fs::write(&edit_path, &file_body)?;
+            run_prepare_hook(&edit_path)?;
             launch_commit_editor(repo, &edit_path)?;
             let edited = fs::read_to_string(&edit_path)?;
             let cleaned =
@@ -4538,6 +4531,7 @@ fn prepare_commit_message(
                 )?;
             }
             fs::write(&edit_path, &file_body)?;
+            run_prepare_hook(&edit_path)?;
             launch_commit_editor(repo, &edit_path)?;
             let edited = fs::read_to_string(&edit_path)?;
             let cleaned =
@@ -4603,6 +4597,7 @@ fn prepare_commit_message(
                 )?;
             }
             fs::write(&edit_path, &file_body)?;
+            run_prepare_hook(&edit_path)?;
             launch_commit_editor(repo, &edit_path)?;
             let edited = fs::read_to_string(&edit_path)?;
             let cleaned =
@@ -4659,6 +4654,7 @@ fn prepare_commit_message(
                 )?;
             }
             fs::write(&edit_path, &file_body)?;
+            run_prepare_hook(&edit_path)?;
             launch_commit_editor(repo, &edit_path)?;
             let edited = fs::read_to_string(&edit_path)?;
             let cleaned =
@@ -4744,6 +4740,7 @@ fn prepare_commit_message(
             )?;
         }
         fs::write(&edit_path, &file_body)?;
+        run_prepare_hook(&edit_path)?;
         launch_commit_editor(repo, &edit_path)?;
         let edited = fs::read_to_string(&edit_path)?;
         let cleaned = apply_cleanup_message(&edited, verbose_level, comment_prefix, cleanup_mode);
@@ -5349,6 +5346,48 @@ fn prepare_commit_msg_hook_args(
     }
     // Plain editor commit (no message source): hook_arg1 stays NULL upstream.
     (None, None)
+}
+
+/// Run the `prepare-commit-msg` hook on `msg_file`, in place.
+///
+/// Mirrors `builtin/commit.c:run_commit_hook(use_editor, …, "prepare-commit-msg", …)`. The hook
+/// receives the message-file path plus the source arguments from [`prepare_commit_msg_hook_args`].
+/// When no editor is used, `GIT_EDITOR=:` is exported so hooks can detect non-interactive commits;
+/// `GIT_INDEX_FILE` is always exported. A non-zero hook exit aborts the commit (`bail!`).
+fn run_prepare_commit_msg_hook_on(
+    repo: &Repository,
+    args: &Args,
+    index_path: &Path,
+    use_editor: bool,
+    msg_file: &Path,
+) -> Result<()> {
+    let msg_path_str = msg_file.to_string_lossy().to_string();
+    let (hook_arg1, hook_arg2) = prepare_commit_msg_hook_args(args, &repo.git_dir);
+    let mut hook_args: Vec<&str> = vec![msg_path_str.as_str()];
+    if let Some(a1) = hook_arg1 {
+        hook_args.push(a1);
+        if let Some(ref a2) = hook_arg2 {
+            hook_args.push(a2.as_str());
+        }
+    }
+    let prepare_hook_env = CommitHookEnv {
+        index_file: Some(index_path),
+        git_editor: if use_editor { None } else { Some(":") },
+        git_prefix: None,
+        extra_env: &[],
+    };
+    let r = run_commit_hook(
+        repo,
+        "prepare-commit-msg",
+        &hook_args,
+        None,
+        &prepare_hook_env,
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    if let HookResult::Failed(code) = r {
+        bail!("prepare-commit-msg hook exited with status {code}");
+    }
+    Ok(())
 }
 
 /// Update HEAD to point to the new commit.
