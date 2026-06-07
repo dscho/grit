@@ -517,6 +517,28 @@ impl Index {
         }
     }
 
+    /// Create a new, empty index at a fixed version without consulting
+    /// `GIT_INDEX_VERSION` or config.
+    ///
+    /// Unlike [`Self::new`], this never reads the environment and therefore never
+    /// emits the "GIT_INDEX_VERSION set, but the value is invalid" warning. Use it
+    /// for throwaway baseline indexes (e.g. sparse-index diff references) where the
+    /// version is irrelevant and Git resolves the format only once per operation.
+    #[must_use]
+    pub fn empty(version: u32) -> Self {
+        Self {
+            version,
+            entries: Vec::new(),
+            sparse_directories: false,
+            untracked_cache: None,
+            fsmonitor_last_update: None,
+            resolve_undo: None,
+            split_link: None,
+            cache_tree_root: None,
+            cache_tree: None,
+        }
+    }
+
     /// Create a new empty index, respecting config values for version.
     ///
     /// Priority matches Git's `prepare_repo_settings`: `GIT_INDEX_VERSION` env, then

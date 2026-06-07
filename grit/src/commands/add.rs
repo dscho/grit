@@ -555,15 +555,20 @@ pub fn run(mut args: Args) -> Result<()> {
         }
     }
     let idx_exists = index_path.exists();
-    let raw_index = if idx_exists {
-        Index::load(&index_path).unwrap_or_else(|_| Index::new())
-    } else {
-        Index::new()
-    };
+    // Resolve the on-disk index format exactly once, matching Git's
+    // `get_index_format_default` (otherwise `GIT_INDEX_VERSION`/`index.version`
+    // warnings would be emitted twice). For a fresh index, `raw_index` is only an
+    // empty sparse-index baseline, so it reuses the already-resolved version
+    // instead of re-reading the environment.
     let mut index = if idx_exists {
         repo.load_index_at(&index_path)?
     } else {
         Index::new_from_config(&config)
+    };
+    let raw_index = if idx_exists {
+        Index::load(&index_path).unwrap_or_else(|_| Index::empty(index.version))
+    } else {
+        Index::empty(index.version)
     };
 
     let odb = &repo.odb;
