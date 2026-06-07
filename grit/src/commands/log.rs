@@ -2668,7 +2668,13 @@ fn run_rev_list_log(
     };
     let _bloom_perf_guard = bloom_stats.as_ref().map(|h| BloomPerfGuard(Arc::clone(h)));
 
-    let ordering = if args.topo_order || args.simplify_merges {
+    let ordering = if args.topo_order
+        || args.simplify_merges
+        // `--simplify-by-decoration` with default (unspecified) ordering walks the rewritten
+        // topology, which Git emits in topo order (e.g. `reach` right after its merge child,
+        // before the older `seventh`). An explicit `--date-order` keeps date ordering.
+        || (args.simplify_by_decoration && !args.date_order && !args.author_date_order)
+    {
         if args.author_date_order {
             OrderingMode::AuthorDateTopo
         } else {
@@ -2682,6 +2688,26 @@ fn run_rev_list_log(
         }
     } else {
         OrderingMode::Default
+    };
+
+    // For `--simplify-by-decoration`, build the filter-aware decorated commit set: the same
+    // decorations the display uses (honoring `--decorate-refs[-exclude]`, `log.excludeDecoration`,
+    // and the default hidden-ref behavior). This drives the parent-rewriting simplification in
+    // the rev-list engine, matching Git's `rev_compare_tree` decoration oracle.
+    let simplify_by_decoration_oids: HashSet<ObjectId> = if args.simplify_by_decoration {
+        // Only the OID keys matter for simplification (full vs short ref display is irrelevant).
+        let dec_map = collect_decorations_inner(
+            repo,
+            false,
+            decorations_initial_set_all(args, &repo.git_dir),
+            &build_decoration_filter(args, &repo.git_dir),
+        )?;
+        dec_map
+            .keys()
+            .filter_map(|hex| hex.parse::<ObjectId>().ok())
+            .collect()
+    } else {
+        HashSet::new()
     };
 
     let mut options = RevListOptions {
@@ -2702,6 +2728,8 @@ fn run_rev_list_log(
         parent_rewrite: args.show_parents || log_parent_format_requested(args),
         sparse: args.sparse,
         simplify_merges: args.simplify_merges,
+        simplify_by_decoration: args.simplify_by_decoration,
+        simplify_by_decoration_oids: simplify_by_decoration_oids.clone(),
         preserve_simplify_merges_graph_merges: args.graph,
         show_pulls: args.show_pulls,
         exclude_first_parent_only: args.exclude_first_parent_only,
@@ -5740,6 +5768,11 @@ pub fn run(mut args: Args) -> Result<()> {
         probe_pathspecs.extend(implied);
     }
     let effective_for_rev_list = resolve_effective_pathspecs(&repo, &probe_pathspecs)?;
+    // `--simplify-by-decoration` (without pathspecs) needs the rev-list engine's
+    // topo-ordered full walk + proper parent-rewriting simplification. With pathspecs the
+    // legacy path-limited walk handles the combined "touch path OR decorated" case.
+    let simplify_decoration_rev_list =
+        args.simplify_by_decoration && effective_for_rev_list.is_empty();
     let wants_rev_list_walk = !args.follow
         && args.branches.is_none()
         && !args.source
@@ -5750,9 +5783,10 @@ pub fn run(mut args: Args) -> Result<()> {
         && args.since.is_none()
         && args.until.is_none()
         && args.since_as_filter.is_none()
-        && !args.simplify_by_decoration
+        && (!args.simplify_by_decoration || simplify_decoration_rev_list)
         && !args.boundary
-        && (args.topo_order
+        && (simplify_decoration_rev_list
+            || args.topo_order
             || args.date_order
             || args.author_date_order
             || args.full_history
@@ -8316,6 +8350,11 @@ enum DecorationKind {
     Stash,
     Head,
     Grafted,
+    /// A ref outside the known namespaces (e.g. `refs/hidden/*`, `refs/prefetch/*`).
+    /// Git renders these with `DECORATION_NONE` (reset color) and the full refname.
+    /// Only decorated when an explicit `--decorate-refs[-exclude]` / `log.excludeDecoration`
+    /// filter is active (or `--clear-decorations`), matching `set_default_decoration_filter`.
+    Other,
 }
 
 /// One ref (or synthetic label) attached to a commit for `--decorate` / `%d`.
@@ -12380,18 +12419,76 @@ fn decorations_initial_set_all(args: &Args, git_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_decoration_filter(args: &Args, git_dir: &Path) -> DecorationFilter {
-    let mut filter = DecorationFilter {
-        include: args
+/// Collect the `--decorate-refs` / `--decorate-refs-exclude` patterns in command-line order,
+/// honoring `--clear-decorations`: that flag clears the patterns given *before* it (Git's
+/// `clear_decorations_callback` in builtin/log.c, which is order-sensitive), while patterns
+/// given after it are retained. Falls back to the clap-collected (order-insensitive) vecs when
+/// the raw argv is unavailable.
+fn ordered_decorate_ref_patterns(args: &Args) -> (Vec<String>, Vec<String>) {
+    if args.raw_argv_tail.is_empty() {
+        let include = args
             .decorate_refs
             .iter()
             .map(|p| normalize_glob_ref(p))
-            .collect(),
-        exclude: args
+            .collect();
+        let exclude = args
             .decorate_refs_exclude
             .iter()
             .map(|p| normalize_glob_ref(p))
-            .collect(),
+            .collect();
+        return (include, exclude);
+    }
+
+    let mut include: Vec<String> = Vec::new();
+    let mut exclude: Vec<String> = Vec::new();
+    let argv = &args.raw_argv_tail;
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--" {
+            break;
+        }
+        if arg == "--clear-decorations" {
+            include.clear();
+            exclude.clear();
+            i += 1;
+            continue;
+        }
+        // Match `--decorate-refs[=val]` and `--decorate-refs-exclude[=val]` (and the space form).
+        let take = |flag: &str, list: &mut Vec<String>, i: &mut usize| -> bool {
+            if let Some(rest) = arg.strip_prefix(flag) {
+                if let Some(val) = rest.strip_prefix('=') {
+                    list.push(normalize_glob_ref(val));
+                    *i += 1;
+                    return true;
+                }
+                if rest.is_empty() {
+                    if let Some(val) = argv.get(*i + 1) {
+                        list.push(normalize_glob_ref(val));
+                    }
+                    *i += 2;
+                    return true;
+                }
+            }
+            false
+        };
+        // Check the longer flag first so `--decorate-refs-exclude` is not eaten by `--decorate-refs`.
+        if take("--decorate-refs-exclude", &mut exclude, &mut i) {
+            continue;
+        }
+        if take("--decorate-refs", &mut include, &mut i) {
+            continue;
+        }
+        i += 1;
+    }
+    (include, exclude)
+}
+
+fn build_decoration_filter(args: &Args, git_dir: &Path) -> DecorationFilter {
+    let (include, exclude) = ordered_decorate_ref_patterns(args);
+    let mut filter = DecorationFilter {
+        include,
+        exclude,
         exclude_config: Vec::new(),
     };
     // `--clear-decorations` drops the config-based exclusions (and Git's default
@@ -12458,6 +12555,8 @@ fn color_for_decoration_kind(paint: &DecorationPaint, kind: DecorationKind) -> &
         DecorationKind::Stash => &paint.stash,
         DecorationKind::Head => &paint.head,
         DecorationKind::Grafted => &paint.grafted,
+        // `DECORATION_NONE` -> `GIT_COLOR_RESET` (log-tree.c `decoration_colors[0]`).
+        DecorationKind::Other => &paint.reset,
     }
 }
 
@@ -12590,17 +12689,21 @@ fn collect_decorations_inner(
             continue;
         }
 
-        // With `--clear-decorations`, the default ref filter is removed, so any
-        // remaining ref (e.g. `refs/notes/commits`) is also decorated. Such refs
-        // are always shown with their full name.
-        if clear_decorations {
+        // Refs outside the known namespaces (e.g. `refs/hidden/*`, `refs/prefetch/*`,
+        // `refs/notes/commits`). Git's `set_default_decoration_filter` (builtin/log.c)
+        // only restricts decorations to the known namespaces when NO `--decorate-refs`,
+        // `--decorate-refs-exclude`, or `log.excludeDecoration` is given. As soon as any
+        // such filter is active (or `--clear-decorations` is set), the default include
+        // list is dropped and every ref that passes the filter is decorated with its full
+        // name and `DECORATION_NONE` (reset) color (log-tree.c `add_ref_decoration`).
+        if clear_decorations || !filter.is_empty() {
             let peeled = peel_to_commit_hex(odb, &oid.to_hex()).unwrap_or_else(|| oid.to_hex());
             prepend_decoration(
                 map.entry(peeled).or_default(),
                 DecorationItem {
                     refname: Some(refname.clone()),
                     display: refname.clone(),
-                    kind: DecorationKind::Branch,
+                    kind: DecorationKind::Other,
                 },
             );
         }
