@@ -8754,8 +8754,17 @@ fn cherry_pick_for_rebase(
         );
         write_rebase_conflict_message(git_dir, &commit, &config)?;
         if todo_cmd != RebaseTodoCmd::Reword {
-            let mut merge_msg = commit.message.clone();
-            append_rebase_conflicts_comment_block(&mut merge_msg, &merge_conflict_files, &config);
+            // Keep MERGE_MSG in the commit output encoding (same as `rebase-merge/message`,
+            // written above by `write_rebase_conflict_message`). Using the UTF-8 `commit.message`
+            // here would make `rebase --continue` decode UTF-8 bytes as the configured non-UTF-8
+            // encoding and corrupt the message (t3434 eucJP -> ISO-2022-JP).
+            let (unicode, _enc, raw_opt) = transcoded_replayed_message(&commit, &config);
+            let mut merge_msg = raw_opt.unwrap_or_else(|| unicode.into_bytes());
+            append_rebase_conflicts_comment_block_bytes(
+                &mut merge_msg,
+                &merge_conflict_files,
+                &config,
+            );
             fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
         }
         eprint_submodule_merge_conflict_advice(repo, &merged_index);
@@ -9120,9 +9129,17 @@ fn finish_rebase(
 
     if head_name != "detached HEAD" {
         let ref_path = git_dir.join(head_name);
-        let old_branch_oid = fs::read_to_string(&ref_path)
-            .ok()
-            .and_then(|s| ObjectId::from_hex(s.trim()).ok())
+        // The reflog "old" value for the `rebase (finish)` entry must be the branch's pre-rebase
+        // tip (so `branch@{1}` resolves to the state before rebase, per t3404 "reflog for the
+        // branch shows state before rebase"). The picks run on a detached HEAD, but the branch
+        // ref file may already point at `new_tip` by the time we reach finish, so reading it back
+        // would record old==new and corrupt `@{N}` resolution. Use the recorded original head.
+        let old_branch_oid = rebase_orig_head_oid(rb_dir)
+            .or_else(|| {
+                fs::read_to_string(&ref_path)
+                    .ok()
+                    .and_then(|s| ObjectId::from_hex(s.trim()).ok())
+            })
             .unwrap_or(new_tip);
 
         let finish_branch = format!("{ra} (finish): {head_name} onto {}", onto_oid.to_hex());
@@ -10649,6 +10666,36 @@ fn append_rebase_conflicts_comment_block(
         msg.push('\n');
     }
     msg.push('\n');
+}
+
+/// Append the `# Conflicts:` hint block to a message held as raw bytes.
+///
+/// MERGE_MSG must stay in the same charset as `rebase-merge/message` (the commit output
+/// encoding), so that `rebase --continue` can decode it correctly. When the message bytes are
+/// not UTF-8 (e.g. eucJP), appending the ASCII conflict block at the byte level avoids the
+/// lossy UTF-8 round-trip that [`append_rebase_conflicts_comment_block`] would impose.
+fn append_rebase_conflicts_comment_block_bytes(
+    msg: &mut Vec<u8>,
+    conflict_files: &[(Vec<u8>, Vec<u8>)],
+    config: &ConfigSet,
+) {
+    if conflict_files.is_empty() {
+        return;
+    }
+    if !msg.ends_with(b"\n") {
+        msg.push(b'\n');
+    }
+    msg.push(b'\n');
+    let comment_prefix = comment_line_prefix_full(config);
+    msg.extend_from_slice(comment_prefix.as_bytes());
+    msg.extend_from_slice(b" Conflicts:\n");
+    for (path, _) in conflict_files {
+        msg.extend_from_slice(comment_prefix.as_bytes());
+        msg.push(b'\t');
+        msg.extend_from_slice(path);
+        msg.push(b'\n');
+    }
+    msg.push(b'\n');
 }
 
 fn read_rebase_continue_message(
