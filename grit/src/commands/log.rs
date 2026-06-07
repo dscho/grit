@@ -1611,12 +1611,14 @@ fn ident_for_author_pattern_match(ident: &str) -> String {
 
 /// Whether `--author` / `--committer` identity patterns should match case-insensitively.
 ///
-/// Unlike `--grep` (case-sensitive unless `-i`), grit matches author and committer identity
-/// filters case-insensitively by default, so `--committer=DANA` finds "Dana Developer"
-/// (t8270-log-author-search, t8280-log-committer-search). An explicit `-i` /
-/// `--regexp-ignore-case` keeps that behavior; there is no flag to make these case-sensitive.
-fn ident_pattern_ignore_case(_regexp_ignore_case: bool) -> bool {
-    true
+/// Like `--grep`, the author/committer identity filters are case-SENSITIVE by default and only
+/// fold case when `-i` / `--regexp-ignore-case` (or the equivalent grep config) is given. In
+/// Git, `revs->grep_filter.ignore_case` is a single flag shared by every grep pattern, header
+/// patterns included (`grep.c` honors `opt->ignore_case` uniformly; `revision.c` sets it only for
+/// `-i`/`--regexp-ignore-case`). So `--author=person` must NOT match author "Another Person"
+/// unless `-i` is supplied (t4209-log-pickaxe `log --author (nomatch)`).
+fn ident_pattern_ignore_case(regexp_ignore_case: bool) -> bool {
+    regexp_ignore_case
 }
 
 /// When `git log --graph <tip> --branches` is used, Git prefers `<tip>` as the leftmost
@@ -5613,8 +5615,8 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Resolve grep pattern flavor (fixed/basic/extended/perl) from CLI flags + grep.patternType.
     // `--grep` is case-SENSITIVE by default; `-i`/`--regexp-ignore-case` enables case-insensitivity.
-    // The `--author`/`--committer` identity filters, by contrast, match case-INSENSITIVELY by
-    // default (see `ident_pattern_ignore_case`), so a pattern like `--author=ALICE` finds "Alice".
+    // The `--author`/`--committer` identity filters share the same single ignore-case flag, so they
+    // are likewise case-SENSITIVE by default (see `ident_pattern_ignore_case`).
     let grep_ptype = resolve_grep_pattern_type(&args, &cfg);
     // Grit is not linked against libpcre2 (the harness leaves USE_LIBPCRE2 unset), so a request
     // for Perl-compatible regexes must die exactly as upstream Git does when compiled without
