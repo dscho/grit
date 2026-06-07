@@ -2567,6 +2567,17 @@ fn resolve_merge_head_token(repo: &Repository, token: &str) -> Result<ObjectId> 
     commit_oid_for_rebase_label(repo, token)
 }
 
+/// Split a commit ident (`Name <email> <secs> <tz>`) into `(name, email, "<secs> <tz>")` for
+/// re-exporting as `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/`GIT_AUTHOR_DATE`.
+fn author_fields_from_ident(ident: &str) -> Option<(String, String, String)> {
+    let lt = ident.find('<')?;
+    let gt = ident[lt + 1..].find('>')? + lt + 1;
+    let name = ident[..lt].trim().to_owned();
+    let email = ident[lt + 1..gt].trim().to_owned();
+    let date = ident[gt + 1..].trim().to_owned();
+    Some((name, email, date))
+}
+
 fn run_rebase_merge_subprocess(
     repo: &Repository,
     git_dir: &Path,
@@ -2579,22 +2590,47 @@ fn run_rebase_merge_subprocess(
     let merge_commit = parse_commit(&merge_obj.data)?;
     let msg_path = git_dir.join("rebase-merge-merge-msg");
     fs::write(&msg_path, &merge_commit.message)?;
+    // An octopus merge step (more than one merge head → 3+ parents) cannot be replayed by the plain
+    // recursive `merge`: Git's `do_merge` runs `git merge -s octopus --no-edit --no-ff --no-log
+    // --no-stat -F <msg> <tips...>` and pulls the AUTHOR from the saved author-script
+    // (`read_env_script`). The `--no-log`/`--no-stat` are essential — a bare octopus `merge -F`
+    // ignores the message file and auto-generates `Merge branches '…'`. Mirror that here (t3430
+    // 'octopus merges' checks both the `Tüntenfüsch` message and the `Hank` author).
+    let (merge_heads, _) = parse_merge_todo_arg_list(merge_args);
+    let is_octopus = merge_heads.len() > 1;
     let self_exe = std::env::current_exe().context("cannot determine grit binary path")?;
     let mut cmd = std::process::Command::new(&self_exe);
     // `--allow-unrelated-histories`: a `merge` step may join independent root commits (Git's
     // `do_merge` performs an in-process recursive merge with no unrelated-histories guard), e.g.
     // `merge first-branch` into a `[new root]` (t3430 'root commits').
-    cmd.args(["merge", "--no-ff", "--allow-unrelated-histories", "-F"])
+    if is_octopus {
+        // `--no-log`/`--no-stat` make the octopus merge honor `-F` instead of auto-generating
+        // `Merge branches '…'`. The `-s octopus` (or an explicit override) is added by the
+        // forwarding block below so a `git rebase -ir -s <strategy>` octopus still works.
+        cmd.args([
+            "merge",
+            "--no-ff",
+            "--no-log",
+            "--no-stat",
+            "--allow-unrelated-histories",
+            "-F",
+        ])
         .arg(msg_path.as_os_str());
+    } else {
+        cmd.args(["merge", "--no-ff", "--allow-unrelated-histories", "-F"])
+            .arg(msg_path.as_os_str());
+    }
     // Forward the rebase's merge strategy and strategy options to the child merge so a
     // `merge`/`merge -C`/`merge -c` honours `git rebase -s <strategy> -X<opt>` (t3430
     // 'merge -c rewords when a strategy is given', '--rebase-merges with strategies').
     let rb_dir = active_rebase_dir(git_dir);
+    let mut explicit_strategy = false;
     if let Some(rb_dir) = rb_dir.as_deref() {
         if let Ok(strategy_raw) = fs::read_to_string(rb_dir.join("strategy")) {
             let strategy = strategy_raw.trim();
             if !strategy.is_empty() {
                 cmd.arg("-s").arg(strategy);
+                explicit_strategy = true;
             }
         }
         if let Ok(opts) = fs::read_to_string(rb_dir.join("strategy-opts")) {
@@ -2608,6 +2644,10 @@ fn run_rebase_merge_subprocess(
                 }
             }
         }
+    }
+    // Octopus with no explicit strategy uses the `octopus` strategy (Git's `do_merge`).
+    if is_octopus && !explicit_strategy {
+        cmd.arg("-s").arg("octopus");
     }
     for tok in merge_args.split_whitespace() {
         let oid = resolve_merge_head_token(repo, tok)?;
@@ -2626,6 +2666,20 @@ fn run_rebase_merge_subprocess(
     }
     if let Ok(p) = std::env::var("PATH") {
         cmd.env("PATH", p);
+    }
+    // Octopus: Git's `do_merge` sets the author from the saved author-script (`read_env_script`)
+    // so the recreated octopus merge keeps the ORIGINAL merge commit's author (t3430 'octopus
+    // merges' asserts `%an` == "Hank"). A 2-parent merge instead amends in-process and preserves the
+    // author via `run_git_commit`; the child `grit merge` strips GIT_AUTHOR_* for octopus, so set
+    // them explicitly here.
+    if is_octopus {
+        if let Some((name, email, date)) = author_fields_from_ident(&merge_commit.author) {
+            cmd.env("GIT_AUTHOR_NAME", name);
+            cmd.env("GIT_AUTHOR_EMAIL", email);
+            if !date.is_empty() {
+                cmd.env("GIT_AUTHOR_DATE", date);
+            }
+        }
     }
     let output = cmd
         .current_dir(repo.work_tree.as_deref().unwrap_or_else(|| Path::new(".")))
@@ -5398,7 +5452,12 @@ fn run_interactive_rebase(
                 todo.push_str(&format!("{comment_prefix} {text}\n"));
             }
             TodoBuildItem::Exec(cmd) => {
-                todo.push_str(&format!("exec {cmd}\n"));
+                let kw = if rebase_abbreviate_commands(config) {
+                    "x"
+                } else {
+                    "exec"
+                };
+                todo.push_str(&format!("{kw} {cmd}\n"));
             }
         }
     }
@@ -6176,6 +6235,7 @@ Use '--' to separate paths from revisions, like this:\n\
                 autostash_oid.as_ref(),
                 want_autosquash,
                 rebase_update_refs_enabled(&args, &config),
+                &args.exec,
                 Some((help_revs.as_str(), short_onto.as_str())),
             )?;
         interactive_validation = Some((original_todo_with_help, raw_edited_todo));
