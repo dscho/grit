@@ -175,6 +175,7 @@ pub mod pack;
 pub mod pack_geometry;
 pub mod pack_name_hash;
 pub mod pack_rev;
+#[cfg(feature = "test-tools")]
 pub mod parse_options_test_tool;
 pub mod patch_ids;
 pub mod path_walk;
@@ -233,6 +234,7 @@ pub mod submodule_config;
 pub mod submodule_config_cache;
 pub mod submodule_gitdir;
 pub mod tab_expand;
+#[cfg(feature = "test-tools")]
 pub mod test_tool_progress;
 pub mod textconv_cache;
 pub mod transport_path;
