@@ -22,6 +22,7 @@
 //! scaffolding they attach to.
 
 pub mod checkout;
+pub mod cherry_pick;
 pub mod log;
 pub mod merge;
 pub mod rebase;
