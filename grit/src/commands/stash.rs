@@ -2726,6 +2726,7 @@ fn show_stash_stat_git_diffstat(
     let opts = DiffstatOptions {
         total_width: terminal_columns(),
         line_prefix: "",
+        width_prefix: "",
         subtract_prefix_from_terminal: false,
         stat_name_width: eff_name_width,
         stat_graph_width: eff_graph_width,

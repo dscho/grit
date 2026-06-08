@@ -10493,6 +10493,7 @@ fn write_compact_summary(
     let opts = DiffstatOptions {
         total_width: terminal_columns(),
         line_prefix: "",
+        width_prefix: "",
         subtract_prefix_from_terminal: false,
         stat_name_width,
         stat_graph_width,
@@ -10708,6 +10709,7 @@ fn write_stat(
     let opts = DiffstatOptions {
         total_width: total_w,
         line_prefix,
+        width_prefix: "",
         subtract_prefix_from_terminal: stat_width.is_none() && !line_prefix.is_empty(),
         stat_name_width: eff_name,
         stat_graph_width: eff_graph,

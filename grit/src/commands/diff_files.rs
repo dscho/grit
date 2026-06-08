@@ -1729,6 +1729,7 @@ fn print_compact_summary_from_diff_entries(
     let opts = DiffstatOptions {
         total_width: terminal_columns(),
         line_prefix: "",
+        width_prefix: "",
         subtract_prefix_from_terminal: false,
         stat_name_width,
         stat_graph_width,

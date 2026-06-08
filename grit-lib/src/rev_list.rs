@@ -1067,7 +1067,17 @@ pub fn rev_list(
     // graph), so remember the full reachable set before narrowing `included` to the survivors.
     let parent_count_filter_active = options.min_parents.is_some() || options.max_parents.is_some();
     let traversable = if parent_count_filter_active {
-        included.clone()
+        // The walk must be able to traverse *through* commits that path limiting already dropped
+        // from `included` (e.g. a tip that does not touch the pathspec): Git never severs the graph
+        // for path limiting, it only suppresses emission. When the dense path-limited closure ran it
+        // pruned `included`, so seed the walk from the full reachable set (`dense_traversable`) it
+        // saved beforehand; otherwise the no-merges walk would start at a dropped tip and emit nothing
+        // (`range-diff <range> -- <path>` whose matching commits are all behind a non-matching tip).
+        if dense_path_limited {
+            dense_traversable.clone()
+        } else {
+            included.clone()
+        }
     } else {
         HashSet::new()
     };
@@ -3748,16 +3758,20 @@ fn path_merge_survives_simplify(
     if commit.parents.len() <= 1 {
         return Ok(false);
     }
-    let commit_map: HashMap<String, ObjectId> =
-        flatten_tree(repo, commit.tree, "")?.into_iter().collect();
+    let commit_map: HashMap<String, (ObjectId, u32)> =
+        flatten_tree_with_mode(repo, commit.tree, "")?
+            .into_iter()
+            .collect();
     let mut treesame_parents = 0usize;
     let mut first_parent_differs = false;
     let mut differing_parent_is_excluded = false;
     let mut differing_parent_oids = Vec::new();
     for (nth, parent_oid) in commit.parents.iter().enumerate() {
         let parent = load_commit(repo, *parent_oid)?;
-        let parent_map: HashMap<String, ObjectId> =
-            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let parent_map: HashMap<String, (ObjectId, u32)> =
+            flatten_tree_with_mode(repo, parent.tree, "")?
+                .into_iter()
+                .collect();
         let differs = path_differs_for_specs(&commit_map, &parent_map, paths);
         if differs {
             differing_parent_oids.push(*parent_oid);
@@ -3823,12 +3837,16 @@ fn path_treesame_parents(
     }
 
     let commit = load_commit(repo, oid)?;
-    let commit_map: HashMap<String, ObjectId> =
-        flatten_tree(repo, commit.tree, "")?.into_iter().collect();
+    let commit_map: HashMap<String, (ObjectId, u32)> =
+        flatten_tree_with_mode(repo, commit.tree, "")?
+            .into_iter()
+            .collect();
     for parent_oid in parents {
         let parent = load_commit(repo, *parent_oid)?;
-        let parent_map: HashMap<String, ObjectId> =
-            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let parent_map: HashMap<String, (ObjectId, u32)> =
+            flatten_tree_with_mode(repo, parent.tree, "")?
+                .into_iter()
+                .collect();
         if !path_differs_for_specs(&commit_map, &parent_map, paths) {
             treesame.insert(*parent_oid);
         }
@@ -4180,8 +4198,8 @@ fn commit_touches_paths(
 ) -> Result<bool> {
     let commit = load_commit(repo, oid)?;
     let parents = graph.parents_of(oid)?;
-    let commit_entries = flatten_tree(repo, commit.tree, "")?;
-    let commit_map: HashMap<String, ObjectId> = commit_entries.into_iter().collect();
+    let commit_entries = flatten_tree_with_mode(repo, commit.tree, "")?;
+    let commit_map: HashMap<String, (ObjectId, u32)> = commit_entries.into_iter().collect();
 
     // Root commit: include only when any requested pathspec exists.
     if parents.is_empty() {
@@ -4220,8 +4238,10 @@ fn commit_touches_paths(
         }
 
         let parent = load_commit(repo, parents[0])?;
-        let parent_map: HashMap<String, ObjectId> =
-            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let parent_map: HashMap<String, (ObjectId, u32)> =
+            flatten_tree_with_mode(repo, parent.tree, "")?
+                .into_iter()
+                .collect();
         let differs = path_differs_for_specs(&commit_map, &parent_map, paths);
         if bloom_ret == BloomPrecheck::Maybe && !differs {
             if let Some(stats) = bloom_stats {
@@ -4274,8 +4294,10 @@ fn commit_touches_paths(
             false
         } else {
             let parent = load_commit(repo, *parent_oid)?;
-            let parent_map: HashMap<String, ObjectId> =
-                flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+            let parent_map: HashMap<String, (ObjectId, u32)> =
+                flatten_tree_with_mode(repo, parent.tree, "")?
+                    .into_iter()
+                    .collect();
             path_differs_for_specs(&commit_map, &parent_map, paths)
         };
         if nth == 0 {
@@ -4515,11 +4537,15 @@ fn consult_dense_bloom_filters(
         if pre == BloomPrecheck::Maybe {
             if let Some(stats) = bloom.stats {
                 let commit = load_commit(repo, *oid)?;
-                let commit_map: HashMap<String, ObjectId> =
-                    flatten_tree(repo, commit.tree, "")?.into_iter().collect();
+                let commit_map: HashMap<String, (ObjectId, u32)> =
+                    flatten_tree_with_mode(repo, commit.tree, "")?
+                        .into_iter()
+                        .collect();
                 let parent = load_commit(repo, first_parent)?;
-                let parent_map: HashMap<String, ObjectId> =
-                    flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+                let parent_map: HashMap<String, (ObjectId, u32)> =
+                    flatten_tree_with_mode(repo, parent.tree, "")?
+                        .into_iter()
+                        .collect();
                 if !path_differs_for_specs(&commit_map, &parent_map, paths) {
                     if let Ok(mut g) = stats.lock() {
                         g.record_false_positive();
@@ -4546,8 +4572,10 @@ fn dense_path_limited_action(
 ) -> Result<DensePathAction> {
     let commit = load_commit(repo, oid)?;
     let parents = graph.parents_of(oid)?;
-    let commit_map: HashMap<String, ObjectId> =
-        flatten_tree(repo, commit.tree, "")?.into_iter().collect();
+    let commit_map: HashMap<String, (ObjectId, u32)> =
+        flatten_tree_with_mode(repo, commit.tree, "")?
+            .into_iter()
+            .collect();
 
     if parents.is_empty() {
         let ctx = crate::pathspec::PathspecMatchContext {
@@ -4569,8 +4597,10 @@ fn dense_path_limited_action(
     let mut first_parent_differs = false;
     for (nth, parent_oid) in parents.iter().enumerate() {
         let parent = load_commit(repo, *parent_oid)?;
-        let parent_map: HashMap<String, ObjectId> =
-            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let parent_map: HashMap<String, (ObjectId, u32)> =
+            flatten_tree_with_mode(repo, parent.tree, "")?
+                .into_iter()
+                .collect();
         if path_differs_for_specs(&commit_map, &parent_map, paths) {
             if nth == 0 {
                 first_parent_differs = true;
@@ -4620,8 +4650,8 @@ pub fn commit_visible_for_dense_pathspecs(
     }
     let commit = load_commit(repo, oid)?;
     let parents = commit.parents.clone();
-    let commit_entries = flatten_tree(repo, commit.tree, "")?;
-    let commit_map: HashMap<String, ObjectId> = commit_entries.into_iter().collect();
+    let commit_entries = flatten_tree_with_mode(repo, commit.tree, "")?;
+    let commit_map: HashMap<String, (ObjectId, u32)> = commit_entries.into_iter().collect();
 
     if parents.is_empty() {
         return Ok(commit_map.keys().any(|path| {
@@ -4640,8 +4670,10 @@ pub fn commit_visible_for_dense_pathspecs(
 
     if parents.len() == 1 {
         let parent = load_commit(repo, parents[0])?;
-        let parent_map: HashMap<String, ObjectId> =
-            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let parent_map: HashMap<String, (ObjectId, u32)> =
+            flatten_tree_with_mode(repo, parent.tree, "")?
+                .into_iter()
+                .collect();
         return Ok(path_differs_for_specs(&commit_map, &parent_map, paths));
     }
 
@@ -4649,8 +4681,10 @@ pub fn commit_visible_for_dense_pathspecs(
     let mut differs_any = false;
     for parent_oid in &parents {
         let parent = load_commit(repo, *parent_oid)?;
-        let parent_map: HashMap<String, ObjectId> =
-            flatten_tree(repo, parent.tree, "")?.into_iter().collect();
+        let parent_map: HashMap<String, (ObjectId, u32)> =
+            flatten_tree_with_mode(repo, parent.tree, "")?
+                .into_iter()
+                .collect();
         let differs = path_differs_for_specs(&commit_map, &parent_map, paths);
         if differs {
             differs_any = true;
@@ -4681,8 +4715,8 @@ fn compute_cherry_patch_id(
 }
 
 fn path_differs_for_specs(
-    current: &HashMap<String, ObjectId>,
-    parent: &HashMap<String, ObjectId>,
+    current: &HashMap<String, (ObjectId, u32)>,
+    parent: &HashMap<String, (ObjectId, u32)>,
     specs: &[String],
 ) -> bool {
     let mut paths = std::collections::BTreeSet::new();
@@ -7061,11 +7095,15 @@ fn kept_object_ids(repo: &Repository) -> Result<HashSet<ObjectId>> {
     Ok(kept)
 }
 
-fn flatten_tree(
+/// Like [`flatten_tree`] but also carries each blob's file mode, so callers can detect
+/// mode-only changes (e.g. an executable-bit flip) when deciding whether a path changed.
+/// Git's tree diff treats a path as modified when *either* the object id or the (canonical)
+/// mode differs; the OID-only [`flatten_tree`] cannot see a mode-only change.
+fn flatten_tree_with_mode(
     repo: &Repository,
     tree_oid: ObjectId,
     prefix: &str,
-) -> Result<Vec<(String, ObjectId)>> {
+) -> Result<Vec<(String, (ObjectId, u32))>> {
     let mut result = Vec::new();
     let object = match repo.odb.read(&tree_oid) {
         Ok(o) => o,
@@ -7088,12 +7126,34 @@ fn flatten_tree(
             Err(err) => return Err(err),
         };
         if child.kind == ObjectKind::Tree {
-            result.extend(flatten_tree(repo, entry.oid, &path)?);
+            result.extend(flatten_tree_with_mode(repo, entry.oid, &path)?);
         } else {
-            result.push((path, entry.oid));
+            result.push((path, (entry.oid, canon_tree_mode(entry.mode))));
         }
     }
     Ok(result)
+}
+
+/// Canonicalize a tree entry mode for path-change comparison, mirroring Git's `canon_mode`:
+/// regular files collapse to `0100644`/`0100755`, symlinks to `0120000`, gitlinks to
+/// `0160000`. This keeps mode comparison stable regardless of incidental low-bit noise.
+fn canon_tree_mode(mode: u32) -> u32 {
+    const S_IFMT: u32 = 0o170000;
+    const S_IFREG: u32 = 0o100000;
+    const S_IFLNK: u32 = 0o120000;
+    const S_IFGITLINK: u32 = 0o160000;
+    match mode & S_IFMT {
+        S_IFREG => {
+            if mode & 0o111 != 0 {
+                0o100755
+            } else {
+                0o100644
+            }
+        }
+        S_IFLNK => 0o120000,
+        S_IFGITLINK => 0o160000,
+        _ => mode,
+    }
 }
 
 /// Compute merge bases between two commits.

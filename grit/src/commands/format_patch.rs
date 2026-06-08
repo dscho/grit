@@ -1591,6 +1591,7 @@ fn diffstat_for_patch_entries(
         let dstat_opts = DiffstatOptions {
             total_width: opts.stat_width,
             line_prefix,
+            width_prefix: "",
             subtract_prefix_from_terminal: false,
             stat_name_width: opts.stat_name_width,
             stat_graph_width: opts.stat_graph_width,

@@ -2956,6 +2956,7 @@ fn run_rev_list_log(
                 mailmap,
                 &combined_pathspecs,
                 None,
+                None,
                 decoration_map_for_display.as_ref(),
                 use_color,
                 decoration_paint.as_ref(),
@@ -3184,17 +3185,22 @@ fn run_graph_log(
     let mut nodes = Vec::new();
     let mut seen = HashSet::new();
 
+    // In plain history (no path-limiting and no decoration/merge simplification) Git never rewrites
+    // a commit's parents away, so a commit whose parent is merely omitted by output limiting (e.g.
+    // `-1`/`-2`) still keeps the continuing vertical rail. Preserve that phantom trailing edge here.
+    let keep_phantom_edge = combined_pathspecs.is_empty() && !simplify_graph_parents;
     for oid in &result.commits {
         if !seen.insert(*oid) {
             continue;
         }
-        let parents = visible_parents_for_graph(
+        let parents = visible_parents_for_graph_inner(
             repo,
             *oid,
             &graph_parent_targets,
             graph_first_parent_direct,
             fp_through_omitted_for_graph,
             simplify_graph_parents,
+            keep_phantom_edge,
         )?;
         nodes.push(GraphCommitNode {
             oid: *oid,
@@ -3363,6 +3369,13 @@ fn run_graph_log(
                             body_buf.pop();
                         }
                     }
+                    if std::env::var("GRIT_NL_DEBUG").is_ok() {
+                        eprintln!(
+                            "BODY oid={} show_commit_body={show_commit_body} wants_sep={wants_separator} body={:?}",
+                            node.oid,
+                            String::from_utf8_lossy(&body_buf)
+                        );
+                    }
                     write_graph_interleaved_commit_msg(
                         &mut out,
                         line_prefix,
@@ -3389,6 +3402,11 @@ fn run_graph_log(
             // `next_line()` then yields a padding line without advancing structural state, so the
             // same rail applies to every body line.
             let (pad_rail, _) = graph.next_line();
+            // The rail (`| `, possibly colored) is prepended to every body line below. The `--stat`
+            // block is rendered unprefixed here, but its width must still be reduced by the rail's
+            // display width so the bar is scaled exactly like Git (`width = term_columns() -
+            // utf8_strnwidth(line_prefix)`). Pass `line_prefix + pad_rail` for width accounting only.
+            let stat_width_prefix = format!("{line_prefix}{pad_rail}");
 
             let mut diff_buf: Vec<u8> = Vec::new();
             write_commit_diff(
@@ -3403,6 +3421,7 @@ fn run_graph_log(
                 // The stat block's own `| ` graph prefix is superseded by the per-line rail
                 // applied below, so render the stat unprefixed here.
                 None,
+                Some(stat_width_prefix.as_str()),
                 decorations.as_ref(),
                 use_color,
                 decoration_paint.as_ref(),
@@ -3568,16 +3587,47 @@ fn visible_parents_for_graph(
     first_parent_through_omitted: bool,
     simplify_merge_parents: bool,
 ) -> Result<Vec<ObjectId>> {
+    visible_parents_for_graph_inner(
+        repo,
+        oid,
+        included,
+        first_parent_only,
+        first_parent_through_omitted,
+        simplify_merge_parents,
+        false,
+    )
+}
+
+/// Resolve the parent edges to draw for `oid` in `--graph` output.
+///
+/// Walks through omitted (non-`included`) parents to connect each shown commit to its nearest
+/// shown ancestor, mirroring Git's parent rewriting for path-limited / simplified history.
+///
+/// When `keep_phantom_edge` is set (plain history, no path-limiting or simplification) and the
+/// commit has real parents but none of them resolve to a shown ancestor — e.g. the parent is
+/// merely omitted by output limiting like `-1`/`-2` — the first real parent is kept as a phantom
+/// edge. The phantom parent is never itself drawn as a commit, so it renders as a continuing
+/// vertical `|` rail beneath/after the commit, matching Git (which never rewrites parents away for
+/// plain output limiting and so keeps the trailing column).
+fn visible_parents_for_graph_inner(
+    repo: &Repository,
+    oid: ObjectId,
+    included: &HashSet<ObjectId>,
+    first_parent_only: bool,
+    first_parent_through_omitted: bool,
+    simplify_merge_parents: bool,
+    keep_phantom_edge: bool,
+) -> Result<Vec<ObjectId>> {
     let mut direct = load_raw_parents(repo, oid)?;
     if first_parent_only && direct.len() > 1 {
         direct.truncate(1);
     }
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for parent in direct {
+    for parent in &direct {
         collect_visible_parent_for_graph(
             repo,
-            parent,
+            *parent,
             included,
             first_parent_only,
             first_parent_through_omitted,
@@ -3589,6 +3639,11 @@ fn visible_parents_for_graph(
         let simplified = graph_simplify_parent_list(repo, included, &out)?;
         let keep: HashSet<ObjectId> = simplified.into_iter().collect();
         out.retain(|parent| keep.contains(parent));
+    }
+    if keep_phantom_edge && out.is_empty() {
+        if let Some(first) = direct.first() {
+            out.push(*first);
+        }
     }
     let mut dedup = HashSet::new();
     out.retain(|parent| dedup.insert(*parent));
@@ -4279,6 +4334,7 @@ impl AsciiGraph {
         if self.current.is_none() {
             return (String::new(), false);
         }
+        let _dbg_state = self.state;
         let mut line = String::new();
         // Visible width of the line, excluding any color escape sequences.
         // This mirrors Git's `graph_line.width` and is what padding uses.
@@ -4322,6 +4378,14 @@ impl AsciiGraph {
         let pad_width = self.width;
         if width < pad_width {
             line.push_str(&" ".repeat(pad_width - width));
+        }
+        if std::env::var("GRIT_NL_DEBUG").is_ok() {
+            eprintln!(
+                "NL state={:?}->{:?} line=[{}]",
+                _dbg_state,
+                self.state,
+                line.replace(' ', ".")
+            );
         }
         (line, shown_commit_line)
     }
@@ -4611,6 +4675,12 @@ impl AsciiGraph {
                 && (2 * i) < self.mapping.len()
                 && self.mapping[2 * i] < i as isize
             {
+                if std::env::var("GRIT_GRAPH_DEBUG").is_ok() {
+                    eprintln!(
+                        "DEBUG commit_line / at i={i} prev_state={:?} old_mapping={:?} mapping={:?}",
+                        self.prev_state, self.old_mapping, self.mapping
+                    );
+                }
                 self.write_column(line, width, &col, '/');
             } else {
                 self.write_column(line, width, &col, '|');
@@ -4618,6 +4688,17 @@ impl AsciiGraph {
             Self::add_char(line, width, ' ');
         }
 
+        if std::env::var("GRIT_GRAPH_DEBUG").is_ok() {
+            eprintln!(
+                "DEBUG commit_line=[{}] prev_state={:?} edges_added={} num_parents={} num_columns={} commit_index={}",
+                line.trim_end(),
+                self.prev_state,
+                self.edges_added,
+                self.num_parents,
+                self.num_columns,
+                self.commit_index
+            );
+        }
         if self.num_parents > 1 {
             self.update_state(GraphState::PostMerge);
         } else if self.is_mapping_correct() {
@@ -6295,6 +6376,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &mailmap,
                     effective_pathspecs,
                     None,
+                    None,
                     decoration_map_for_display.as_ref(),
                     use_color,
                     decoration_paint.as_ref(),
@@ -6524,6 +6606,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     use_mailmap,
                     &mailmap,
                     &combined_pathspecs,
+                    None,
                     None,
                     decoration_map_for_display.as_ref(),
                     use_color,
@@ -7004,6 +7087,7 @@ pub fn run_no_walk(
                 use_mailmap,
                 &mailmap,
                 &args.pathspecs,
+                None,
                 None,
                 decorations.as_ref(),
                 use_color,
@@ -7930,6 +8014,7 @@ fn run_reflog_walk(
                 use_mailmap,
                 mailmap,
                 &args.pathspecs,
+                None,
                 None,
                 None,
                 use_color,
@@ -10366,6 +10451,12 @@ fn format_commit(
             let author_name = format_ident_display_mailmap(mailmap, &info.author, use_mailmap);
             writeln!(out, "Author: {author_name}")?;
             writeln!(out)?;
+            // Git's `pretty_print_commit` right-trims the whole buffer after emitting the body
+            // (`strbuf_rtrim`) and then appends exactly one `\n`, so a builtin pretty entry ends
+            // with a single newline and no trailing blank line. The inter-commit blank separator is
+            // supplied by the log walk, not by the format itself — emitting a trailing blank here
+            // would double the separator (and, under `--graph -p`, inject a stray rail line between
+            // the message and the diff/stat body).
             for line in info.message.lines().take(1) {
                 writeln!(
                     out,
@@ -10373,7 +10464,6 @@ fn format_commit(
                     grit_lib::tab_expand::indent_and_expand_tabs(line, 4, et)
                 )?;
             }
-            writeln!(out)?;
         }
         Some("medium") | None => {
             let dec = format_decoration(
@@ -13107,6 +13197,7 @@ fn write_commit_diff(
     mailmap: &MailmapTable,
     pathspecs: &[String],
     graph_stat_prefix: Option<&str>,
+    graph_stat_width_prefix: Option<&str>,
     decorations: Option<&DecorationMap>,
     use_color: bool,
     decoration_paint: Option<&DecorationPaint>,
@@ -13220,6 +13311,7 @@ fn write_commit_diff(
                 args,
                 pathspecs,
                 graph_stat_prefix,
+                graph_stat_width_prefix,
                 show_patch,
                 false,
                 patch_context,
@@ -13317,6 +13409,7 @@ fn write_commit_diff(
         args,
         pathspecs,
         graph_stat_prefix,
+        graph_stat_width_prefix,
         show_patch,
         is_merge,
         patch_context,
@@ -13367,6 +13460,7 @@ fn write_commit_diff_body(
     args: &Args,
     pathspecs: &[String],
     graph_stat_prefix: Option<&str>,
+    graph_stat_width_prefix: Option<&str>,
     show_patch: bool,
     treat_as_merge_for_format: bool,
     patch_context: usize,
@@ -13463,6 +13557,7 @@ fn write_commit_diff_body(
             has_patch,
             args,
             graph_stat_prefix,
+            graph_stat_width_prefix,
             git_dir,
         )?;
     }
@@ -13933,6 +14028,12 @@ fn apply_diff_output_indicators(patch: &str, args: &Args) -> String {
 }
 
 /// Write a `--stat` summary for log.
+///
+/// `graph_line_prefix` is the prefix actually printed before each stat line (used by the
+/// `-L` line-log graph path that emits the stat inline). `graph_width_prefix` is the graph's
+/// vertical rail that the *caller* prints separately (regular `--graph` path): it is not
+/// printed here, but its display width is subtracted from the terminal columns so the stat
+/// graph is scaled exactly like Git's `width = term_columns() - utf8_strnwidth(line_prefix)`.
 fn log_print_stat_summary(
     out: &mut impl Write,
     odb: &Odb,
@@ -13940,6 +14041,7 @@ fn log_print_stat_summary(
     trailing_blank: bool,
     args: &Args,
     graph_line_prefix: Option<&str>,
+    graph_width_prefix: Option<&str>,
     git_dir: &Path,
 ) -> Result<()> {
     let use_color = log_resolve_stdout_color(args, git_dir);
@@ -13952,16 +14054,6 @@ fn log_print_stat_summary(
         .get("diff.statGraphWidth")
         .and_then(|s| s.parse::<usize>().ok());
     let eff_graph_width = args.stat_graph_width.or(cfg_stat_graph);
-    let graph_bar_slack = if graph_line_prefix.is_some() {
-        if args.stat_graph_width.is_some() || cfg_stat_graph.is_some() || args.stat_width.is_some()
-        {
-            0
-        } else {
-            1
-        }
-    } else {
-        0
-    };
     let (color_add, color_del, color_reset) = if use_color {
         let add = cfg
             .get("color.diff.new")
@@ -13977,7 +14069,12 @@ fn log_print_stat_summary(
     };
 
     let line_prefix = graph_line_prefix.unwrap_or("");
-    let subtract_prefix = graph_line_prefix.is_some() && args.stat_width.is_none();
+    // The rail whose width is subtracted from the terminal columns: the printed prefix for the
+    // inline `-L` path, or the separately-printed rail for the regular `--graph` path. Git only
+    // subtracts it when the width is derived from the terminal (no explicit `--stat-width`).
+    let width_prefix = graph_width_prefix.unwrap_or(line_prefix);
+    let subtract_prefix =
+        (graph_line_prefix.is_some() || graph_width_prefix.is_some()) && args.stat_width.is_none();
 
     let mut files: Vec<FileStatInput> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -14034,6 +14131,7 @@ fn log_print_stat_summary(
     let opts = DiffstatOptions {
         total_width: args.stat_width.unwrap_or_else(terminal_columns),
         line_prefix,
+        width_prefix,
         subtract_prefix_from_terminal: subtract_prefix,
         stat_name_width: eff_name_width,
         stat_graph_width: eff_graph_width,
@@ -14041,12 +14139,8 @@ fn log_print_stat_summary(
         color_add: color_add.as_str(),
         color_del: color_del.as_str(),
         color_reset: color_reset.as_str(),
-        graph_bar_slack,
-        graph_prefix_budget_slack: if graph_line_prefix.is_some() && use_color {
-            1
-        } else {
-            0
-        },
+        graph_bar_slack: 0,
+        graph_prefix_budget_slack: 0,
     };
     write_diffstat_block(out, &files, &opts)?;
     // `--summary`: condensed extended-header lines (create/delete/rename mode), emitted right

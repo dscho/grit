@@ -142,7 +142,17 @@ pub fn run(args: Args) -> Result<()> {
         }
         let repo = Repository::discover(None).context("not a git repository")?;
         let source = args.source.as_deref();
-        return crate::commands::checkout::restore_patch_worktree_only(&repo, source, &pathspecs);
+        let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        let context = crate::commands::add::resolve_patch_context(args.unified, &cfg)?;
+        let inter_hunk_context =
+            crate::commands::add::resolve_patch_interhunk(args.inter_hunk_context, &cfg)?;
+        return crate::commands::checkout::restore_patch_worktree_only(
+            &repo,
+            source,
+            &pathspecs,
+            context,
+            inter_hunk_context,
+        );
     }
 
     let repo = Repository::discover(None).context("not a git repository")?;

@@ -909,7 +909,17 @@ pub fn run(mut args: Args) -> Result<()> {
                 }
             }
         }
-        return checkout_patch(&repo, patch_target.as_deref(), &patch_paths);
+        let patch_cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+        let context = crate::commands::add::resolve_patch_context(args.unified, &patch_cfg)?;
+        let inter_hunk_context =
+            crate::commands::add::resolve_patch_interhunk(args.inter_hunk_context, &patch_cfg)?;
+        return checkout_patch(
+            &repo,
+            patch_target.as_deref(),
+            &patch_paths,
+            context,
+            inter_hunk_context,
+        );
     }
 
     // Case: checkout --orphan <name> [<start_point>]
@@ -2114,7 +2124,9 @@ fn switch_branch(
                 .map(|idx| idx.entries.is_empty())
                 .unwrap_or(true);
             let sparse_on = sparse_checkout_config_enabled(&repo.git_dir);
-            if index_empty || sparse_on {
+            if index_empty {
+                // Index is unpopulated (e.g. `clone --no-checkout`): materialize it from the
+                // target tree.
                 switch_to_tree(
                     repo,
                     &head,
@@ -2122,6 +2134,14 @@ fn switch_branch(
                     false,
                     RECURSE_SUBMODULES.with(|r| r.get()),
                 )?;
+            } else if sparse_on {
+                // Already on this branch with a populated index: a no-op branch checkout must not
+                // reset the index to the target tree (that would discard staged changes, including
+                // staged directory/file replacements). Real Git only re-applies the sparsity rules
+                // to the working tree (so an edited `info/sparse-checkout` takes effect — t1090)
+                // while leaving the index content alone (t1092 'diff with renames and conflicts').
+                write_noop_checkout_index(repo)?;
+                crate::commands::sparse_checkout::reapply_sparse_checkout_if_configured(repo)?;
             } else {
                 write_noop_checkout_index(repo)?;
             }
@@ -3181,7 +3201,6 @@ fn switch_to_tree(
     };
 
     let cfg = grit_lib::config::ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
-    let sparse_checkout_enabled = sparse_checkout_config_enabled(&repo.git_dir);
     if grit_lib::promisor::repo_treats_promisor_packs(&repo.git_dir, &cfg)
         && !crate::commands::promisor_hydrate::git_no_lazy_fetch_env_disables_lazy()?
     {
@@ -3310,10 +3329,29 @@ fn switch_to_tree(
                     // directory in the target (TreeUnderStaged), Git drops the entry
                     // silently and reports nothing here — matching full-checkout and
                     // sparse-index, which produce no output for that case.
+                    //
+                    // Two distinct cases produce Git's `D <dir>` / `A <surviving-file>`
+                    // oddity (t1092 df-conflict-1 / df-conflict-2):
+                    //
+                    // 1. The replacing file has a same-prefix sibling in the target
+                    //    (the genuine dir→file rename case, e.g. `folder1/` → file
+                    //    `folder1` alongside `folder1-`). This fires for both the
+                    //    full-checkout and sparse-checkout repos (df-conflict-1).
+                    //
+                    // 2. The staged entry was skip-worktree (sparse-checkout, but NOT
+                    //    sparse-index). When a now-sparse directory's staged change
+                    //    collides with a dir→file replacement, Git keeps the sparse
+                    //    staged entry and reports the oddity — even with no sibling
+                    //    (df-conflict-2: `folder2/` → file `folder2`, no `folder2-`).
+                    //    The full-checkout repo has the same path in the worktree (not
+                    //    skip-worktree), so it stays silent there, matching Git.
+                    //
+                    // Both are gated on `!raw_index_had_sparse_dirs`, so the sparse-index
+                    // repo (folder collapsed to a placeholder) reports nothing for either.
                     let report_git_df_oddity = kind == StagedTreeConflict::StagedUnderTreeFile
                         && !raw_index_had_sparse_dirs
-                        && (sparse_checkout_enabled
-                            || tree_path_has_same_prefix_sibling(&ancestor, &new_paths));
+                        && (tree_path_has_same_prefix_sibling(&ancestor, &new_paths)
+                            || old_entry.skip_worktree());
                     if report_git_df_oddity {
                         df_conflict_reports.push((ancestor, old_entry.path.clone()));
                     }
@@ -4174,6 +4212,70 @@ fn checkout_record_index_result(
         Ok(false) => {}
         Err(e) => path_errors.push(e),
     }
+}
+
+/// Restore one source-tree entry into the index for `git checkout <tree> -- <pathspec>`,
+/// mirroring Git's `update_some()` + `mark_ce_for_checkout()` (builtin/checkout.c).
+///
+/// Returns `true` when the entry should be written to the working tree.
+///
+/// Git's rule: when the existing index entry already matches the source (same mode + oid),
+/// the *old* cache entry is kept in place (preserving its SKIP_WORKTREE bit) and is only
+/// written to the worktree if it is not skip-worktree. When the entry is new or its content
+/// changed, a fresh entry replaces it (clearing SKIP_WORKTREE) and it is always written. This
+/// keeps unchanged out-of-cone paths sparse instead of materializing the whole directory.
+fn restore_tree_entry_into_index(
+    index: &mut Index,
+    source_entry: &IndexEntry,
+    ignore_skip_worktree_bits: bool,
+) -> bool {
+    let existing = index.get(&source_entry.path, 0);
+    let unchanged = existing
+        .map(|old| old.mode == source_entry.mode && old.oid == source_entry.oid)
+        .unwrap_or(false);
+
+    if unchanged {
+        // Keep the existing entry untouched (preserves SKIP_WORKTREE, like Git keeping `old`).
+        // Only write to the worktree when the entry is actually populated there.
+        let skip_worktree = existing.map(|e| e.skip_worktree()).unwrap_or(false);
+        let write_to_worktree = ignore_skip_worktree_bits || !skip_worktree;
+        if write_to_worktree {
+            clear_skip_worktree_on_df_descendants(index, &source_entry.path);
+        }
+        write_to_worktree
+    } else {
+        // New or changed content: replace with a fresh (non-sparse) entry and materialize it.
+        // Git's add_index_entry(ADD_CACHE_OK_TO_REPLACE) resolves directory/file conflicts by
+        // dropping any existing entry whose path is an ancestor of (or descends from) the new
+        // path. Without this, restoring `folder2/0/1/1` would leave a stale `folder2/0/1` file
+        // entry, producing a bogus D/F index state.
+        remove_df_conflicting_entries(index, &source_entry.path);
+        index.remove_path_all_stages(&source_entry.path);
+        index.add_or_replace(source_entry.clone());
+        clear_skip_worktree_on_df_descendants(index, &source_entry.path);
+        true
+    }
+}
+
+/// Drop stage-0 index entries that form a directory/file conflict with `path`:
+/// any entry that is a strict path-prefix ancestor of `path` (a file where `path`
+/// needs a directory), or that descends from `path` (a directory where `path` is now
+/// a file). Mirrors Git's add_index_entry(ADD_CACHE_OK_TO_REPLACE) D/F resolution.
+fn remove_df_conflicting_entries(index: &mut Index, path: &[u8]) {
+    index.entries.retain(|e| {
+        if e.stage() != 0 || e.path == path {
+            return true;
+        }
+        // `e.path` is an ancestor file of `path` (e.g. file `d` vs new `d/e`).
+        if path.len() > e.path.len() && path.starts_with(&e.path) && path[e.path.len()] == b'/' {
+            return false;
+        }
+        // `e.path` descends from `path` (e.g. dir `d/e` vs new file `d`).
+        if e.path.len() > path.len() && e.path.starts_with(path) && e.path[path.len()] == b'/' {
+            return false;
+        }
+        true
+    });
 }
 
 fn clear_skip_worktree_on_df_descendants(index: &mut Index, path: &[u8]) -> bool {
@@ -5043,6 +5145,18 @@ checking out of the index."
                         if !glob_matches(&rel, &entry_path) {
                             continue;
                         }
+                        // Mirror Git's update_some()/mark_ce_for_checkout: unchanged out-of-cone
+                        // (skip-worktree) paths keep their entry and are not materialized.
+                        let write_to_worktree = restore_tree_entry_into_index(
+                            &mut index,
+                            flat_entry,
+                            ignore_skip_worktree_bits,
+                        );
+                        index_modified = true;
+                        matched = true;
+                        if !write_to_worktree {
+                            continue;
+                        }
                         let w = write_blob_to_worktree(
                             repo,
                             work_tree,
@@ -5053,15 +5167,6 @@ checking out of the index."
                             false,
                             Some(&mut delayed),
                         );
-                        if w.is_ok() {
-                            // Collapse any leftover conflict stages (1/2/3) so the
-                            // restored path becomes a single stage-0 entry, matching git.
-                            index.remove_path_all_stages(&flat_entry.path);
-                            index.add_or_replace(flat_entry.clone());
-                            clear_skip_worktree_on_df_descendants(&mut index, &flat_entry.path);
-                            index_modified = true;
-                            matched = true;
-                        }
                         checkout_record_path_result(w, &mut updated_paths, &mut path_errors);
                     }
                     if no_overlay {
@@ -5136,6 +5241,18 @@ checking out of the index."
                         if !prefix.is_empty() && !entry_path.starts_with(&prefix) {
                             continue;
                         }
+                        // Mirror Git's update_some()/mark_ce_for_checkout: unchanged out-of-cone
+                        // (skip-worktree) paths keep their entry and are not materialized.
+                        let write_to_worktree = restore_tree_entry_into_index(
+                            &mut index,
+                            flat_entry,
+                            ignore_skip_worktree_bits,
+                        );
+                        index_modified = true;
+                        matched = true;
+                        if !write_to_worktree {
+                            continue;
+                        }
                         let w = write_blob_to_worktree(
                             repo,
                             work_tree,
@@ -5146,15 +5263,6 @@ checking out of the index."
                             false,
                             Some(&mut delayed),
                         );
-                        if w.is_ok() {
-                            // Collapse any leftover conflict stages (1/2/3) so the
-                            // restored path becomes a single stage-0 entry, matching git.
-                            index.remove_path_all_stages(&flat_entry.path);
-                            index.add_or_replace(flat_entry.clone());
-                            clear_skip_worktree_on_df_descendants(&mut index, &flat_entry.path);
-                            index_modified = true;
-                            matched = true;
-                        }
                         checkout_record_path_result(w, &mut updated_paths, &mut path_errors);
                     }
                     // In no-overlay mode, remove index entries that match the
@@ -5502,16 +5610,20 @@ pub(crate) fn checkout_patch(
     repo: &Repository,
     source: Option<&str>,
     paths: &[String],
+    context: usize,
+    inter_hunk_context: usize,
 ) -> Result<()> {
-    checkout_patch_inner(repo, source, paths, false)
+    checkout_patch_inner(repo, source, paths, false, context, inter_hunk_context)
 }
 
 pub(crate) fn restore_patch_worktree_only(
     repo: &Repository,
     source: Option<&str>,
     paths: &[String],
+    context: usize,
+    inter_hunk_context: usize,
 ) -> Result<()> {
-    checkout_patch_inner(repo, source, paths, true)
+    checkout_patch_inner(repo, source, paths, true, context, inter_hunk_context)
 }
 
 fn checkout_patch_inner(
@@ -5519,6 +5631,8 @@ fn checkout_patch_inner(
     source: Option<&str>,
     paths: &[String],
     worktree_only: bool,
+    context: usize,
+    inter_hunk_context: usize,
 ) -> Result<()> {
     use similar::TextDiff;
     use std::io::{self, BufRead, Write};
@@ -5692,17 +5806,33 @@ fn checkout_patch_inner(
         let worktree_str = String::from_utf8_lossy(worktree_data);
 
         let text_diff = TextDiff::from_lines(source_str.as_ref(), worktree_str.as_ref());
-        let hunks: Vec<_> = text_diff
-            .unified_diff()
-            .context_radius(3)
-            .iter_hunks()
-            .collect();
-
-        if hunks.is_empty() {
+        let ops: Vec<_> = text_diff.ops().to_vec();
+        let has_change = ops
+            .iter()
+            .any(|o| !matches!(o, similar::DiffOp::Equal { .. }));
+        if !has_change {
             continue;
         }
 
-        let hunk_texts: Vec<String> = hunks.iter().map(|h| format!("{h}")).collect();
+        // Hunk into the same `@@` blocks `git diff -U<context> --inter-hunk-context=<inter>` would
+        // emit, so `-U`/`--inter-hunk-context` are honored (t3701 "<cmd> accepts -U ...").
+        let hunk_ranges =
+            crate::commands::add_patch::natural_hunk_ranges(&ops, context, inter_hunk_context);
+        let hunk_texts: Vec<String> = hunk_ranges
+            .iter()
+            .map(|&(s, e)| {
+                crate::commands::stash::partial_unified_for_op_range_interhunk(
+                    path,
+                    source_data,
+                    worktree_data,
+                    &ops[s..e],
+                    context,
+                    inter_hunk_context,
+                    true,
+                )
+            })
+            .collect();
+        let n_hunks = hunk_texts.len();
 
         let update_index = !worktree_only
             && matches!(patch_mode, PatchMode::HeadTree | PatchMode::OtherTree)
@@ -5722,9 +5852,9 @@ fn checkout_patch_inner(
 
         let mut accept_all = false;
         let mut skip_file = false;
-        let mut accepted_hunks: Vec<bool> = vec![false; hunks.len()];
+        let mut accepted_hunks: Vec<bool> = vec![false; n_hunks];
 
-        for (i, hunk) in hunks.iter().enumerate() {
+        for (i, hunk) in hunk_texts.iter().enumerate() {
             if skip_file {
                 break;
             }
@@ -5781,6 +5911,7 @@ fn checkout_patch_inner(
                             *index_mode,
                             update_index,
                             &accepted_hunks,
+                            Some(&hunk_ranges),
                         )?;
                         repo.write_index(&mut index)?;
                     }
@@ -5793,7 +5924,7 @@ fn checkout_patch_inner(
         // Git prints a trailing newline when leaving each file's interactive hunk loop
         // (`patch_update_file`'s final `putchar('\n')`), so the raw output ends with a newline
         // exactly like the color-decoded copy (t3701 "falls back to color.ui").
-        if !hunks.is_empty() {
+        if !hunk_texts.is_empty() {
             writeln!(out).ok();
         }
 
@@ -5820,6 +5951,7 @@ fn checkout_patch_inner(
                 *index_mode,
                 update_index,
                 &accepted_hunks,
+                Some(&hunk_ranges),
             )?;
         }
     }
@@ -6051,6 +6183,10 @@ pub(crate) fn blend_line_diff_by_hunk_ranges(
 ///
 /// When `update_index` is true, accepted hunks also update the index blob (from blended staged +
 /// worktree sides); otherwise only the worktree file is written.
+///
+/// `ranges`: op-index ranges (one per displayed hunk) so `accepted` maps to the same hunking shown
+/// to the user (honoring `-U`/`--inter-hunk-context`); `None` falls back to change-group grouping.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn apply_accepted_hunks(
     repo: &Repository,
     index: &mut Index,
@@ -6062,6 +6198,7 @@ pub(crate) fn apply_accepted_hunks(
     index_mode: u32,
     update_index: bool,
     accepted: &[bool],
+    ranges: Option<&[(usize, usize)]>,
 ) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -6074,6 +6211,10 @@ pub(crate) fn apply_accepted_hunks(
 
     let wt_out = if accepted.iter().all(|&a| a) {
         source_data.to_vec()
+    } else if let Some(ranges) = ranges {
+        // For `checkout -p`/`restore -p`, accepted hunks revert to the source side; the blend
+        // helper's `accepted` means "take source", so pass `accepted` directly.
+        blend_line_diff_by_hunk_ranges(source_data, worktree_data, ranges, accepted).into_bytes()
     } else {
         blend_line_diff_by_hunks(source_data, worktree_data, accepted).into_bytes()
     };
@@ -6090,6 +6231,8 @@ pub(crate) fn apply_accepted_hunks(
     if update_index {
         let idx_out = if accepted.iter().all(|&a| a) {
             source_data.to_vec()
+        } else if let Some(ranges) = ranges {
+            blend_line_diff_by_hunk_ranges(source_data, staged_data, ranges, accepted).into_bytes()
         } else {
             blend_line_diff_by_hunks(source_data, staged_data, accepted).into_bytes()
         };

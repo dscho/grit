@@ -19,7 +19,7 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use grit_lib::commit_trailers::{append_signoff_trailer, format_signoff_line};
-use grit_lib::config::ConfigSet;
+use grit_lib::config::{ConfigScope, ConfigSet};
 use grit_lib::diff::{self, count_changes, diff_index_to_tree, diff_index_to_worktree, DiffEntry};
 use grit_lib::hooks::{run_commit_hook, run_hook, CommitHookEnv, HookResult};
 use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
@@ -5028,6 +5028,73 @@ fn sequence_editor_cmd(config: &ConfigSet) -> Result<String> {
     git_editor_cmd(config)
 }
 
+/// Warn (once per process) that `core.commentChar=auto` / `core.commentString=auto` is deprecated,
+/// matching Git's `check_auto_comment_char_config` (config.c). The warning and the follow-up advice
+/// are emitted to stderr just before the rebase sequence editor opens (the comment string is needed
+/// to render the todo help block). Git uses the `GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN`
+/// environment variable to suppress repeats in subprocesses; we honor the same guard.
+///
+/// The advice's `git config ...` lines carry a scope flag (`--global`, `--system`, `--worktree`)
+/// for non-local origins, mirroring `add_config_scope_arg`; repository-local config gets no flag.
+fn warn_auto_comment_char_once(config: &ConfigSet) {
+    const WARN_ENV: &str = "GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN";
+
+    // Find the last (highest-priority) entry for commentChar/commentString that is set to "auto".
+    // Git tracks `last_key_id`/`auto_set_in_file`; the effective value is the highest-priority one.
+    let mut auto_entry: Option<(&str, ConfigScope)> = None;
+    for entry in config.entries() {
+        let key_name = match entry.key.as_str() {
+            "core.commentchar" => "core.commentChar",
+            "core.commentstring" => "core.commentString",
+            _ => continue,
+        };
+        let is_auto = entry
+            .value
+            .as_deref()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("auto"));
+        if is_auto {
+            auto_entry = Some((key_name, entry.scope));
+        } else {
+            // A later non-auto override for the same key clears the auto state.
+            auto_entry = None;
+        }
+    }
+    let Some((key_name, scope)) = auto_entry else {
+        return;
+    };
+
+    if std::env::var("GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN")
+        .ok()
+        .as_deref()
+        .is_some_and(|v| matches!(v, "1" | "true" | "yes" | "on"))
+    {
+        return;
+    }
+    // Single-threaded CLI process; set before spawning the editor subprocess so it does not repeat.
+    std::env::set_var(WARN_ENV, "true");
+
+    let scope_flag = match scope {
+        ConfigScope::Global => "--global ",
+        ConfigScope::System => "--system ",
+        ConfigScope::Worktree => "--worktree ",
+        ConfigScope::Local | ConfigScope::Command => "",
+    };
+
+    eprintln!(
+        "warning: Support for '{key_name}=auto' is deprecated and will be removed in Git 3.0"
+    );
+    eprintln!("hint: ");
+    eprintln!("hint: To use the default comment string (#) please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config unset {scope_flag}{key_name}");
+    eprintln!("hint: ");
+    eprintln!("hint: To set a custom comment string please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config set {scope_flag}{key_name} <comment string>");
+    eprintln!("hint: ");
+    eprintln!("hint: where '<comment string>' is the string you wish to use.");
+}
+
 fn run_shell_editor(editor: &str, path: &Path) -> Result<std::process::ExitStatus> {
     let status = if editor.trim() == ":" {
         std::process::Command::new("true").status()
@@ -5617,6 +5684,7 @@ fn run_interactive_rebase(
     let command_count = count_rebase_todo_actionable_lines(&todo);
     let todo_with_help = append_rebase_todo_help(&todo, command_count, revs_onto, config);
     fs::write(&todo_path, todo_with_help.as_bytes())?;
+    warn_auto_comment_char_once(config);
     let editor = sequence_editor_cmd(config)?;
     let status = run_shell_editor(&editor, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
@@ -5767,6 +5835,7 @@ fn run_interactive_rebase_with_initial_todo(
     fs::write(&todo_path, todo_with_help.as_bytes())?;
     let orig_path = git_dir.join("ORIGINAL-TODO");
     fs::write(&orig_path, todo_with_help.as_bytes())?;
+    warn_auto_comment_char_once(config);
     let editor = sequence_editor_cmd(config)?;
     let status = run_shell_editor(&editor, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
@@ -5869,6 +5938,7 @@ fn do_edit_todo() -> Result<()> {
     write_rebase_todo_file(&repo, &rb_dir, &content)?;
 
     let path = rebase_todo_file_path(&repo, &rb_dir);
+    warn_auto_comment_char_once(&config);
     let editor = sequence_editor_cmd(&config)?;
     let status = run_shell_editor(&editor, &path)?;
     if !status.success() {

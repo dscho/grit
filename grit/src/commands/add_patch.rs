@@ -560,7 +560,7 @@ fn render_hunk_with_offsets(
 /// range still includes the full separating equal runs (the renderer caps the shown context to
 /// `context`), with overlap on the boundary equal run so each hunk renders its surrounding context,
 /// mirroring [`split_hunk_into_all`].
-fn natural_hunk_ranges(
+pub(crate) fn natural_hunk_ranges(
     ops: &[similar::DiffOp],
     context: usize,
     inter_hunk_context: usize,

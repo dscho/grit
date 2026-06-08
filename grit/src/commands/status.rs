@@ -3164,9 +3164,20 @@ fn format_long(
                 )?;
             }
             cpw(out, cp, "")?;
-        } else if split_commit_in_progress(git_dir, head)
-            || long_status_split_commit_in_progress(git_dir, head, unstaged)
-        {
+        } else if {
+            // Mirror wt-status.c `split_commit_in_progress`: a clean working tree
+            // (no staged or unstaged changes to tracked files) during an `edit`
+            // stop means the commit is "being edited", not "being split", even when
+            // the rebase-merge amend/orig-head bookkeeping would otherwise look like
+            // a split (e.g. after splitting an earlier commit and continuing). git
+            // bails out of split detection up front unless the work tree is dirty
+            // (or status is in amend/nowarn mode, which this plain-status path is
+            // not).
+            let workdir_dirty = !staged.is_empty() || !unstaged.is_empty();
+            workdir_dirty
+                && (split_commit_in_progress(git_dir, head)
+                    || long_status_split_commit_in_progress(git_dir, head, unstaged))
+        } {
             long_status_print_splitting(out, cp, show_hints, repo, git_dir, head, state)?;
         } else {
             long_status_print_editing(out, cp, show_hints, repo, git_dir, head, state)?;

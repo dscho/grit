@@ -11846,6 +11846,7 @@ fn print_diffstat(repo: &Repository, entries: &[DiffEntry], compact: bool) {
     let opts = DiffstatOptions {
         total_width: terminal_columns(),
         line_prefix: "",
+        width_prefix: "",
         subtract_prefix_from_terminal: false,
         stat_name_width,
         stat_graph_width,
