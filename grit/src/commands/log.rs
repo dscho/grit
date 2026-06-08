@@ -1611,12 +1611,14 @@ fn ident_for_author_pattern_match(ident: &str) -> String {
 
 /// Whether `--author` / `--committer` identity patterns should match case-insensitively.
 ///
-/// Unlike `--grep` (case-sensitive unless `-i`), grit matches author and committer identity
-/// filters case-insensitively by default, so `--committer=DANA` finds "Dana Developer"
-/// (t8270-log-author-search, t8280-log-committer-search). An explicit `-i` /
-/// `--regexp-ignore-case` keeps that behavior; there is no flag to make these case-sensitive.
-fn ident_pattern_ignore_case(_regexp_ignore_case: bool) -> bool {
-    true
+/// Like `--grep`, the author/committer identity filters are case-SENSITIVE by default and only
+/// fold case when `-i` / `--regexp-ignore-case` (or the equivalent grep config) is given. In
+/// Git, `revs->grep_filter.ignore_case` is a single flag shared by every grep pattern, header
+/// patterns included (`grep.c` honors `opt->ignore_case` uniformly; `revision.c` sets it only for
+/// `-i`/`--regexp-ignore-case`). So `--author=person` must NOT match author "Another Person"
+/// unless `-i` is supplied (t4209-log-pickaxe `log --author (nomatch)`).
+fn ident_pattern_ignore_case(regexp_ignore_case: bool) -> bool {
+    regexp_ignore_case
 }
 
 /// When `git log --graph <tip> --branches` is used, Git prefers `<tip>` as the leftmost
@@ -2668,7 +2670,13 @@ fn run_rev_list_log(
     };
     let _bloom_perf_guard = bloom_stats.as_ref().map(|h| BloomPerfGuard(Arc::clone(h)));
 
-    let ordering = if args.topo_order || args.simplify_merges {
+    let ordering = if args.topo_order
+        || args.simplify_merges
+        // `--simplify-by-decoration` with default (unspecified) ordering walks the rewritten
+        // topology, which Git emits in topo order (e.g. `reach` right after its merge child,
+        // before the older `seventh`). An explicit `--date-order` keeps date ordering.
+        || (args.simplify_by_decoration && !args.date_order && !args.author_date_order)
+    {
         if args.author_date_order {
             OrderingMode::AuthorDateTopo
         } else {
@@ -2682,6 +2690,26 @@ fn run_rev_list_log(
         }
     } else {
         OrderingMode::Default
+    };
+
+    // For `--simplify-by-decoration`, build the filter-aware decorated commit set: the same
+    // decorations the display uses (honoring `--decorate-refs[-exclude]`, `log.excludeDecoration`,
+    // and the default hidden-ref behavior). This drives the parent-rewriting simplification in
+    // the rev-list engine, matching Git's `rev_compare_tree` decoration oracle.
+    let simplify_by_decoration_oids: HashSet<ObjectId> = if args.simplify_by_decoration {
+        // Only the OID keys matter for simplification (full vs short ref display is irrelevant).
+        let dec_map = collect_decorations_inner(
+            repo,
+            false,
+            decorations_initial_set_all(args, &repo.git_dir),
+            &build_decoration_filter(args, &repo.git_dir),
+        )?;
+        dec_map
+            .keys()
+            .filter_map(|hex| hex.parse::<ObjectId>().ok())
+            .collect()
+    } else {
+        HashSet::new()
     };
 
     let mut options = RevListOptions {
@@ -2702,6 +2730,8 @@ fn run_rev_list_log(
         parent_rewrite: args.show_parents || log_parent_format_requested(args),
         sparse: args.sparse,
         simplify_merges: args.simplify_merges,
+        simplify_by_decoration: args.simplify_by_decoration,
+        simplify_by_decoration_oids: simplify_by_decoration_oids.clone(),
         preserve_simplify_merges_graph_merges: args.graph,
         show_pulls: args.show_pulls,
         exclude_first_parent_only: args.exclude_first_parent_only,
@@ -2826,6 +2856,7 @@ fn run_rev_list_log(
             committer: commit.committer.clone(),
             message: commit.message.clone(),
             raw_message: commit.raw_message.clone(),
+            encoding: commit.encoding.clone(),
         };
 
         let author_ok =
@@ -2924,6 +2955,7 @@ fn run_rev_list_log(
                 use_mailmap,
                 mailmap,
                 &combined_pathspecs,
+                None,
                 None,
                 decoration_map_for_display.as_ref(),
                 use_color,
@@ -3153,17 +3185,22 @@ fn run_graph_log(
     let mut nodes = Vec::new();
     let mut seen = HashSet::new();
 
+    // In plain history (no path-limiting and no decoration/merge simplification) Git never rewrites
+    // a commit's parents away, so a commit whose parent is merely omitted by output limiting (e.g.
+    // `-1`/`-2`) still keeps the continuing vertical rail. Preserve that phantom trailing edge here.
+    let keep_phantom_edge = combined_pathspecs.is_empty() && !simplify_graph_parents;
     for oid in &result.commits {
         if !seen.insert(*oid) {
             continue;
         }
-        let parents = visible_parents_for_graph(
+        let parents = visible_parents_for_graph_inner(
             repo,
             *oid,
             &graph_parent_targets,
             graph_first_parent_direct,
             fp_through_omitted_for_graph,
             simplify_graph_parents,
+            keep_phantom_edge,
         )?;
         nodes.push(GraphCommitNode {
             oid: *oid,
@@ -3332,6 +3369,13 @@ fn run_graph_log(
                             body_buf.pop();
                         }
                     }
+                    if std::env::var("GRIT_NL_DEBUG").is_ok() {
+                        eprintln!(
+                            "BODY oid={} show_commit_body={show_commit_body} wants_sep={wants_separator} body={:?}",
+                            node.oid,
+                            String::from_utf8_lossy(&body_buf)
+                        );
+                    }
                     write_graph_interleaved_commit_msg(
                         &mut out,
                         line_prefix,
@@ -3358,6 +3402,11 @@ fn run_graph_log(
             // `next_line()` then yields a padding line without advancing structural state, so the
             // same rail applies to every body line.
             let (pad_rail, _) = graph.next_line();
+            // The rail (`| `, possibly colored) is prepended to every body line below. The `--stat`
+            // block is rendered unprefixed here, but its width must still be reduced by the rail's
+            // display width so the bar is scaled exactly like Git (`width = term_columns() -
+            // utf8_strnwidth(line_prefix)`). Pass `line_prefix + pad_rail` for width accounting only.
+            let stat_width_prefix = format!("{line_prefix}{pad_rail}");
 
             let mut diff_buf: Vec<u8> = Vec::new();
             write_commit_diff(
@@ -3372,6 +3421,7 @@ fn run_graph_log(
                 // The stat block's own `| ` graph prefix is superseded by the per-line rail
                 // applied below, so render the stat unprefixed here.
                 None,
+                Some(stat_width_prefix.as_str()),
                 decorations.as_ref(),
                 use_color,
                 decoration_paint.as_ref(),
@@ -3537,16 +3587,47 @@ fn visible_parents_for_graph(
     first_parent_through_omitted: bool,
     simplify_merge_parents: bool,
 ) -> Result<Vec<ObjectId>> {
+    visible_parents_for_graph_inner(
+        repo,
+        oid,
+        included,
+        first_parent_only,
+        first_parent_through_omitted,
+        simplify_merge_parents,
+        false,
+    )
+}
+
+/// Resolve the parent edges to draw for `oid` in `--graph` output.
+///
+/// Walks through omitted (non-`included`) parents to connect each shown commit to its nearest
+/// shown ancestor, mirroring Git's parent rewriting for path-limited / simplified history.
+///
+/// When `keep_phantom_edge` is set (plain history, no path-limiting or simplification) and the
+/// commit has real parents but none of them resolve to a shown ancestor — e.g. the parent is
+/// merely omitted by output limiting like `-1`/`-2` — the first real parent is kept as a phantom
+/// edge. The phantom parent is never itself drawn as a commit, so it renders as a continuing
+/// vertical `|` rail beneath/after the commit, matching Git (which never rewrites parents away for
+/// plain output limiting and so keeps the trailing column).
+fn visible_parents_for_graph_inner(
+    repo: &Repository,
+    oid: ObjectId,
+    included: &HashSet<ObjectId>,
+    first_parent_only: bool,
+    first_parent_through_omitted: bool,
+    simplify_merge_parents: bool,
+    keep_phantom_edge: bool,
+) -> Result<Vec<ObjectId>> {
     let mut direct = load_raw_parents(repo, oid)?;
     if first_parent_only && direct.len() > 1 {
         direct.truncate(1);
     }
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for parent in direct {
+    for parent in &direct {
         collect_visible_parent_for_graph(
             repo,
-            parent,
+            *parent,
             included,
             first_parent_only,
             first_parent_through_omitted,
@@ -3558,6 +3639,11 @@ fn visible_parents_for_graph(
         let simplified = graph_simplify_parent_list(repo, included, &out)?;
         let keep: HashSet<ObjectId> = simplified.into_iter().collect();
         out.retain(|parent| keep.contains(parent));
+    }
+    if keep_phantom_edge && out.is_empty() {
+        if let Some(first) = direct.first() {
+            out.push(*first);
+        }
     }
     let mut dedup = HashSet::new();
     out.retain(|parent| dedup.insert(*parent));
@@ -3923,6 +4009,7 @@ fn load_commit_info(repo: &Repository, oid: ObjectId) -> Result<CommitInfo> {
         committer: commit.committer,
         message: commit.message,
         raw_message: commit.raw_message,
+        encoding: commit.encoding,
     })
 }
 
@@ -4247,6 +4334,7 @@ impl AsciiGraph {
         if self.current.is_none() {
             return (String::new(), false);
         }
+        let _dbg_state = self.state;
         let mut line = String::new();
         // Visible width of the line, excluding any color escape sequences.
         // This mirrors Git's `graph_line.width` and is what padding uses.
@@ -4290,6 +4378,14 @@ impl AsciiGraph {
         let pad_width = self.width;
         if width < pad_width {
             line.push_str(&" ".repeat(pad_width - width));
+        }
+        if std::env::var("GRIT_NL_DEBUG").is_ok() {
+            eprintln!(
+                "NL state={:?}->{:?} line=[{}]",
+                _dbg_state,
+                self.state,
+                line.replace(' ', ".")
+            );
         }
         (line, shown_commit_line)
     }
@@ -4579,6 +4675,12 @@ impl AsciiGraph {
                 && (2 * i) < self.mapping.len()
                 && self.mapping[2 * i] < i as isize
             {
+                if std::env::var("GRIT_GRAPH_DEBUG").is_ok() {
+                    eprintln!(
+                        "DEBUG commit_line / at i={i} prev_state={:?} old_mapping={:?} mapping={:?}",
+                        self.prev_state, self.old_mapping, self.mapping
+                    );
+                }
                 self.write_column(line, width, &col, '/');
             } else {
                 self.write_column(line, width, &col, '|');
@@ -4586,6 +4688,17 @@ impl AsciiGraph {
             Self::add_char(line, width, ' ');
         }
 
+        if std::env::var("GRIT_GRAPH_DEBUG").is_ok() {
+            eprintln!(
+                "DEBUG commit_line=[{}] prev_state={:?} edges_added={} num_parents={} num_columns={} commit_index={}",
+                line.trim_end(),
+                self.prev_state,
+                self.edges_added,
+                self.num_parents,
+                self.num_columns,
+                self.commit_index
+            );
+        }
         if self.num_parents > 1 {
             self.update_state(GraphState::PostMerge);
         } else if self.is_mapping_correct() {
@@ -5583,8 +5696,8 @@ pub fn run(mut args: Args) -> Result<()> {
 
     // Resolve grep pattern flavor (fixed/basic/extended/perl) from CLI flags + grep.patternType.
     // `--grep` is case-SENSITIVE by default; `-i`/`--regexp-ignore-case` enables case-insensitivity.
-    // The `--author`/`--committer` identity filters, by contrast, match case-INSENSITIVELY by
-    // default (see `ident_pattern_ignore_case`), so a pattern like `--author=ALICE` finds "Alice".
+    // The `--author`/`--committer` identity filters share the same single ignore-case flag, so they
+    // are likewise case-SENSITIVE by default (see `ident_pattern_ignore_case`).
     let grep_ptype = resolve_grep_pattern_type(&args, &cfg);
     // Grit is not linked against libpcre2 (the harness leaves USE_LIBPCRE2 unset), so a request
     // for Perl-compatible regexes must die exactly as upstream Git does when compiled without
@@ -5738,6 +5851,11 @@ pub fn run(mut args: Args) -> Result<()> {
         probe_pathspecs.extend(implied);
     }
     let effective_for_rev_list = resolve_effective_pathspecs(&repo, &probe_pathspecs)?;
+    // `--simplify-by-decoration` (without pathspecs) needs the rev-list engine's
+    // topo-ordered full walk + proper parent-rewriting simplification. With pathspecs the
+    // legacy path-limited walk handles the combined "touch path OR decorated" case.
+    let simplify_decoration_rev_list =
+        args.simplify_by_decoration && effective_for_rev_list.is_empty();
     let wants_rev_list_walk = !args.follow
         && args.branches.is_none()
         && !args.source
@@ -5748,9 +5866,10 @@ pub fn run(mut args: Args) -> Result<()> {
         && args.since.is_none()
         && args.until.is_none()
         && args.since_as_filter.is_none()
-        && !args.simplify_by_decoration
+        && (!args.simplify_by_decoration || simplify_decoration_rev_list)
         && !args.boundary
-        && (args.topo_order
+        && (simplify_decoration_rev_list
+            || args.topo_order
             || args.date_order
             || args.author_date_order
             || args.full_history
@@ -6257,6 +6376,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     &mailmap,
                     effective_pathspecs,
                     None,
+                    None,
                     decoration_map_for_display.as_ref(),
                     use_color,
                     decoration_paint.as_ref(),
@@ -6486,6 +6606,7 @@ pub fn run(mut args: Args) -> Result<()> {
                     use_mailmap,
                     &mailmap,
                     &combined_pathspecs,
+                    None,
                     None,
                     decoration_map_for_display.as_ref(),
                     use_color,
@@ -6858,6 +6979,7 @@ pub fn run_no_walk(
             committer: commit.committer.clone(),
             message: commit.message.clone(),
             raw_message: commit.raw_message.clone(),
+            encoding: commit.encoding.clone(),
         };
         commits.push((oid, info));
     }
@@ -6965,6 +7087,7 @@ pub fn run_no_walk(
                 use_mailmap,
                 &mailmap,
                 &args.pathspecs,
+                None,
                 None,
                 decorations.as_ref(),
                 use_color,
@@ -7864,6 +7987,7 @@ fn run_reflog_walk(
             committer: commit_data.committer.clone(),
             message: commit_data.message.clone(),
             raw_message: commit_data.raw_message.clone(),
+            encoding: commit_data.encoding.clone(),
         };
         let show_diff = args.patch
             || args.patch_u
@@ -7890,6 +8014,7 @@ fn run_reflog_walk(
                 use_mailmap,
                 mailmap,
                 &args.pathspecs,
+                None,
                 None,
                 None,
                 use_color,
@@ -8186,14 +8311,80 @@ struct CommitInfo {
     /// (e.g. `i18n.commitEncoding=non-utf-8`). Set from [`CommitData::raw_message`]; the body
     /// emitters use these instead of the lossy `message` so invalid-UTF-8 bytes round-trip.
     raw_message: Option<Vec<u8>>,
+    /// The commit's `encoding` header (`i18n.commitEncoding` at commit time), if any. Used to
+    /// re-encode the body into the log output encoding, mirroring Git's `logmsg_reencode`.
+    encoding: Option<String>,
 }
 
 /// Emit a commit message body line by line with a 4-space indent, matching Git's `pp_handle_indent`.
 ///
 /// When `info.raw_message` is present (non-decodable commit encoding) the verbatim bytes are
 /// written without lossy UTF-8 conversion; otherwise the decoded `message` string is used.
-fn write_commit_body(out: &mut impl Write, info: &CommitInfo, et: usize) -> Result<()> {
-    write_commit_body_colored(out, info, et, None)
+fn write_commit_body(
+    out: &mut impl Write,
+    info: &CommitInfo,
+    et: usize,
+    output_encoding: Option<&str>,
+) -> Result<()> {
+    write_commit_body_colored(out, info, et, None, output_encoding)
+}
+
+/// Resolve the body bytes to print, mirroring Git's `logmsg_reencode`/`pretty_print_commit`.
+///
+/// Git re-encodes every builtin pretty format (medium/full/fuller/raw/short) from the commit's
+/// `encoding` header into the log output encoding before formatting. grit keeps the *decoded*
+/// UTF-8 form in `info.message` plus the original bytes in `info.raw_message`; this picks the
+/// right one:
+///
+/// * Output is UTF-8 (`output_encoding` is `None`): emit the decoded `message` (already UTF-8) —
+///   unless grit could not faithfully decode the commit encoding (unknown label), in which case
+///   Git's `reencode_string` returns NULL and the verbatim bytes are kept (`raw_message`).
+/// * Output is a non-UTF-8 label: re-encode the decoded `message` into that label; if encoding
+///   fails (unknown target) fall back to the verbatim bytes (Git's no-op fallback).
+fn commit_body_output_bytes<'a>(
+    info: &'a CommitInfo,
+    output_encoding: Option<&str>,
+) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+    // Whether grit can faithfully decode the commit's stored encoding (so `message` is exact).
+    let commit_encoding_decodable = match info.encoding.as_deref() {
+        None => true,
+        Some(label) => {
+            label.eq_ignore_ascii_case("utf-8")
+                || label.eq_ignore_ascii_case("utf8")
+                || grit_lib::commit_encoding::is_known_encoding(label)
+        }
+    };
+    match output_encoding {
+        None => {
+            // UTF-8 output: prefer the decoded message when the decode was faithful; otherwise
+            // keep the verbatim bytes (Git keeps the raw buffer when reencoding is impossible).
+            if commit_encoding_decodable {
+                Cow::Borrowed(info.message.as_bytes())
+            } else if let Some(raw) = info.raw_message.as_deref() {
+                Cow::Borrowed(raw)
+            } else {
+                Cow::Borrowed(info.message.as_bytes())
+            }
+        }
+        Some(label) => {
+            // Non-UTF-8 output: re-encode the decoded message into the target charset.
+            if commit_encoding_decodable {
+                match grit_lib::commit_encoding::encode_header_text(label, &info.message) {
+                    Some(bytes) => Cow::Owned(bytes),
+                    None => info
+                        .raw_message
+                        .as_deref()
+                        .map(Cow::Borrowed)
+                        .unwrap_or(Cow::Borrowed(info.message.as_bytes())),
+                }
+            } else if let Some(raw) = info.raw_message.as_deref() {
+                Cow::Borrowed(raw)
+            } else {
+                Cow::Borrowed(info.message.as_bytes())
+            }
+        }
+    }
 }
 
 /// Like [`write_commit_body`] but, when `colorizer` is set, colorizes grep
@@ -8204,8 +8395,11 @@ fn write_commit_body_colored(
     info: &CommitInfo,
     et: usize,
     colorizer: Option<&GrepColorizer>,
+    output_encoding: Option<&str>,
 ) -> Result<()> {
-    if let Some(raw) = info.raw_message.as_deref() {
+    let body_bytes = commit_body_output_bytes(info, output_encoding);
+    {
+        let raw = body_bytes.as_ref();
         // Mirror `str::lines()`: split on '\n', strip a trailing '\r', and drop the final empty
         // segment produced by a body that ends in '\n' (Git does not print a spurious blank line).
         let body = raw.strip_suffix(b"\n").unwrap_or(raw);
@@ -8226,22 +8420,6 @@ fn write_commit_body_colored(
             ))?;
             out.write_all(b"\n")?;
         }
-    } else {
-        for line in info.message.lines() {
-            if let Some(colored) = colorizer.and_then(|c| c.colorize_message(line)) {
-                writeln!(
-                    out,
-                    "{}",
-                    grit_lib::tab_expand::indent_and_expand_tabs(&colored, 4, et)
-                )?;
-            } else {
-                writeln!(
-                    out,
-                    "{}",
-                    grit_lib::tab_expand::indent_and_expand_tabs(line, 4, et)
-                )?;
-            }
-        }
     }
     Ok(())
 }
@@ -8259,6 +8437,11 @@ enum DecorationKind {
     Stash,
     Head,
     Grafted,
+    /// A ref outside the known namespaces (e.g. `refs/hidden/*`, `refs/prefetch/*`).
+    /// Git renders these with `DECORATION_NONE` (reset color) and the full refname.
+    /// Only decorated when an explicit `--decorate-refs[-exclude]` / `log.excludeDecoration`
+    /// filter is active (or `--clear-decorations`), matching `set_default_decoration_filter`.
+    Other,
 }
 
 /// One ref (or synthetic label) attached to a commit for `--decorate` / `%d`.
@@ -8467,6 +8650,7 @@ impl<'a> WalkCommitsIter<'a> {
                 committer: commit.committer.clone(),
                 message: commit.message.clone(),
                 raw_message: commit.raw_message.clone(),
+                encoding: commit.encoding.clone(),
             };
 
             if !self.shallow_boundaries.contains(&oid) {
@@ -10236,7 +10420,7 @@ fn format_commit(
             writeln!(out, "author {}", info.author)?;
             writeln!(out, "committer {}", info.committer)?;
             writeln!(out)?;
-            write_commit_body(out, info, et)?;
+            write_commit_body(out, info, et, args.log_output_encoding.as_deref())?;
             // `git log --pretty=raw` omits notes unless `--notes` / `--show-notes` is given.
             if matches!(
                 std::env::var("GIT_GRIT_LOG_NOTES_CLI").ok().as_deref(),
@@ -10267,6 +10451,12 @@ fn format_commit(
             let author_name = format_ident_display_mailmap(mailmap, &info.author, use_mailmap);
             writeln!(out, "Author: {author_name}")?;
             writeln!(out)?;
+            // Git's `pretty_print_commit` right-trims the whole buffer after emitting the body
+            // (`strbuf_rtrim`) and then appends exactly one `\n`, so a builtin pretty entry ends
+            // with a single newline and no trailing blank line. The inter-commit blank separator is
+            // supplied by the log walk, not by the format itself — emitting a trailing blank here
+            // would double the separator (and, under `--graph -p`, inject a stray rail line between
+            // the message and the diff/stat body).
             for line in info.message.lines().take(1) {
                 writeln!(
                     out,
@@ -10274,7 +10464,6 @@ fn format_commit(
                     grit_lib::tab_expand::indent_and_expand_tabs(line, 4, et)
                 )?;
             }
-            writeln!(out)?;
         }
         Some("medium") | None => {
             let dec = format_decoration(
@@ -10319,7 +10508,13 @@ fn format_commit(
                 format_author_date_internal(&info.author, date_format, true)
             )?;
             writeln!(out)?;
-            write_commit_body_colored(out, info, et, grep_colorizer)?;
+            write_commit_body_colored(
+                out,
+                info,
+                et,
+                grep_colorizer,
+                args.log_output_encoding.as_deref(),
+            )?;
             write_notes(out, oid, notes_cache, args, odb)?;
         }
         Some("full") => {
@@ -10356,7 +10551,13 @@ fn format_commit(
                 .unwrap_or(committer_disp);
             writeln!(out, "Commit: {committer_disp}")?;
             writeln!(out)?;
-            write_commit_body_colored(out, info, et, grep_colorizer)?;
+            write_commit_body_colored(
+                out,
+                info,
+                et,
+                grep_colorizer,
+                args.log_output_encoding.as_deref(),
+            )?;
             write_notes(out, oid, notes_cache, args, odb)?;
         }
         Some("fuller") => {
@@ -10403,7 +10604,13 @@ fn format_commit(
                 format_author_date_internal(&info.committer, date_format, true)
             )?;
             writeln!(out)?;
-            write_commit_body_colored(out, info, et, grep_colorizer)?;
+            write_commit_body_colored(
+                out,
+                info,
+                et,
+                grep_colorizer,
+                args.log_output_encoding.as_deref(),
+            )?;
             write_notes(out, oid, notes_cache, args, odb)?;
         }
         Some("reference") => {
@@ -12304,18 +12511,76 @@ fn decorations_initial_set_all(args: &Args, git_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn build_decoration_filter(args: &Args, git_dir: &Path) -> DecorationFilter {
-    let mut filter = DecorationFilter {
-        include: args
+/// Collect the `--decorate-refs` / `--decorate-refs-exclude` patterns in command-line order,
+/// honoring `--clear-decorations`: that flag clears the patterns given *before* it (Git's
+/// `clear_decorations_callback` in builtin/log.c, which is order-sensitive), while patterns
+/// given after it are retained. Falls back to the clap-collected (order-insensitive) vecs when
+/// the raw argv is unavailable.
+fn ordered_decorate_ref_patterns(args: &Args) -> (Vec<String>, Vec<String>) {
+    if args.raw_argv_tail.is_empty() {
+        let include = args
             .decorate_refs
             .iter()
             .map(|p| normalize_glob_ref(p))
-            .collect(),
-        exclude: args
+            .collect();
+        let exclude = args
             .decorate_refs_exclude
             .iter()
             .map(|p| normalize_glob_ref(p))
-            .collect(),
+            .collect();
+        return (include, exclude);
+    }
+
+    let mut include: Vec<String> = Vec::new();
+    let mut exclude: Vec<String> = Vec::new();
+    let argv = &args.raw_argv_tail;
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        if arg == "--" {
+            break;
+        }
+        if arg == "--clear-decorations" {
+            include.clear();
+            exclude.clear();
+            i += 1;
+            continue;
+        }
+        // Match `--decorate-refs[=val]` and `--decorate-refs-exclude[=val]` (and the space form).
+        let take = |flag: &str, list: &mut Vec<String>, i: &mut usize| -> bool {
+            if let Some(rest) = arg.strip_prefix(flag) {
+                if let Some(val) = rest.strip_prefix('=') {
+                    list.push(normalize_glob_ref(val));
+                    *i += 1;
+                    return true;
+                }
+                if rest.is_empty() {
+                    if let Some(val) = argv.get(*i + 1) {
+                        list.push(normalize_glob_ref(val));
+                    }
+                    *i += 2;
+                    return true;
+                }
+            }
+            false
+        };
+        // Check the longer flag first so `--decorate-refs-exclude` is not eaten by `--decorate-refs`.
+        if take("--decorate-refs-exclude", &mut exclude, &mut i) {
+            continue;
+        }
+        if take("--decorate-refs", &mut include, &mut i) {
+            continue;
+        }
+        i += 1;
+    }
+    (include, exclude)
+}
+
+fn build_decoration_filter(args: &Args, git_dir: &Path) -> DecorationFilter {
+    let (include, exclude) = ordered_decorate_ref_patterns(args);
+    let mut filter = DecorationFilter {
+        include,
+        exclude,
         exclude_config: Vec::new(),
     };
     // `--clear-decorations` drops the config-based exclusions (and Git's default
@@ -12382,6 +12647,8 @@ fn color_for_decoration_kind(paint: &DecorationPaint, kind: DecorationKind) -> &
         DecorationKind::Stash => &paint.stash,
         DecorationKind::Head => &paint.head,
         DecorationKind::Grafted => &paint.grafted,
+        // `DECORATION_NONE` -> `GIT_COLOR_RESET` (log-tree.c `decoration_colors[0]`).
+        DecorationKind::Other => &paint.reset,
     }
 }
 
@@ -12514,17 +12781,21 @@ fn collect_decorations_inner(
             continue;
         }
 
-        // With `--clear-decorations`, the default ref filter is removed, so any
-        // remaining ref (e.g. `refs/notes/commits`) is also decorated. Such refs
-        // are always shown with their full name.
-        if clear_decorations {
+        // Refs outside the known namespaces (e.g. `refs/hidden/*`, `refs/prefetch/*`,
+        // `refs/notes/commits`). Git's `set_default_decoration_filter` (builtin/log.c)
+        // only restricts decorations to the known namespaces when NO `--decorate-refs`,
+        // `--decorate-refs-exclude`, or `log.excludeDecoration` is given. As soon as any
+        // such filter is active (or `--clear-decorations` is set), the default include
+        // list is dropped and every ref that passes the filter is decorated with its full
+        // name and `DECORATION_NONE` (reset) color (log-tree.c `add_ref_decoration`).
+        if clear_decorations || !filter.is_empty() {
             let peeled = peel_to_commit_hex(odb, &oid.to_hex()).unwrap_or_else(|| oid.to_hex());
             prepend_decoration(
                 map.entry(peeled).or_default(),
                 DecorationItem {
                     refname: Some(refname.clone()),
                     display: refname.clone(),
-                    kind: DecorationKind::Branch,
+                    kind: DecorationKind::Other,
                 },
             );
         }
@@ -12926,6 +13197,7 @@ fn write_commit_diff(
     mailmap: &MailmapTable,
     pathspecs: &[String],
     graph_stat_prefix: Option<&str>,
+    graph_stat_width_prefix: Option<&str>,
     decorations: Option<&DecorationMap>,
     use_color: bool,
     decoration_paint: Option<&DecorationPaint>,
@@ -13039,6 +13311,7 @@ fn write_commit_diff(
                 args,
                 pathspecs,
                 graph_stat_prefix,
+                graph_stat_width_prefix,
                 show_patch,
                 false,
                 patch_context,
@@ -13136,6 +13409,7 @@ fn write_commit_diff(
         args,
         pathspecs,
         graph_stat_prefix,
+        graph_stat_width_prefix,
         show_patch,
         is_merge,
         patch_context,
@@ -13186,6 +13460,7 @@ fn write_commit_diff_body(
     args: &Args,
     pathspecs: &[String],
     graph_stat_prefix: Option<&str>,
+    graph_stat_width_prefix: Option<&str>,
     show_patch: bool,
     treat_as_merge_for_format: bool,
     patch_context: usize,
@@ -13282,6 +13557,7 @@ fn write_commit_diff_body(
             has_patch,
             args,
             graph_stat_prefix,
+            graph_stat_width_prefix,
             git_dir,
         )?;
     }
@@ -13752,6 +14028,12 @@ fn apply_diff_output_indicators(patch: &str, args: &Args) -> String {
 }
 
 /// Write a `--stat` summary for log.
+///
+/// `graph_line_prefix` is the prefix actually printed before each stat line (used by the
+/// `-L` line-log graph path that emits the stat inline). `graph_width_prefix` is the graph's
+/// vertical rail that the *caller* prints separately (regular `--graph` path): it is not
+/// printed here, but its display width is subtracted from the terminal columns so the stat
+/// graph is scaled exactly like Git's `width = term_columns() - utf8_strnwidth(line_prefix)`.
 fn log_print_stat_summary(
     out: &mut impl Write,
     odb: &Odb,
@@ -13759,6 +14041,7 @@ fn log_print_stat_summary(
     trailing_blank: bool,
     args: &Args,
     graph_line_prefix: Option<&str>,
+    graph_width_prefix: Option<&str>,
     git_dir: &Path,
 ) -> Result<()> {
     let use_color = log_resolve_stdout_color(args, git_dir);
@@ -13771,16 +14054,6 @@ fn log_print_stat_summary(
         .get("diff.statGraphWidth")
         .and_then(|s| s.parse::<usize>().ok());
     let eff_graph_width = args.stat_graph_width.or(cfg_stat_graph);
-    let graph_bar_slack = if graph_line_prefix.is_some() {
-        if args.stat_graph_width.is_some() || cfg_stat_graph.is_some() || args.stat_width.is_some()
-        {
-            0
-        } else {
-            1
-        }
-    } else {
-        0
-    };
     let (color_add, color_del, color_reset) = if use_color {
         let add = cfg
             .get("color.diff.new")
@@ -13796,7 +14069,12 @@ fn log_print_stat_summary(
     };
 
     let line_prefix = graph_line_prefix.unwrap_or("");
-    let subtract_prefix = graph_line_prefix.is_some() && args.stat_width.is_none();
+    // The rail whose width is subtracted from the terminal columns: the printed prefix for the
+    // inline `-L` path, or the separately-printed rail for the regular `--graph` path. Git only
+    // subtracts it when the width is derived from the terminal (no explicit `--stat-width`).
+    let width_prefix = graph_width_prefix.unwrap_or(line_prefix);
+    let subtract_prefix =
+        (graph_line_prefix.is_some() || graph_width_prefix.is_some()) && args.stat_width.is_none();
 
     let mut files: Vec<FileStatInput> = Vec::with_capacity(entries.len());
     for entry in entries {
@@ -13853,6 +14131,7 @@ fn log_print_stat_summary(
     let opts = DiffstatOptions {
         total_width: args.stat_width.unwrap_or_else(terminal_columns),
         line_prefix,
+        width_prefix,
         subtract_prefix_from_terminal: subtract_prefix,
         stat_name_width: eff_name_width,
         stat_graph_width: eff_graph_width,
@@ -13860,12 +14139,8 @@ fn log_print_stat_summary(
         color_add: color_add.as_str(),
         color_del: color_del.as_str(),
         color_reset: color_reset.as_str(),
-        graph_bar_slack,
-        graph_prefix_budget_slack: if graph_line_prefix.is_some() && use_color {
-            1
-        } else {
-            0
-        },
+        graph_bar_slack: 0,
+        graph_prefix_budget_slack: 0,
     };
     write_diffstat_block(out, &files, &opts)?;
     // `--summary`: condensed extended-header lines (create/delete/rename mode), emitted right

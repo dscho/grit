@@ -54,6 +54,56 @@ fn is_linked_worktree_git_dir(git_dir: &Path) -> bool {
         .any(|c| c.as_os_str() == std::ffi::OsStr::new("worktrees"))
 }
 
+/// Compute the gitdir string the way Git's `setup_git_directory` would leave
+/// `the_repository->gitdir` for the current `cwd`. Git keeps the gitdir relative
+/// to the working directory when it was discovered by walking up to a literal
+/// `.git` directory (yielding `.git`, `../.git`, …), but keeps it absolute when
+/// the `.git` is a gitfile pointing elsewhere (separate gitdir / linked
+/// worktree) or `GIT_DIR` named an explicit path.
+fn setup_relative_git_dir(git_dir: &Path, cwd: &Path) -> PathBuf {
+    if let Ok(gd) = std::env::var("GIT_DIR") {
+        if !gd.is_empty() {
+            return PathBuf::from(gd);
+        }
+    }
+    let git_a = realpath_forgiving(git_dir);
+    let cwd_a = realpath_forgiving(cwd);
+    // At the gitdir itself (typical for a bare repo): Git reports ".".
+    if git_a == cwd_a {
+        return PathBuf::from(".");
+    }
+    // A gitfile (`.git` is a file) keeps the absolute target. Linked worktree
+    // admin dirs live under `.../worktrees/<name>` and are likewise absolute.
+    if cwd.join(".git").is_file() || is_linked_worktree_git_dir(&git_a) {
+        return git_a;
+    }
+    // `.git` discovered as a directory in cwd or an ancestor: keep it relative.
+    if git_a.file_name() == Some(std::ffi::OsStr::new(".git")) {
+        if let Some(parent) = git_a.parent() {
+            let parent_a = realpath_forgiving(parent);
+            if cwd_a == parent_a || cwd_a.starts_with(&parent_a) {
+                return PathBuf::from(to_relative_path(&git_a, &cwd_a));
+            }
+        }
+    }
+    git_a
+}
+
+/// Mirror Git's `get_common_dir_noenv`: if the gitdir has a `commondir` file the
+/// common dir is the canonical absolute path it points at, otherwise it is the
+/// gitdir itself (in the cwd-relative form Git's setup would have produced).
+fn computed_common_dir(git_dir: &Path, cwd: &Path) -> PathBuf {
+    if let Ok(common) = std::env::var("GIT_COMMON_DIR") {
+        if !common.is_empty() {
+            return PathBuf::from(common);
+        }
+    }
+    if let Some(common) = refs::common_dir(git_dir) {
+        return common;
+    }
+    setup_relative_git_dir(git_dir, cwd)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PathDefaultMode {
     /// Pass through `path` without canonicalization (e.g. literal `.git`).
@@ -116,6 +166,46 @@ fn print_rev_parse_path(
                     }
                 } else {
                     println!("{}", path_abs.display());
+                }
+            }
+        },
+    }
+}
+
+/// Faithful port of Git's `print_path(path, prefix, format, DEFAULT_RELATIVE_IF_SHARED)`
+/// as used by `--git-common-dir`.
+///
+/// * `--path-format=absolute` (`Some(true)`) → realpath, absolute.
+/// * `--path-format=relative` (`Some(false)`) → relative to `--prefix` or cwd
+///   after canonicalizing both ends.
+/// * default (`None`) → `relative_path(path, prefix)`, where `prefix` is NULL
+///   unless an explicit `--prefix` was given. A NULL prefix prints `path`
+///   verbatim; a sharing prefix yields a relative path.
+fn print_common_dir_path(path: &Path, cli_prefix: Option<&Path>, fmt: Option<bool>) {
+    match fmt {
+        Some(true) => {
+            println!("{}", realpath_forgiving(path).display());
+        }
+        Some(false) => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let base = cli_prefix
+                .map(realpath_forgiving)
+                .unwrap_or_else(|| realpath_forgiving(&cwd));
+            println!("{}", to_relative_path(&realpath_forgiving(path), &base));
+        }
+        None => match cli_prefix {
+            // Git passes the command-line prefix straight through; with no
+            // `--prefix` it is NULL and `relative_path` returns the path as-is.
+            None => println!("{}", path.display()),
+            Some(prefix) => {
+                let path_abs = realpath_forgiving(path);
+                let prefix_abs = realpath_forgiving(prefix);
+                let path_s = path_abs.to_string_lossy();
+                let prefix_s = prefix_abs.to_string_lossy();
+                let mut sb = String::new();
+                match grit_lib::git_path::relative_path(&path_s, &prefix_s, &mut sb) {
+                    Some(rel) => println!("{rel}"),
+                    None => println!("{}", path.display()),
                 }
             }
         },
@@ -981,20 +1071,14 @@ pub fn run(args: Args) -> Result<()> {
                 let Some(current) = repo.as_ref() else {
                     bail!("not a git repository (or any of the parent directories)");
                 };
-                let common_git_dir =
-                    refs::common_dir(&current.git_dir).unwrap_or_else(|| current.git_dir.clone());
-                let default_mode = if current.git_dir.join("commondir").exists() {
-                    PathDefaultMode::Canonical
-                } else {
-                    PathDefaultMode::RelativeToCwd
-                };
-                print_rev_parse_path(
-                    &common_git_dir,
-                    &cwd,
-                    cli_prefix_path.as_deref(),
-                    *fmt,
-                    default_mode,
-                );
+                // Git: `print_path(repo_get_common_dir(), prefix, format,
+                // DEFAULT_RELATIVE_IF_SHARED)`. The common dir is reported in the
+                // same form Git's setup left it in (cwd-relative for an in-tree
+                // `.git`, absolute for a gitfile / linked worktree), and the
+                // RELATIVE_IF_SHARED default prints it verbatim unless an
+                // explicit `--prefix` was given that shares a filesystem root.
+                let common_git_dir = computed_common_dir(&current.git_dir, &cwd);
+                print_common_dir_path(&common_git_dir, cli_prefix_path.as_deref(), *fmt);
             }
             Action::ShowAbsoluteGitDir => {
                 let Some(current) = repo.as_ref() else {

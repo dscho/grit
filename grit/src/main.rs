@@ -924,11 +924,11 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
     }
     let backend = rest[1].as_str();
     let sub = rest[2].as_str();
-    if backend.starts_with("worktree:") {
+    if backend.starts_with("worktree:") || backend.starts_with("submodule:") {
         return commands::test_tool_ref_store::run(&rest[1..]);
     }
     if backend != "main" {
-        bail!("test-tool ref-store: unsupported backend (only 'main' and 'worktree:*' are implemented)");
+        bail!("test-tool ref-store: unsupported backend (only 'main', 'worktree:*' and 'submodule:*' are implemented)");
     }
 
     let repo = grit_lib::repo::Repository::discover(None)?;
@@ -973,8 +973,9 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             let skip_refname_verification =
                 flags.iter().any(|f| f == "REF_SKIP_REFNAME_VERIFICATION");
 
+            // `dispatch` is given the subcommand name separately, so `args` must contain
+            // only the flags/operands of `git update-ref` (not the "update-ref" word itself).
             let mut args = vec![
-                "update-ref".to_owned(),
                 "-m".to_owned(),
                 msg.clone(),
                 refname.clone(),
@@ -1003,6 +1004,16 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                     &git_dir, refname, &old, &oid, &identity, msg, true,
                 );
                 return Ok(());
+            }
+            // Without REF_SKIP_OID_VERIFICATION, `refs_update_ref` (REF_STORE_WRITE) requires the
+            // new value to name an existing object; reject dangling OIDs so a non-skipping
+            // update of an invalid OID fails (t0610 "can skip object ID verification").
+            if !new_oid.starts_with("0000000000000000000000000000000000000000") {
+                if let Ok(oid) = grit_lib::objects::ObjectId::from_hex(new_oid) {
+                    if !repo.odb.exists(&oid) {
+                        bail!("update_ref failed for ref '{refname}': cannot update ref '{refname}': trying to write ref '{refname}' with nonexistent object {new_oid}");
+                    }
+                }
             }
             dispatch("update-ref", &args, &GlobalOpts::default())
         }
@@ -1052,7 +1063,10 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
                 } else {
                     oid.as_str()
                 };
-                println!("{display_oid} {name} {flags}");
+                // The C helper sets `trim_prefix = strlen(prefix)`, so the prefix is stripped
+                // from the emitted refname (e.g. `refs/heads/main` -> `main`).
+                let display = name.strip_prefix(prefix).unwrap_or(&name);
+                println!("{display_oid} {display} {flags}");
             }
             Ok(())
         }
@@ -1141,11 +1155,122 @@ fn run_test_tool_ref_store(rest: &[String]) -> Result<()> {
             std::fs::rename(lock_path, path)?;
             Ok(())
         }
-        "resolve-ref" => commands::test_tool_ref_store::run(&rest[2..]),
+        "rename-ref" => {
+            // rename-ref <oldref> <newref> [logmsg]
+            if rest.len() < 5 {
+                bail!("usage: test-tool ref-store main rename-ref <oldref> <newref> [logmsg]");
+            }
+            let oldref = &rest[3];
+            let newref = &rest[4];
+            let logmsg = rest.get(5).cloned().unwrap_or_default();
+            run_ref_store_rename(&repo, &git_dir, oldref, newref, &logmsg)
+        }
+        "verify-ref" => {
+            // verify-ref <refname>: succeeds iff creating <refname> would not hit a D/F
+            // conflict with another ref (matches refs_verify_refname_available).
+            let refname = rest.get(3).ok_or_else(|| {
+                anyhow::anyhow!("usage: test-tool ref-store main verify-ref <refname>")
+            })?;
+            match grit_lib::refs::verify_refname_available_for_create(
+                &git_dir,
+                refname,
+                &std::collections::BTreeSet::new(),
+                &std::collections::HashSet::new(),
+            ) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    println!("{}", e.lock_message_suffix());
+                    std::process::exit(1);
+                }
+            }
+        }
+        "delete-ref" => {
+            // delete-ref <msg> <refname> <old-sha1> <flags>
+            if rest.len() < 6 {
+                bail!("usage: test-tool ref-store main delete-ref <msg> <ref> <old-sha1> <flags>");
+            }
+            let _msg = &rest[3];
+            let refname = &rest[4];
+            let old_sha1 = &rest[5];
+            // Honor the old-sha1 precondition (REF_NO_DEREF/flags don't change this test's path).
+            if old_sha1 != "0000000000000000000000000000000000000000" {
+                let expected = grit_lib::objects::ObjectId::from_hex(old_sha1)
+                    .with_context(|| format!("cannot parse {old_sha1} as object id"))?;
+                match grit_lib::refs::resolve_ref(&git_dir, refname) {
+                    Ok(current) if current == expected => {}
+                    Ok(current) => bail!(
+                        "ref {refname} is at {} but expected {}",
+                        current.to_hex(),
+                        expected.to_hex()
+                    ),
+                    Err(e) => bail!("cannot lock ref '{refname}': {e}"),
+                }
+            }
+            grit_lib::refs::delete_ref(&git_dir, refname).map_err(|e| anyhow::anyhow!("{e}"))
+        }
         // The module entry point expects `<store> <function> ...`, so pass the backend too.
+        "resolve-ref" => commands::test_tool_ref_store::run(&rest[1..]),
         "for-each-reflog" => commands::test_tool_ref_store::run(&rest[1..]),
         other => bail!("test-tool ref-store: unsupported subcommand '{other}'"),
     }
+}
+
+/// Low-level ref rename for `test-tool ref-store main rename-ref`, mirroring the files-backend
+/// `files_copy_or_rename_ref`: resolve the old ref without dereferencing (symrefs are rejected),
+/// migrate its reflog, delete the old ref, write the new ref, and append the rename reflog entry.
+fn run_ref_store_rename(
+    repo: &grit_lib::repo::Repository,
+    git_dir: &std::path::Path,
+    oldref: &str,
+    newref: &str,
+    logmsg: &str,
+) -> Result<()> {
+    // Renaming a symbolic ref is not supported (matches the C backend).
+    if matches!(
+        grit_lib::refs::read_symbolic_ref(git_dir, oldref),
+        Ok(Some(_))
+    ) {
+        bail!("refname {oldref} is a symbolic ref, renaming it is not supported");
+    }
+
+    let old_oid = grit_lib::refs::resolve_ref(git_dir, oldref)
+        .map_err(|_| anyhow::anyhow!("refname {oldref} not found"))?;
+
+    // Capture the old reflog bytes before deleting the ref (delete_ref removes logs/<ref> too).
+    let logs_dir = git_dir.join("logs");
+    let old_log_path = logs_dir.join(oldref);
+    let old_reflog_bytes = if old_log_path.is_file() {
+        std::fs::read(&old_log_path).ok()
+    } else {
+        None
+    };
+
+    // Delete the old ref first to avoid d/f conflicts when old/new share a path prefix.
+    grit_lib::refs::delete_ref(git_dir, oldref).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Remove any pre-existing destination ref so the write lands cleanly.
+    let _ = grit_lib::refs::delete_ref(git_dir, newref);
+
+    grit_lib::refs::write_ref(git_dir, newref, &old_oid).map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    // Migrate the reflog content to the new ref's reflog path.
+    if let Some(log_bytes) = old_reflog_bytes {
+        let new_log = logs_dir.join(newref);
+        if let Some(parent) = new_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(&new_log, log_bytes)?;
+    }
+
+    // Append a reflog entry for the rename when a log message was supplied (an empty logmsg
+    // leaves the migrated reflog untouched, matching commit_ref_update with a NULL message).
+    if !logmsg.is_empty() {
+        let identity = commands::update_ref::resolve_reflog_identity(repo);
+        let _ = grit_lib::refs::append_reflog(
+            git_dir, newref, &old_oid, &old_oid, &identity, logmsg, true,
+        );
+    }
+
+    Ok(())
 }
 
 fn dir_iterator_error_name(kind: std::io::ErrorKind) -> &'static str {
@@ -5664,6 +5789,7 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
             commands::imap_send::run_from_argv(rest)
         }
         "index-pack" => {
+            commands::upstream_synopsis_help::try_print_upstream_help_and_exit(subcmd, rest);
             let args = commands::index_pack::parse_argv(rest.to_vec())?;
             commands::index_pack::run(args)
         }
@@ -5838,7 +5964,10 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "sh-i18n--envsubst" => commands::sh_i18n_envsubst::run_from_argv(rest),
         "sh-setup" => commands::sh_setup::run(parse_cmd_args(subcmd, rest)),
         "shell" => commands::shell::run(parse_cmd_args(subcmd, rest)),
-        "shortlog" => commands::shortlog::run_with_raw_args(rest),
+        "shortlog" => {
+            commands::upstream_synopsis_help::try_print_upstream_help_and_exit(subcmd, rest);
+            commands::shortlog::run_with_raw_args(rest)
+        }
         "show" => {
             let rest = preprocess_expand_tabs_for_rev_cmd(rest);
             let rest = preprocess_show_argv(&rest);
@@ -5929,7 +6058,10 @@ pub(crate) fn dispatch(subcmd: &str, rest: &[String], opts: &GlobalOpts) -> Resu
         "verify-tag" => commands::verify_tag::run(parse_cmd_args(subcmd, rest)),
         "version" => commands::version::run(parse_cmd_args(subcmd, rest)),
         "web--browse" => commands::web_browse::run(parse_cmd_args(subcmd, rest)),
-        "whatchanged" => commands::whatchanged::run(rest),
+        "whatchanged" => {
+            commands::upstream_synopsis_help::try_print_upstream_help_and_exit(subcmd, rest);
+            commands::whatchanged::run(rest)
+        }
         "worktree" => commands::worktree::run(parse_cmd_args(subcmd, rest)),
         "write-tree" => commands::write_tree::run(parse_cmd_args(subcmd, rest)),
         "test-tool" => {
@@ -7448,6 +7580,34 @@ fn test_tool_parse_git_bool_strict(value: &str) -> std::result::Result<bool, ()>
     }
 }
 
+/// Locate the repository git directory for `test-tool config` without requiring config to parse.
+///
+/// `Repository::discover` reads (and parses) the repository config as part of discovery, so when the
+/// config file contains a syntax error discovery fails and returns `None`. The config test helper
+/// must still find the local `config` file in that case so the malformed line surfaces as a fatal
+/// parse error (t1308 "proper error on error in default config files"). Mirror the `git config`
+/// command's `resolve_git_dir`: try discovery first, then fall back to a config-free directory walk.
+fn test_tool_config_locate_git_dir() -> Option<std::path::PathBuf> {
+    if let Ok(dir) = std::env::var("GIT_DIR") {
+        let p = std::path::PathBuf::from(dir);
+        if p.is_absolute() {
+            return Some(p);
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            return Some(cwd.join(p));
+        }
+        return Some(p);
+    }
+    grit_lib::repo::Repository::discover(None)
+        .ok()
+        .map(|r| r.git_dir)
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .and_then(grit_lib::precompose_config::locate_git_dir_from_cwd)
+        })
+}
+
 /// Handle `test-tool config` — config API test helper.
 fn run_test_tool_config(rest: &[String]) -> Result<()> {
     use grit_lib::config::{canonical_key, ConfigFile};
@@ -7457,8 +7617,14 @@ fn run_test_tool_config(rest: &[String]) -> Result<()> {
 
     if subcmd == "read_early_config" {
         let key = rest.get(1).map(|s| s.as_str()).unwrap_or("");
-        let repo = grit_lib::repo::Repository::discover(None).ok();
-        let git_dir = repo.as_ref().map(|r| r.git_dir.as_path());
+        // Locate the git dir the way Git's `read_early_config`/`discover_git_directory_reason`
+        // does: still record the gitdir even when the repository format is unsupported
+        // (`GIT_DIR_INVALID_FORMAT`), so `read_early_config` can emit the
+        // "Expected git repo version <= N" warning and skip the repo's local config (t1309).
+        // `Repository::discover` validates the format and would yield no gitdir for such a repo,
+        // so use the validation-free locator (it still honors GIT_DIR/ceilings).
+        let git_dir_buf = test_tool_config_locate_git_dir();
+        let git_dir = git_dir_buf.as_deref();
         return match ConfigSet::read_early_config(git_dir, key) {
             Ok(values) => {
                 if values.is_empty() {
@@ -7473,8 +7639,8 @@ fn run_test_tool_config(rest: &[String]) -> Result<()> {
         };
     }
 
-    let repo = grit_lib::repo::Repository::discover(None).ok();
-    let git_dir = repo.as_ref().map(|r| r.git_dir.as_path());
+    let git_dir_buf = test_tool_config_locate_git_dir();
+    let git_dir = git_dir_buf.as_deref();
 
     match subcmd {
         "get" => {

@@ -7803,6 +7803,14 @@ fn write_patch_with_prefix(
         let new_path = entry.new_path.as_deref().unwrap_or("/dev/null");
         let path_for_attrs = repo_path_for_diff_entry(entry, relative_prefix);
 
+        // `git diff --cached` reports an unmerged (conflicted) index entry as a single
+        // `* Unmerged path <name>` line — it has no stage-0 blob to diff against HEAD
+        // (t3701 "patch mode ignores unmerged entries").
+        if cached && entry.status == DiffStatus::Unmerged {
+            writeln!(out, "* Unmerged path {}", entry.path())?;
+            continue;
+        }
+
         if let Some(fmt) = submodule_fmt {
             if entry.old_mode == "160000" || entry.new_mode == "160000" {
                 // A blob→gitlink typechange against the work tree records the new gitlink as zero;
@@ -8278,6 +8286,16 @@ fn write_patch_with_prefix(
         if !cached
             && entry.status == DiffStatus::Added
             && entry.old_oid == zero_oid()
+            && old_content.is_empty()
+            && new_content.is_empty()
+        {
+            continue;
+        }
+
+        // Adding or deleting an empty file (both blobs empty) has no content hunk: git emits only
+        // the `diff --git` / `new|deleted file mode` / `index` header, with no `--- / +++` lines
+        // (t3701 "deleting an empty file" / "adding an empty file").
+        if matches!(entry.status, DiffStatus::Added | DiffStatus::Deleted)
             && old_content.is_empty()
             && new_content.is_empty()
         {
@@ -10475,6 +10493,7 @@ fn write_compact_summary(
     let opts = DiffstatOptions {
         total_width: terminal_columns(),
         line_prefix: "",
+        width_prefix: "",
         subtract_prefix_from_terminal: false,
         stat_name_width,
         stat_graph_width,
@@ -10690,6 +10709,7 @@ fn write_stat(
     let opts = DiffstatOptions {
         total_width: total_w,
         line_prefix,
+        width_prefix: "",
         subtract_prefix_from_terminal: stat_width.is_none() && !line_prefix.is_empty(),
         stat_name_width: eff_name,
         stat_graph_width: eff_graph,

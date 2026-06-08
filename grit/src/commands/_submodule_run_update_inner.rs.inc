@@ -389,19 +389,26 @@ fn run_update_inner(args: &UpdateArgs, discover_base: Option<PathBuf>) -> Result
                     )?;
                 }
 
-                let abs_origin = if Path::new(&clone_src_str).is_absolute() {
-                    Path::new(&clone_src_str).canonicalize()
-                } else {
-                    work_tree.join(&clone_src_str).canonicalize()
-                };
-                if let Ok(p) = abs_origin {
-                    let sub_cfg_path = modules_dir.join("config");
-                    if sub_cfg_path.exists() {
-                        let sub_content = fs::read_to_string(&sub_cfg_path)?;
-                        let mut sub_cfg =
-                            ConfigFile::parse(&sub_cfg_path, &sub_content, ConfigScope::Local)?;
-                        sub_cfg.set("remote.origin.url", &p.to_string_lossy())?;
-                        sub_cfg.write()?;
+                // C Git's `git clone` records `remote.origin.url` *verbatim* as the clone
+                // argument for local paths — it does not canonicalize (so `<super>/.` stays
+                // `<super>/.`). Preserving this is load-bearing for *nested* submodules whose
+                // `.gitmodules` url is relative (`../.`): the nested url is resolved against the
+                // parent submodule's recorded origin (`relative_url`), and chopping a trailing
+                // `/.` off the parent origin would land one directory too high (t3600 nested
+                // subsubmodule). grit's own `clone` already records `clone_src_str` verbatim, so
+                // for an *absolute* source we leave that untouched. Only when the clone source is
+                // relative do we rewrite it to an absolute path so recursive fetches from the
+                // submodule's own object store resolve correctly (t7406).
+                if !Path::new(&clone_src_str).is_absolute() {
+                    if let Ok(p) = work_tree.join(&clone_src_str).canonicalize() {
+                        let sub_cfg_path = modules_dir.join("config");
+                        if sub_cfg_path.exists() {
+                            let sub_content = fs::read_to_string(&sub_cfg_path)?;
+                            let mut sub_cfg =
+                                ConfigFile::parse(&sub_cfg_path, &sub_content, ConfigScope::Local)?;
+                            sub_cfg.set("remote.origin.url", &p.to_string_lossy())?;
+                            sub_cfg.write()?;
+                        }
                     }
                 }
             }

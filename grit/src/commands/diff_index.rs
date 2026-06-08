@@ -363,6 +363,14 @@ pub fn run(mut args: Args) -> Result<()> {
         diff_entries
     };
 
+    // `--diff-filter=<letters>`: include uppercase status letters, exclude lowercase ones
+    // (e.g. `u` excludes unmerged `U`). Mirrors `git diff`'s diff-filter (t3701 reset -p check).
+    let diff_entries: Vec<DiffEntry> = if let Some(ref df) = options.diff_filter {
+        apply_diff_index_diff_filter(diff_entries, df)
+    } else {
+        diff_entries
+    };
+
     if options.check {
         let merged_attrs = match load_gitattributes_for_diff(&repo) {
             Ok(a) => a,
@@ -616,6 +624,37 @@ fn normalize_ignore_space_change_line(line: &str) -> String {
     normalized.trim_end().to_owned()
 }
 
+/// Apply `--diff-filter` like `git diff` (`apply_diff_filter`): uppercase letters select a status,
+/// lowercase letters exclude it. With at least one uppercase letter the filter is an allow-list;
+/// otherwise everything not excluded passes.
+fn apply_diff_index_diff_filter(entries: Vec<DiffEntry>, filter: &str) -> Vec<DiffEntry> {
+    let mut include: Option<std::collections::HashSet<char>> = None;
+    let mut exclude: std::collections::HashSet<char> = std::collections::HashSet::new();
+    for c in filter.chars() {
+        if c == '*' {
+            continue;
+        }
+        if c.is_ascii_uppercase() {
+            include.get_or_insert_with(Default::default).insert(c);
+        } else if c.is_ascii_lowercase() {
+            exclude.insert(c.to_ascii_uppercase());
+        }
+    }
+    entries
+        .into_iter()
+        .filter(|e| {
+            let ch = e.status.letter();
+            if exclude.contains(&ch) {
+                return false;
+            }
+            if let Some(ref inc) = include {
+                return inc.contains(&ch);
+            }
+            true
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct Options {
     tree_ish: String,
@@ -648,6 +687,9 @@ struct Options {
     nul_terminated: bool,
     relative: bool,
     check: bool,
+    /// `--diff-filter=<letters>`: include uppercase status letters, exclude lowercase (Git's
+    /// `diff_filter`). `u`/`U` selects unmerged entries.
+    diff_filter: Option<String>,
     indent_heuristic: bool,
     /// Git `-B` / `--break-rewrites`: split large in-place edits before rename/copy, then merge
     /// surviving pairs (see `diffcore-break.c`).
@@ -742,6 +784,7 @@ fn parse_options(argv: &[String]) -> Result<Options> {
     let mut nul_terminated = false;
     let mut relative = false;
     let mut check = false;
+    let mut diff_filter: Option<String> = None;
     let mut break_rewrites = false;
     let mut break_score: u64 = grit_lib::diff::GIT_DIFF_DEFAULT_BREAK_SCORE;
     let mut merge_after_break_score: u64 = GIT_DIFF_DEFAULT_MERGE_SCORE_AFTER_BREAK;
@@ -912,6 +955,9 @@ fn parse_options(argv: &[String]) -> Result<Options> {
                 "--check" => {
                     check = true;
                 }
+                _ if arg.starts_with("--diff-filter=") => {
+                    diff_filter = Some(arg.trim_start_matches("--diff-filter=").to_owned());
+                }
                 "--ignore-submodules" => {
                     ignore_submodules_all = true;
                 }
@@ -1004,6 +1050,7 @@ fn parse_options(argv: &[String]) -> Result<Options> {
         nul_terminated,
         relative,
         check,
+        diff_filter,
         indent_heuristic,
         break_rewrites,
         break_score,

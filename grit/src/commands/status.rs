@@ -94,7 +94,6 @@ fn has_racy_timestamp(index: &Index, index_mtime_sec: u32, index_mtime_nsec: u32
     })
 }
 
-
 /// Arguments for `grit status`.
 #[derive(Debug, ClapArgs)]
 #[command(about = "Show the working tree status")]
@@ -1036,6 +1035,10 @@ directory contents. Running 'git clean' may assist in this cleanup."
         );
         let (index_mtime_sec, index_mtime_nsec) = index_mtime;
         let racy = has_racy_timestamp(&index, index_mtime_sec, index_mtime_nsec);
+        // Git's `tweak_split_index` marks the cache changed when `core.splitIndex=true` but the
+        // loaded index is not yet split, so `repo_update_index_if_able` rewrites it in split form
+        // (creating `.git/sharedindex.<oid>`) even when nothing else changed (t1700 #22).
+        let force_split_index_write = repo.split_index_would_force_write(&index);
         // Opportunistic write, like Git: persist when refresh changed an entry or when the
         // index itself is stale/racy enough that rewriting advances its mtime.
         // Best-effort: status must succeed even when `.git/` is read-only (t7508).
@@ -1043,6 +1046,7 @@ directory contents. Running 'git clean' may assist in this cleanup."
             || racy
             || force_full_index_write
             || force_sparse_index_write
+            || force_split_index_write
             || write_index_for_untracked_cache
         {
             if force_sparse_index_write {
@@ -3160,9 +3164,20 @@ fn format_long(
                 )?;
             }
             cpw(out, cp, "")?;
-        } else if split_commit_in_progress(git_dir, head)
-            || long_status_split_commit_in_progress(git_dir, head, unstaged)
-        {
+        } else if {
+            // Mirror wt-status.c `split_commit_in_progress`: a clean working tree
+            // (no staged or unstaged changes to tracked files) during an `edit`
+            // stop means the commit is "being edited", not "being split", even when
+            // the rebase-merge amend/orig-head bookkeeping would otherwise look like
+            // a split (e.g. after splitting an earlier commit and continuing). git
+            // bails out of split detection up front unless the work tree is dirty
+            // (or status is in amend/nowarn mode, which this plain-status path is
+            // not).
+            let workdir_dirty = !staged.is_empty() || !unstaged.is_empty();
+            workdir_dirty
+                && (split_commit_in_progress(git_dir, head)
+                    || long_status_split_commit_in_progress(git_dir, head, unstaged))
+        } {
             long_status_print_splitting(out, cp, show_hints, repo, git_dir, head, state)?;
         } else {
             long_status_print_editing(out, cp, show_hints, repo, git_dir, head, state)?;

@@ -19,7 +19,7 @@ use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 use grit_lib::commit_trailers::{append_signoff_trailer, format_signoff_line};
-use grit_lib::config::ConfigSet;
+use grit_lib::config::{ConfigScope, ConfigSet};
 use grit_lib::diff::{self, count_changes, diff_index_to_tree, diff_index_to_worktree, DiffEntry};
 use grit_lib::hooks::{run_commit_hook, run_hook, CommitHookEnv, HookResult};
 use grit_lib::index::{Index, IndexEntry, MODE_EXECUTABLE, MODE_GITLINK, MODE_SYMLINK, MODE_TREE};
@@ -923,7 +923,18 @@ fn validate_rebase_trailer_options(args: &Args) -> Result<()> {
 }
 
 fn rebase_force_rewrite_requested(args: &Args) -> bool {
-    args.no_ff || args.signoff || !args.trailer.is_empty()
+    // Git's `builtin/rebase.c` sets `REBASE_FORCE` (which clears `replay.allow_ff`) for `--no-ff`,
+    // `--force-rebase`, signoff, trailers, and for the date-rewriting options
+    // `--committer-date-is-author-date` / `--reset-author-date` (`--ignore-date`). With those date
+    // options a tree-identical pick — including a root pick after `reset [new root]` in a
+    // `rebase -r` script — must be rewritten rather than fast-forwarded so the new committer/author
+    // timestamp is actually applied (t3436 `--committer-date-is-author-date`/`--reset-author-date`
+    // with `rebase -r`).
+    args.no_ff
+        || args.signoff
+        || !args.trailer.is_empty()
+        || args.committer_date_is_author_date
+        || args.reset_author_date
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2984,6 +2995,51 @@ fn rebase_state_todo_lines(
         .collect()
 }
 
+/// Build the non-interactive todo for a plain merge-backend rebase with `--update-refs`.
+///
+/// Each commit becomes a `pick` line; after a commit, any local branch pointing at it is
+/// interleaved as an `update-ref <ref>` step (or a `# Ref ... checked out` comment when the
+/// branch is occupied by a worktree), mirroring Git's `todo_list_add_update_ref_commands`. This
+/// lets a plain `git rebase --update-refs <upstream>` populate the `rebase-merge/update-refs`
+/// state file even though no sequence editor was opened, so the scheduled branches become
+/// "used by worktree" while the rebase is paused on a conflict (t2407 #6).
+///
+/// # Parameters
+/// - `repo`: repository handle (for worktree-occupancy checks and object reads).
+/// - `git_dir`: git directory for branch-decoration enumeration.
+/// - `config`: config set controlling the comment prefix and todo-line formatting.
+/// - `commits`: the commits to rebase, in todo order (oldest first).
+///
+/// # Errors
+/// Propagates object-read and ref-enumeration failures.
+fn rebase_update_refs_todo_lines(
+    repo: &Repository,
+    git_dir: &Path,
+    config: &ConfigSet,
+    commits: &[ObjectId],
+) -> Result<Vec<String>> {
+    let items = build_autosquash_with_update_refs(repo, git_dir, commits, false, true)?;
+    let comment_prefix = comment_line_prefix_full(config);
+    let mut lines = Vec::with_capacity(items.len());
+    for item in &items {
+        match item {
+            TodoBuildItem::Commit(oid, cmd) => {
+                lines.push(format_rebase_todo_line(repo, oid, *cmd, config, false)?);
+            }
+            TodoBuildItem::UpdateRef(refname) => {
+                lines.push(format!("update-ref {refname}"));
+            }
+            TodoBuildItem::RefComment(text) => {
+                lines.push(format!("{comment_prefix} {text}"));
+            }
+            TodoBuildItem::Exec(cmd) => {
+                lines.push(format!("exec {cmd}"));
+            }
+        }
+    }
+    Ok(lines)
+}
+
 /// Index of the next todo line that is not a `fixup`/`squash` pick, if any.
 fn next_non_fixup_index(
     repo: &Repository,
@@ -3251,45 +3307,97 @@ fn append_commented(buf: &mut String, text: &str) {
     }
 }
 
-fn comment_block(text: &str) -> String {
+/// Comment out any un-commented commit messages in the squash buffer and rewrite their headers
+/// from "This is the Nth commit message:" to "The Nth commit message will be skipped:", leaving
+/// already-skipped sections untouched.
+///
+/// This is a faithful port of Git's `update_squash_message_for_fixup` (`sequencer.c`): it is run
+/// when a `fixup -C`/`fixup -c` step replaces the accumulated message (`is_fixup_flag && !seen_squash`)
+/// so every section accumulated so far is dropped from the final message. Unlike a single-section
+/// marker, it walks the whole buffer, so a chain such as `pick, fixup, fixup -C` correctly skips
+/// both the pick target's message and the plain fixup's section (t3437 #8/#12).
+fn update_squash_message_for_fixup(buf: &mut String) {
+    // `comment_line_str` is "#"; the commented header forms Git compares against.
+    let mut buf1 = String::from("# This is the 1st commit message:\n");
+    let mut buf2 = String::from("# The 1st commit message will be skipped:\n");
+    let update_comment_bufs = |b1: &mut String, b2: &mut String, n: usize| {
+        *b1 = format!("# This is the commit message #{n}:\n");
+        *b2 = format!("# The commit message #{n} will be skipped:\n");
+    };
+
+    let orig = std::mem::take(buf);
+    let bytes = orig.as_bytes();
     let mut out = String::new();
-    append_commented(&mut out, text.trim_end_matches('\n'));
-    out
+    // `start` marks the beginning of the not-yet-copied region; `comment_mode` selects whether the
+    // copied body is passed through verbatim or commented out (matching Git's `copy_lines` switch).
+    let mut start = 0usize;
+    let mut comment_mode = false;
+    let mut i = 1usize;
+    let mut s = 0usize;
+    while s < orig.len() {
+        if orig[s..].starts_with(buf1.as_str()) {
+            // An un-skipped header: copy the preceding section, drop the blank line that precedes
+            // this header, emit the "skipped" header, comment the following body.
+            let off = usize::from(s > start + 1 && bytes[s - 2] == b'\n');
+            copy_section(&mut out, &orig[start..s - off], comment_mode);
+            if off == 1 {
+                out.push('\n');
+            }
+            out.push_str(&buf2);
+            let mut next = s + buf1.len();
+            if next < orig.len() && bytes[next] == b'\n' {
+                out.push('\n');
+                next += 1;
+            }
+            start = next;
+            s = next;
+            comment_mode = true;
+            i += 1;
+            update_comment_bufs(&mut buf1, &mut buf2, i);
+        } else if orig[s..].starts_with(buf2.as_str()) {
+            // An already-skipped header: copy the preceding section verbatim (the body that follows
+            // is already commented), then continue in verbatim mode.
+            let off = usize::from(s > start + 1 && bytes[s - 2] == b'\n');
+            copy_section(&mut out, &orig[start..s - off], comment_mode);
+            start = s - off;
+            s += buf2.len();
+            comment_mode = false;
+            i += 1;
+            update_comment_bufs(&mut buf1, &mut buf2, i);
+        } else {
+            match orig[s..].find('\n') {
+                Some(rel) => s += rel + 1,
+                None => break,
+            }
+        }
+    }
+    copy_section(&mut out, &orig[start..], comment_mode);
+    *buf = out;
 }
 
-fn comment_block_preserving_comments(text: &str) -> String {
-    let mut out = String::new();
-    for line in text.trim_end_matches('\n').lines() {
-        if line.starts_with('#') {
+/// Copy `text` into `out`, commenting it out (Git's `add_commented_lines`, which avoids
+/// double-commenting already-commented lines) when `comment_mode` is set.
+///
+/// Already-commented lines (starting with `#`) are passed through verbatim; every other line —
+/// including empty ones, which become a bare `#` — is prefixed, matching Git's
+/// `strbuf_add_commented_lines`.
+fn copy_section(out: &mut String, text: &str, comment_mode: bool) {
+    if !comment_mode || text.is_empty() {
+        out.push_str(text);
+        return;
+    }
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if content.starts_with('#') {
             out.push_str(line);
-            out.push('\n');
-        } else if line.is_empty() {
-            out.push_str("#\n");
+        } else if content.is_empty() {
+            out.push('#');
+            out.push_str(line);
         } else {
             out.push_str("# ");
             out.push_str(line);
-            out.push('\n');
         }
     }
-    out
-}
-
-fn mark_squash_section_skipped(buf: &mut String, section: usize) {
-    let header = format!("# This is the commit message #{section}:\n\n");
-    let Some(start) = buf.find(&header) else {
-        return;
-    };
-    let body_start = start + header.len();
-    let tail = &buf[body_start..];
-    let next_rel = tail.find("\n# This is the commit message #");
-    let next_rel = next_rel.or_else(|| tail.find("\n# The commit message #"));
-    let body_end = next_rel.map_or(buf.len(), |pos| body_start + pos + 1);
-    let body = buf[body_start..body_end].to_string();
-    let replacement = format!(
-        "# The commit message #{section} will be skipped:\n\n{}",
-        comment_block_preserving_comments(&body)
-    );
-    buf.replace_range(start..body_end, &replacement);
 }
 
 fn append_skipped_squash_message(buf: &mut String, body: &str, n: usize) {
@@ -3704,25 +3812,13 @@ fn update_squash_message_file(
         } else {
             append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, 2);
         }
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() {
-            fs::write(rb_dir.join("message-fixup-active-section"), "2\n")?;
-        }
         fs::write(&squash_path, buf)?;
     } else {
         let mut buf = fs::read_to_string(&squash_path)?;
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() {
-            if !ctx.seen_squash {
-                if let Ok(section) = fs::read_to_string(rb_dir.join("message-fixup-active-section"))
-                {
-                    if let Ok(section) = section.trim().parse::<usize>() {
-                        mark_squash_section_skipped(&mut buf, section);
-                    }
-                }
-            }
-            write_fixup_message_mode(rb_dir, fixup_message_mode)?;
-            fs::write(&fixup_path, fixup_replacement_message(&picked.message))?;
-        }
+        let is_fixup_flag = cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some();
         let n = ctx.count + 2;
+        // Splice the combination-count header first (Git rewrites the leading line in place),
+        // matching `update_squash_messages`' `strbuf_splice` of `combined_commit_msg_fmt`.
         if let Some(pos) = buf.find('\n') {
             if buf.starts_with("# This is a combination of") {
                 buf.replace_range(
@@ -3731,16 +3827,20 @@ fn update_squash_message_file(
                 );
             }
         }
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_none() {
-            append_skipped_squash_message(&mut buf, body, ctx.count + 2);
-        } else {
-            append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, ctx.count + 2);
+        // A `fixup -C`/`fixup -c` that replaces the message (and is not after a squash) drops every
+        // section accumulated so far by commenting them out and flipping their headers to
+        // "will be skipped" — Git's `update_squash_message_for_fixup`.
+        if is_fixup_flag && !ctx.seen_squash {
+            update_squash_message_for_fixup(&mut buf);
         }
-        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_some() && !ctx.seen_squash {
-            fs::write(
-                rb_dir.join("message-fixup-active-section"),
-                format!("{}\n", ctx.count + 2),
-            )?;
+        if is_fixup_flag {
+            write_fixup_message_mode(rb_dir, fixup_message_mode)?;
+            fs::write(&fixup_path, fixup_replacement_message(&picked.message))?;
+        }
+        if cmd == RebaseTodoCmd::Fixup && fixup_message_mode.is_none() {
+            append_skipped_squash_message(&mut buf, body, n);
+        } else {
+            append_nth_squash_message(&mut buf, body, cmd, ctx.seen_squash, n);
         }
         fs::write(&squash_path, buf)?;
     }
@@ -4077,10 +4177,8 @@ fn rebase_todo_line_is_comment(line: &str) -> bool {
 fn rebase_todo_actionable_lines(content: &str) -> Vec<&str> {
     content
         .lines()
-        .filter(|l| {
-            let t = l.trim();
-            !t.is_empty() && !rebase_todo_line_is_comment(t)
-        })
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !rebase_todo_line_is_comment(t))
         .collect()
 }
 
@@ -4930,6 +5028,73 @@ fn sequence_editor_cmd(config: &ConfigSet) -> Result<String> {
     git_editor_cmd(config)
 }
 
+/// Warn (once per process) that `core.commentChar=auto` / `core.commentString=auto` is deprecated,
+/// matching Git's `check_auto_comment_char_config` (config.c). The warning and the follow-up advice
+/// are emitted to stderr just before the rebase sequence editor opens (the comment string is needed
+/// to render the todo help block). Git uses the `GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN`
+/// environment variable to suppress repeats in subprocesses; we honor the same guard.
+///
+/// The advice's `git config ...` lines carry a scope flag (`--global`, `--system`, `--worktree`)
+/// for non-local origins, mirroring `add_config_scope_arg`; repository-local config gets no flag.
+fn warn_auto_comment_char_once(config: &ConfigSet) {
+    const WARN_ENV: &str = "GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN";
+
+    // Find the last (highest-priority) entry for commentChar/commentString that is set to "auto".
+    // Git tracks `last_key_id`/`auto_set_in_file`; the effective value is the highest-priority one.
+    let mut auto_entry: Option<(&str, ConfigScope)> = None;
+    for entry in config.entries() {
+        let key_name = match entry.key.as_str() {
+            "core.commentchar" => "core.commentChar",
+            "core.commentstring" => "core.commentString",
+            _ => continue,
+        };
+        let is_auto = entry
+            .value
+            .as_deref()
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("auto"));
+        if is_auto {
+            auto_entry = Some((key_name, entry.scope));
+        } else {
+            // A later non-auto override for the same key clears the auto state.
+            auto_entry = None;
+        }
+    }
+    let Some((key_name, scope)) = auto_entry else {
+        return;
+    };
+
+    if std::env::var("GIT_AUTO_COMMENT_CHAR_CONFIG_WARNING_GIVEN")
+        .ok()
+        .as_deref()
+        .is_some_and(|v| matches!(v, "1" | "true" | "yes" | "on"))
+    {
+        return;
+    }
+    // Single-threaded CLI process; set before spawning the editor subprocess so it does not repeat.
+    std::env::set_var(WARN_ENV, "true");
+
+    let scope_flag = match scope {
+        ConfigScope::Global => "--global ",
+        ConfigScope::System => "--system ",
+        ConfigScope::Worktree => "--worktree ",
+        ConfigScope::Local | ConfigScope::Command => "",
+    };
+
+    eprintln!(
+        "warning: Support for '{key_name}=auto' is deprecated and will be removed in Git 3.0"
+    );
+    eprintln!("hint: ");
+    eprintln!("hint: To use the default comment string (#) please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config unset {scope_flag}{key_name}");
+    eprintln!("hint: ");
+    eprintln!("hint: To set a custom comment string please run");
+    eprintln!("hint: ");
+    eprintln!("hint:     git config set {scope_flag}{key_name} <comment string>");
+    eprintln!("hint: ");
+    eprintln!("hint: where '<comment string>' is the string you wish to use.");
+}
+
 fn run_shell_editor(editor: &str, path: &Path) -> Result<std::process::ExitStatus> {
     let status = if editor.trim() == ":" {
         std::process::Command::new("true").status()
@@ -5519,6 +5684,7 @@ fn run_interactive_rebase(
     let command_count = count_rebase_todo_actionable_lines(&todo);
     let todo_with_help = append_rebase_todo_help(&todo, command_count, revs_onto, config);
     fs::write(&todo_path, todo_with_help.as_bytes())?;
+    warn_auto_comment_char_once(config);
     let editor = sequence_editor_cmd(config)?;
     let status = run_shell_editor(&editor, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
@@ -5669,6 +5835,7 @@ fn run_interactive_rebase_with_initial_todo(
     fs::write(&todo_path, todo_with_help.as_bytes())?;
     let orig_path = git_dir.join("ORIGINAL-TODO");
     fs::write(&orig_path, todo_with_help.as_bytes())?;
+    warn_auto_comment_char_once(config);
     let editor = sequence_editor_cmd(config)?;
     let status = run_shell_editor(&editor, &todo_path)?;
     let edited = fs::read_to_string(&todo_path)?;
@@ -5771,6 +5938,7 @@ fn do_edit_todo() -> Result<()> {
     write_rebase_todo_file(&repo, &rb_dir, &content)?;
 
     let path = rebase_todo_file_path(&repo, &rb_dir);
+    warn_auto_comment_char_once(&config);
     let editor = sequence_editor_cmd(&config)?;
     let status = run_shell_editor(&editor, &path)?;
     if !status.success() {
@@ -5966,7 +6134,7 @@ Use '--' to separate paths from revisions, like this:\n\
                 Err(e) if e.to_string().contains("no merge base") => {}
                 Err(e) => {
                     return Err(e)
-                        .with_context(|| format!("fork-point resolution failed for '{fp_spec}'"))
+                        .with_context(|| format!("fork-point resolution failed for '{fp_spec}'"));
                 }
             }
         }
@@ -6118,7 +6286,20 @@ Use '--' to separate paths from revisions, like this:\n\
         upstream_oid
     };
     let mut commits = if args.root {
-        collect_commits_for_root_rebase(&repo, head_oid, onto_oid, args.onto.is_some())?
+        // Upstream `sequencer_make_script` sets `revs.max_parents = 1` unless `--rebase-merges`,
+        // so a plain `rebase -i --root` (or any non-merge backend that would build a pick list)
+        // excludes merge commits from the todo rather than emitting `pick <merge>` lines, which
+        // `pick` rejects. The sequential/apply root backend keeps merges and flattens them via the
+        // first-parent walk (`message_for_root_replayed_commit`), so only exclude merges for the
+        // interactive, non-rebase-merges case (t3412 `rebase -i --root with conflict`).
+        let exclude_merges = args.interactive && !rebase_merges_on;
+        collect_commits_for_root_rebase(
+            &repo,
+            head_oid,
+            onto_oid,
+            args.onto.is_some(),
+            exclude_merges,
+        )?
     } else {
         collect_rebase_todo_commits(&repo, head_oid, commits_upstream, filter_cherry_equivalents)?
     };
@@ -6345,6 +6526,17 @@ Use '--' to separate paths from revisions, like this:\n\
     } else if want_autosquash {
         let entries = rearrange_autosquash(&repo, commits)?;
         (rebase_state_todo_lines(&repo, &config, &entries)?, false)
+    } else if rebase_update_refs_enabled(&args, &config)
+        && matches!(choose_rebase_backend(&args), RebaseBackend::Merge)
+    {
+        // A plain merge-backend `rebase --update-refs` still schedules branch updates even though
+        // no sequence editor opens: Git's `todo_list_add_update_ref_commands` interleaves
+        // `update-ref` steps so the scheduled branches are recorded in `rebase-merge/update-refs`
+        // and become "used by worktree" while the rebase is paused (t2407 #6).
+        (
+            rebase_update_refs_todo_lines(&repo, git_dir, &config, &commits)?,
+            false,
+        )
     } else {
         let entries: Vec<(ObjectId, RebaseTodoCmd)> = commits
             .into_iter()
@@ -6970,17 +7162,32 @@ fn collect_commits_to_replay(
 
 /// Commits to replay for `rebase --root --onto <onto>`: same set as `git rev-list <onto>..<head>`.
 ///
-/// Order matches `git rev-list` default output reversed (oldest first), including merge topology.
+/// When `exclude_merges` is false (the default, sequential/apply backend), the walk follows
+/// first-parent and *includes* merge commits, which are later flattened by recording the second
+/// parent's message ([`message_for_root_replayed_commit`]). When `exclude_merges` is true
+/// (interactive `-i` without `--rebase-merges`), it mirrors upstream `sequencer_make_script`, which
+/// sets `revs.max_parents = 1`: the full topological history is walked but merge commits are
+/// omitted entirely (their non-merge ancestors on every side are still picked individually). This
+/// keeps `git rebase -i --root` from emitting `pick <merge>` lines, which `pick` rejects
+/// (t3412 `rebase -i --root with conflict`).
+///
+/// Order matches `git rev-list` default output reversed (oldest first).
 fn collect_commits_for_root_rebase(
     repo: &Repository,
     head: ObjectId,
     onto: ObjectId,
     filter_redundant: bool,
+    exclude_merges: bool,
 ) -> Result<Vec<ObjectId>> {
     let mut opts = RevListOptions::default();
-    opts.first_parent = true;
-    opts.ordering = OrderingMode::Default;
     opts.reverse = true;
+    if exclude_merges {
+        opts.max_parents = Some(1);
+        opts.ordering = OrderingMode::Topo;
+    } else {
+        opts.first_parent = true;
+        opts.ordering = OrderingMode::Default;
+    }
     let listed = if onto.is_zero() {
         // `rebase --root` without `--onto`: replay the full first-parent chain from the branch tip
         // (Git uses an empty lower bound; we cannot pass the null OID through rev-list).
@@ -8084,6 +8291,19 @@ fn replay_remaining(
                             continue 'rebase_loop;
                         }
                         Err(_e) => {
+                            // An untracked-file obstruction (the commit never applied) sets the
+                            // `obstructed-pick` marker in the child. Git keeps such a pick pending and
+                            // re-consumes it into `done` on retry, so the obstructed line appears in
+                            // `done` *twice* (t3404 "rebase -i commits that overwrite untracked
+                            // files"). The line was already appended to `done` above; remember it
+                            // verbatim so the obstructed-pick re-apply on `--continue` can append it a
+                            // second time. A genuine merge conflict (no marker) keeps the single record.
+                            if rebase_interactive && rb_dir.join("obstructed-pick").exists() {
+                                let _ = fs::write(
+                                    rb_dir.join("obstructed-pick-line"),
+                                    format!("{}\n", todo[i]),
+                                );
+                            }
                             let remaining: Vec<&str> = if rebase_interactive {
                                 todo[i + 1..].to_vec()
                             } else {
@@ -10056,6 +10276,35 @@ fn do_continue() -> Result<()> {
             // (t3404 "auto-amend only edited commits after edit").
             bail!("error: you have staged changes in your working tree");
         }
+        // Git's `commit_staged_changes`: when the worktree is clean (`is_clean` and not a final
+        // fixup), an `edit` continue does NOT re-commit — it removes CHERRY_PICK_HEAD/MERGE_MSG and
+        // returns, leaving HEAD at the edited commit, then proceeds to the next todo item. Amending
+        // an unchanged `edit` here would rewrite the commit with a fresh committer (new OID) and could
+        // even pick up a stale message, so a subsequent obstruction would leave HEAD on the rewritten
+        // commit instead of the original (t3404 "rebase -i commits that overwrite untracked files
+        // (squash)"/"(no ff)", whose `test_cmp_rev HEAD F` must still hold after the failed continue).
+        if edit_continue
+            && !read_current_final_fixup(&rb_dir)
+            && worktree_matches_head(&repo, git_dir)?
+        {
+            let _ = fs::remove_file(git_dir.join("CHERRY_PICK_HEAD"));
+            let _ = fs::remove_file(git_dir.join("MERGE_MSG"));
+            let next_peek_amend =
+                peek_next_rebase_flush_hint(&repo, &todo_lines_continue, 0, interactive_continue);
+            record_rebase_in_rewritten_pending(git_dir, &rb_dir, &amend_old_oid, next_peek_amend)?;
+            let _ = fs::remove_file(rb_dir.join("stopped-sha"));
+            let _ = fs::remove_file(rb_dir.join("amend"));
+            let _ = fs::remove_file(rb_dir.join("rebase-amend-continue"));
+            let _ = fs::remove_file(rb_dir.join("rebase-edit-continue"));
+            return replay_remaining(
+                &repo,
+                &rb_dir,
+                autostash_continue,
+                backend_continue,
+                had_autostash_continue,
+                force_rewrite_continue,
+            );
+        }
         let amend_src_commit = repo
             .odb
             .read(&amend_old_oid)
@@ -10065,7 +10314,13 @@ fn do_continue() -> Result<()> {
             .as_ref()
             .map(|c| c.author.clone())
             .unwrap_or_else(|| hc.author.clone());
-        let msg_src = if git_dir.join("COMMIT_EDITMSG").exists() {
+        // For an `edit` continue, Git amends HEAD via `git commit --amend -F rebase-merge/message`,
+        // i.e. it reuses the *edited commit's* message (which is HEAD's message, since `edit` applied
+        // the commit and left HEAD at it). A leftover `.git/COMMIT_EDITMSG` from an unrelated earlier
+        // commit must NOT be used here (t3404 "rebase -i commits that overwrite untracked files
+        // (squash)", where a stale COMMIT_EDITMSG held "P" and corrupted the amended `edit` commit's
+        // message). `COMMIT_EDITMSG` is only the message source for reword/user-edited flows.
+        let msg_src = if !edit_continue && git_dir.join("COMMIT_EDITMSG").exists() {
             fs::read_to_string(git_dir.join("COMMIT_EDITMSG"))?
         } else {
             hc.message.clone()
@@ -10157,6 +10412,29 @@ fn do_continue() -> Result<()> {
             had_autostash_continue,
             force_rewrite_continue,
         );
+    }
+
+    // Git's `commit_staged_changes` gate (sequencer.c): a pick that was *blocked* before it could
+    // touch the index (an untracked working-tree file would have been overwritten) leaves no
+    // `.git/rebase-merge/message` — the commit never started. If the user then stages unrelated
+    // changes and runs `--continue`, Git refuses with "you have staged changes in your working
+    // tree" rather than silently re-running the pick against a dirty index. This must run BEFORE the
+    // `stopped-sha`/`patch` files are consumed below: deleting them would disarm the obstructed-pick
+    // re-apply path so the subsequent clean `--continue` (after `git reset --hard`) would rewrite the
+    // commit instead of fast-forwarding it (t3404 "rebase -i commits that overwrite untracked
+    // files", whose final `HEAD` must stay byte-identical to the original commit `D`).
+    if rb_dir.join("current").exists() && !rb_dir.join("message").exists() {
+        if let Some(obstructed_oid) = fs::read_to_string(rb_dir.join("current"))
+            .ok()
+            .and_then(|s| ObjectId::from_hex(s.trim()).ok())
+        {
+            if rebase_pick_was_obstructed(&rb_dir, &obstructed_oid)
+                && !worktree_matches_head(&repo, git_dir)?
+            {
+                // main.rs prefixes `error: `, so emit the bare message to match Git exactly.
+                bail!("you have staged changes in your working tree");
+            }
+        }
     }
 
     let stopped_path = rb_dir.join("stopped-sha");
@@ -10318,6 +10596,18 @@ fn do_continue() -> Result<()> {
         let needs_reapply = matches!(todo_cmd, RebaseTodoCmd::Pick | RebaseTodoCmd::Fixup)
             && rebase_pick_was_obstructed(&rb_dir, &current_oid);
         if needs_reapply {
+            // Git re-consumes the obstructed pick into `done` when it is retried, so the obstructed
+            // line is recorded twice (t3404 "rebase -i commits that overwrite untracked files"). The
+            // halt saved the verbatim line; append it again here, before re-applying.
+            if interactive_continue {
+                if let Ok(line) = fs::read_to_string(rb_dir.join("obstructed-pick-line")) {
+                    let line = line.trim_end_matches('\n');
+                    if !line.is_empty() {
+                        append_interactive_rebase_done_line(&rb_dir, line)?;
+                    }
+                }
+            }
+            let _ = fs::remove_file(rb_dir.join("obstructed-pick-line"));
             // Consume the obstruction marker before re-running so a fresh obstruction on a later step
             // re-arms it cleanly and a stale value can never divert an unrelated continue.
             let _ = fs::remove_file(rb_dir.join("obstructed-pick"));

@@ -1820,9 +1820,21 @@ pub fn run(mut args: Args) -> Result<()> {
     // finished with a plain `git commit` (t3507 "successful final commit clears ... state").
     // This applies equally to a revert sequence (REVERT_HEAD), matching
     // sequencer_post_commit_cleanup which sets need_cleanup for either head.
-    if (resume_pick_after_cp || resume_revert_after_rv)
-        && sequencer_finished_last_pick(&repo.git_dir)
-    {
+    //
+    // grit's cherry-pick and revert keep the sequencer todo in different shapes:
+    // cherry-pick leaves the *current* (conflicting) item at the head of the todo
+    // (git's on-disk format), so "finished the last pick" means the todo has at
+    // most one line left. grit's revert instead drops the current item from the
+    // todo and tracks it via REVERT_HEAD, so the todo only ever holds the *remaining*
+    // un-attempted reverts; for revert the sequence is finished only when that todo
+    // is empty. Using the wrong test here would prematurely tear down the sequencer
+    // after committing the resolution of an intermediate revert (t7512.42).
+    let finished = if resume_revert_after_rv {
+        sequencer_todo_remaining_empty(&repo.git_dir)
+    } else {
+        sequencer_finished_last_pick(&repo.git_dir)
+    };
+    if (resume_pick_after_cp || resume_revert_after_rv) && finished {
         let _ = fs::remove_dir_all(repo.git_dir.join("sequencer"));
     }
 
@@ -2550,6 +2562,11 @@ fn run_commit_patch_mode(
     use similar::{Algorithm, TextDiff};
     use std::io::BufRead;
 
+    let patch_cfg = ConfigSet::load(Some(&repo.git_dir), true).unwrap_or_default();
+    let context = crate::commands::add::resolve_patch_context(args.unified, &patch_cfg)?;
+    let inter_hunk_context =
+        crate::commands::add::resolve_patch_interhunk(args.inter_hunk_context, &patch_cfg)?;
+
     let index_path = resolved_index_path(repo);
     let disk_index = match repo.load_index_at(&index_path) {
         Ok(idx) => idx,
@@ -2707,12 +2724,13 @@ fn run_commit_patch_mode(
 
                 let display_idx = hunk_cursor + 1;
                 let (s, e) = hunk_ranges[hunk_cursor];
-                let hunk_only = crate::commands::stash::partial_unified_for_op_range(
+                let hunk_only = crate::commands::stash::partial_unified_for_op_range_interhunk(
                     path.as_str(),
                     &index_content,
                     &cur_work,
                     &ops[s..e],
-                    3,
+                    context,
+                    inter_hunk_context,
                     true,
                 );
 
@@ -5471,6 +5489,24 @@ fn sequencer_finished_last_pick(git_dir: &Path) -> bool {
         None => true,
         Some(eol) => content[eol + 1..].is_empty(),
     }
+}
+
+/// Whether the revert sequencer todo has no remaining un-attempted reverts.
+///
+/// grit's revert sequencer records only the commits *after* the current one in
+/// `sequencer/todo` (the in-progress revert is tracked via `REVERT_HEAD`). The
+/// whole revert sequence is therefore complete only when that todo holds no more
+/// `revert` lines. Returns `true` when the todo is missing or contains only blank
+/// or comment lines.
+fn sequencer_todo_remaining_empty(git_dir: &Path) -> bool {
+    let todo_path = git_dir.join("sequencer").join("todo");
+    let Ok(content) = fs::read_to_string(&todo_path) else {
+        return true;
+    };
+    !content.lines().any(|line| {
+        let t = line.trim();
+        !t.is_empty() && !t.starts_with('#')
+    })
 }
 
 /// Clean up merge-related state files after a successful commit.

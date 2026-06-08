@@ -454,13 +454,15 @@ fn run_batch(repo: &Repository, args: &Args) -> Result<()> {
 }
 
 fn run_implicit_stdin_batch(repo: &Repository, args: &Args, text: &str) -> Result<()> {
+    // Only mutating commands claim a ref for the duration of the transaction;
+    // two mutations targeting the same ref are rejected ("multiple updates for
+    // ref"). A `verify` is a read-only precondition check, so it may coexist
+    // with a later mutation of the same ref (e.g. `verify X <old>` followed by
+    // `update X <new> <old>`) — the verify simply runs first.
     let mut seen_refs = HashSet::new();
     for line in text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if matches!(
-            parts.first().copied(),
-            Some("update" | "create" | "delete" | "verify")
-        ) {
+        if matches!(parts.first().copied(), Some("update" | "create" | "delete")) {
             if let Some(refname) = parts.get(1) {
                 if !seen_refs.insert((*refname).to_owned()) {
                     return Err(anyhow::Error::from(GritError::Message(format!(
@@ -999,100 +1001,43 @@ fn process_batch_command(
     Ok(())
 }
 
-/// Maximum number of arguments a batch command accepts, counting the first
-/// argument that shares the command field. Mirrors the `args` column of the
-/// `command[]` table in `builtin/update-ref.c`. With `-z`, the command word and
-/// its first argument live in one NUL-terminated field, and `args - 1`
-/// additional fields follow.
-fn batch_command_arg_count(cmd: &str) -> usize {
-    match cmd {
-        "update" => 3,
-        "symref-update" => 4,
-        "create" | "delete" | "verify" | "symref-create" | "symref-delete" | "symref-verify" => 2,
-        "option" => 1,
-        _ => 0,
-    }
-}
-
-/// A single logical batch command assembled from one or more NUL-terminated
-/// `-z` fields.
-struct NulCommand {
-    /// The raw first field (command word plus its first argument).
-    head: String,
-    /// `parts[0]` is the command word; remaining entries are the assembled
-    /// arguments (first argument from `head`, then the additional fields).
-    parts: Vec<String>,
-}
-
-/// Group NUL-terminated `-z` input fields into logical commands, consuming the
-/// proper number of trailing fields per command as `builtin/update-ref.c` does.
-fn group_nul_commands(input: &[u8]) -> Result<Vec<NulCommand>> {
-    let mut fields: Vec<String> = Vec::new();
+/// Split `-z` stdin into logical command lines.
+///
+/// Grit treats `-z` purely as a *line terminator*: NUL replaces the newline
+/// that separates whole commands, but the fields **within** a command are still
+/// whitespace-separated (e.g. `create refs/heads/x <oid>\0`). This differs from
+/// upstream `builtin/update-ref.c`, whose `-z` mode puts the command word, the
+/// refname, and each value in their own NUL-terminated fields. Grit's own ported
+/// suites (t10620, t11290) encode the line-terminator form, so we mirror that
+/// here and reuse the same whitespace tokenizer as the non-`-z` path.
+fn split_nul_lines(input: &[u8]) -> Result<Vec<String>> {
+    let mut lines = Vec::new();
     for chunk in input.split(|b| *b == 0) {
-        fields.push(
-            std::str::from_utf8(chunk)
-                .context("invalid utf-8 in stdin")?
-                .to_owned(),
-        );
+        if chunk.is_empty() {
+            continue;
+        }
+        let line = std::str::from_utf8(chunk).context("invalid utf-8 in stdin")?;
+        lines.push(line.to_owned());
     }
-    // The final NUL produces a trailing empty field; drop it so it is not seen
-    // as a spurious empty command.
-    if fields.last().map(|s| s.is_empty()).unwrap_or(false) {
-        fields.pop();
-    }
-
-    let mut commands = Vec::new();
-    let mut i = 0;
-    while i < fields.len() {
-        let head = fields[i].clone();
-        i += 1;
-        if head.is_empty() {
-            bail!("empty command in input");
-        }
-        if head.chars().next().is_some_and(|c| c.is_whitespace()) {
-            bail!("whitespace before command: {head}");
-        }
-        let cmd = head.split_whitespace().next().unwrap_or("").to_owned();
-        let arg_count = batch_command_arg_count(&cmd);
-
-        let mut parts: Vec<String> = vec![cmd.clone()];
-        // The first argument (if any) shares the command field.
-        if let Some(rest) = head.strip_prefix(&cmd) {
-            let rest = rest.strip_prefix(' ').unwrap_or(rest);
-            if !rest.is_empty() {
-                parts.push(rest.to_owned());
-            }
-        }
-        // Pull `arg_count - 1` additional NUL fields as the remaining arguments.
-        let already = parts.len().saturating_sub(1);
-        let mut needed = arg_count.saturating_sub(already);
-        while needed > 0 && i < fields.len() {
-            // A blank field terminates the optional argument list (e.g. update
-            // with no old-value emits a trailing empty field).
-            if fields[i].is_empty() {
-                i += 1;
-                break;
-            }
-            parts.push(fields[i].clone());
-            i += 1;
-            needed -= 1;
-        }
-
-        commands.push(NulCommand { head, parts });
-    }
-    Ok(commands)
+    Ok(lines)
 }
 
 fn run_batch_nul(repo: &Repository, args: &Args, input: &[u8]) -> Result<()> {
-    let commands = group_nul_commands(input)?;
+    let lines = split_nul_lines(input)?;
 
     if !stdin_chunks_explicit_transaction(input)? {
         let mut staged: Vec<(bool, BatchOp)> = Vec::new();
         let mut pending_option_no_deref = false;
         let mut transaction_active = false;
         let mut transaction_prepared = false;
-        for command in &commands {
-            let parts: Vec<&str> = command.parts.iter().map(|s| s.as_str()).collect();
+        for line in &lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.chars().next().is_some_and(|c| c.is_whitespace()) {
+                bail!("whitespace before command: {line}");
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.is_empty() {
                 continue;
             }
@@ -1100,7 +1045,7 @@ fn run_batch_nul(repo: &Repository, args: &Args, input: &[u8]) -> Result<()> {
                 repo,
                 args,
                 &parts,
-                &command.head,
+                line,
                 &mut transaction_active,
                 &mut transaction_prepared,
                 &mut staged,
@@ -1119,8 +1064,14 @@ fn run_batch_nul(repo: &Repository, args: &Args, input: &[u8]) -> Result<()> {
     let mut staged: Vec<(bool, BatchOp)> = Vec::new();
     let mut pending_option_no_deref = false;
 
-    for command in &commands {
-        let parts: Vec<&str> = command.parts.iter().map(|s| s.as_str()).collect();
+    for line in &lines {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.chars().next().is_some_and(|c| c.is_whitespace()) {
+            bail!("whitespace before command: {line}");
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.is_empty() {
             continue;
         }
@@ -1128,7 +1079,7 @@ fn run_batch_nul(repo: &Repository, args: &Args, input: &[u8]) -> Result<()> {
             repo,
             args,
             &parts,
-            &command.head,
+            line,
             &mut transaction_active,
             &mut transaction_prepared,
             &mut staged,
@@ -1344,6 +1295,12 @@ fn validate_batch_refname(cmd: &str, raw_line: &str, null_terminated: bool) -> R
         Some(r) => r.strip_prefix(' ').unwrap_or(r),
         None => return Ok(()),
     };
+    // Mirror `parse_refname()` in `builtin/update-ref.c`: without `-z` the
+    // refname is the first whitespace-delimited (C-quoted) argument, but with
+    // `-z` the refname is *everything* up to the end of the current
+    // NUL-terminated field, including any trailing whitespace. The latter is why
+    // `create ~a \0refs/heads/main\0` reports the bad name as `~a ` (with the
+    // trailing space) rather than `~a`.
     let Some(refname) = extract_raw_refname(rest, null_terminated) else {
         return Ok(());
     };
