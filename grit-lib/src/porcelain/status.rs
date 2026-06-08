@@ -674,3 +674,225 @@ fn directory_pathspec_matches_self(rel_dir: &str, pathspecs: &[String]) -> bool 
     pathspecs.is_empty()
         || status_path_matches(&format!("{}/", rel_dir.trim_end_matches('/')), pathspecs)
 }
+
+// --- The status operation ---------------------------------------------------
+
+use crate::progress::ProgressSink;
+
+/// Compute the status of `repo`'s work tree as a [`StatusModel`].
+///
+/// This is the clean library computation: load and sparse-expand the index,
+/// resolve HEAD and the in-progress operation [`state`](crate::state), compute
+/// the staged (index-vs-HEAD) and unstaged (index-vs-worktree) diffs with
+/// optional rename detection, walk the work tree for untracked/ignored paths,
+/// and count stash entries.
+///
+/// The `grit` CLI's performance and diagnostic layers — the fsmonitor query, the
+/// untracked cache, and trace2 emission — are intentionally *not* part of this;
+/// they wrap the call in the binary. A library consumer that just wants the
+/// status of a repository calls this directly.
+pub fn status(
+    repo: &Repository,
+    opts: &StatusOptions,
+    progress: &mut dyn ProgressSink,
+) -> Result<StatusModel> {
+    let work_tree = repo
+        .work_tree
+        .as_deref()
+        .ok_or_else(|| crate::error::Error::Message("this operation must be run in a work tree".into()))?;
+
+    let head = crate::state::resolve_head(&repo.git_dir)?;
+    let state = crate::state::wt_status_get_state(&repo.git_dir, &head, true)?;
+
+    // Load the index, remembering whether it was sparse on disk, then expand
+    // sparse-directory placeholders so the diffs see real entries.
+    let index_path = repo.index_path();
+    let mut index = match Index::load(&index_path) {
+        Ok(i) => i,
+        Err(crate::error::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
+        Err(e) => return Err(e),
+    };
+    let sparse_directory_prefixes: Vec<Vec<u8>> = index
+        .entries
+        .iter()
+        .filter(|e| e.is_sparse_directory_placeholder())
+        .map(|e| e.path.clone())
+        .collect();
+    let index_sparse_on_disk =
+        index.sparse_directories || index.has_sparse_directory_placeholders();
+    let _ = index.expand_sparse_directory_placeholders(&repo.odb);
+
+    let head_tree = match head.oid() {
+        Some(oid) => {
+            let obj = repo.odb.read(oid)?;
+            Some(crate::objects::parse_commit(&obj.data)?.tree)
+        }
+        None => None,
+    };
+
+    progress.start("status", None);
+
+    // Staged: index vs HEAD tree, narrowed to pathspecs before rename detection.
+    let mut staged: Vec<DiffEntry> =
+        crate::diff::diff_index_to_tree(&repo.odb, &index, head_tree.as_ref(), false)?
+            .into_iter()
+            .filter(|e| status_path_matches(e.path(), &opts.pathspecs))
+            .collect();
+
+    // Unstaged: worktree vs index, narrowed before rename detection.
+    let mut unstaged: Vec<DiffEntry> = crate::diff::diff_index_to_worktree_with_options(
+        &repo.odb,
+        &index,
+        work_tree,
+        crate::diff::DiffIndexToWorktreeOptions {
+            ignore_submodule_untracked: opts.untracked == UntrackedMode::No,
+            ..Default::default()
+        },
+    )?
+    .into_iter()
+    .filter(|e| status_path_matches(e.path(), &opts.pathspecs))
+    .collect();
+
+    if let Some(rd) = opts.renames {
+        staged = apply_status_renames(&repo.odb, staged, rd, head_tree.as_ref())?;
+        unstaged = apply_status_renames(&repo.odb, unstaged, rd, head_tree.as_ref())?;
+    }
+
+    let (untracked, ignored) = if opts.untracked == UntrackedMode::No {
+        (Vec::new(), Vec::new())
+    } else {
+        collect_untracked_and_ignored(
+            repo,
+            &index,
+            work_tree,
+            opts.ignored,
+            opts.untracked == UntrackedMode::All,
+            &opts.pathspecs,
+        )?
+    };
+
+    let stash_count = crate::reflog::read_reflog(&repo.git_dir, "refs/stash")
+        .map(|e| e.len())
+        .unwrap_or(0);
+
+    progress.finish();
+
+    Ok(StatusModel {
+        head,
+        head_tree,
+        state,
+        index,
+        staged,
+        unstaged,
+        untracked,
+        ignored,
+        stash_count,
+        index_sparse_on_disk,
+        sparse_directory_prefixes,
+    })
+}
+
+/// Apply status rename (and optionally copy) detection, mirroring git's
+/// candidate-count guards so a huge add/delete set is left undetected.
+fn apply_status_renames(
+    odb: &crate::odb::Odb,
+    entries: Vec<DiffEntry>,
+    rd: RenameDetection,
+    head_tree: Option<&ObjectId>,
+) -> Result<Vec<DiffEntry>> {
+    use crate::diff::DiffStatus;
+    const MATRIX_BUDGET: usize = 50_000;
+    const CANDIDATE_LIMIT: usize = 2_000;
+
+    let mut deleted = 0usize;
+    let mut added = 0usize;
+    for entry in &entries {
+        match entry.status {
+            DiffStatus::Deleted => deleted += 1,
+            DiffStatus::Added => added += 1,
+            _ => {}
+        }
+    }
+    if deleted == 0 || added == 0 {
+        return Ok(entries);
+    }
+    if deleted.saturating_add(added) > CANDIDATE_LIMIT
+        || deleted.saturating_mul(added) > MATRIX_BUDGET
+    {
+        return Ok(entries);
+    }
+    if rd.copies {
+        return crate::diff::status_apply_rename_copy_detection(
+            odb,
+            entries,
+            rd.threshold,
+            true,
+            head_tree,
+        );
+    }
+    Ok(crate::diff::detect_renames(odb, None, entries, rd.threshold))
+}
+
+#[cfg(test)]
+mod status_op_tests {
+    use super::*;
+    use crate::progress::NullProgress;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn init_min_repo(root: &std::path::Path) {
+        let git = root.join(".git");
+        fs::create_dir_all(git.join("objects")).unwrap();
+        fs::create_dir_all(git.join("refs/heads")).unwrap();
+        fs::write(git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(
+            git.join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tbare = false\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn status_detects_untracked_file_on_unborn_branch() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_min_repo(root);
+        fs::write(root.join("foo.txt"), b"hello\n").unwrap();
+
+        let repo = Repository::open(&root.join(".git"), Some(root)).unwrap();
+        let model = status(&repo, &StatusOptions::default(), &mut NullProgress).unwrap();
+
+        assert!(model.head_tree.is_none(), "unborn HEAD has no tree");
+        assert!(model.staged.is_empty(), "nothing staged: {:?}", model.staged);
+        assert!(
+            model.unstaged.is_empty(),
+            "nothing unstaged: {:?}",
+            model.unstaged
+        );
+        assert!(
+            model.untracked.iter().any(|p| p == "foo.txt"),
+            "foo.txt should be untracked, got {:?}",
+            model.untracked
+        );
+    }
+
+    #[test]
+    fn status_untracked_mode_no_skips_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        init_min_repo(root);
+        fs::write(root.join("foo.txt"), b"hi\n").unwrap();
+
+        let repo = Repository::open(&root.join(".git"), Some(root)).unwrap();
+        let opts = StatusOptions {
+            untracked: UntrackedMode::No,
+            ..StatusOptions::default()
+        };
+        let model = status(&repo, &opts, &mut NullProgress).unwrap();
+        assert!(
+            model.untracked.is_empty(),
+            "untracked=No must report nothing, got {:?}",
+            model.untracked
+        );
+    }
+}
