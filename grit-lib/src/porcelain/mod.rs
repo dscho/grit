@@ -23,6 +23,7 @@
 
 pub mod checkout;
 pub mod cherry_pick;
+pub mod format_patch;
 pub mod log;
 pub mod merge;
 pub mod rebase;

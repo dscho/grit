@@ -696,10 +696,9 @@ pub fn status(
     opts: &StatusOptions,
     progress: &mut dyn ProgressSink,
 ) -> Result<StatusModel> {
-    let work_tree = repo
-        .work_tree
-        .as_deref()
-        .ok_or_else(|| crate::error::Error::Message("this operation must be run in a work tree".into()))?;
+    let work_tree = repo.work_tree.as_deref().ok_or_else(|| {
+        crate::error::Error::Message("this operation must be run in a work tree".into())
+    })?;
 
     let head = crate::state::resolve_head(&repo.git_dir)?;
     let state = crate::state::wt_status_get_state(&repo.git_dir, &head, true)?;
@@ -830,7 +829,12 @@ fn apply_status_renames(
             head_tree,
         );
     }
-    Ok(crate::diff::detect_renames(odb, None, entries, rd.threshold))
+    Ok(crate::diff::detect_renames(
+        odb,
+        None,
+        entries,
+        rd.threshold,
+    ))
 }
 
 #[cfg(test)]
@@ -863,7 +867,11 @@ mod status_op_tests {
         let model = status(&repo, &StatusOptions::default(), &mut NullProgress).unwrap();
 
         assert!(model.head_tree.is_none(), "unborn HEAD has no tree");
-        assert!(model.staged.is_empty(), "nothing staged: {:?}", model.staged);
+        assert!(
+            model.staged.is_empty(),
+            "nothing staged: {:?}",
+            model.staged
+        );
         assert!(
             model.unstaged.is_empty(),
             "nothing unstaged: {:?}",

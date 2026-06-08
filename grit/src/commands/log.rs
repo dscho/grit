@@ -11480,7 +11480,7 @@ fn apply_format_string(
                     chars.next();
                     // Sanitized subject line, suitable for a filename.
                     let subj = grit_lib::commit_pretty::message_subject(&info.message);
-                    result.push_str(&crate::commands::format_patch::sanitize_subject(&subj));
+                    result.push_str(&grit_lib::porcelain::format_patch::sanitize_subject(&subj));
                 }
                 Some('b') => {
                     chars.next();
