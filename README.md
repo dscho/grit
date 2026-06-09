@@ -22,6 +22,10 @@ $ curl -fsSL https://grit-scm.com/install | sh
 
 There are builds for Mac and Linux, (aarch64 and x86_64 for both). Windows is on the list, but there's some work to do there.
 
+## Updating
+
+To update your version of Grit CLI, you can run `grit update` and it will re-run the install script.
+
 ## Rust Crates
 
 | Crate                                           | Description                                                                                     |
