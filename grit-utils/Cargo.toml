@@ -1,0 +1,20 @@
+[package]
+name = "grit-utils"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+description = "Benchmarking and utility tools for grit"
+repository = "https://github.com/schacon/grit"
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "grit-bench"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
