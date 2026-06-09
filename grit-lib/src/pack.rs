@@ -66,7 +66,7 @@ impl PackIndex {
         }
         let slice = &self.entries[lo..hi];
         slice
-            .binary_search_by(|e| e.oid.as_slice().cmp(needle.as_slice()))
+            .binary_search_by(|e| e.oid.as_slice().cmp(needle))
             .ok()
             .map(|idx| slice[idx].offset)
     }
@@ -865,7 +865,7 @@ pub fn oid_bytes_to_hex(oid: &[u8]) -> String {
 /// True when `entry` stores a SHA-1 OID matching `oid` (SHA-256 pack entries are ignored).
 #[must_use]
 pub fn pack_index_entry_matches_sha1_oid(entry: &PackIndexEntry, oid: &ObjectId) -> bool {
-    entry.oid.len() == 20 && entry.oid.as_slice() == oid.as_bytes().as_slice()
+    entry.oid.len() == 20 && entry.oid.as_slice() == oid.as_bytes()
 }
 
 /// Hash canonical loose object bytes (`kind SP size NUL data`) with the repo hash width.
@@ -1579,7 +1579,7 @@ pub fn packed_ref_delta_reuse_slice(
         let Some(entry) = idx
             .entries
             .iter()
-            .find(|e| e.oid.len() == 20 && e.oid.as_slice() == oid.as_bytes().as_slice())
+            .find(|e| e.oid.len() == 20 && e.oid.as_slice() == oid.as_bytes())
         else {
             continue;
         };
@@ -1672,7 +1672,7 @@ pub fn packed_delta_base_oid(objects_dir: &Path, oid: &ObjectId) -> Result<Optio
         let Some(entry) = idx
             .entries
             .iter()
-            .find(|e| e.oid.len() == 20 && e.oid.as_slice() == oid.as_bytes().as_slice())
+            .find(|e| e.oid.len() == 20 && e.oid.as_slice() == oid.as_bytes())
         else {
             continue;
         };

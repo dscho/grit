@@ -536,7 +536,7 @@ pub fn run(args: Args) -> Result<()> {
     let rev_path = rev_path_for_index(&idx_path);
     if write_rev {
         let mut sorted_entries: Vec<&ResolvedObject> = resolved.iter().collect();
-        sorted_entries.sort_by_key(|e| *e.oid.as_bytes());
+        sorted_entries.sort_by_key(|e| e.oid);
         let idx_order_offsets: Vec<u64> = sorted_entries.iter().map(|e| e.offset).collect();
         let pack_hash_bytes = infer_pack_trailer_bytes(&pack_bytes)?;
         let rev_bytes = build_pack_rev_bytes_from_index_order_offsets_and_checksum(
@@ -1254,7 +1254,7 @@ fn build_idx(
 
 fn build_idx_v1(entries: &[ResolvedObject], pack_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut sorted: Vec<&ResolvedObject> = entries.iter().collect();
-    sorted.sort_by_key(|e| *e.oid.as_bytes());
+    sorted.sort_by_key(|e| e.oid);
 
     let mut buf = Vec::new();
     let mut fanout = [0u32; 256];
@@ -1289,7 +1289,7 @@ fn build_idx_v2(
 ) -> Result<Vec<u8>> {
     // Sort by OID.
     let mut sorted: Vec<&ResolvedObject> = entries.iter().collect();
-    sorted.sort_by_key(|e| *e.oid.as_bytes());
+    sorted.sort_by_key(|e| e.oid);
 
     let mut buf: Vec<u8> = Vec::new();
 

@@ -66,7 +66,7 @@ pub fn read_ref_file(path: &Path) -> Result<Ref> {
 pub(crate) fn parse_ref_content(content: &str) -> Result<Ref> {
     if let Some(target) = content.strip_prefix("ref: ") {
         Ok(Ref::Symbolic(target.trim().to_owned()))
-    } else if content.len() == 40 && content.chars().all(|c| c.is_ascii_hexdigit()) {
+    } else if ObjectId::is_full_hex(content) {
         let oid: ObjectId = content.parse()?;
         Ok(Ref::Direct(oid))
     } else if content == "unknown-oid" {
@@ -606,7 +606,7 @@ fn lookup_packed_ref(git_dir: &Path, refname: &str) -> Result<Option<ObjectId>> 
         let mut parts = line.splitn(2, ' ');
         let hash = parts.next().unwrap_or("");
         let name = parts.next().unwrap_or("").trim();
-        if name == refname && hash.len() == 40 {
+        if name == refname && ObjectId::is_hex_len(hash.len()) {
             let oid: ObjectId = hash.parse()?;
             return Ok(Some(oid));
         }
@@ -1480,7 +1480,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 fn loose_ref_file_direct_oid(path: &Path) -> Option<ObjectId> {
     let content = fs::read_to_string(path).ok()?;
     let content = content.trim_end_matches('\n').trim();
-    if content.len() == 40 && content.chars().all(|c| c.is_ascii_hexdigit()) {
+    if ObjectId::is_full_hex(content) {
         content.parse().ok()
     } else {
         None
@@ -1611,7 +1611,7 @@ fn collect_packed_refs_into_map(
         let mut parts = line.splitn(2, ' ');
         let hash = parts.next().unwrap_or("");
         let refname = parts.next().unwrap_or("").trim();
-        if !ref_name_matches_list_prefix(refname, prefix) || hash.len() != 40 {
+        if !ref_name_matches_list_prefix(refname, prefix) || !ObjectId::is_hex_len(hash.len()) {
             continue;
         }
         let oid: ObjectId = hash.parse()?;

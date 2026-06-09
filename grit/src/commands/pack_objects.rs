@@ -791,7 +791,7 @@ pub fn run(mut args: Args) -> Result<()> {
         };
         let mut pack_id = hash_object_bytes(obj.kind, &obj.data, pack_hash_bytes)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        if pack_hash_bytes == 20 && pack_id.as_slice() != oid.as_bytes().as_slice() {
+        if pack_hash_bytes == 20 && pack_id.as_slice() != oid.as_bytes() {
             pack_id = oid.as_bytes().to_vec();
         }
         entries.push(PackEntry {

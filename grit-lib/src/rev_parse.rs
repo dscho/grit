@@ -2160,7 +2160,7 @@ fn resolve_base(
             let Some(oid_hex) = parts.next() else {
                 continue;
             };
-            if oid_hex.len() == 40 && oid_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if ObjectId::is_full_hex(oid_hex) {
                 let oid = oid_hex
                     .parse::<ObjectId>()
                     .map_err(|_| Error::InvalidRef("invalid FETCH_HEAD object id".to_owned()))?;
@@ -3691,7 +3691,9 @@ fn collect_loose_object_ids_in_dir(objects_dir: &Path) -> Result<Vec<String>> {
             let Some(suffix) = file_name.to_str() else {
                 continue;
             };
-            if suffix.len() == 38 && suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            if ObjectId::is_loose_suffix_len(suffix.len())
+                && suffix.chars().all(|ch| ch.is_ascii_hexdigit())
+            {
                 ids.push(format!("{prefix}{suffix}"));
             }
         }
