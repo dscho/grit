@@ -27,9 +27,12 @@
 //! are supported. Conditions: `gitdir:`, `gitdir/i:`, `onbranch:`,
 //! and `hasconfig:remote.*.url:`.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::error::{Error, Result};
 use crate::refs;
@@ -1457,6 +1460,7 @@ fatal: bad config variable 'fetch.negotiationalgorithm' in file '{file_disp}' at
             };
             fs::write(&self.path, content)?;
         }
+        evict_config_cache_for_path(&self.path);
         Ok(())
     }
 
@@ -1821,7 +1825,44 @@ impl ConfigSet {
     /// Load the standard configuration cascade with explicit include and scope control.
     ///
     /// See [`LoadConfigOptions`] for `GIT_CONFIG_PARAMETERS` / `-c` include behaviour.
+    ///
+    /// Results are memoized for the process lifetime and revalidated against
+    /// the cascade files' stat stamps on every call (see the cache notes near
+    /// [`ConfigCacheKey`]).
     pub fn load_with_options(git_dir: Option<&Path>, opts: &LoadConfigOptions) -> Result<Self> {
+        let Some(env_fp) = config_env_fingerprint() else {
+            return Self::load_with_options_uncached(git_dir, opts, &mut Vec::new());
+        };
+        let key = ConfigCacheKey::new(git_dir, opts);
+        let base_stamps = config_file_stamps(git_dir, opts);
+        if let Some(cached) = config_cache_lookup(&key, &env_fp, &base_stamps) {
+            return Ok(cached);
+        }
+        let mut included_files = Vec::new();
+        let set = Self::load_with_options_uncached(git_dir, opts, &mut included_files)?;
+        included_files.sort_unstable();
+        included_files.dedup();
+        let extra_stamps = stamp_paths(included_files);
+        let mut cache = config_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.insert(
+            key,
+            ConfigCacheEntry {
+                env_fingerprint: env_fp,
+                base_stamps,
+                extra_stamps,
+                set: Arc::new(set.clone()),
+            },
+        );
+        Ok(set)
+    }
+
+    fn load_with_options_uncached(
+        git_dir: Option<&Path>,
+        opts: &LoadConfigOptions,
+        included_files: &mut Vec<PathBuf>,
+    ) -> Result<Self> {
         let mut set = Self::new();
         let proc = opts.process_includes;
         let ctx = opts.include_ctx.clone();
@@ -1832,7 +1873,7 @@ impl ConfigSet {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|_| std::path::PathBuf::from("/etc/gitconfig"));
             match ConfigFile::from_path(&system_path, ConfigScope::System) {
-                Ok(Some(f)) => Self::merge_with_includes(&mut set, &f, proc, 0, &ctx)?,
+                Ok(Some(f)) => Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?,
                 Ok(None) => {}
                 Err(e) => return Err(e),
             }
@@ -1841,7 +1882,7 @@ impl ConfigSet {
         // Global config (Git merges every existing file: XDG then ~/.gitconfig).
         for path in global_config_paths() {
             match ConfigFile::from_path(&path, ConfigScope::Global) {
-                Ok(Some(f)) => Self::merge_with_includes(&mut set, &f, proc, 0, &ctx)?,
+                Ok(Some(f)) => Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?,
                 Ok(None) => {}
                 Err(e) => return Err(e),
             }
@@ -1852,7 +1893,7 @@ impl ConfigSet {
             let common_dir = crate::repo::common_git_dir_for_config(gd);
             let local_path = common_dir.join("config");
             match ConfigFile::from_path(&local_path, ConfigScope::Local) {
-                Ok(Some(f)) => Self::merge_with_includes(&mut set, &f, proc, 0, &ctx)?,
+                Ok(Some(f)) => Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?,
                 Ok(None) => {}
                 Err(e) => return Err(e),
             }
@@ -1862,7 +1903,7 @@ impl ConfigSet {
             let wt_path = gd.join("config.worktree");
             if crate::repo::worktree_config_enabled(&common_dir) {
                 match ConfigFile::from_path(&wt_path, ConfigScope::Worktree) {
-                    Ok(Some(f)) => Self::merge_with_includes(&mut set, &f, proc, 0, &ctx)?,
+                    Ok(Some(f)) => Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?,
                     Ok(None) => {}
                     Err(e) => return Err(e),
                 }
@@ -1874,7 +1915,7 @@ impl ConfigSet {
             match ConfigFile::from_path(Path::new(&path), ConfigScope::Command) {
                 Ok(Some(f)) => {
                     if proc {
-                        Self::merge_with_includes(&mut set, &f, proc, 0, &ctx)?;
+                        Self::merge_with_includes_collect(&mut set, &f, proc, 0, &ctx, included_files)?;
                     } else {
                         set.merge(&f);
                     }
@@ -1891,7 +1932,7 @@ impl ConfigSet {
             if proc && opts.command_includes && !params.trim().is_empty() {
                 let pseudo = Path::new(":GIT_CONFIG_PARAMETERS");
                 let cmd_file = ConfigFile::from_git_config_parameters(pseudo, &params)?;
-                Self::merge_with_includes(&mut set, &cmd_file, proc, 0, &ctx)?;
+                Self::merge_with_includes_collect(&mut set, &cmd_file, proc, 0, &ctx, included_files)?;
             } else if !params.trim().is_empty() {
                 for entry in parse_config_parameters(&params) {
                     if let Some((key, val)) =
@@ -2078,6 +2119,28 @@ impl ConfigSet {
         depth: usize,
         ctx: &IncludeContext,
     ) -> Result<()> {
+        let mut included_files = Vec::new();
+        Self::merge_with_includes_collect(
+            set,
+            file,
+            process_includes,
+            depth,
+            ctx,
+            &mut included_files,
+        )
+    }
+
+    /// [`Self::merge_with_includes`], additionally recording every resolved
+    /// include target path in `included_files` (whether or not the target
+    /// exists) so the cascade cache can stamp them.
+    fn merge_with_includes_collect(
+        set: &mut Self,
+        file: &ConfigFile,
+        process_includes: bool,
+        depth: usize,
+        ctx: &IncludeContext,
+        included_files: &mut Vec<PathBuf>,
+    ) -> Result<()> {
         // Mirror Git behavior and stop runaway include recursion.
         // t0017 expects the diagnostic to contain this exact phrase.
         const MAX_INCLUDE_DEPTH: usize = 10;
@@ -2110,6 +2173,7 @@ impl ConfigSet {
                 Err(Error::ConfigError(msg)) if msg.is_empty() => continue,
                 Err(e) => return Err(e),
             };
+            included_files.push(resolved.clone());
             // Git's `git_config_from_file` surfaces parse errors in an included file as a
             // fatal error (t0001 #102 `re-init reads matching includeIf.onbranch`). A missing
             // include target is silently skipped (`from_path` -> `Ok(None)`).
@@ -2125,7 +2189,14 @@ impl ConfigSet {
                 }
             }
 
-            Self::merge_with_includes(set, &inc_file, process_includes, depth + 1, ctx)?;
+            Self::merge_with_includes_collect(
+                set,
+                &inc_file,
+                process_includes,
+                depth + 1,
+                ctx,
+                included_files,
+            )?;
         }
 
         Ok(())
@@ -2142,6 +2213,195 @@ fn include_directive_for_entry(entry: &ConfigEntry) -> Option<(String, Option<St
         return Some((val.clone(), Some(mid.to_owned())));
     }
     None
+}
+
+// ── Process-lifetime config cascade cache ───────────────────────────
+//
+// `ConfigSet::load` / `load_with_options` are called per file in hot loops
+// (grep/diff/add re-load the cascade for every path), so the parsed cascade
+// is memoized for the lifetime of the process. A cached entry is served only
+// when every input that fed it is provably unchanged:
+//
+// - the stat stamps (mtime + size, or "absent") of every base cascade file,
+//   recorded *before* the parse, still match. `HEAD` is stamped too so that
+//   `includeIf.onbranch:` condition flips invalidate;
+// - every include target the parse resolved (even ones that were missing)
+//   still carries the stamp it had at parse time;
+// - the config-relevant environment is byte-identical.
+//
+// The remaining `includeIf` condition inputs are covered transitively:
+// `gitdir:` depends only on the cache key and environment, and
+// `hasconfig:remote.*.url:` depends only on the (stamped) file contents.
+//
+// In-process writers ([`ConfigFile::write`]) additionally evict every entry
+// whose cascade contains the written path, closing the window where a
+// rewrite lands within one mtime tick at an unchanged size. External writers
+// in that same window are not detectable by stat; C git parses the cascade
+// once per process with no revalidation at all, so serving a stamped copy is
+// strictly more conservative than upstream.
+
+/// Stat snapshot of one cascade file (`None` = file absent).
+type ConfigFileStamp = (PathBuf, Option<(SystemTime, u64)>);
+
+#[derive(PartialEq, Eq, Hash)]
+struct ConfigCacheKey {
+    git_dir: Option<PathBuf>,
+    include_system: bool,
+    process_includes: bool,
+    command_includes: bool,
+    ctx_git_dir: Option<PathBuf>,
+    ctx_relative_include_is_error: bool,
+}
+
+impl ConfigCacheKey {
+    fn new(git_dir: Option<&Path>, opts: &LoadConfigOptions) -> Self {
+        Self {
+            git_dir: git_dir.map(Path::to_path_buf),
+            include_system: opts.include_system,
+            process_includes: opts.process_includes,
+            command_includes: opts.command_includes,
+            ctx_git_dir: opts.include_ctx.git_dir.clone(),
+            ctx_relative_include_is_error: opts.include_ctx.command_line_relative_include_is_error,
+        }
+    }
+}
+
+struct ConfigCacheEntry {
+    env_fingerprint: Vec<(String, Option<String>)>,
+    /// Stamps of the fixed cascade files (recomputable from key + env).
+    base_stamps: Vec<ConfigFileStamp>,
+    /// Stamps of the include targets this parse resolved (revalidated by
+    /// re-statting each stored path).
+    extra_stamps: Vec<ConfigFileStamp>,
+    set: Arc<ConfigSet>,
+}
+
+fn config_cache() -> &'static Mutex<HashMap<ConfigCacheKey, ConfigCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<ConfigCacheKey, ConfigCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Environment that feeds the cascade (file paths and synthetic entries).
+/// `None` means "do not cache this load".
+fn config_env_fingerprint() -> Option<Vec<(String, Option<String>)>> {
+    const VARS: [&str; 8] = [
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "XDG_CONFIG_HOME",
+        "HOME",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ];
+    let mut fp: Vec<(String, Option<String>)> = VARS
+        .iter()
+        .map(|name| ((*name).to_owned(), std::env::var(name).ok()))
+        .collect();
+    if let Ok(count_str) = std::env::var("GIT_CONFIG_COUNT") {
+        // Mirror `add_environment_config_pairs`; absurd counts are not worth caching.
+        const MAX_TRACKED: usize = 256;
+        match count_str.parse::<usize>() {
+            Ok(n) if n <= MAX_TRACKED => {
+                for i in 0..n {
+                    for var in [format!("GIT_CONFIG_KEY_{i}"), format!("GIT_CONFIG_VALUE_{i}")] {
+                        let val = std::env::var(&var).ok();
+                        fp.push((var, val));
+                    }
+                }
+            }
+            Ok(_) => return None,
+            Err(_) => {}
+        }
+    }
+    Some(fp)
+}
+
+/// The on-disk files [`ConfigSet::load_with_options_uncached`] would consult,
+/// in cascade order.
+fn config_cascade_file_paths(git_dir: Option<&Path>, opts: &LoadConfigOptions) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if opts.include_system && !git_config_nosystem_enabled() {
+        paths.push(
+            std::env::var("GIT_CONFIG_SYSTEM")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/etc/gitconfig")),
+        );
+    }
+    paths.extend(global_config_paths());
+    if let Some(gd) = git_dir {
+        let common_dir = crate::repo::common_git_dir_for_config(gd);
+        paths.push(common_dir.join("config"));
+        // Stamped unconditionally: whether it is merged depends on
+        // `extensions.worktreeConfig` in the (stamped) common config.
+        paths.push(gd.join("config.worktree"));
+        // `includeIf.onbranch:` conditions read HEAD; stamping it means a
+        // branch switch invalidates cascades that could depend on it.
+        paths.push(gd.join("HEAD"));
+    }
+    if let Some(cgd) = &opts.include_ctx.git_dir {
+        if Some(cgd.as_path()) != git_dir {
+            paths.push(cgd.join("HEAD"));
+        }
+    }
+    if let Ok(p) = std::env::var("GIT_CONFIG") {
+        paths.push(PathBuf::from(p));
+    }
+    paths
+}
+
+fn stamp_for_path(path: &Path) -> Option<(SystemTime, u64)> {
+    fs::metadata(path)
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())))
+}
+
+fn stamp_paths(paths: Vec<PathBuf>) -> Vec<ConfigFileStamp> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let stamp = stamp_for_path(&path);
+            (path, stamp)
+        })
+        .collect()
+}
+
+fn config_file_stamps(git_dir: Option<&Path>, opts: &LoadConfigOptions) -> Vec<ConfigFileStamp> {
+    stamp_paths(config_cascade_file_paths(git_dir, opts))
+}
+
+fn config_cache_lookup(
+    key: &ConfigCacheKey,
+    env_fp: &[(String, Option<String>)],
+    base_stamps: &[ConfigFileStamp],
+) -> Option<ConfigSet> {
+    let cache = config_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = cache.get(key)?;
+    if entry.env_fingerprint.as_slice() != env_fp || entry.base_stamps.as_slice() != base_stamps {
+        return None;
+    }
+    for (path, stamp) in &entry.extra_stamps {
+        if stamp_for_path(path) != *stamp {
+            return None;
+        }
+    }
+    Some((*entry.set).clone())
+}
+
+/// Drop every cached cascade that read `path` (called on in-process writes).
+fn evict_config_cache_for_path(path: &Path) {
+    let mut cache = config_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.retain(|_, entry| {
+        !entry
+            .base_stamps
+            .iter()
+            .chain(&entry.extra_stamps)
+            .any(|(p, _)| p == path)
+    });
 }
 
 fn git_config_nosystem_enabled() -> bool {
@@ -3646,5 +3906,131 @@ mod pack_compression_tests {
             "[core]\n\tloosecompression = 1\n\tcompression = 0\n[pack]\n\tcompression = 9\n",
         );
         assert_eq!(set.pack_objects_zlib_level().unwrap(), 9);
+    }
+}
+
+#[cfg(test)]
+mod config_cache_tests {
+    use super::*;
+    use filetime::FileTime;
+
+    fn local_opts(git_dir: &Path) -> LoadConfigOptions {
+        let mut opts = LoadConfigOptions::default();
+        opts.include_system = false;
+        opts.include_ctx.git_dir = Some(git_dir.to_path_buf());
+        opts
+    }
+
+    fn load_value(git_dir: &Path) -> Option<String> {
+        let opts = local_opts(git_dir);
+        let set = ConfigSet::load_with_options(Some(git_dir), &opts).expect("load cascade");
+        set.get("gritcachetest.value")
+    }
+
+    fn mtime_of(path: &Path) -> FileTime {
+        FileTime::from_last_modification_time(&fs::metadata(path).expect("stat config"))
+    }
+
+    fn restore_mtime(path: &Path, stamp: FileTime) {
+        filetime::set_file_mtime(path, stamp).expect("restore mtime");
+    }
+
+    #[test]
+    fn cache_serves_same_stamp_and_config_write_evicts() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let gd = td.path();
+        let cfg = gd.join("config");
+        fs::write(&cfg, "[gritcachetest]\n\tvalue = aaa\n").expect("write v1");
+        let t0 = mtime_of(&cfg);
+        assert_eq!(load_value(gd).as_deref(), Some("aaa"));
+
+        // Same size + restored mtime: indistinguishable by stat, so the cache
+        // serves the old parse. (This is the window `ConfigFile::write`
+        // eviction closes for in-process writers; C git would not re-read at
+        // all.) This assertion is what proves the cache is actually used.
+        fs::write(&cfg, "[gritcachetest]\n\tvalue = bbb\n").expect("write v2");
+        restore_mtime(&cfg, t0);
+        assert_eq!(load_value(gd).as_deref(), Some("aaa"));
+
+        // An in-process `ConfigFile::write` evicts even with identical stamps.
+        let mut file = ConfigFile::from_path(&cfg, ConfigScope::Local)
+            .expect("read config")
+            .expect("config exists");
+        file.set("gritcachetest.value", "ccc").expect("set value");
+        file.write().expect("persist");
+        restore_mtime(&cfg, t0);
+        assert_eq!(load_value(gd).as_deref(), Some("ccc"));
+    }
+
+    #[test]
+    fn cache_invalidates_on_size_or_existence_change() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let gd = td.path();
+        let cfg = gd.join("config");
+        // Absent local config is cached as "absent"...
+        assert_eq!(load_value(gd), None);
+        // ...and creating the file is a stamp change (None -> Some).
+        fs::write(&cfg, "[gritcachetest]\n\tvalue = first\n").expect("create");
+        assert_eq!(load_value(gd).as_deref(), Some("first"));
+        // A size change invalidates even with a restored mtime.
+        let t0 = mtime_of(&cfg);
+        fs::write(&cfg, "[gritcachetest]\n\tvalue = second-longer\n").expect("rewrite");
+        restore_mtime(&cfg, t0);
+        assert_eq!(load_value(gd).as_deref(), Some("second-longer"));
+    }
+
+    #[test]
+    fn include_targets_are_stamped_and_invalidate() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let gd = td.path();
+        fs::write(gd.join("config"), "[include]\n\tpath = extra.conf\n").expect("write parent");
+        let inc = gd.join("extra.conf");
+        fs::write(&inc, "[gritcachetest]\n\tvalue = one\n").expect("write include v1");
+        assert_eq!(load_value(gd).as_deref(), Some("one"));
+
+        // Same-size + restored-mtime rewrite of only the included file: the
+        // parse result is served from cache (proving the include target is
+        // stamped rather than re-read)...
+        let t0 = mtime_of(&inc);
+        fs::write(&inc, "[gritcachetest]\n\tvalue = two\n").expect("write include v2");
+        restore_mtime(&inc, t0);
+        assert_eq!(load_value(gd).as_deref(), Some("one"));
+
+        // ...while a stat-visible change to the included file invalidates.
+        fs::write(&inc, "[gritcachetest]\n\tvalue = two-longer\n").expect("write include v3");
+        assert_eq!(load_value(gd).as_deref(), Some("two-longer"));
+    }
+
+    #[test]
+    fn missing_include_target_is_watched() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let gd = td.path();
+        fs::write(gd.join("config"), "[include]\n\tpath = extra.conf\n").expect("write parent");
+        assert_eq!(load_value(gd), None);
+
+        // The resolved-but-missing target was stamped as absent; creating it
+        // must invalidate the cached parse.
+        fs::write(gd.join("extra.conf"), "[gritcachetest]\n\tvalue = born\n").expect("create");
+        assert_eq!(load_value(gd).as_deref(), Some("born"));
+    }
+
+    #[test]
+    fn onbranch_condition_follows_head() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let gd = td.path();
+        fs::write(gd.join("HEAD"), "ref: refs/heads/main\n").expect("write HEAD");
+        fs::write(
+            gd.join("config"),
+            "[includeIf \"onbranch:main\"]\n\tpath = branch.conf\n",
+        )
+        .expect("write config");
+        fs::write(gd.join("branch.conf"), "[gritcachetest]\n\tvalue = onmain\n")
+            .expect("write branch config");
+        assert_eq!(load_value(gd).as_deref(), Some("onmain"));
+
+        // Switching branches rewrites HEAD; the stamped HEAD must invalidate
+        // the cached cascade so the condition is re-evaluated.
+        fs::write(gd.join("HEAD"), "ref: refs/heads/dev\n").expect("rewrite HEAD");
+        assert_eq!(load_value(gd), None);
     }
 }
