@@ -140,6 +140,7 @@ fn main() -> grit_lib::error::Result<()> {
         theirs_tree,
         MergeFavor::default(),
         WhitespaceMergeOptions::default(),
+        None,
         grit_lib::merge_trees::TreeMergeConflictPresentation {
             label_ours: "HEAD",
             label_theirs: grit_lib::merge_trees::TheirsConflictLabel::Fixed("picked"),
