@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// Maximum length of a single `.gitattributes` line (bytes), matching Git (`ATTR_MAX_LINE_LENGTH`).
 /// Lines of this length or longer are ignored with a warning.
@@ -133,7 +135,7 @@ pub struct MacroTable {
 }
 
 /// Result of parsing a gitattributes file.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ParsedGitAttributes {
     pub rules: Vec<AttrRule>,
     pub macros: MacroTable,
@@ -877,8 +879,146 @@ fn walk_dirs(root: &Path, cur: &Path, dirs: &mut Vec<PathBuf>) {
     }
 }
 
+// ── Process-lifetime gitattributes cache ─────────────────────────────
+//
+// `load_gitattributes_stack` re-walks the entire working tree (`read_dir`
+// per directory) and re-parses every `.gitattributes` on each call, and hot
+// paths (grep/diff/add/checkout) call it per file. The parsed stack is
+// memoized for the process lifetime and revalidated with stat stamps on
+// every call:
+//
+// - the global attributes file, root `.gitattributes`, `info/attributes`,
+//   and every nested per-directory `.gitattributes` path are stamped
+//   (mtime + size, or "absent"), recorded *before* the parse;
+// - every walked directory (and the work-tree root) is mtime-stamped, so
+//   creating or deleting a subdirectory or a `.gitattributes` file changes
+//   a stamped mtime and forces a re-walk.
+//
+// Tree-sourced stacks (`attr.tree` / `GIT_ATTR_SOURCE`) are keyed by tree
+// OID and never revalidated: tree objects are content-addressed and
+// immutable.
+//
+// The resolved global-attributes *path* (from `core.attributesFile`) is
+// recorded at parse time and only re-statted afterwards; a mid-process
+// change to that config value is not detected. C git caches the attribute
+// stack per directory for the whole process with no revalidation at all,
+// so serving a stamped copy is strictly more conservative than upstream.
+
+type AttrFileStamp = (PathBuf, Option<(SystemTime, u64)>);
+type AttrDirStamp = (PathBuf, Option<SystemTime>);
+
+struct AttrStackCacheEntry {
+    file_stamps: Vec<AttrFileStamp>,
+    dir_stamps: Vec<AttrDirStamp>,
+    parsed: Arc<ParsedGitAttributes>,
+}
+
+fn attr_stack_cache() -> &'static Mutex<HashMap<(PathBuf, PathBuf), AttrStackCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<(PathBuf, PathBuf), AttrStackCacheEntry>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn attr_bare_cache() -> &'static Mutex<HashMap<PathBuf, AttrStackCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, AttrStackCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn attr_tree_cache() -> &'static Mutex<HashMap<ObjectId, Arc<ParsedGitAttributes>>> {
+    static CACHE: OnceLock<Mutex<HashMap<ObjectId, Arc<ParsedGitAttributes>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `symlink_metadata`-based stamp, matching `read_gitattributes_maybe_symlink`
+/// (symlinked `.gitattributes` files are skipped by the parser, but stamping
+/// the link still detects replacement by a regular file).
+fn attr_file_stamp(path: &Path) -> Option<(SystemTime, u64)> {
+    fs::symlink_metadata(path)
+        .ok()
+        .and_then(|m| Some((m.modified().ok()?, m.len())))
+}
+
+fn attr_dir_stamp(path: &Path) -> Option<SystemTime> {
+    fs::symlink_metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+fn attr_stamps_valid(entry: &AttrStackCacheEntry) -> bool {
+    entry
+        .file_stamps
+        .iter()
+        .all(|(path, stamp)| attr_file_stamp(path) == *stamp)
+        && entry
+            .dir_stamps
+            .iter()
+            .all(|(path, stamp)| attr_dir_stamp(path) == *stamp)
+}
+
+/// Stamp every input `load_gitattributes_stack_uncached` reads (walks the
+/// directory tree once, like the loader itself).
+fn collect_stack_stamps(
+    repo: &Repository,
+    work_tree: &Path,
+) -> std::result::Result<(Vec<AttrFileStamp>, Vec<AttrDirStamp>), crate::error::Error> {
+    let mut file_stamps = Vec::new();
+    let mut dir_stamps = Vec::new();
+    if let Some(g) = global_attributes_path(repo)? {
+        let stamp = attr_file_stamp(&g);
+        file_stamps.push((g, stamp));
+    }
+    let root_ga = work_tree.join(".gitattributes");
+    let stamp = attr_file_stamp(&root_ga);
+    file_stamps.push((root_ga, stamp));
+    dir_stamps.push((work_tree.to_path_buf(), attr_dir_stamp(work_tree)));
+    for rel in collect_nested_gitattributes_dirs(work_tree) {
+        let dir_abs = work_tree.join(&rel);
+        let ga = dir_abs.join(".gitattributes");
+        let stamp = attr_file_stamp(&ga);
+        file_stamps.push((ga, stamp));
+        let stamp = attr_dir_stamp(&dir_abs);
+        dir_stamps.push((dir_abs, stamp));
+    }
+    let info = repo.git_dir.join("info/attributes");
+    let stamp = attr_file_stamp(&info);
+    file_stamps.push((info, stamp));
+    Ok((file_stamps, dir_stamps))
+}
+
 /// Load the full stack of attribute rules for a normal repository (working tree).
+///
+/// Results are memoized for the process lifetime and revalidated against
+/// stat stamps on every call (see the cache notes above).
 pub fn load_gitattributes_stack(
+    repo: &Repository,
+    work_tree: &Path,
+) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
+    let key = (repo.git_dir.clone(), work_tree.to_path_buf());
+    {
+        let cache = attr_stack_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.get(&key) {
+            if attr_stamps_valid(entry) {
+                return Ok((*entry.parsed).clone());
+            }
+        }
+    }
+    let (file_stamps, dir_stamps) = collect_stack_stamps(repo, work_tree)?;
+    let parsed = load_gitattributes_stack_uncached(repo, work_tree)?;
+    let mut cache = attr_stack_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(
+        key,
+        AttrStackCacheEntry {
+            file_stamps,
+            dir_stamps,
+            parsed: Arc::new(parsed.clone()),
+        },
+    );
+    Ok(parsed)
+}
+
+fn load_gitattributes_stack_uncached(
     repo: &Repository,
     work_tree: &Path,
 ) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
@@ -961,7 +1101,46 @@ pub fn load_gitattributes_stack(
 }
 
 /// Bare repository: only `info/attributes` from disk (no in-repo `.gitattributes` file).
+///
+/// Memoized like [`load_gitattributes_stack`], keyed by `git_dir`.
 pub fn load_gitattributes_bare(
+    repo: &Repository,
+) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
+    let key = repo.git_dir.clone();
+    {
+        let cache = attr_bare_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = cache.get(&key) {
+            if attr_stamps_valid(entry) {
+                return Ok((*entry.parsed).clone());
+            }
+        }
+    }
+    let mut file_stamps = Vec::new();
+    if let Some(g) = global_attributes_path(repo)? {
+        let stamp = attr_file_stamp(&g);
+        file_stamps.push((g, stamp));
+    }
+    let info = repo.git_dir.join("info/attributes");
+    let stamp = attr_file_stamp(&info);
+    file_stamps.push((info, stamp));
+    let parsed = load_gitattributes_bare_uncached(repo)?;
+    let mut cache = attr_bare_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(
+        key,
+        AttrStackCacheEntry {
+            file_stamps,
+            dir_stamps: Vec::new(),
+            parsed: Arc::new(parsed.clone()),
+        },
+    );
+    Ok(parsed)
+}
+
+fn load_gitattributes_bare_uncached(
     repo: &Repository,
 ) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
     let mut merged = ParsedGitAttributes::default();
@@ -1014,8 +1193,21 @@ pub fn load_gitattributes_from_tree(
     odb: &Odb,
     tree_oid: &ObjectId,
 ) -> std::result::Result<ParsedGitAttributes, crate::error::Error> {
+    // Tree objects are content-addressed and immutable: no revalidation.
+    {
+        let cache = attr_tree_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(parsed) = cache.get(tree_oid) {
+            return Ok((**parsed).clone());
+        }
+    }
     let mut merged = ParsedGitAttributes::default();
     walk_tree_attrs(odb, tree_oid, "", &mut merged)?;
+    let mut cache = attr_tree_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.insert(*tree_oid, Arc::new(merged.clone()));
     Ok(merged)
 }
 
@@ -1279,5 +1471,105 @@ mod tests {
             "expected test cleared by notest macro, got {:?}",
             m.get("test")
         );
+    }
+}
+
+#[cfg(test)]
+mod attr_cache_tests {
+    use super::*;
+    use filetime::FileTime;
+
+    fn test_repo(td: &Path) -> Repository {
+        crate::repo::init_repository(td, false, "main", None, "files").expect("init repo")
+    }
+
+    fn rules_for(repo: &Repository, wt: &Path) -> Vec<String> {
+        let parsed = load_gitattributes_stack(repo, wt).expect("load stack");
+        parsed.rules.iter().map(|r| r.pattern.clone()).collect()
+    }
+
+    fn mtime_of(path: &Path) -> FileTime {
+        FileTime::from_last_modification_time(&fs::symlink_metadata(path).expect("stat"))
+    }
+
+    fn restore_mtime(path: &Path, stamp: FileTime) {
+        filetime::set_file_mtime(path, stamp).expect("restore mtime");
+    }
+
+    #[test]
+    fn stack_cache_serves_same_stamp_and_invalidates_on_change() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let wt = td.path();
+        let repo = test_repo(wt);
+        let ga = wt.join(".gitattributes");
+        fs::write(&ga, "*.aaa text\n").expect("write v1");
+        let wt_t0 = mtime_of(wt);
+        restore_mtime(wt, wt_t0);
+        let t0 = mtime_of(&ga);
+        assert_eq!(rules_for(&repo, wt), vec!["*.aaa".to_string()]);
+
+        // Same size + restored mtime (file and work-tree dir): stat cannot
+        // tell the difference, so the cached parse is served. This is the
+        // assertion that proves the cache is actually used.
+        fs::write(&ga, "*.bbb text\n").expect("write v2");
+        restore_mtime(&ga, t0);
+        restore_mtime(wt, wt_t0);
+        assert_eq!(rules_for(&repo, wt), vec!["*.aaa".to_string()]);
+
+        // A size change invalidates even with restored mtimes.
+        fs::write(&ga, "*.ccc-longer text\n").expect("write v3");
+        restore_mtime(&ga, t0);
+        restore_mtime(wt, wt_t0);
+        assert_eq!(rules_for(&repo, wt), vec!["*.ccc-longer".to_string()]);
+    }
+
+    #[test]
+    fn new_nested_gitattributes_is_detected() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let wt = td.path();
+        let repo = test_repo(wt);
+        fs::write(wt.join(".gitattributes"), "root-rule text\n").expect("write root");
+        // Pre-age the work-tree mtime so the upcoming mkdir visibly bumps it
+        // even on filesystems with coarse mtime ticks.
+        restore_mtime(wt, FileTime::from_unix_time(1_000_000_000, 0));
+        assert_eq!(rules_for(&repo, wt), vec!["root-rule".to_string()]);
+
+        // Creating a subdirectory bumps the stamped work-tree mtime, forcing
+        // a re-walk that discovers the new nested file.
+        fs::create_dir(wt.join("sub")).expect("mkdir");
+        fs::write(wt.join("sub/.gitattributes"), "nested-rule text\n").expect("write nested");
+        assert_eq!(
+            rules_for(&repo, wt),
+            vec!["root-rule".to_string(), "nested-rule".to_string()]
+        );
+    }
+
+    #[test]
+    fn modified_nested_gitattributes_is_detected() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let wt = td.path();
+        let repo = test_repo(wt);
+        fs::create_dir(wt.join("sub")).expect("mkdir");
+        let nested = wt.join("sub/.gitattributes");
+        fs::write(&nested, "one text\n").expect("write v1");
+        assert_eq!(rules_for(&repo, wt), vec!["one".to_string()]);
+
+        // Content change at a different size: the nested file's own stamp
+        // invalidates (directory mtimes do not change on content edits).
+        fs::write(&nested, "two-longer text\n").expect("write v2");
+        assert_eq!(rules_for(&repo, wt), vec!["two-longer".to_string()]);
+    }
+
+    #[test]
+    fn info_attributes_is_stamped() {
+        let td = tempfile::tempdir().expect("tempdir");
+        let wt = td.path();
+        let repo = test_repo(wt);
+        assert!(rules_for(&repo, wt).is_empty());
+
+        // info/attributes appearing after a cached empty load must be seen.
+        fs::write(repo.git_dir.join("info/attributes"), "from-info text\n")
+            .expect("write info");
+        assert_eq!(rules_for(&repo, wt), vec!["from-info".to_string()]);
     }
 }
