@@ -1184,6 +1184,26 @@ fn clear_conflicting_reflog_files(logs_root: &Path, target: &Path) {
     }
 }
 
+/// Render a reflog entry's `(old, new)` OIDs as hex, widening a null OID to the
+/// width of the non-null side so the line matches the repository hash algorithm.
+fn reflog_oid_hex_pair(old: &ObjectId, new: &ObjectId) -> (String, String) {
+    let width = if !old.is_zero() {
+        old.algo().hex_len()
+    } else if !new.is_zero() {
+        new.algo().hex_len()
+    } else {
+        old.algo().hex_len()
+    };
+    let render = |oid: &ObjectId| {
+        if oid.is_zero() {
+            "0".repeat(width)
+        } else {
+            oid.to_hex()
+        }
+    };
+    (render(old), render(new))
+}
+
 pub fn append_reflog(
     git_dir: &Path,
     refname: &str,
@@ -1220,10 +1240,15 @@ pub fn append_reflog(
         clear_conflicting_reflog_files(&logs_root, parent);
         fs::create_dir_all(parent)?;
     }
+    // A reflog records `<old> <new>` at the repository's hash width. The null
+    // ("0000…") side of a ref creation/deletion is stored at SHA-1 width by
+    // callers; widen it to match the non-null side so sha256 reflogs are
+    // internally consistent (and re-parseable).
+    let (old_hex, new_hex) = reflog_oid_hex_pair(old_oid, new_oid);
     let line = if message.is_empty() {
-        format!("{old_oid} {new_oid} {identity}\n")
+        format!("{old_hex} {new_hex} {identity}\n")
     } else {
-        format!("{old_oid} {new_oid} {identity}\t{message}\n")
+        format!("{old_hex} {new_hex} {identity}\t{message}\n")
     };
     let mut file = fs::OpenOptions::new()
         .create(true)

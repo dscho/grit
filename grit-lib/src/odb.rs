@@ -439,7 +439,9 @@ impl Odb {
         let file = fs::File::open(path).map_err(Error::Io)?;
         let raw = read_zlib_loose_payload(file)?;
         let obj = parse_object_bytes_with_oid(&raw, expected_oid)?;
-        let computed = hash_object_from_parsed(&obj);
+        // Verify against the expected OID using its own hash algorithm; a SHA-256
+        // loose object must be re-hashed with SHA-256, not SHA-1.
+        let computed = hash_object_data_with(expected_oid.algo(), obj.kind, &obj.data);
         if computed != *expected_oid {
             return Err(Error::LooseHashMismatch {
                 path: path.display().to_string(),
@@ -879,10 +881,6 @@ fn freshen_object_in_objects_dir(objects_dir: &Path, oid: &ObjectId) -> bool {
         }
     }
     false
-}
-
-fn hash_object_from_parsed(obj: &Object) -> ObjectId {
-    Odb::hash_object_data(obj.kind, &obj.data)
 }
 
 /// Hash the canonical store bytes of an object (`"<kind> <len>\0<data>"`) with

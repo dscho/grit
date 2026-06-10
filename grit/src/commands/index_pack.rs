@@ -1274,10 +1274,9 @@ fn build_idx_v1(entries: &[ResolvedObject], pack_bytes: &[u8]) -> Result<Vec<u8>
         buf.extend_from_slice(&(entry.offset as u32).to_be_bytes());
         buf.extend_from_slice(entry.oid.as_bytes());
     }
-    buf.extend_from_slice(&pack_bytes[pack_bytes.len() - 20..]);
-    let mut h = Sha1::new();
-    h.update(&buf);
-    buf.extend_from_slice(h.finalize().as_slice());
+    let hash_bytes = infer_pack_trailer_bytes(pack_bytes)?;
+    buf.extend_from_slice(&pack_bytes[pack_bytes.len() - hash_bytes..]);
+    append_idx_checksum(&mut buf, hash_bytes);
     Ok(buf)
 }
 
@@ -1338,17 +1337,35 @@ fn build_idx_v2(
         buf.extend_from_slice(&off.to_be_bytes());
     }
 
-    // Pack checksum (last 20 bytes of pack file).
-    let pack_checksum = &pack_bytes[pack_bytes.len() - 20..];
+    // Pack checksum (the pack file's trailing hash) and index checksum both use
+    // the repository hash width, inferred from the pack trailer (20 for SHA-1,
+    // 32 for SHA-256).
+    let hash_bytes = infer_pack_trailer_bytes(pack_bytes)?;
+    let pack_checksum = &pack_bytes[pack_bytes.len() - hash_bytes..];
     buf.extend_from_slice(pack_checksum);
 
-    // Index checksum.
-    let mut h = Sha1::new();
-    h.update(&buf);
-    let idx_checksum = h.finalize();
-    buf.extend_from_slice(idx_checksum.as_slice());
+    append_idx_checksum(&mut buf, hash_bytes);
 
     Ok(buf)
+}
+
+/// Append the trailing index checksum, hashing the index body so far with the
+/// algorithm implied by `hash_bytes` (SHA-1 for 20, SHA-256 for 32).
+fn append_idx_checksum(buf: &mut Vec<u8>, hash_bytes: usize) {
+    match hash_bytes {
+        32 => {
+            let mut h = Sha256::new();
+            h.update(&*buf);
+            let digest = h.finalize();
+            buf.extend_from_slice(digest.as_slice());
+        }
+        _ => {
+            let mut h = Sha1::new();
+            h.update(&*buf);
+            let digest = h.finalize();
+            buf.extend_from_slice(digest.as_slice());
+        }
+    }
 }
 
 fn reject_sha256_idx_without_flag(idx_path: &std::path::Path, args: &Args) -> Result<()> {

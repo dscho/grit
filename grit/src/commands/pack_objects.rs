@@ -5284,6 +5284,20 @@ fn build_pack(
 /// Build idx v2 for a pack we just wrote.
 ///
 /// The second return value is object offsets in **index row order** (OID-sorted), for `.rev` files.
+/// Append the trailing `.idx` checksum, hashing the index body so far with the
+/// algorithm implied by `hash_bytes` (SHA-1 for 20, SHA-256 for 32).
+fn append_idx_trailing_checksum(buf: &mut Vec<u8>, hash_bytes: usize) {
+    if hash_bytes == 32 {
+        let mut h = Sha256::new();
+        Sha256Digest::update(&mut h, &*buf);
+        buf.extend_from_slice(h.finalize().as_slice());
+    } else {
+        let mut h = Sha1::new();
+        Sha1Digest::update(&mut h, &*buf);
+        buf.extend_from_slice(h.finalize().as_slice());
+    }
+}
+
 fn build_idx_for_pack(
     pack_bytes: &[u8],
     entries: &[PackWriteEntry],
@@ -5350,9 +5364,7 @@ fn build_idx_for_pack(
         }
         let pack_checksum = &pack_bytes[pack_bytes.len() - pack_hash_bytes..];
         buf.extend_from_slice(pack_checksum);
-        let mut h = Sha1::new();
-        h.update(&buf);
-        buf.extend_from_slice(h.finalize().as_slice());
+        append_idx_trailing_checksum(&mut buf, pack_hash_bytes);
         let idx_order_offsets: Vec<u64> = sorted
             .iter()
             .map(|(orig_idx, _)| offsets[*orig_idx])
@@ -5406,11 +5418,8 @@ fn build_idx_for_pack(
     let pack_checksum = &pack_bytes[pack_bytes.len() - pack_hash_bytes..];
     buf.extend_from_slice(pack_checksum);
 
-    // Index checksum.
-    let mut h = Sha1::new();
-    h.update(&buf);
-    let idx_checksum = h.finalize();
-    buf.extend_from_slice(idx_checksum.as_slice());
+    // Index checksum (matches the repository hash width).
+    append_idx_trailing_checksum(&mut buf, pack_hash_bytes);
 
     let idx_order_offsets: Vec<u64> = sorted
         .iter()
