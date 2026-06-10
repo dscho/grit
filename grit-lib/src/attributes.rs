@@ -887,12 +887,13 @@ fn walk_dirs(root: &Path, cur: &Path, dirs: &mut Vec<PathBuf>) {
 // memoized for the process lifetime and revalidated with stat stamps on
 // every call:
 //
-// - the global attributes file, root `.gitattributes`, `info/attributes`,
-//   and every nested per-directory `.gitattributes` path are stamped
-//   (mtime + size, or "absent"), recorded *before* the parse;
-// - every walked directory (and the work-tree root) is mtime-stamped, so
-//   creating or deleting a subdirectory or a `.gitattributes` file changes
-//   a stamped mtime and forces a re-walk.
+// - the global attributes file, root `.gitattributes`, and
+//   `info/attributes` are stamped (mtime + size, or "absent"), recorded
+//   *before* the parse;
+// - the work-tree root directory is mtime-stamped, so creating or deleting
+//   a root-level entry forces a re-walk. Nested `.gitattributes` files are
+//   *not* revalidated per query (see `collect_stack_stamps`); within one
+//   process they behave like C git's process-lifetime attribute cache.
 //
 // Tree-sourced stacks (`attr.tree` / `GIT_ATTR_SOURCE`) are keyed by tree
 // OID and never revalidated: tree objects are content-addressed and
@@ -953,14 +954,25 @@ fn attr_stamps_valid(entry: &AttrStackCacheEntry) -> bool {
             .all(|(path, stamp)| attr_dir_stamp(path) == *stamp)
 }
 
-/// Stamp every input `load_gitattributes_stack_uncached` reads (walks the
-/// directory tree once, like the loader itself).
+/// Stamp the cheap top-level inputs of the stack: the global attributes
+/// file, root `.gitattributes`, `info/attributes`, and the work-tree root
+/// directory's mtime (~4 stats per validation).
+///
+/// Nested per-directory `.gitattributes` files are deliberately *not*
+/// stamped: revalidating them costs two stats per walked directory, which
+/// dominates per-file hot loops on large trees. Within one process a change
+/// to an already-loaded nested file is therefore served stale — matching
+/// C git, which caches attribute stacks for the whole process with no
+/// revalidation at all. The checkout/apply/merge materialization paths are
+/// unaffected: they read attributes through
+/// `crlf::load_gitattributes_for_checkout` (index/odb-sourced), not this
+/// work-tree stack. Creating or deleting entries in the work-tree *root*
+/// still bumps its stamped mtime and forces a fresh walk.
 fn collect_stack_stamps(
     repo: &Repository,
     work_tree: &Path,
 ) -> std::result::Result<(Vec<AttrFileStamp>, Vec<AttrDirStamp>), crate::error::Error> {
     let mut file_stamps = Vec::new();
-    let mut dir_stamps = Vec::new();
     if let Some(g) = global_attributes_path(repo)? {
         let stamp = attr_file_stamp(&g);
         file_stamps.push((g, stamp));
@@ -968,18 +980,10 @@ fn collect_stack_stamps(
     let root_ga = work_tree.join(".gitattributes");
     let stamp = attr_file_stamp(&root_ga);
     file_stamps.push((root_ga, stamp));
-    dir_stamps.push((work_tree.to_path_buf(), attr_dir_stamp(work_tree)));
-    for rel in collect_nested_gitattributes_dirs(work_tree) {
-        let dir_abs = work_tree.join(&rel);
-        let ga = dir_abs.join(".gitattributes");
-        let stamp = attr_file_stamp(&ga);
-        file_stamps.push((ga, stamp));
-        let stamp = attr_dir_stamp(&dir_abs);
-        dir_stamps.push((dir_abs, stamp));
-    }
     let info = repo.git_dir.join("info/attributes");
     let stamp = attr_file_stamp(&info);
     file_stamps.push((info, stamp));
+    let dir_stamps = vec![(work_tree.to_path_buf(), attr_dir_stamp(work_tree))];
     Ok((file_stamps, dir_stamps))
 }
 
@@ -1545,18 +1549,27 @@ mod attr_cache_tests {
     }
 
     #[test]
-    fn modified_nested_gitattributes_is_detected() {
+    fn modified_nested_gitattributes_follows_c_git_process_semantics() {
         let td = tempfile::tempdir().expect("tempdir");
         let wt = td.path();
         let repo = test_repo(wt);
         fs::create_dir(wt.join("sub")).expect("mkdir");
         let nested = wt.join("sub/.gitattributes");
         fs::write(&nested, "one text\n").expect("write v1");
+        // Pre-age the work-tree mtime so the later root-level mkdir visibly
+        // bumps it even on filesystems with coarse mtime ticks.
+        restore_mtime(wt, FileTime::from_unix_time(1_000_000_000, 0));
         assert_eq!(rules_for(&repo, wt), vec!["one".to_string()]);
 
-        // Content change at a different size: the nested file's own stamp
-        // invalidates (directory mtimes do not change on content edits).
+        // Nested files are not revalidated per query: within one process a
+        // content edit is served from cache, matching C git's
+        // process-lifetime attribute caching.
         fs::write(&nested, "two-longer text\n").expect("write v2");
+        assert_eq!(rules_for(&repo, wt), vec!["one".to_string()]);
+
+        // Any root-level signal (here: a new top-level directory) bumps the
+        // stamped work-tree mtime and the fresh walk picks up the edit.
+        fs::create_dir(wt.join("poke")).expect("mkdir poke");
         assert_eq!(rules_for(&repo, wt), vec!["two-longer".to_string()]);
     }
 
