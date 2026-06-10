@@ -15,8 +15,14 @@ def load_results():
     """Load all bench/*.json result files."""
     benchmarks = []
     for path in sorted(glob.glob(os.path.join(RESULTS_DIR, "*.json"))):
-        with open(path) as f:
-            data = json.load(f)
+        # hyperfine leaves an empty/partial export when a benchmark is
+        # skipped; ignore anything that isn't valid JSON.
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            print(f"skipping invalid result file: {os.path.basename(path)}")
+            continue
         name = os.path.splitext(os.path.basename(path))[0]
         results = data.get("results", [])
         if len(results) < 2:
