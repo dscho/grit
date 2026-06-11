@@ -343,18 +343,24 @@ pub fn run(args: Args) -> Result<()> {
         && grit_lib::precompose_config::filesystem_nfd_nfc_aliases(&repo.git_dir);
     let quote_fully = config.quote_path_fully();
     let index_path = resolved_env_index_path(&repo);
-    let raw_index_had_sparse_dirs = grit_lib::index::Index::load(&index_path)
-        .map(|idx| idx.has_sparse_directory_placeholders())
-        .unwrap_or(false);
     let mut index = if args.sparse {
         grit_lib::index::Index::load(&index_path).context("loading index")?
     } else {
         repo.load_index_at(&index_path).context("loading index")?
     };
-    if !args.sparse && args.pathspecs.is_empty() && raw_index_had_sparse_dirs {
+    if !args.sparse && args.pathspecs.is_empty() {
         if let Ok(trace2_event) = std::env::var("GIT_TRACE2_EVENT") {
             if !trace2_event.trim().is_empty() {
-                let _ = crate::trace2_region_json(&trace2_event, "index", "ensure_full_index");
+                // Loaded raw (un-expanded) only here: `load_index_at` has
+                // already expanded sparse placeholders, so re-read to learn
+                // whether the on-disk index had any. Off the hot path —
+                // only when trace2 event output is requested.
+                let raw_index_had_sparse_dirs = grit_lib::index::Index::load(&index_path)
+                    .map(|idx| idx.has_sparse_directory_placeholders())
+                    .unwrap_or(false);
+                if raw_index_had_sparse_dirs {
+                    let _ = crate::trace2_region_json(&trace2_event, "index", "ensure_full_index");
+                }
             }
         }
     }
@@ -401,7 +407,10 @@ pub fn run(args: Args) -> Result<()> {
     }
 
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    // Rust's StdoutLock is line-buffered; per-entry lines would issue one
+    // write(2) each (10k syscalls on a 10k-file index). Fully buffer like
+    // C git's stdio and flush once at the end.
+    let mut out = io::BufWriter::new(stdout.lock());
 
     let term = if args.null_terminated { b'\0' } else { b'\n' };
     let use_nul = args.null_terminated;
@@ -1281,6 +1290,7 @@ pub fn run(args: Args) -> Result<()> {
         }
     }
 
+    out.flush()?;
     Ok(())
 }
 
@@ -2313,6 +2323,14 @@ fn format_ls_display_path<'a>(
     config: &grit_lib::config::ConfigSet,
 ) -> Result<Cow<'a, [u8]>> {
     if full_name {
+        return Ok(Cow::Borrowed(repo_rel));
+    }
+    // From the work-tree root the cwd-relative display is the repo-relative
+    // path itself, including for paths under an active submodule
+    // (`ls_files_display_through_submodule` reduces to `first_seg/rest`).
+    // Returning it verbatim skips the per-entry submodule probe (~3 stat(2)
+    // per entry) and is byte-exact for non-UTF-8 paths.
+    if normalize_path(cwd) == normalize_path(work_tree) {
         return Ok(Cow::Borrowed(repo_rel));
     }
     if cwd_inside_work_tree(cwd, work_tree) {

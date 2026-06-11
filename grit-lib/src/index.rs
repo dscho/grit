@@ -936,10 +936,15 @@ impl Index {
         let mut pos = 12usize;
         let mut entries = Vec::with_capacity(count as usize);
 
-        let mut prev_path: Vec<u8> = Vec::new();
         for _ in 0..count {
-            let (entry, consumed) = parse_entry(&body[pos..], version, &prev_path, hash_len)?;
-            prev_path = entry.path.clone();
+            // Only v4 prefix-compresses paths against the previous entry;
+            // borrow it from `entries` instead of cloning every path.
+            let prev_path: &[u8] = if version == 4 {
+                entries.last().map_or(&[][..], |e: &IndexEntry| &e.path)
+            } else {
+                &[]
+            };
+            let (entry, consumed) = parse_entry(&body[pos..], version, prev_path, hash_len)?;
             entries.push(entry);
             pos += consumed;
         }
@@ -2122,7 +2127,8 @@ fn parse_entry(
         let suffix = &data[pos..pos + nul];
         pos += nul + 1;
         let keep = prev_path.len().saturating_sub(strip_len);
-        let mut full_path = prev_path[..keep].to_vec();
+        let mut full_path = Vec::with_capacity(keep + suffix.len());
+        full_path.extend_from_slice(&prev_path[..keep]);
         full_path.extend_from_slice(suffix);
         path = full_path;
     } else {
