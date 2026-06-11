@@ -15,9 +15,12 @@
 use std::path::Path;
 
 use crate::error::{Error, Result};
-use crate::index::{MODE_EXECUTABLE, MODE_SYMLINK};
+#[cfg(unix)]
+use crate::index::MODE_EXECUTABLE;
+use crate::index::MODE_SYMLINK;
 
 /// Set `abs_path` permissions to match Git index `mode` (regular vs executable blob).
+#[cfg(unix)]
 pub fn apply_index_file_mode(abs_path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(abs_path)?.permissions();
@@ -28,6 +31,16 @@ pub fn apply_index_file_mode(abs_path: &Path, mode: u32) -> Result<()> {
     };
     perms.set_mode(new_mode);
     std::fs::set_permissions(abs_path, perms)?;
+    Ok(())
+}
+
+/// Set `abs_path` permissions to match Git index `mode` (regular vs executable blob).
+///
+/// On Windows the filesystem has no Unix-style executable bit, and Git for Windows
+/// defaults to `core.fileMode = false` precisely because the bit cannot be tracked
+/// faithfully, so we mirror that and do nothing.
+#[cfg(not(unix))]
+pub fn apply_index_file_mode(_abs_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -93,6 +106,7 @@ pub fn write_to_worktree(work_tree: &Path, rel_path: &str, data: &[u8], mode: u3
         std::fs::write(&abs_path, data)
             .map_err(|e| Error::PathError(format!("writing '{rel_path}': {e}")))?;
 
+        #[cfg(unix)]
         if mode == MODE_EXECUTABLE {
             use std::os::unix::fs::PermissionsExt;
             let mut perms = std::fs::metadata(&abs_path)?.permissions();
