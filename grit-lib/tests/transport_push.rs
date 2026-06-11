@@ -284,4 +284,132 @@ fn push_over_git_daemon_lands_ref_and_objects_and_reports_rejection() {
         remote_main_after, main_oid,
         "rejected non-ff push must not move the remote ref"
     );
+
+    // --- 3. Force-update: the divergent tip is accepted with `force` ----------
+    // Same non-ff update as case 2, but with force: the server accepts it and
+    // the remote ref advances to the divergent commit.
+    let mut conn3 = transport
+        .connect(&url, Service::ReceivePack, &ConnectOptions::default())
+        .expect("reconnect for forced push");
+    let forced = PushRefSpec {
+        src: Some(diverged),
+        dst: "refs/heads/main".to_owned(),
+        force: true,
+        delete: false,
+        expected_old: None,
+        expect_absent: false,
+    };
+    let outcome3 = push_remote(
+        &local_git,
+        &mut *conn3,
+        &[forced],
+        &PushOptions::default(),
+        &mut NoProgress,
+    )
+    .expect("forced push_remote completes");
+    drop(conn3);
+
+    let r3 = &outcome3.results[0];
+    assert_eq!(
+        r3.status,
+        PushRefStatus::Ok,
+        "forced push should be accepted, got {:?} ({:?})",
+        r3.status,
+        r3.message
+    );
+    assert!(r3.forced, "forced update should be flagged forced");
+    assert_eq!(r3.new_oid, Some(diverged));
+    let remote_main_forced =
+        resolve_ref(&bare, "refs/heads/main").expect("remote main after force");
+    assert_eq!(
+        remote_main_forced, diverged,
+        "forced push must advance the remote ref to the divergent tip"
+    );
+
+    // The divergent commit's objects landed and the bare repo still fscks clean.
+    let remote_odb2 = open_odb(&bare);
+    assert!(
+        remote_odb2.exists(&diverged),
+        "divergent object {} missing after forced push",
+        diverged.to_hex()
+    );
+    let fsck2 = Command::new("git")
+        .current_dir(&bare)
+        .args(["fsck", "--no-dangling"])
+        .output()
+        .expect("run git fsck");
+    assert!(
+        fsck2.status.success(),
+        "git fsck failed after forced push: {}",
+        String::from_utf8_lossy(&fsck2.stderr)
+    );
+
+    // --- 4. Deletion: push a null update to remove the remote ref -------------
+    // First create a second ref to delete (so we never delete the repo's only
+    // branch, which the daemon may protect), then delete it with a null source.
+    let mut conn_mk = transport
+        .connect(&url, Service::ReceivePack, &ConnectOptions::default())
+        .expect("reconnect to create deletable ref");
+    let mk = PushRefSpec {
+        src: Some(diverged),
+        dst: "refs/heads/scratch".to_owned(),
+        force: false,
+        delete: false,
+        expected_old: None,
+        expect_absent: false,
+    };
+    push_remote(
+        &local_git,
+        &mut *conn_mk,
+        &[mk],
+        &PushOptions::default(),
+        &mut NoProgress,
+    )
+    .expect("create scratch ref");
+    drop(conn_mk);
+    assert_eq!(
+        resolve_ref(&bare, "refs/heads/scratch").expect("scratch created"),
+        diverged,
+        "scratch ref should be created before deletion"
+    );
+
+    let mut conn_del = transport
+        .connect(&url, Service::ReceivePack, &ConnectOptions::default())
+        .expect("reconnect for deletion");
+    let del = PushRefSpec {
+        src: None,
+        dst: "refs/heads/scratch".to_owned(),
+        force: false,
+        delete: true,
+        expected_old: None,
+        expect_absent: false,
+    };
+    let outcome_del = push_remote(
+        &local_git,
+        &mut *conn_del,
+        &[del],
+        &PushOptions::default(),
+        &mut NoProgress,
+    )
+    .expect("deletion push_remote completes");
+    drop(conn_del);
+
+    let rdel = &outcome_del.results[0];
+    assert_eq!(
+        rdel.status,
+        PushRefStatus::Ok,
+        "deletion should be accepted, got {:?} ({:?})",
+        rdel.status,
+        rdel.message
+    );
+    assert!(rdel.deletion, "result should be flagged as a deletion");
+    assert!(
+        rdel.new_oid.is_none(),
+        "a deletion has no new oid, got {:?}",
+        rdel.new_oid
+    );
+    assert!(
+        resolve_ref(&bare, "refs/heads/scratch").is_err(),
+        "scratch ref must be gone after a deletion push"
+    );
 }

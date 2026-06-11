@@ -21,9 +21,14 @@
 //! behind the `http-ureq` cargo feature; it wires a [`CredentialProvider`] for
 //! HTTP basic auth on `401`.
 //!
-//! Protocol v0/v1 (stateless RPC) is implemented here; a protocol-v2 server is
-//! detected (the `version 2` preamble) and reported as unsupported in this pass,
-//! since the bundled `grit-http-server` fixture serves v0/v1.
+//! Both protocol v0/v1 (the classic stateless RPC) and protocol v2 (the
+//! stateless multi-POST flow) are implemented here. A v2 server is detected from
+//! the `version 2` capability advertisement returned by `info/refs` (requested
+//! with the `Git-Protocol: version=2` header); [`http_fetch`] then runs the v2
+//! `command=ls-refs` + `command=fetch` rounds as separate POSTs — each round
+//! resends the capability echo, all `want`s, and the accumulated `have`s —
+//! reusing the shared v2 request framing and side-band demuxer from
+//! [`crate::fetch`].
 
 use std::collections::HashSet;
 use std::io::{Cursor, Read, Write};
@@ -34,6 +39,7 @@ use crate::fetch::Progress;
 use crate::fetch_negotiator::SkippingNegotiator;
 use crate::objects::ObjectId;
 use crate::pkt_line;
+use crate::protocol_v2;
 use crate::refspec::{parse_fetch_refspec, RefspecItem};
 use crate::transfer::{
     classify_update, match_positive, open_odb, prune_tracking_refs, ref_excluded, refspecs_force,
@@ -88,6 +94,33 @@ pub trait HttpClient: Send + Sync {
     /// `true`; embedders that honor `GIT_SMART_HTTP=0` may return `false`.
     fn smart_http_enabled(&self) -> bool {
         true
+    }
+}
+
+/// Forward [`HttpClient`] through a shared [`std::sync::Arc`], so one client can
+/// back several transports (and be observed by the caller) without moving it.
+impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
+    fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>> {
+        (**self).get(url, git_protocol)
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        content_type: &str,
+        accept: &str,
+        body: &[u8],
+        git_protocol: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        (**self).post(url, content_type, accept, body, git_protocol)
+    }
+
+    fn git_protocol_header(&self) -> Option<&str> {
+        (**self).git_protocol_header()
+    }
+
+    fn smart_http_enabled(&self) -> bool {
+        (**self).smart_http_enabled()
     }
 }
 
@@ -375,15 +408,60 @@ impl<C: HttpClient> SmartHttpTransport<C> {
         &self.client
     }
 
+    /// Push `refs` to `repo_url` over smart HTTP (`git-receive-pack`), returning a
+    /// [`crate::transfer::PushOutcome`].
+    ///
+    /// This is the push counterpart to [`http_fetch`]: it discovers the
+    /// receive-pack advertisement, decides each update, builds the command block +
+    /// pack, POSTs `git-receive-pack`, and parses the `report-status` reply —
+    /// reusing the same decision/pack/report machinery as the duplex
+    /// [`crate::push::push_remote`]. Delegates to [`crate::push::push_http`].
+    ///
+    /// Protocol v0/v1 only (a v2 receive-pack advertisement is rejected).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if discovery fails, the advertisement is protocol v2, a
+    /// source object is missing locally, the pack build fails, or on wire/parse
+    /// I/O failure.
+    pub fn push(
+        &self,
+        local_git_dir: &Path,
+        repo_url: &str,
+        refs: &[crate::transfer::PushRefSpec],
+        opts: &crate::transfer::PushOptions,
+        progress: &mut dyn Progress,
+    ) -> Result<crate::transfer::PushOutcome> {
+        crate::push::push_http(&self.client, local_git_dir, repo_url, refs, opts, progress)
+    }
+
     /// Perform the `info/refs` discovery for `repo_url` and `service`, returning
     /// the parsed [`Discovery`].
-    fn discover(&self, repo_url: &str, _service: Service) -> Result<Discovery> {
+    ///
+    /// `git_protocol` is the `Git-Protocol` request-header value to apply (e.g.
+    /// `version=2` to request a v2 advertisement); when `None`, the client's
+    /// default ([`HttpClient::git_protocol_header`]) is used.
+    fn discover(
+        &self,
+        repo_url: &str,
+        _service: Service,
+        git_protocol: Option<&str>,
+    ) -> Result<Discovery> {
         let url = info_refs_url(repo_url);
-        let body = self
-            .client
-            .get(&url, self.client.git_protocol_header())?;
+        let gp = git_protocol.or_else(|| self.client.git_protocol_header());
+        let body = self.client.get(&url, gp)?;
         let stripped = strip_service_advertisement(&body)?;
         parse_advertisement(stripped)
+    }
+}
+
+/// The `Git-Protocol` request-header value for a requested protocol version, or
+/// `None` for v0 (no header — the classic advertisement).
+fn git_protocol_for_version(version: u8) -> Option<String> {
+    if version >= 1 {
+        Some(format!("version={version}"))
+    } else {
+        None
     }
 }
 
@@ -392,9 +470,14 @@ impl<C: HttpClient> Transport for SmartHttpTransport<C> {
         &self,
         url: &str,
         service: Service,
-        _opts: &ConnectOptions,
+        opts: &ConnectOptions,
     ) -> Result<Box<dyn Connection>> {
-        let disc = self.discover(url, service)?;
+        // Request the protocol version the caller asked for via the
+        // `Git-Protocol` header (a v2 server only returns its v2 capability
+        // advertisement when it sees `version=2`); fall back to the client's
+        // default header otherwise. The server may still downgrade.
+        let gp = git_protocol_for_version(opts.protocol_version);
+        let disc = self.discover(url, service, gp.as_deref())?;
         let adv_refs: Vec<(String, ObjectId)> = disc
             .refs
             .iter()
@@ -825,12 +908,17 @@ fn match_refspecs(
 /// classification reuse the shared [`crate::transfer`] helpers, so the
 /// [`FetchOutcome`] shape matches every other fetch path.
 ///
-/// Protocol v0/v1 only in this pass; a v2 server is reported as unsupported.
+/// Both protocol v0/v1 and protocol v2 are handled: the version is taken from
+/// the `info/refs` advertisement (the v2 capability block is returned only when
+/// the discovery GET carries `Git-Protocol: version=2`, which the client's
+/// default header supplies). For v2 the ref map is recovered with a
+/// `command=ls-refs` POST and the pack is negotiated with `command=fetch` POSTs
+/// (stateless: every round resends the wants + accumulated haves).
 ///
 /// # Errors
 ///
-/// Returns an error if discovery fails, the server speaks protocol v2, a refspec
-/// is invalid, or negotiation / pack ingest / ref I/O fails.
+/// Returns an error if discovery fails, a refspec is invalid, or negotiation /
+/// pack ingest / ref I/O fails.
 pub fn http_fetch(
     client: &dyn HttpClient,
     local_git_dir: &Path,
@@ -838,7 +926,8 @@ pub fn http_fetch(
     opts: &FetchOptions,
     progress: &mut dyn Progress,
 ) -> Result<FetchOutcome> {
-    // 1. Discovery.
+    // 1. Discovery (request v2 via the client's default `Git-Protocol` header;
+    // a v0/v1 server ignores it and returns the classic advertisement).
     let disc = {
         let url = info_refs_url(repo_url);
         let body = client.get(&url, client.git_protocol_header())?;
@@ -846,9 +935,7 @@ pub fn http_fetch(
         parse_advertisement(stripped)?
     };
     if disc.protocol_version >= 2 {
-        return Err(Error::Message(
-            "http_fetch: protocol v2 not supported in this pass (server advertised v2)".to_owned(),
-        ));
+        return http_fetch_v2(client, local_git_dir, repo_url, &disc, opts, progress);
     }
 
     let local_odb = open_odb(local_git_dir);
@@ -1006,6 +1093,306 @@ pub fn http_fetch(
         updates,
         default_branch,
     })
+}
+
+/// Fetch from a smart-HTTP remote that speaks protocol v2 (stateless multi-POST).
+///
+/// `disc` is the already-parsed v2 capability advertisement (no refs). This
+/// recovers the ref map with a `command=ls-refs` POST, matches refspecs / tags
+/// with the same shared [`crate::transfer`] helpers as the v0/v1 path, then
+/// negotiates the pack with `command=fetch` POSTs (each round resends the
+/// capability echo, all `want`s, and the accumulated `have`s) and demuxes the
+/// side-band-64k `packfile` section. Lifted from the CLI's stateless v2 flow
+/// (`http_ls_refs` / `http_negotiate_only_common` / `http_fetch_pack`), reusing
+/// the v2 request framing factored out of [`crate::fetch`].
+fn http_fetch_v2(
+    client: &dyn HttpClient,
+    local_git_dir: &Path,
+    repo_url: &str,
+    disc: &Discovery,
+    opts: &FetchOptions,
+    progress: &mut dyn Progress,
+) -> Result<FetchOutcome> {
+    let local_odb = open_odb(local_git_dir);
+    // The v2 capability lines, as a `Vec<String>` for the `protocol_v2` /
+    // `crate::fetch` helpers (each entry is one advertised capability line, e.g.
+    // `agent=…`, `fetch=…`, `object-format=…`).
+    let server_caps: Vec<String> = disc.caps.iter().cloned().collect();
+
+    let post_url = upload_pack_url(repo_url);
+    let content_type = format!("application/x-{UPLOAD_PACK}-request");
+    let accept = format!("application/x-{UPLOAD_PACK}-result");
+    // Pin v2 on every POST so the server runs its v2 serve loop for this request.
+    let git_protocol = "version=2";
+
+    // 1. Recover the ref map via `command=ls-refs`.
+    let (remote_refs, head_symref) = {
+        let req =
+            crate::fetch::build_v2_ls_refs_request(&server_caps, &local_odb, opts.tags, &opts.refspecs)?;
+        let resp = client.post(&post_url, &content_type, &accept, &req, Some(git_protocol))?;
+        let mut cur = Cursor::new(resp);
+        crate::fetch::parse_v2_ls_refs_response(&mut cur)?
+    };
+    let default_branch = head_symref
+        .as_deref()
+        .map(|t| t.strip_prefix("refs/heads/").unwrap_or(t).to_owned());
+
+    // 2. Parse refspecs.
+    let mut positive: Vec<RefspecItem> = Vec::new();
+    let mut negatives: Vec<RefspecItem> = Vec::new();
+    for spec in &opts.refspecs {
+        let item = parse_fetch_refspec(spec)
+            .map_err(|e| Error::Message(format!("invalid refspec '{spec}': {e}")))?;
+        if item.negative {
+            negatives.push(item);
+        } else {
+            positive.push(item);
+        }
+    }
+    for spec in &opts.negative_refspecs {
+        let item = parse_fetch_refspec(spec)
+            .map_err(|e| Error::Message(format!("invalid negative refspec '{spec}': {e}")))?;
+        negatives.push(item);
+    }
+
+    // 3. Match refs to refspecs (shared with the v0/v1 path).
+    let MatchPlan {
+        mut matched,
+        mut wants,
+        mut seen,
+    } = match_refspecs(&remote_refs, &positive, &negatives);
+
+    // 4. TagMode: add tags (the wire `include-tag` capability brings tag objects
+    // with the pack; All adds every advertised tag, Following adds them
+    // provisionally and prunes unreachable ones after the pack lands).
+    if opts.tags != TagMode::None {
+        for (name, oid) in &remote_refs {
+            if !name.starts_with("refs/tags/") {
+                continue;
+            }
+            if seen.contains(name) || ref_excluded(name, &negatives) {
+                continue;
+            }
+            seen.insert(name.clone());
+            wants.insert(*oid);
+            matched.push(crate::transfer::MatchedRef {
+                remote_ref: name.clone(),
+                local_ref: Some(name.clone()),
+                oid: *oid,
+                force: false,
+                is_tag: true,
+            });
+        }
+    }
+
+    // 5. Wants absent locally → negotiate + ingest the pack.
+    let need: Vec<ObjectId> = wants
+        .iter()
+        .copied()
+        .filter(|oid| !local_odb.exists(oid))
+        .collect();
+
+    if !need.is_empty() && !opts.dry_run {
+        let pack = negotiate_pack_v2_http(
+            client,
+            local_git_dir,
+            &post_url,
+            &content_type,
+            &accept,
+            git_protocol,
+            &server_caps,
+            &local_odb,
+            &need,
+            progress,
+        )?;
+        if !pack.is_empty() {
+            if pack.len() < 12 || &pack[0..4] != b"PACK" {
+                return Err(Error::Message(
+                    "did not receive a valid pack from v2 HTTP fetch".to_owned(),
+                ));
+            }
+            let mut cursor = Cursor::new(pack);
+            crate::unpack_objects::unpack_objects(
+                &mut cursor,
+                &local_odb,
+                &crate::unpack_objects::UnpackOptions {
+                    quiet: true,
+                    ..Default::default()
+                },
+            )?;
+        }
+    }
+
+    // 6. For TagMode::Following, drop tags whose target did not arrive.
+    if opts.tags == TagMode::Following {
+        retain_following_tags(&local_odb, &mut matched, &wants);
+    }
+
+    // 7. Classify + apply ref updates (shared with the v0/v1 path).
+    let local_repo = if opts.dry_run {
+        None
+    } else {
+        crate::repo::Repository::open(local_git_dir, None).ok()
+    };
+
+    let mut updates: Vec<RefUpdate> = Vec::new();
+    if opts.prune {
+        prune_tracking_refs(
+            local_git_dir,
+            &positive,
+            &remote_refs,
+            opts.dry_run,
+            &mut updates,
+        )?;
+    }
+
+    for m in &matched {
+        let Some(local_ref) = &m.local_ref else {
+            updates.push(RefUpdate {
+                remote_ref: m.remote_ref.clone(),
+                local_ref: None,
+                old_oid: None,
+                new_oid: Some(m.oid),
+                mode: UpdateMode::NoChangeNeeded,
+                note: Some("not stored (empty destination)".to_owned()),
+            });
+            continue;
+        };
+        let old = crate::refs::resolve_ref(local_git_dir, local_ref).ok();
+        let mode = classify_update(old.as_ref(), &m.oid, m.force, m.is_tag, local_repo.as_ref());
+        let write = matches!(
+            mode,
+            UpdateMode::New | UpdateMode::FastForward | UpdateMode::Forced
+        );
+        if write && !opts.dry_run {
+            crate::refs::write_ref(local_git_dir, local_ref, &m.oid)?;
+        }
+        updates.push(RefUpdate {
+            remote_ref: m.remote_ref.clone(),
+            local_ref: Some(local_ref.clone()),
+            old_oid: old,
+            new_oid: Some(m.oid),
+            mode,
+            note: None,
+        });
+    }
+
+    Ok(FetchOutcome {
+        updates,
+        default_branch,
+    })
+}
+
+/// Negotiate and download the pack for `wants` over stateless-RPC HTTP using
+/// protocol v2 (`command=fetch`), returning the raw pack bytes.
+///
+/// Stateless: every POST resends the capability echo, every `want`, and all the
+/// `have`s accumulated so far. The round structure mirrors the v0/v1 stateless
+/// loop and the streaming v2 path:
+///
+/// * no local history → a single POST with `want`s + `done`, then read the
+///   `packfile` section;
+/// * otherwise → batched rounds that send `want`s + the growing have-prefix
+///   *without* `done`, reading the `acknowledgments` section each time. When the
+///   server replies `ready`, that same response carries the pack (read it and
+///   stop). If the haves are exhausted without `ready`, a final POST sends every
+///   have + `done` and reads the pack.
+#[allow(clippy::too_many_arguments)]
+fn negotiate_pack_v2_http(
+    client: &dyn HttpClient,
+    local_git_dir: &Path,
+    post_url: &str,
+    content_type: &str,
+    accept: &str,
+    git_protocol: &str,
+    server_caps: &[String],
+    local_odb: &crate::odb::Odb,
+    wants: &[ObjectId],
+    progress: &mut dyn Progress,
+) -> Result<Vec<u8>> {
+    if wants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let object_format = crate::fetch::v2_object_format(server_caps, local_odb);
+    let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
+    let sideband_all = protocol_v2::fetch_supports_sideband_all(server_caps);
+
+    // The ordered have list, built with the shared skipping-negotiator helper so
+    // the wire offers match the streaming v2 path exactly.
+    let haves = crate::fetch::v2_local_haves(local_git_dir, wants)?;
+
+    let mut pack = Vec::new();
+
+    // No local history: one POST, wants + done, then the pack.
+    if haves.is_empty() {
+        let mut req = Vec::new();
+        crate::fetch::write_v2_fetch_request(
+            &mut req,
+            &object_format,
+            &cap_echo,
+            wants,
+            &[],
+            sideband_all,
+            true,
+        )?;
+        let resp = client.post(post_url, content_type, accept, &req, Some(git_protocol))?;
+        let mut cur = Cursor::new(resp);
+        crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
+        return Ok(pack);
+    }
+
+    // Batched negotiation: each round resends wants + the accumulated have prefix
+    // (stateless) without `done`, reading the acknowledgments section. The flush
+    // schedule matches `fetch-pack.c` (`next_flush`).
+    const INITIAL_FLUSH: usize = 16;
+    let mut flush_at: usize = INITIAL_FLUSH.min(haves.len());
+    loop {
+        if flush_at < haves.len() {
+            // Non-final round: offer the have prefix [0..flush_at) without `done`.
+            let mut req = Vec::new();
+            crate::fetch::write_v2_fetch_request(
+                &mut req,
+                &object_format,
+                &cap_echo,
+                wants,
+                &haves[..flush_at],
+                sideband_all,
+                false,
+            )?;
+            let resp = client.post(post_url, content_type, accept, &req, Some(git_protocol))?;
+            let mut cur = Cursor::new(resp);
+            let ack = crate::fetch::read_v2_acknowledgments(&mut cur)?;
+            if let Some(round) = ack {
+                if round.ready {
+                    // The pack follows in this same response after the delimiter.
+                    crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
+                    return Ok(pack);
+                }
+            } else {
+                // Server skipped acknowledgments and went straight to the pack.
+                crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
+                return Ok(pack);
+            }
+            flush_at = next_flush(flush_at).min(haves.len());
+            continue;
+        }
+
+        // Final round: send every have + `done`, then read the pack.
+        let mut req = Vec::new();
+        crate::fetch::write_v2_fetch_request(
+            &mut req,
+            &object_format,
+            &cap_echo,
+            wants,
+            &haves,
+            sideband_all,
+            true,
+        )?;
+        let resp = client.post(post_url, content_type, accept, &req, Some(git_protocol))?;
+        let mut cur = Cursor::new(resp);
+        crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
+        return Ok(pack);
+    }
 }
 
 /// Drop provisional `Following` tags whose object did not arrive in the pack.

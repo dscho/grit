@@ -391,7 +391,7 @@ fn negotiate_pack(
 /// The `object-format=` value to put on the wire for a v2 request: echo the
 /// server's advertised object-format when present, else fall back to the local
 /// odb's hash algorithm (sha1/sha256). Keeps the negotiation hash-algo-aware.
-fn v2_object_format(server_caps: &[String], local_odb: &crate::odb::Odb) -> String {
+pub(crate) fn v2_object_format(server_caps: &[String], local_odb: &crate::odb::Odb) -> String {
     for c in server_caps {
         if let Some(fmt) = c.strip_prefix("object-format=") {
             let f = fmt.trim();
@@ -496,6 +496,26 @@ fn v2_ls_refs(
     tags: crate::transfer::TagMode,
     refspecs: &[String],
 ) -> Result<(Vec<(String, ObjectId)>, Option<String>)> {
+    let req = build_v2_ls_refs_request(server_caps, local_odb, tags, refspecs)?;
+    conn.writer().write_all(&req)?;
+    conn.writer().flush()?;
+    parse_v2_ls_refs_response(conn.reader())
+}
+
+/// Build the `command=ls-refs` request body (capability echo + `0001` + the
+/// `symrefs`/`peel`/`ref-prefix` argument lines + flush) for a v2 fetch.
+///
+/// Factored out of [`v2_ls_refs`] so the streaming transports (which write it to
+/// a duplex socket) and the stateless smart-HTTP transport (which POSTs it as a
+/// request body) share one request builder. `HEAD` is always requested so the
+/// server advertises its `symref-target`; `refs/tags/` is added under `--tags` /
+/// tag-following even when the refspecs name only heads.
+pub(crate) fn build_v2_ls_refs_request(
+    server_caps: &[String],
+    local_odb: &crate::odb::Odb,
+    tags: crate::transfer::TagMode,
+    refspecs: &[String],
+) -> Result<Vec<u8>> {
     let object_format = v2_object_format(server_caps, local_odb);
     let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
 
@@ -536,13 +556,21 @@ fn v2_ls_refs(
         pkt_line::write_line(&mut req, &format!("ref-prefix {p}"))?;
     }
     pkt_line::write_flush(&mut req)?;
-    conn.writer().write_all(&req)?;
-    conn.writer().flush()?;
+    Ok(req)
+}
 
+/// Parse a `command=ls-refs` response into `(advertised refs, HEAD symref)`.
+///
+/// Reads `<oid> <refname>[ symref-target:…][ peeled:…]` lines up to the
+/// terminating flush, dropping peeled `^{}` carriers and recording the `HEAD`
+/// symref target. Shared by the streaming and stateless-HTTP v2 paths.
+pub(crate) fn parse_v2_ls_refs_response(
+    reader: &mut dyn Read,
+) -> Result<(Vec<(String, ObjectId)>, Option<String>)> {
     // Response: `<oid> <refname>[ symref-target:…][ peeled:…]` lines, flush-terminated.
     let mut advertised: Vec<(String, ObjectId)> = Vec::new();
     let mut head_symref: Option<String> = None;
-    let mut reader = conn.reader();
+    let mut reader = reader;
     loop {
         match pkt_line::read_packet(&mut reader)? {
             None | Some(pkt_line::Packet::Flush) | Some(pkt_line::Packet::Delim) => break,
@@ -580,38 +608,19 @@ fn v2_ls_refs(
     Ok((advertised, head_symref))
 }
 
-/// Run a v2 `command=fetch` negotiation over the connection and return the raw
-/// pack bytes for `wants`.
+/// Build the ordered `have` candidate list for a v2 fetch from the local ref
+/// tips (heads, tags, HEAD), peeled to commits and excluding the wants, driven
+/// through the [`SkippingNegotiator`]'s skipping schedule.
 ///
-/// Drives the [`SkippingNegotiator`] exactly like the v0/v1 path, but frames the
-/// request as v2 (`command=fetch`, capability echo, `0001`, then
-/// `thin-pack`/`no-progress`/`ofs-delta`, `want <oid>` lines, `have <oid>` lines,
-/// and `done`). Multi-round: round 1 sends the first batch of haves *without*
-/// `done`, reads the `acknowledgments` section (looking for `ready`); if not yet
-/// ready it sends the remaining haves + `done`. Then reads the response sections
-/// (`acknowledgments`, optional `shallow-info`/`wanted-refs`, then `packfile`) and
-/// demuxes the side-band-64k pack. Lifted from `write_v2_fetch_request` +
-/// `read_v2_acknowledgments` / `read_v2_fetch_pack_response`.
-fn negotiate_pack_v2(
+/// Shared by the streaming (`negotiate_pack_v2`) and stateless-HTTP v2 fetch
+/// paths so both offer the server the same `have`s in the same order. The wire
+/// rounds (how many haves per request, when to send `done`) are batched by the
+/// caller, which differs between a duplex socket and stateless POSTs.
+pub(crate) fn v2_local_haves(
     local_git_dir: &Path,
-    conn: &mut dyn Connection,
-    server_caps: &[String],
-    local_odb: &crate::odb::Odb,
     wants: &[ObjectId],
-    progress: &mut dyn Progress,
-) -> Result<Vec<u8>> {
-    if wants.is_empty() {
-        return Ok(Vec::new());
-    }
-    let object_format = v2_object_format(server_caps, local_odb);
-    let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
-    let sideband_all = protocol_v2::fetch_supports_sideband_all(server_caps);
+) -> Result<Vec<ObjectId>> {
     let want_set: HashSet<ObjectId> = wants.iter().copied().collect();
-
-    // Build the negotiator's local `have` candidates from the local ref tips
-    // (heads, tags, HEAD), peeled to commits, excluding the wants — same tips the
-    // v0/v1 path feeds `add_tip`. The full ordered walk is produced by
-    // `SkippingNegotiator::next_have`.
     let local_repo = crate::repo::Repository::open(local_git_dir, None)?;
     let mut negotiator = SkippingNegotiator::new(local_repo);
     let mut tips: Vec<ObjectId> = Vec::new();
@@ -638,13 +647,45 @@ fn negotiate_pack_v2(
     for t in tips {
         negotiator.add_tip(t)?;
     }
-
     // Drain the negotiator into an ordered have list (it already applies the
-    // skipping schedule); we batch the wire rounds ourselves.
+    // skipping schedule); the caller batches the wire rounds.
     let mut haves: Vec<ObjectId> = Vec::new();
     while let Some(oid) = negotiator.next_have()? {
         haves.push(oid);
     }
+    Ok(haves)
+}
+
+/// Run a v2 `command=fetch` negotiation over the connection and return the raw
+/// pack bytes for `wants`.
+///
+/// Drives the [`SkippingNegotiator`] exactly like the v0/v1 path, but frames the
+/// request as v2 (`command=fetch`, capability echo, `0001`, then
+/// `thin-pack`/`no-progress`/`ofs-delta`, `want <oid>` lines, `have <oid>` lines,
+/// and `done`). Multi-round: round 1 sends the first batch of haves *without*
+/// `done`, reads the `acknowledgments` section (looking for `ready`); if not yet
+/// ready it sends the remaining haves + `done`. Then reads the response sections
+/// (`acknowledgments`, optional `shallow-info`/`wanted-refs`, then `packfile`) and
+/// demuxes the side-band-64k pack. Lifted from `write_v2_fetch_request` +
+/// `read_v2_acknowledgments` / `read_v2_fetch_pack_response`.
+fn negotiate_pack_v2(
+    local_git_dir: &Path,
+    conn: &mut dyn Connection,
+    server_caps: &[String],
+    local_odb: &crate::odb::Odb,
+    wants: &[ObjectId],
+    progress: &mut dyn Progress,
+) -> Result<Vec<u8>> {
+    if wants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let object_format = v2_object_format(server_caps, local_odb);
+    let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
+    let sideband_all = protocol_v2::fetch_supports_sideband_all(server_caps);
+
+    // The ordered `have` list, built from the local ref tips with the skipping
+    // negotiator (shared with the stateless-HTTP v2 path).
+    let haves = v2_local_haves(local_git_dir, wants)?;
 
     let mut pack = Vec::new();
     if haves.is_empty() {
@@ -707,7 +748,7 @@ fn negotiate_pack_v2(
 /// arguments, the `want <oid>` lines, the `have <oid>` lines, and `done` when
 /// `send_done`, terminated by flush. Lifted from the CLI's
 /// `write_v2_fetch_request` (streaming-fetch subset).
-fn write_v2_fetch_request(
+pub(crate) fn write_v2_fetch_request(
     w: &mut dyn Write,
     object_format: &str,
     cap_echo: &[String],
@@ -756,10 +797,10 @@ fn write_v2_fetch_request(
 }
 
 /// Outcome of reading one v2 `acknowledgments` section.
-struct V2AckRound {
+pub(crate) struct V2AckRound {
     /// Server emitted `ready`: the packfile follows in the same response after a
     /// delimiter — the caller reads the pack now without sending more.
-    ready: bool,
+    pub(crate) ready: bool,
 }
 
 /// Read a v2 `acknowledgments` section header and its `ACK`/`NAK`/`ready` lines.
@@ -769,7 +810,7 @@ struct V2AckRound {
 /// section and started a different one (e.g. went straight to `packfile`) — in
 /// which case the header has been consumed and the caller proceeds to read the
 /// pack response directly. Lifted from the CLI's `read_v2_acknowledgments`.
-fn read_v2_acknowledgments(reader: &mut dyn Read) -> Result<Option<V2AckRound>> {
+pub(crate) fn read_v2_acknowledgments(reader: &mut dyn Read) -> Result<Option<V2AckRound>> {
     let mut reader = reader;
     let hdr = match pkt_line::read_packet(&mut reader)? {
         Some(pkt_line::Packet::Data(s)) => s,
@@ -830,7 +871,7 @@ fn read_v2_acknowledgments(reader: &mut dyn Read) -> Result<Option<V2AckRound>> 
 /// (`acknowledgments`/`wanted-refs`/`shallow-info`/`packfile-uris`) and demux the
 /// side-band-64k pack from the `packfile` section into `out`. Lifted from the
 /// CLI's `read_v2_fetch_pack_response`.
-fn read_v2_fetch_pack_response(
+pub(crate) fn read_v2_fetch_pack_response(
     reader: &mut dyn Read,
     out: &mut Vec<u8>,
     progress: &mut dyn Progress,

@@ -13,7 +13,7 @@ use anyhow::Result;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
@@ -62,6 +62,24 @@ fn pkt_line(data: &str) -> Vec<u8> {
     format!("{len:04x}{data}").into_bytes()
 }
 
+/// Parse the requested protocol version from the `Git-Protocol` request header.
+///
+/// Git sends `Git-Protocol: version=2` to request protocol v2 over smart HTTP;
+/// the header carries colon-separated key=value entries (e.g.
+/// `version=2:agent=git/2`). We extract the `version=` value. Returns `None`
+/// (the classic v0/v1 advertisement / stateless RPC) when absent or not v2.
+fn protocol_version_from_headers(headers: &HeaderMap) -> Option<u8> {
+    let raw = headers.get("Git-Protocol")?.to_str().ok()?;
+    for entry in raw.split([':', ' ']) {
+        if let Some(v) = entry.trim().strip_prefix("version=") {
+            if let Ok(n) = v.trim().parse::<u8>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
 fn no_cache_headers(builder: axum::http::response::Builder) -> axum::http::response::Builder {
     builder
         .header(header::EXPIRES, "Fri, 01 Jan 1980 00:00:00 GMT")
@@ -77,6 +95,7 @@ async fn info_refs(
     State(state): State<Arc<AppState>>,
     Path(repo): Path<String>,
     Query(query): Query<InfoRefsQuery>,
+    protocol_version: Option<u8>,
 ) -> Response {
     let service = match &query.service {
         Some(s) if s == "git-upload-pack" || s == "git-receive-pack" => s.clone(),
@@ -90,9 +109,8 @@ async fn info_refs(
         Err(e) => return e,
     };
 
-    // Parse protocol version from query (Git protocol v2 sends it via Git-Protocol header,
-    // but for the PoC we just support v1 and detect v2 from the environment)
-    let protocol_version = None; // v1 for now
+    // Protocol v2 is requested via the `Git-Protocol: version=2` header; absent
+    // (or v1), serve the classic v0/v1 advertisement.
 
     let content_type = format!("application/x-{service}-advertisement");
 
@@ -128,14 +146,13 @@ async fn info_refs(
 async fn upload_pack_rpc(
     State(state): State<Arc<AppState>>,
     Path(repo): Path<String>,
+    protocol_version: Option<u8>,
     body: Bytes,
 ) -> Response {
     let repo_path = match state.repo_path(&repo) {
         Ok(p) => p,
         Err(e) => return e,
     };
-
-    let protocol_version = None;
 
     match grit_protocol::upload_pack::stateless_rpc(&repo_path, &body, protocol_version) {
         Ok(data) => no_cache_headers(axum::http::Response::builder())
@@ -200,12 +217,14 @@ async fn info_refs_dispatch(
     state: State<Arc<AppState>>,
     Path(full_path): Path<String>,
     query: Query<InfoRefsQuery>,
+    headers: HeaderMap,
 ) -> Response {
     if let Some(repo) = full_path.strip_suffix("/info/refs") {
         if repo.is_empty() {
             return (StatusCode::BAD_REQUEST, "missing repository").into_response();
         }
-        info_refs(state, Path(repo.to_string()), query).await
+        let protocol_version = protocol_version_from_headers(&headers);
+        info_refs(state, Path(repo.to_string()), query, protocol_version).await
     } else {
         (StatusCode::NOT_FOUND, "not found").into_response()
     }
@@ -215,13 +234,15 @@ async fn info_refs_dispatch(
 async fn rpc_dispatch(
     state: State<Arc<AppState>>,
     Path(full_path): Path<String>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Some(repo) = full_path.strip_suffix("/git-upload-pack") {
         if repo.is_empty() {
             return (StatusCode::BAD_REQUEST, "missing repository").into_response();
         }
-        upload_pack_rpc(state, Path(repo.to_string()), body).await
+        let protocol_version = protocol_version_from_headers(&headers);
+        upload_pack_rpc(state, Path(repo.to_string()), protocol_version, body).await
     } else if let Some(repo) = full_path.strip_suffix("/git-receive-pack") {
         if repo.is_empty() {
             return (StatusCode::BAD_REQUEST, "missing repository").into_response();

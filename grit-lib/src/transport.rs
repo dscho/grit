@@ -889,6 +889,14 @@ impl Connection for SshConnection {
 
 impl Drop for SshConnection {
     fn drop(&mut self) {
+        // Close the write half (child stdin) *before* waiting: a remote blocked
+        // reading its input — e.g. a `git-receive-pack` still waiting for the
+        // command list after a client-side-only push decision (non-ff reject,
+        // up-to-date) sent nothing — only exits once it sees EOF. Dropping the
+        // `ChildStdin` here signals that EOF; otherwise `child.wait()` would
+        // deadlock against a process that never terminates. (Fields drop after
+        // `drop()` returns, i.e. after the wait, so we must close it explicitly.)
+        self.writer = None;
         // Best-effort reap so we don't leak zombies if the caller drops mid-stream.
         let _ = self.child.wait();
     }
