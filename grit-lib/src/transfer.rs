@@ -420,6 +420,16 @@ pub fn fetch_local(
     remote_git_dir: &Path,
     opts: &FetchOptions,
 ) -> Result<FetchOutcome> {
+    // Validate that the remote is actually a Git repository: a missing or
+    // non-repo path must error (e.g. cloning a bad source) rather than silently
+    // fetching nothing. A repo has an `objects` directory (bare or `.git`).
+    if !remote_git_dir.join("objects").is_dir() {
+        return Err(Error::Message(format!(
+            "could not find repository at '{}'",
+            remote_git_dir.display()
+        )));
+    }
+
     let local_odb = open_odb(local_git_dir);
     let remote_odb = open_odb(remote_git_dir);
 
@@ -551,6 +561,21 @@ pub fn fetch_local(
     };
 
     let mut updates: Vec<RefUpdate> = Vec::new();
+
+    // Prune BEFORE writing the new tips. A stale tracking ref stored as a file
+    // (e.g. `refs/remotes/origin/a`) otherwise blocks creating a nested ref the
+    // same fetch introduces (`refs/remotes/origin/a/b`) with a "File exists"
+    // directory/file conflict (matches `git fetch --prune` ordering).
+    if opts.prune {
+        prune_tracking_refs(
+            local_git_dir,
+            &positive,
+            &remote_refs,
+            opts.dry_run,
+            &mut updates,
+        )?;
+    }
+
     for m in &matched {
         let Some(local_ref) = &m.local_ref else {
             // dst empty: fetched but not stored. Report as a no-store update.
@@ -590,17 +615,6 @@ pub fn fetch_local(
             mode,
             note: None,
         });
-    }
-
-    // 5. Prune: delete local tracking refs whose remote counterpart is gone.
-    if opts.prune {
-        prune_tracking_refs(
-            local_git_dir,
-            &positive,
-            &remote_refs,
-            opts.dry_run,
-            &mut updates,
-        )?;
     }
 
     Ok(FetchOutcome {
@@ -759,31 +773,11 @@ fn decide_push(
 ) -> Result<PushDecision> {
     let remote_current = crate::refs::resolve_ref(remote_git_dir, &spec.dst).ok();
 
-    // Absence lease (force-with-lease that the ref not exist): a push that
-    // expected the destination to be absent is rejected when it is present, even
-    // if it happens to already point at the source (Git enforces the lease
-    // strictly). Checked before the up-to-date shortcut below.
-    if spec.expect_absent && remote_current.is_some() {
-        return Ok(PushDecision {
-            result: PushRefResult {
-                local_ref: None,
-                remote_ref: spec.dst.clone(),
-                old_oid: remote_current,
-                new_oid: spec.src,
-                forced: false,
-                deletion: spec.delete,
-                status: PushRefStatus::RejectStale,
-                message: Some("stale info".to_owned()),
-            },
-            action: PushAction::None,
-            apply: false,
-        });
-    }
-
-    // Up-to-date trumps the lease: pushing a non-delete to where the remote ref
-    // already points is a no-op that succeeds even when `expected_old` (the
-    // force-with-lease expectation) differs ("moving a bookmark to the same place
-    // it already is is OK"). This check must precede the compare-and-swap check.
+    // Up-to-date trumps every lease: pushing a non-delete to where the remote ref
+    // already points is a no-op that succeeds even when the force-with-lease
+    // expectation (a specific `expected_old` value, or `expect_absent`) does not
+    // hold — "creating/moving a bookmark to the same place it already is is OK".
+    // Must precede both the absence-lease and compare-and-swap checks below.
     if !spec.delete {
         if let Some(src) = spec.src {
             if remote_current == Some(src) {
@@ -805,9 +799,29 @@ fn decide_push(
         }
     }
 
+    // Absence lease (force-with-lease that the ref not exist): once the value is
+    // actually changing (handled above), a destination that already exists fails
+    // the lease and is rejected as stale.
+    if spec.expect_absent && remote_current.is_some() {
+        return Ok(PushDecision {
+            result: PushRefResult {
+                local_ref: None,
+                remote_ref: spec.dst.clone(),
+                old_oid: remote_current,
+                new_oid: spec.src,
+                forced: false,
+                deletion: spec.delete,
+                status: PushRefStatus::RejectStale,
+                message: Some("stale info".to_owned()),
+            },
+            action: PushAction::None,
+            apply: false,
+        });
+    }
+
     // Compare-and-swap (force-with-lease): the remote's current value must match
     // the caller's expectation, otherwise reject as stale. A `None` expectation
-    // disables the check. An expectation that the ref be absent is honored too.
+    // disables the value check.
     if let Some(expected) = spec.expected_old {
         if remote_current != Some(expected) {
             return Ok(PushDecision {
@@ -1182,23 +1196,31 @@ fn prune_tracking_refs(
         }
     }
 
-    // For each wildcard positive refspec, enumerate existing local refs under its
-    // destination prefix and prune those not in `live`.
     let mut pruned: HashMap<String, ObjectId> = HashMap::new();
     for item in positive {
         let Some(dst) = item.dst.as_deref() else {
             continue;
         };
-        let Some(star) = dst.find('*') else {
-            continue;
-        };
-        let prefix = &dst[..star];
-        for (name, oid) in crate::refs::list_refs(local_git_dir, prefix)? {
-            if !name.starts_with(prefix) {
-                continue;
+        if let Some(star) = dst.find('*') {
+            // Wildcard refspec: enumerate existing local refs under its
+            // destination prefix and prune those the current remote no longer
+            // justifies.
+            let prefix = &dst[..star];
+            for (name, oid) in crate::refs::list_refs(local_git_dir, prefix)? {
+                if !name.starts_with(prefix) {
+                    continue;
+                }
+                if !live.contains(&name) {
+                    pruned.entry(name).or_insert(oid);
+                }
             }
-            if !live.contains(&name) {
-                pruned.entry(name).or_insert(oid);
+        } else if !live.contains(dst) {
+            // Exact refspec (e.g. `refs/heads/a2:refs/remotes/origin/a2`): when
+            // the source ref is gone from the remote, `dst` is absent from `live`,
+            // so prune the tracking ref if it still exists locally. This is the
+            // explicit `git fetch <remote> <branch>` / `--prune` deletion case.
+            if let Ok(oid) = crate::refs::resolve_ref(local_git_dir, dst) {
+                pruned.entry(dst.to_owned()).or_insert(oid);
             }
         }
     }
