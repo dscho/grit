@@ -565,6 +565,11 @@ fn parse_ack(line: &str) -> Option<Ack> {
 struct RoundResult {
     acks: Vec<Ack>,
     got_pack: bool,
+    /// Shallow boundaries the server reported (`shallow <oid>`) in this response's
+    /// leading `shallow-info` section (empty unless a deepen was requested).
+    shallow: Vec<ObjectId>,
+    /// Boundaries the server un-shallowed (`unshallow <oid>`) in this response.
+    unshallow: Vec<ObjectId>,
 }
 
 /// Demultiplex the side-band pack from a stateless-RPC response, appending pack
@@ -641,17 +646,51 @@ fn append_pack_data(data: &[u8], out: &mut Vec<u8>, pending: &mut Vec<u8>, seen_
     }
 }
 
-/// Parse one v0 stateless-RPC `git-upload-pack` response: optional `ACK`/`NAK`
-/// negotiation lines, then (if the server is generating one) the side-band pack.
+/// Parse one v0 stateless-RPC `git-upload-pack` response: an optional leading
+/// `shallow-info` section (only when `expect_shallow`, i.e. a deepen was
+/// requested), then optional `ACK`/`NAK` negotiation lines, then (if the server
+/// is generating one) the side-band pack.
 fn read_stateless_response(
     resp: &[u8],
     sideband: bool,
+    expect_shallow: bool,
     pack_buf: &mut Vec<u8>,
     progress: &mut dyn Progress,
 ) -> Result<RoundResult> {
     let mut cur = Cursor::new(resp);
     let mut acks = Vec::new();
     let mut got_pack = false;
+    let mut shallow = Vec::new();
+    let mut unshallow = Vec::new();
+
+    // Shallow-info section: `shallow`/`unshallow` lines terminated by a flush. A
+    // server with nothing to report still emits the trailing flush. Rewind and
+    // fall through if the first line is not a shallow-info line (no section).
+    if expect_shallow {
+        loop {
+            let start = cur.position() as usize;
+            match pkt_line::read_packet(&mut cur)? {
+                None | Some(pkt_line::Packet::Flush) => break,
+                Some(pkt_line::Packet::Data(line)) => {
+                    let line = line.trim_end_matches('\n');
+                    if let Some(rest) = line.strip_prefix("shallow ") {
+                        if let Ok(oid) = ObjectId::from_hex(rest.trim()) {
+                            shallow.push(oid);
+                        }
+                    } else if let Some(rest) = line.strip_prefix("unshallow ") {
+                        if let Ok(oid) = ObjectId::from_hex(rest.trim()) {
+                            unshallow.push(oid);
+                        }
+                    } else {
+                        cur.set_position(start as u64);
+                        break;
+                    }
+                }
+                Some(_) => break,
+            }
+        }
+    }
+
     loop {
         let start = cur.position() as usize;
         let Some(payload) = read_pkt_payload(&mut cur)? else {
@@ -686,7 +725,12 @@ fn read_stateless_response(
             acks.push(ack);
         }
     }
-    Ok(RoundResult { acks, got_pack })
+    Ok(RoundResult {
+        acks,
+        got_pack,
+        shallow,
+        unshallow,
+    })
 }
 
 /// The v0/v1 fetch capabilities we request, intersected with what the server
@@ -728,8 +772,44 @@ fn next_flush(count: usize) -> usize {
     }
 }
 
+/// Append the v0/v1 shallow/deepen request lines (the client's `shallow <oid>`
+/// grafts and any `deepen`/`deepen-since`/`deepen-not`) to the persistent request
+/// `state`, gated on the server capability where one exists. Mirrors the CLI's
+/// `append_fetch_request_extensions_v0_v1`.
+fn append_shallow_request_v0_http(
+    req: &mut Vec<u8>,
+    caps: &HashSet<String>,
+    local_shallow: &[ObjectId],
+    opts: &FetchOptions,
+) -> Result<()> {
+    for oid in local_shallow {
+        pkt_line::write_line_to_vec(req, &format!("shallow {}", oid.to_hex()))?;
+    }
+    if opts.unshallow {
+        pkt_line::write_line_to_vec(req, &format!("deepen {}", crate::shallow::INFINITE_DEPTH))?;
+    } else if let Some(depth) = opts.depth.filter(|d| *d > 0) {
+        pkt_line::write_line_to_vec(req, &format!("deepen {depth}"))?;
+    }
+    if let Some(since) = opts.deepen_since.as_deref().filter(|s| !s.trim().is_empty()) {
+        if caps.contains("deepen-since") {
+            let value = crate::shallow::deepen_since_wire_value(since);
+            pkt_line::write_line_to_vec(req, &format!("deepen-since {value}"))?;
+        }
+    }
+    if caps.contains("deepen-not") {
+        for excl in &opts.deepen_not {
+            let excl = excl.trim();
+            if !excl.is_empty() {
+                pkt_line::write_line_to_vec(req, &format!("deepen-not {excl}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Negotiate and download the pack for `wants` over stateless-RPC HTTP,
-/// returning the raw pack bytes (empty if the server sent none).
+/// returning the raw pack bytes (empty if the server sent none) plus any
+/// shallow-boundary updates the server reported.
 fn negotiate_pack_http(
     client: &dyn HttpClient,
     local_git_dir: &Path,
@@ -737,8 +817,10 @@ fn negotiate_pack_http(
     caps: &HashSet<String>,
     advertised: &[AdvRef],
     wants: &[ObjectId],
+    opts: &FetchOptions,
+    local_shallow: &[ObjectId],
     progress: &mut dyn Progress,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, crate::fetch::ShallowUpdate)> {
     let post_url = upload_pack_url(repo_url);
     let content_type = format!("application/x-{UPLOAD_PACK}-request");
     let accept = format!("application/x-{UPLOAD_PACK}-result");
@@ -747,67 +829,80 @@ fn negotiate_pack_http(
     let multi_ack_detailed = caps.contains("multi_ack_detailed");
     let no_done = multi_ack_detailed && caps.contains("no-done");
 
+    // A deepen/shallow request precedes the pack with a `shallow-info` section and
+    // does not offer local haves (its objects bottom out at grafts).
+    let shallow_request = opts.has_deepen_request() || !local_shallow.is_empty();
+
     let want_set: HashSet<ObjectId> = wants.iter().copied().collect();
 
     // Build the persistent request prefix replayed on every RPC: the want lines
-    // (capabilities on the first) and the terminating flush.
+    // (capabilities on the first), the shallow/deepen extensions, and the
+    // terminating flush.
     let mut state = Vec::new();
     let first = wants[0];
     pkt_line::write_line_to_vec(&mut state, &format!("want {}{}", first.to_hex(), fetch_caps))?;
     for w in wants.iter().skip(1) {
         pkt_line::write_line_to_vec(&mut state, &format!("want {}", w.to_hex()))?;
     }
+    append_shallow_request_v0_http(&mut state, caps, local_shallow, opts)?;
     pkt_line::write_flush(&mut state)?;
 
+    let mut shallow_update = crate::fetch::ShallowUpdate::default();
+
     // Build the negotiator from local tips, marking advertised tips we already
-    // have as known-common.
+    // have as known-common. Skipped for a shallow request.
     let local_repo = crate::repo::Repository::open(local_git_dir, None)?;
     let mut negotiator = SkippingNegotiator::new(local_repo);
-    for w in wants {
-        if negotiator.repo().odb.read(w).is_ok() {
-            negotiator.add_tip(*w)?;
+    if !shallow_request {
+        for w in wants {
+            if negotiator.repo().odb.read(w).is_ok() {
+                negotiator.add_tip(*w)?;
+            }
         }
-    }
-    let mut tips: Vec<ObjectId> = Vec::new();
-    for prefix in ["refs/heads/", "refs/tags/"] {
-        if let Ok(entries) = crate::refs::list_refs(local_git_dir, prefix) {
-            for (_, oid) in entries {
-                if negotiator.repo().odb.read(&oid).is_ok() {
-                    tips.push(oid);
+        let mut tips: Vec<ObjectId> = Vec::new();
+        for prefix in ["refs/heads/", "refs/tags/"] {
+            if let Ok(entries) = crate::refs::list_refs(local_git_dir, prefix) {
+                for (_, oid) in entries {
+                    if negotiator.repo().odb.read(&oid).is_ok() {
+                        tips.push(oid);
+                    }
                 }
             }
         }
-    }
-    if let Ok(h) = crate::refs::resolve_ref(local_git_dir, "HEAD") {
-        if negotiator.repo().odb.read(&h).is_ok() {
-            tips.push(h);
+        if let Ok(h) = crate::refs::resolve_ref(local_git_dir, "HEAD") {
+            if negotiator.repo().odb.read(&h).is_ok() {
+                tips.push(h);
+            }
         }
-    }
-    tips.sort_by_key(ObjectId::to_hex);
-    tips.dedup();
-    for t in tips {
-        if want_set.contains(&t) {
-            continue;
+        tips.sort_by_key(ObjectId::to_hex);
+        tips.dedup();
+        for t in tips {
+            if want_set.contains(&t) {
+                continue;
+            }
+            negotiator.add_tip(t)?;
         }
-        negotiator.add_tip(t)?;
-    }
-    for e in advertised {
-        if want_set.contains(&e.oid) {
-            continue;
-        }
-        if negotiator.repo().odb.read(&e.oid).is_ok() {
-            negotiator.known_common(e.oid)?;
+        for e in advertised {
+            if want_set.contains(&e.oid) {
+                continue;
+            }
+            if negotiator.repo().odb.read(&e.oid).is_ok() {
+                negotiator.known_common(e.oid)?;
+            }
         }
     }
 
     let mut pack_buf: Vec<u8> = Vec::new();
     let mut got_ready = false;
     let mut got_pack = false;
+    let mut shallow_applied = false;
 
     const INITIAL_FLUSH: usize = 16;
     let mut count: usize = 0;
     let mut flush_at: usize = INITIAL_FLUSH;
     let mut round = Vec::new();
+    // The negotiator is empty for a shallow request, so this loop is skipped and
+    // the single `done` RPC below carries the wants + shallow lines.
     while let Some(oid) = negotiator.next_have()? {
         pkt_line::write_line_to_vec(&mut round, &format!("have {}", oid.to_hex()))?;
         count += 1;
@@ -822,7 +917,13 @@ fn negotiate_pack_http(
         round.clear();
 
         let resp = client.post(&post_url, &content_type, &accept, &req, None)?;
-        let round_result = read_stateless_response(&resp, sideband, &mut pack_buf, progress)?;
+        let round_result =
+            read_stateless_response(&resp, sideband, shallow_request, &mut pack_buf, progress)?;
+        if shallow_request && !shallow_applied {
+            shallow_update.shallow.extend(round_result.shallow.iter().copied());
+            shallow_update.unshallow.extend(round_result.unshallow.iter().copied());
+            shallow_applied = true;
+        }
         for ack in &round_result.acks {
             if matches!(ack.kind, AckKind::Bare) {
                 continue;
@@ -851,10 +952,15 @@ fn negotiate_pack_http(
         pkt_line::write_line_to_vec(&mut req, "done")?;
         pkt_line::write_flush(&mut req)?;
         let resp = client.post(&post_url, &content_type, &accept, &req, None)?;
-        let _ = read_stateless_response(&resp, sideband, &mut pack_buf, progress)?;
+        let round_result =
+            read_stateless_response(&resp, sideband, shallow_request, &mut pack_buf, progress)?;
+        if shallow_request && !shallow_applied {
+            shallow_update.shallow.extend(round_result.shallow);
+            shallow_update.unshallow.extend(round_result.unshallow);
+        }
     }
 
-    Ok(pack_buf)
+    Ok((pack_buf, shallow_update))
 }
 
 /// Resolve the `wants` for a fetch from the advertised refs and the matched set.
@@ -1000,23 +1106,36 @@ pub fn http_fetch(
         }
     }
 
-    // 5. Wants absent locally → negotiate + ingest the pack.
-    let need: Vec<ObjectId> = wants
-        .iter()
-        .copied()
-        .filter(|oid| !local_odb.exists(oid))
-        .collect();
+    // 5. Wants → negotiate + ingest the pack. Normally the matched oids absent
+    // locally; for a deepen/`--unshallow` request we must still `want` the tips
+    // even if present so the server fills in ancestors past the old boundary.
+    let local_shallow = crate::shallow::load_shallow_oids(local_git_dir)?;
+    let shallow_request = opts.has_deepen_request() || !local_shallow.is_empty();
+    let need: Vec<ObjectId> = if shallow_request {
+        wants.iter().copied().collect()
+    } else {
+        wants
+            .iter()
+            .copied()
+            .filter(|oid| !local_odb.exists(oid))
+            .collect()
+    };
+
+    let mut shallow_update = crate::fetch::ShallowUpdate::default();
 
     if !need.is_empty() && !opts.dry_run {
-        let pack = negotiate_pack_http(
+        let (pack, su) = negotiate_pack_http(
             client,
             local_git_dir,
             repo_url,
             &disc.caps,
             &disc.refs,
             &need,
+            opts,
+            &local_shallow,
             progress,
         )?;
+        shallow_update = su;
         if !pack.is_empty() {
             if pack.len() < 12 || &pack[0..4] != b"PACK" {
                 return Err(Error::Message(
@@ -1033,6 +1152,15 @@ pub fn http_fetch(
                 },
             )?;
         }
+    }
+
+    // Apply shallow/unshallow boundary updates to the on-disk `shallow` file.
+    if !opts.dry_run {
+        crate::shallow::apply_shallow_updates(
+            local_git_dir,
+            &shallow_update.shallow,
+            &shallow_update.unshallow,
+        )?;
     }
 
     // 6. For TagMode::Following, drop tags whose target did not arrive.
@@ -1092,6 +1220,8 @@ pub fn http_fetch(
     Ok(FetchOutcome {
         updates,
         default_branch,
+        new_shallow: shallow_update.shallow,
+        new_unshallow: shallow_update.unshallow,
     })
 }
 
@@ -1185,15 +1315,26 @@ fn http_fetch_v2(
         }
     }
 
-    // 5. Wants absent locally → negotiate + ingest the pack.
-    let need: Vec<ObjectId> = wants
-        .iter()
-        .copied()
-        .filter(|oid| !local_odb.exists(oid))
-        .collect();
+    // 5. Wants → negotiate + ingest the pack. Normally the matched oids absent
+    // locally; for a deepen/`--unshallow` request we must still `want` the tips
+    // even if present so the server fills in ancestors past the old boundary.
+    let local_shallow = crate::shallow::load_shallow_oids(local_git_dir)?;
+    let shallow_request = opts.has_deepen_request() || !local_shallow.is_empty();
+    let need: Vec<ObjectId> = if shallow_request {
+        wants.iter().copied().collect()
+    } else {
+        wants
+            .iter()
+            .copied()
+            .filter(|oid| !local_odb.exists(oid))
+            .collect()
+    };
+
+    let mut shallow_update = crate::fetch::ShallowUpdate::default();
 
     if !need.is_empty() && !opts.dry_run {
-        let pack = negotiate_pack_v2_http(
+        let deepen = crate::fetch::V2DeepenArgs::from_opts(opts, &local_shallow);
+        let (pack, su) = negotiate_pack_v2_http(
             client,
             local_git_dir,
             &post_url,
@@ -1203,8 +1344,10 @@ fn http_fetch_v2(
             &server_caps,
             &local_odb,
             &need,
+            &deepen,
             progress,
         )?;
+        shallow_update = su;
         if !pack.is_empty() {
             if pack.len() < 12 || &pack[0..4] != b"PACK" {
                 return Err(Error::Message(
@@ -1221,6 +1364,15 @@ fn http_fetch_v2(
                 },
             )?;
         }
+    }
+
+    // Apply shallow/unshallow boundary updates to the on-disk `shallow` file.
+    if !opts.dry_run {
+        crate::shallow::apply_shallow_updates(
+            local_git_dir,
+            &shallow_update.shallow,
+            &shallow_update.unshallow,
+        )?;
     }
 
     // 6. For TagMode::Following, drop tags whose target did not arrive.
@@ -1280,6 +1432,8 @@ fn http_fetch_v2(
     Ok(FetchOutcome {
         updates,
         default_branch,
+        new_shallow: shallow_update.shallow,
+        new_unshallow: shallow_update.unshallow,
     })
 }
 
@@ -1308,20 +1462,32 @@ fn negotiate_pack_v2_http(
     server_caps: &[String],
     local_odb: &crate::odb::Odb,
     wants: &[ObjectId],
+    deepen: &crate::fetch::V2DeepenArgs,
     progress: &mut dyn Progress,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, crate::fetch::ShallowUpdate)> {
     if wants.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), crate::fetch::ShallowUpdate::default()));
     }
     let object_format = crate::fetch::v2_object_format(server_caps, local_odb);
     let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
     let sideband_all = protocol_v2::fetch_supports_sideband_all(server_caps);
 
+    // A deepen/shallow request does not offer haves (its objects bottom out at
+    // grafts), forcing the single-round path so the server precedes the pack with
+    // a `shallow-info` section.
+    let shallow_request = deepen.is_shallow_request();
+
     // The ordered have list, built with the shared skipping-negotiator helper so
-    // the wire offers match the streaming v2 path exactly.
-    let haves = crate::fetch::v2_local_haves(local_git_dir, wants)?;
+    // the wire offers match the streaming v2 path exactly. Empty for a shallow
+    // request.
+    let haves = if shallow_request {
+        Vec::new()
+    } else {
+        crate::fetch::v2_local_haves(local_git_dir, wants)?
+    };
 
     let mut pack = Vec::new();
+    let mut shallow_update = crate::fetch::ShallowUpdate::default();
 
     // No local history: one POST, wants + done, then the pack.
     if haves.is_empty() {
@@ -1333,12 +1499,13 @@ fn negotiate_pack_v2_http(
             wants,
             &[],
             sideband_all,
+            deepen,
             true,
         )?;
         let resp = client.post(post_url, content_type, accept, &req, Some(git_protocol))?;
         let mut cur = Cursor::new(resp);
-        crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
-        return Ok(pack);
+        crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, &mut shallow_update, progress)?;
+        return Ok((pack, shallow_update));
     }
 
     // Batched negotiation: each round resends wants + the accumulated have prefix
@@ -1357,6 +1524,7 @@ fn negotiate_pack_v2_http(
                 wants,
                 &haves[..flush_at],
                 sideband_all,
+                deepen,
                 false,
             )?;
             let resp = client.post(post_url, content_type, accept, &req, Some(git_protocol))?;
@@ -1365,13 +1533,23 @@ fn negotiate_pack_v2_http(
             if let Some(round) = ack {
                 if round.ready {
                     // The pack follows in this same response after the delimiter.
-                    crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
-                    return Ok(pack);
+                    crate::fetch::read_v2_fetch_pack_response(
+                        &mut cur,
+                        &mut pack,
+                        &mut shallow_update,
+                        progress,
+                    )?;
+                    return Ok((pack, shallow_update));
                 }
             } else {
                 // Server skipped acknowledgments and went straight to the pack.
-                crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
-                return Ok(pack);
+                crate::fetch::read_v2_fetch_pack_response(
+                    &mut cur,
+                    &mut pack,
+                    &mut shallow_update,
+                    progress,
+                )?;
+                return Ok((pack, shallow_update));
             }
             flush_at = next_flush(flush_at).min(haves.len());
             continue;
@@ -1386,12 +1564,13 @@ fn negotiate_pack_v2_http(
             wants,
             &haves,
             sideband_all,
+            deepen,
             true,
         )?;
         let resp = client.post(post_url, content_type, accept, &req, Some(git_protocol))?;
         let mut cur = Cursor::new(resp);
-        crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, progress)?;
-        return Ok(pack);
+        crate::fetch::read_v2_fetch_pack_response(&mut cur, &mut pack, &mut shallow_update, progress)?;
+        return Ok((pack, shallow_update));
     }
 }
 

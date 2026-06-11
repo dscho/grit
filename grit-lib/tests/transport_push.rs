@@ -69,10 +69,21 @@ fn build_source(dir: &Path) {
 }
 
 fn free_port() -> Option<u16> {
-    let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
-    let p = l.local_addr().ok()?.port();
-    drop(l);
-    Some(p)
+    // Dedup port handout per process so a concurrent caller never accepts a
+    // port another test already reserved (closes the bind-before-spawn TOCTOU
+    // that let two servers share a port under high test parallelism).
+    static USED: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..200 {
+        let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+        let p = l.local_addr().ok()?.port();
+        drop(l);
+        if !used.contains(&p) {
+            used.push(p);
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Spawn `git daemon` over `base_path` on `port` with receive-pack enabled.

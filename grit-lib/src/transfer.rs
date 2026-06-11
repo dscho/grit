@@ -103,6 +103,24 @@ pub struct FetchOptions {
     pub prune: bool,
     /// Compute and report updates without writing any refs or objects.
     pub dry_run: bool,
+    /// Truncate history to the given number of commits per tip
+    /// (`git fetch --depth N`). Drives the wire `deepen N` / v2 `deepen` arg and,
+    /// for a previously shallow repo, deepens the existing boundary. `None`
+    /// requests full history.
+    pub depth: Option<u32>,
+    /// Deepen history to include commits no older than this cutoff
+    /// (`git fetch --shallow-since <date>`). The value is sent verbatim as the
+    /// wire `deepen-since <value>`; callers should pass the Unix timestamp Git's
+    /// `upload-pack` expects (a bare integer), not a human date string.
+    pub deepen_since: Option<String>,
+    /// Deepen history but stop at (exclude) commits reachable from these refs/oids
+    /// (`git fetch --shallow-exclude <ref>`). Each entry is sent as a wire
+    /// `deepen-not <ref>`.
+    pub deepen_not: Vec<String>,
+    /// Convert a shallow repository back into a complete one
+    /// (`git fetch --unshallow`). Drives the wire `deepen 0x7fffffff` request and
+    /// removes the local `shallow` boundaries that get reported as `unshallow`.
+    pub unshallow: bool,
 }
 
 impl Default for FetchOptions {
@@ -113,7 +131,29 @@ impl Default for FetchOptions {
             tags: TagMode::default(),
             prune: false,
             dry_run: false,
+            depth: None,
+            deepen_since: None,
+            deepen_not: Vec::new(),
+            unshallow: false,
         }
+    }
+}
+
+impl FetchOptions {
+    /// Whether this fetch carries any shallow/deepen request (an explicit
+    /// `depth`/`deepen-since`/`deepen-not`/`unshallow`). Note this does NOT cover
+    /// the "already shallow, fetching more of the same boundary" case — that is
+    /// driven by the on-disk `shallow` file, checked separately by the fetch
+    /// paths via [`crate::shallow::load_shallow_oids`].
+    #[must_use]
+    pub fn has_deepen_request(&self) -> bool {
+        self.depth.is_some()
+            || self
+                .deepen_since
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty())
+            || self.deepen_not.iter().any(|v| !v.trim().is_empty())
+            || self.unshallow
     }
 }
 
@@ -124,6 +164,14 @@ pub struct FetchOutcome {
     pub updates: Vec<RefUpdate>,
     /// The remote's default branch (from `HEAD` symref), if known.
     pub default_branch: Option<String>,
+    /// New shallow boundary commits the server reported (`shallow <oid>`), already
+    /// applied to the local `shallow` file. The commits' parents are intentionally
+    /// absent from the local object store after this fetch.
+    pub new_shallow: Vec<ObjectId>,
+    /// Commits the server reported as no longer shallow (`unshallow <oid>`), i.e.
+    /// boundaries removed from the local `shallow` file because their history is
+    /// now complete. Populated by a deepen / `--unshallow` fetch.
+    pub new_unshallow: Vec<ObjectId>,
 }
 
 /// A single ref update requested by a push.
@@ -154,6 +202,17 @@ pub struct PushOptions {
     pub atomic: bool,
     /// Compute results without writing to the remote.
     pub dry_run: bool,
+    /// Server-side push options to transmit (`git push --push-option <value>`).
+    ///
+    /// When non-empty, the negotiated capability list includes `push-options`
+    /// and one `push-option <value>` pkt-line per entry is written after the
+    /// ref-update command block and before the flush/pack. The remote exposes
+    /// these to its hooks via `GIT_PUSH_OPTION_COUNT` / `GIT_PUSH_OPTION_<n>`.
+    ///
+    /// If this is non-empty but the remote `git-receive-pack` does not advertise
+    /// the `push-options` capability, the push fails with
+    /// [`crate::error::Error::PushOptionsUnsupported`] (matching Git).
+    pub push_options: Vec<String>,
 }
 
 /// The structured result of a push. Reuses [`PushRefResult`] for per-ref status.
@@ -185,6 +244,23 @@ pub struct PackBuildOptions {
     /// in the pack; otherwise `REF_DELTA` (base named by OID). Thin/external
     /// bases always use `REF_DELTA` regardless of this flag.
     pub use_ofs_delta: bool,
+    /// Honor delta islands (`pack.island` config) when selecting bases, so a
+    /// target only deltas against a base in a compatible (superset) island and
+    /// the base preference is biased toward objects living in dominating islands.
+    ///
+    /// Mirrors `git pack-objects --delta-islands`. When `false` (the default,
+    /// preserving the prior behavior) islands are ignored entirely — equivalent
+    /// to no `pack.island` config. Loading islands walks the ref graph, so this
+    /// only does work when the repository actually configures islands.
+    pub respect_islands: bool,
+    /// Reuse on-disk `REF_DELTA`/`OFS_DELTA` edges from existing packs when both
+    /// the target and its recorded base are in this pack, instead of recomputing
+    /// a fresh delta. Mirrors Git's `reuse_delta` window-reuse path.
+    ///
+    /// `false` (the default) preserves the prior behavior of always computing
+    /// fresh deltas. Reuse only applies to SHA-1 packs (the reuse helpers read
+    /// 20-byte index entries) and is skipped silently otherwise.
+    pub reuse_deltas: bool,
 }
 
 impl Default for PackBuildOptions {
@@ -195,6 +271,8 @@ impl Default for PackBuildOptions {
             window: 10,
             max_depth: 50,
             use_ofs_delta: true,
+            respect_islands: false,
+            reuse_deltas: false,
         }
     }
 }
@@ -419,6 +497,11 @@ struct PlannedEntry {
     /// The base may be an in-pack object or — for thin packs — an external base
     /// present only on the peer.
     base: Option<ObjectId>,
+    /// A delta instruction stream reused verbatim from an existing on-disk pack
+    /// (Git's `reuse_delta`). When present, the serializer emits these bytes
+    /// instead of recomputing the delta against `base`. Only set for a delta
+    /// entry whose `base` matches the recorded on-disk base.
+    reused_delta: Option<Vec<u8>>,
 }
 
 /// The full delta plan: the ordered entries to emit plus the set of external
@@ -481,12 +564,24 @@ fn apply_delta_depth_limit(map: &mut HashMap<ObjectId, ObjectId>, max_depth: usi
 
 /// Select blob deltas for `send` and produce an ordered emit plan.
 ///
-/// This is a simplified lift of the CLI's `optimize_blob_deltas`: a size-sorted
-/// prefix/LCP window heuristic over blobs only, depth-limited via
-/// [`apply_delta_depth_limit`]. It does NOT implement full delta-island parity
-/// (islands default to inactive here) and does not delta trees/commits — those
-/// are emitted whole. Correctness (re-indexability) is preserved because every
-/// chosen base is acyclic and either in-pack or, for thin packs, peer-held.
+/// A lift of the CLI's `optimize_blob_deltas`: a size-sorted prefix/LCP window
+/// heuristic over blobs, depth-limited via [`apply_delta_depth_limit`]. Trees and
+/// commits are emitted whole (matching the CLI's blob-only delta selection).
+/// Correctness (re-indexability) is preserved because every chosen base is acyclic
+/// and either in-pack or, for thin packs, peer-held.
+///
+/// Two optional refinements bring this closer to the CLI packer:
+///
+/// * **Delta islands** (`opts.respect_islands`): when `pack.island` config marks
+///   any ref, a target only deltas against a base in a compatible (superset)
+///   island ([`crate::delta_islands::DeltaIslands::in_same_island`]) and ties are
+///   broken toward bases in dominating islands
+///   ([`crate::delta_islands::DeltaIslands::delta_cmp`]). Islands default to
+///   inactive (the prior behavior).
+/// * **On-disk delta reuse** (`opts.reuse_deltas`): an existing
+///   `REF_DELTA`/`OFS_DELTA` edge whose base is also in this pack is reused
+///   verbatim ([`crate::pack::packed_ref_delta_reuse_slice`]) rather than
+///   recomputed, still subject to island rules.
 ///
 /// When `opts.thin`, a blob may also delta against a base reachable from the
 /// peer's `haves` (`have_closure`) even though that base is not emitted; the base
@@ -507,11 +602,42 @@ fn plan_deltas(
 
     let in_pack: HashSet<ObjectId> = send.iter().copied().collect();
 
+    // Delta islands (`--delta-islands`): only loaded when requested AND a git dir
+    // is attached to the odb. An inactive island set (no `pack.island` config, or
+    // no matched ref) imposes no restriction, so the common case is unaffected.
+    let islands = load_islands_for_pack(odb, &in_pack, opts);
+
     // target oid -> base oid (the object `target` deltas against).
     let mut delta_to_base: HashMap<ObjectId, ObjectId> = HashMap::new();
+    // Deltas whose instruction stream is reused verbatim from an existing pack.
+    let mut reused: HashMap<ObjectId, Vec<u8>> = HashMap::new();
     let mut external_bases: HashSet<ObjectId> = HashSet::new();
 
     if opts.window > 0 && opts.max_depth > 0 {
+        // (1) On-disk delta reuse: for each in-pack blob whose existing on-disk
+        // representation is a delta against another in-pack object, reuse that
+        // edge directly. Island rules still apply (never base on an incompatible
+        // island). SHA-256 packs are skipped inside the reuse helper.
+        if opts.reuse_deltas && odb.hash_algo() == HashAlgo::Sha1 {
+            let objects_dir = odb.objects_dir();
+            for &t in send {
+                if objects[&t].kind != ObjectKind::Blob || objects[&t].data.is_empty() {
+                    continue;
+                }
+                if let Ok(Some((base, zdelta))) =
+                    crate::pack::packed_ref_delta_reuse_slice(objects_dir, &t, &in_pack)
+                {
+                    if base != t
+                        && in_pack.contains(&base)
+                        && islands.in_same_island(&t, &base)
+                    {
+                        delta_to_base.insert(t, base);
+                        reused.insert(t, zdelta);
+                    }
+                }
+            }
+        }
+
         // Blobs in the pack, smallest-first (size-sorted window proximity).
         let mut blobs: Vec<ObjectId> = send
             .iter()
@@ -537,9 +663,16 @@ fn plan_deltas(
         }
 
         for (i, &t) in blobs.iter().enumerate() {
+            // A reused on-disk delta already covers this target.
+            if delta_to_base.contains_key(&t) {
+                continue;
+            }
             let t_data = &objects[&t].data;
 
-            let mut best: Option<(ObjectId, usize, usize, bool)> = None; // (base, common, base_len, external)
+            // (base, common, base_len, external). When islands are active the
+            // selection additionally prefers a base in a dominating island via
+            // `delta_cmp`, matching the CLI's `island_delta_cmp` bias.
+            let mut best: Option<(ObjectId, usize, usize, bool)> = None;
 
             // Consider larger in-pack blobs within the window (closest in size).
             // `blobs` is ascending by size, so later entries are the larger bases.
@@ -549,6 +682,10 @@ fn plan_deltas(
                     break;
                 }
                 considered += 1;
+                // Island rule: never base `t` on a blob in a non-superset island.
+                if !islands.in_same_island(&t, &b) {
+                    continue;
+                }
                 let b_data = &objects[&b].data;
                 if b_data.len() <= t_data.len() {
                     continue;
@@ -559,7 +696,19 @@ fn plan_deltas(
                     common_prefix_len(t_data, b_data)
                 };
                 if common > 64 && common.saturating_mul(2) >= t_data.len() {
-                    let better = best.is_none_or(|(_, bc, bl, _)| {
+                    let better = best.is_none_or(|(prev_b, bc, bl, _)| {
+                        // Prefer a strictly dominating island first (Git's
+                        // `island_delta_cmp`), then more common prefix, then the
+                        // smaller (closer-in-size) base.
+                        if islands.is_active() {
+                            let cmp = islands.delta_cmp(&b, &prev_b);
+                            if cmp < 0 {
+                                return true;
+                            }
+                            if cmp > 0 {
+                                return false;
+                            }
+                        }
                         common > bc || (common == bc && b_data.len() < bl)
                     });
                     if better {
@@ -578,6 +727,10 @@ fn plan_deltas(
                     if b == t {
                         continue;
                     }
+                    // External (peer-held) bases participate in island rules too.
+                    if !islands.in_same_island(&t, &b) {
+                        continue;
+                    }
                     let common = common_prefix_len(t_data, b_data);
                     if common > 64 && common.saturating_mul(2) >= t_data.len() {
                         let better = best.is_none_or(|(_, bc, bl, ext)| {
@@ -594,15 +747,21 @@ fn plan_deltas(
                 delta_to_base.insert(t, base);
                 if external {
                     external_bases.insert(base);
-                    external_blob_data
-                        .get(&base)
-                        .map(|d| objects.entry(base).or_insert_with(|| Object::new(ObjectKind::Blob, d.clone())));
+                    if let Some(d) = external_blob_data.get(&base) {
+                        objects
+                            .entry(base)
+                            .or_insert_with(|| Object::new(ObjectKind::Blob, d.clone()));
+                    }
                 }
             }
         }
 
         // Cap chain length. After snipping, any removed target reverts to whole.
         apply_delta_depth_limit(&mut delta_to_base, opts.max_depth);
+
+        // A reused delta whose target was snipped (or whose base ceased to be the
+        // chosen base) reverts to a freshly-computed full/delta object.
+        reused.retain(|t, _| delta_to_base.contains_key(t));
 
         // A base that is no longer referenced as an external base (because its
         // only dependent was snipped) must not be counted as external.
@@ -622,6 +781,7 @@ fn plan_deltas(
             kind: obj.kind,
             data: obj.data.clone(),
             base: delta_to_base.get(&oid).copied(),
+            reused_delta: reused.get(&oid).cloned(),
         });
     }
 
@@ -629,6 +789,29 @@ fn plan_deltas(
         entries,
         external_bases,
     })
+}
+
+/// Load delta-island marks for the objects being packed, honoring
+/// `opts.respect_islands`. Returns an inactive (no-op) island set when islands
+/// are not requested, when the odb has no attached git directory, or when no
+/// `pack.island` regex matches a ref — so callers can always consult the result
+/// without a flag check.
+fn load_islands_for_pack(
+    odb: &Odb,
+    in_pack: &HashSet<ObjectId>,
+    opts: &PackBuildOptions,
+) -> crate::delta_islands::DeltaIslands {
+    if !opts.respect_islands {
+        return crate::delta_islands::DeltaIslands::default();
+    }
+    let Some(git_dir) = odb.config_git_dir() else {
+        return crate::delta_islands::DeltaIslands::default();
+    };
+    let Ok(repo) = crate::repo::Repository::open(git_dir, None) else {
+        return crate::delta_islands::DeltaIslands::default();
+    };
+    let cfg = crate::config::ConfigSet::load(Some(git_dir), true).unwrap_or_default();
+    crate::delta_islands::load_delta_islands(&repo, &cfg, in_pack)
 }
 
 /// Serialize a [`DeltaPlan`] into a PACK v2 stream.
@@ -667,18 +850,22 @@ fn serialize_pack_with_deltas(
                 oid_to_offset.insert(entry.oid, start);
             }
             Some(base_oid) => {
-                // Resolve the base payload: in-pack first, else (thin) from odb.
-                let base_data: Vec<u8> = if let Some(d) = payloads.get(&base_oid) {
-                    d.to_vec()
+                // A reused on-disk delta stream is emitted verbatim; otherwise
+                // compute a fresh delta against the resolved base payload.
+                let delta = if let Some(reused) = &entry.reused_delta {
+                    reused.clone()
                 } else {
-                    odb.read(&base_oid)?.data
-                };
-                let delta = if entry.data.starts_with(&base_data)
-                    && entry.data.len() > base_data.len()
-                {
-                    encode_prefix_extension_delta(&base_data, &entry.data)?
-                } else {
-                    encode_lcp_delta(&base_data, &entry.data)?
+                    // Resolve the base payload: in-pack first, else (thin) from odb.
+                    let base_data: Vec<u8> = if let Some(d) = payloads.get(&base_oid) {
+                        d.to_vec()
+                    } else {
+                        odb.read(&base_oid)?.data
+                    };
+                    if entry.data.starts_with(&base_data) && entry.data.len() > base_data.len() {
+                        encode_prefix_extension_delta(&base_data, &entry.data)?
+                    } else {
+                        encode_lcp_delta(&base_data, &entry.data)?
+                    }
                 };
 
                 let in_pack_offset = oid_to_offset.get(&base_oid).copied();
@@ -969,9 +1156,13 @@ pub fn fetch_local(
         });
     }
 
+    // The local / file:// path copies the exact object closure and never grafts,
+    // so it neither introduces nor resolves shallow boundaries.
     Ok(FetchOutcome {
         updates,
         default_branch,
+        new_shallow: Vec::new(),
+        new_unshallow: Vec::new(),
     })
 }
 

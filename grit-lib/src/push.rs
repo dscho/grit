@@ -101,6 +101,10 @@ pub fn push_remote(
     //    remote ref map and the `.have` hints, and read the negotiated caps.
     let adv = AdvertisedState::from_connection(conn);
 
+    // Push-options require the server's `push-options` capability; fail typed
+    // (matching Git) before sending anything if the server lacks it.
+    require_push_options_supported(&adv, opts)?;
+
     // 2–3. Decide each ref update client-side, handling atomic/dry-run/no-op
     //       early-returns; the shared planner mirrors `push_local`'s gate.
     let mut plan = match plan_push(refs, &local_odb, local_git_dir, &adv, opts)? {
@@ -113,7 +117,7 @@ pub fn push_remote(
     //    push streams no pack at all (matching `git send-pack`); `receive-pack`
     //    does not read one after a delete-only command block, so sending an empty
     //    pack would leave unread bytes on the wire and reset the connection.
-    let commands = build_command_block(&plan, &adv, algo)?;
+    let commands = build_command_block(&plan, &adv, algo, &opts.push_options)?;
     conn.writer().write_all(&commands)?;
     conn.writer().flush()?;
 
@@ -199,15 +203,20 @@ pub fn push_http(
         ));
     }
 
+    // Push-options require the server's `push-options` capability; fail typed
+    // (matching Git) before sending anything if the server lacks it.
+    require_push_options_supported(&adv.state, opts)?;
+
     // 2–3. Decide each ref update client-side (shared with `push_remote`).
     let mut plan = match plan_push(refs, &local_odb, local_git_dir, &adv.state, opts)? {
         PlanOutcome::Send(plan) => plan,
         PlanOutcome::Done(results) => return Ok(PushOutcome { results }),
     };
 
-    // 4. Build the single POST body: ref-update commands + flush, then the pack
-    //    (omitted entirely for a deletion-only push, matching `git send-pack`).
-    let mut body = build_command_block(&plan, &adv.state, algo)?;
+    // 4. Build the single POST body: ref-update commands + flush (then the
+    //    push-option lines + flush when negotiated), then the pack (omitted
+    //    entirely for a deletion-only push, matching `git send-pack`).
+    let mut body = build_command_block(&plan, &adv.state, algo, &opts.push_options)?;
     if let Some(pack) = build_push_pack(&plan, &local_odb, &adv.state)? {
         body.extend_from_slice(&pack);
     }
@@ -246,6 +255,8 @@ struct AdvertisedState {
     server_sideband: bool,
     /// Whether the server advertised `ofs-delta` (offset-relative delta bases).
     server_ofs_delta: bool,
+    /// Whether the server advertised `push-options` (server-side push options).
+    server_push_options: bool,
 }
 
 impl AdvertisedState {
@@ -270,6 +281,7 @@ impl AdvertisedState {
                 .iter()
                 .any(|c| c == "side-band-64k" || c == "side-band"),
             server_ofs_delta: caps.iter().any(|c| c == "ofs-delta"),
+            server_push_options: caps.iter().any(|c| c == "push-options"),
         }
     }
 }
@@ -344,6 +356,7 @@ fn parse_receive_pack_advertisement(body: &[u8]) -> Result<ReceivePackAdvertisem
                     advertised_haves: Vec::new(),
                     server_sideband: false,
                     server_ofs_delta: false,
+                    server_push_options: false,
                 },
             });
         }
@@ -376,6 +389,7 @@ fn parse_receive_pack_advertisement(body: &[u8]) -> Result<ReceivePackAdvertisem
                     .iter()
                     .any(|c| c == "side-band-64k" || c == "side-band"),
                 server_ofs_delta: caps.iter().any(|c| c == "ofs-delta"),
+                server_push_options: caps.iter().any(|c| c == "push-options"),
             },
         });
     }
@@ -450,6 +464,7 @@ fn parse_receive_pack_advertisement(body: &[u8]) -> Result<ReceivePackAdvertisem
                 .iter()
                 .any(|c| c == "side-band-64k" || c == "side-band"),
             server_ofs_delta: caps.iter().any(|c| c == "ofs-delta"),
+            server_push_options: caps.iter().any(|c| c == "push-options"),
         },
     })
 }
@@ -524,19 +539,43 @@ fn plan_push(
     Ok(PlanOutcome::Send(PushPlan { decisions, to_send }))
 }
 
+/// Reject a push that carries `push_options` when the server's receive-pack did
+/// not advertise the `push-options` capability.
+///
+/// Returns [`Error::PushOptionsUnsupported`] (matching Git's
+/// `fatal: the receiving end does not support push options`) so embedders can
+/// distinguish this negotiation failure without string-matching. A no-op when
+/// `push_options` is empty or the server advertised the capability.
+fn require_push_options_supported(adv: &AdvertisedState, opts: &PushOptions) -> Result<()> {
+    if !opts.push_options.is_empty() && !adv.server_push_options {
+        return Err(Error::PushOptionsUnsupported);
+    }
+    Ok(())
+}
+
 /// Build the ref-update command block: one pkt-line per accepted update plus a
 /// trailing flush. The first command carries the negotiated capability list
 /// after a NUL; the rest are bare. The OID width is the repository's hash
 /// algorithm (zero/null OID for create/delete). Shared by both push paths.
+///
+/// When `push_options` is non-empty, the negotiated capability list includes
+/// `push-options` and, after the command-list flush, one `push-option <value>`
+/// pkt-line per option is written followed by a second flush (matching Git's
+/// `send-pack`: command-list, flush, push-option lines, flush, then pack). The
+/// caller must have already verified the server advertised `push-options`.
 fn build_command_block(
     plan: &PushPlan,
     adv: &AdvertisedState,
     algo: HashAlgo,
+    push_options: &[String],
 ) -> Result<Vec<u8>> {
     let zero_hex = "0".repeat(algo.hex_len());
     let mut command_caps = PUSH_CAPS_BASE.to_owned();
     if adv.server_sideband {
         command_caps.push_str(" side-band-64k");
+    }
+    if !push_options.is_empty() {
+        command_caps.push_str(" push-options");
     }
     command_caps.push_str(&format!(" object-format={}", algo.name()));
 
@@ -554,15 +593,29 @@ fn build_command_block(
             .new_oid
             .map(|o| o.to_hex())
             .unwrap_or_else(|| zero_hex.clone());
+        // `write_line_to_vec` appends the pkt-line's trailing newline itself, so
+        // the command payload must NOT carry one of its own; otherwise the bare
+        // (second and later) command lines would frame as `<old> <new> <ref>\n`
+        // and `git-receive-pack` would read a refname with an embedded newline
+        // ("funny refname"). The first line's capability list rides the NUL.
         let line = if first {
             first = false;
-            format!("{old_hex} {new_hex} {}\0{command_caps}\n", d.result.remote_ref)
+            format!("{old_hex} {new_hex} {}\0{command_caps}", d.result.remote_ref)
         } else {
-            format!("{old_hex} {new_hex} {}\n", d.result.remote_ref)
+            format!("{old_hex} {new_hex} {}", d.result.remote_ref)
         };
         pkt_line::write_line_to_vec(&mut commands, &line)?;
     }
+    // Flush terminates the command list. When push-options are negotiated, the
+    // option lines follow this flush and are themselves terminated by a second
+    // flush before the pack (per the receive-pack protocol).
     commands.extend_from_slice(b"0000");
+    if !push_options.is_empty() {
+        for opt in push_options {
+            pkt_line::write_line_to_vec(&mut commands, opt)?;
+        }
+        commands.extend_from_slice(b"0000");
+    }
     Ok(commands)
 }
 
@@ -955,6 +1008,135 @@ mod tests {
         }
         buf.extend_from_slice(b"0000");
         buf
+    }
+
+    fn adv_state(sideband: bool, ofs_delta: bool, push_options: bool) -> AdvertisedState {
+        AdvertisedState {
+            remote_refs: HashMap::new(),
+            advertised_haves: Vec::new(),
+            server_sideband: sideband,
+            server_ofs_delta: ofs_delta,
+            server_push_options: push_options,
+        }
+    }
+
+    /// Decode a command block into a flat list of packets: each `Data(line)`
+    /// becomes `Some(line)` and each flush becomes `None`, so the framing
+    /// (command lines / flush / push-option lines / flush) is fully visible.
+    fn decode_block(block: &[u8]) -> Vec<Option<String>> {
+        let mut cur = Cursor::new(block);
+        let mut out = Vec::new();
+        while let Ok(pkt) = pkt_line::read_packet(&mut cur) {
+            match pkt {
+                Some(Packet::Data(s)) => out.push(Some(s.trim_end_matches('\n').to_owned())),
+                Some(Packet::Flush) => out.push(None),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    fn send_decision(refname: &str, new_oid: ObjectId) -> PushDecision {
+        PushDecision {
+            result: PushRefResult {
+                local_ref: None,
+                remote_ref: refname.to_owned(),
+                old_oid: None,
+                new_oid: Some(new_oid),
+                forced: false,
+                deletion: false,
+                status: PushRefStatus::Ok,
+                message: None,
+            },
+            new_tip: Some(new_oid),
+            send: true,
+        }
+    }
+
+    #[test]
+    fn command_block_without_push_options_has_no_capability_or_lines() {
+        let new = ObjectId::from_hex(&"1".repeat(40)).unwrap();
+        let plan = PushPlan {
+            decisions: vec![send_decision("refs/heads/main", new)],
+            to_send: vec![0],
+        };
+        let block =
+            build_command_block(&plan, &adv_state(false, false, true), HashAlgo::Sha1, &[]).unwrap();
+        let pkts = decode_block(&block);
+        // command line, then a single terminating flush — nothing else.
+        assert_eq!(pkts.len(), 2);
+        let cmd = pkts[0].as_deref().unwrap();
+        assert!(
+            cmd.contains("refs/heads/main"),
+            "first line is the ref command, got {cmd:?}"
+        );
+        assert!(
+            !cmd.contains("push-options"),
+            "no push-options capability without options, got {cmd:?}"
+        );
+        assert_eq!(pkts[1], None, "single trailing flush");
+    }
+
+    #[test]
+    fn command_block_with_push_options_negotiates_cap_and_emits_lines() {
+        let new = ObjectId::from_hex(&"1".repeat(40)).unwrap();
+        let plan = PushPlan {
+            decisions: vec![send_decision("refs/heads/main", new)],
+            to_send: vec![0],
+        };
+        let opts = vec!["ci.skip".to_owned(), "reviewer=alice".to_owned()];
+        let block = build_command_block(
+            &plan,
+            &adv_state(true, true, true),
+            HashAlgo::Sha1,
+            &opts,
+        )
+        .unwrap();
+        let pkts = decode_block(&block);
+        // command line | flush | push-option ci.skip | push-option reviewer=alice | flush
+        assert_eq!(
+            pkts,
+            vec![
+                pkts[0].clone(),
+                None,
+                Some("ci.skip".to_owned()),
+                Some("reviewer=alice".to_owned()),
+                None,
+            ],
+            "push-option lines must follow the command-list flush, then a flush"
+        );
+        let cmd = pkts[0].as_deref().unwrap();
+        assert!(
+            cmd.contains("push-options"),
+            "capability list must advertise push-options, got {cmd:?}"
+        );
+        // The first command line still carries the rest of the negotiated caps.
+        assert!(cmd.contains("report-status"));
+        assert!(cmd.contains("side-band-64k"));
+        assert!(cmd.contains("object-format=sha1"));
+    }
+
+    #[test]
+    fn require_push_options_errors_typed_when_server_lacks_capability() {
+        let opts = PushOptions {
+            push_options: vec!["x".to_owned()],
+            ..PushOptions::default()
+        };
+        // Server did NOT advertise push-options: typed error, not Message.
+        let err = require_push_options_supported(&adv_state(true, true, false), &opts).unwrap_err();
+        assert!(
+            matches!(err, Error::PushOptionsUnsupported),
+            "expected PushOptionsUnsupported, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "the receiving end does not support push options"
+        );
+        // Server advertised it: ok.
+        require_push_options_supported(&adv_state(true, true, true), &opts).unwrap();
+        // No options: ok regardless of capability.
+        require_push_options_supported(&adv_state(true, true, false), &PushOptions::default())
+            .unwrap();
     }
 
     #[test]

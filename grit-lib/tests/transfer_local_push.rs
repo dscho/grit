@@ -316,6 +316,7 @@ fn push_local_atomic_rejects_all_on_any_failure() {
         &PushOptions {
             atomic: true,
             dry_run: false,
+            ..PushOptions::default()
         },
     )
     .expect("atomic push call");

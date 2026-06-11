@@ -233,32 +233,94 @@ fn peel_to_commit(repo: &crate::repo::Repository, oid: ObjectId) -> Option<Objec
     None
 }
 
+/// New shallow boundaries the server reported during a fetch, captured from the
+/// `shallow-info` section so [`fetch_remote`] (and the HTTP fetch paths) can
+/// update the local `shallow` file and surface them in [`FetchOutcome`].
+#[derive(Default)]
+pub(crate) struct ShallowUpdate {
+    pub(crate) shallow: Vec<ObjectId>,
+    pub(crate) unshallow: Vec<ObjectId>,
+}
+
+/// Append the v0/v1 shallow/deepen request lines (after the `want`s, before the
+/// terminating flush): the client's current `shallow <oid>` grafts and any
+/// `deepen` / `deepen-since` / `deepen-not` the caller requested. Gated on the
+/// matching server capability where one exists. Mirrors the CLI's
+/// `append_fetch_request_extensions_v0_v1`.
+fn append_shallow_request_v0(
+    req: &mut Vec<u8>,
+    server_caps: &str,
+    local_shallow: &[ObjectId],
+    opts: &FetchOptions,
+) -> Result<()> {
+    for oid in local_shallow {
+        pkt_line::write_line_to_vec(req, &format!("shallow {}", oid.to_hex()))?;
+    }
+    if opts.unshallow {
+        pkt_line::write_line_to_vec(req, &format!("deepen {}", crate::shallow::INFINITE_DEPTH))?;
+    } else if let Some(depth) = opts.depth.filter(|d| *d > 0) {
+        pkt_line::write_line_to_vec(req, &format!("deepen {depth}"))?;
+    }
+    if let Some(since) = opts.deepen_since.as_deref().filter(|s| !s.trim().is_empty()) {
+        if server_caps.contains("deepen-since") {
+            let value = crate::shallow::deepen_since_wire_value(since);
+            pkt_line::write_line_to_vec(req, &format!("deepen-since {value}"))?;
+        }
+    }
+    if server_caps.contains("deepen-not") {
+        for excl in &opts.deepen_not {
+            let excl = excl.trim();
+            if !excl.is_empty() {
+                pkt_line::write_line_to_vec(req, &format!("deepen-not {excl}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Negotiate with `git-upload-pack` over the connection and return the raw
-/// packfile bytes for the requested `wants`.
+/// packfile bytes for the requested `wants`, plus any shallow-boundary updates
+/// the server reported (`shallow`/`unshallow`).
 ///
 /// Drives the [`SkippingNegotiator`] over the connection: sends `want` lines
 /// (with v0/v1 capabilities) and the advertised refs as `known_common`, batches
 /// local `have`s with flushes (reading interleaved ACK rounds), sends `done`,
 /// consumes the final ACK/NAK, then demuxes the side-band pack.
+///
+/// When `opts` requests a deepen (or the repo is already shallow), the `want`
+/// block carries the client's `shallow <oid>` grafts and the `deepen*` args, and
+/// the server precedes the pack with a `shallow-info` section that this reads
+/// into the returned [`ShallowUpdate`].
 fn negotiate_pack(
     local_git_dir: &Path,
     conn: &mut dyn Connection,
     wants: &[ObjectId],
+    opts: &FetchOptions,
+    local_shallow: &[ObjectId],
     progress: &mut dyn Progress,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, ShallowUpdate)> {
     let local_repo = crate::repo::Repository::open(local_git_dir, None)?;
     let want_set: HashSet<ObjectId> = wants.iter().copied().collect();
 
     let Some(first_want) = wants.first().copied() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), ShallowUpdate::default()));
     };
+
+    // A deepen/shallow request changes the negotiation: the server precedes the
+    // pack with a `shallow-info` section, and the client's local history is not a
+    // usable negotiation base (its objects bottom out at grafts), so we skip
+    // offering `have`s. Mirrors `fetch-pack.c`'s shallow handling.
+    let shallow_request = opts.has_deepen_request() || !local_shallow.is_empty();
 
     // Capability set matching `git fetch-pack`'s first `want` line for v0/v1.
     let caps = " multi_ack_detailed side-band-64k thin-pack no-progress include-tag ofs-delta agent=grit";
 
     // Capture the advertised refs before borrowing the writer (avoids aliasing
-    // the connection's reader/writer with its accessors).
+    // the connection's reader/writer with its accessors). v0/v1 shallow servers
+    // append `shallow <oid>` trailer lines to the advertisement; the capability
+    // string we read from the advertisement drives `deepen-since`/`deepen-not`.
     let advertised: Vec<(String, ObjectId)> = conn.advertised_refs().to_vec();
+    let server_caps: String = conn.capabilities().join(" ");
 
     let mut req: Vec<u8> = Vec::new();
     let w0 = format!("want {}{}", first_want.to_hex(), caps);
@@ -267,10 +329,12 @@ fn negotiate_pack(
         pkt_line::write_line_to_vec(&mut req, &format!("want {}", w.to_hex()))?;
     }
     // Match `git fetch-pack`: with a single unique OID, repeat the bare want.
-    // git-daemon expects this.
-    if wants.len() == 1 {
+    // git-daemon expects this. (Not done for shallow requests, which append
+    // shallow/deepen lines instead.)
+    if wants.len() == 1 && !shallow_request {
         pkt_line::write_line_to_vec(&mut req, &format!("want {}", first_want.to_hex()))?;
     }
+    append_shallow_request_v0(&mut req, &server_caps, local_shallow, opts)?;
     req.extend_from_slice(b"0000");
     conn.writer().write_all(&req)?;
     conn.writer().flush()?;
@@ -300,16 +364,29 @@ fn negotiate_pack(
         }
     }
     tips.sort_by_key(ObjectId::to_hex);
-    for t in tips {
-        negotiator.add_tip(t)?;
+    if !shallow_request {
+        for t in tips {
+            negotiator.add_tip(t)?;
+        }
+        for (_, oid) in &advertised {
+            if want_set.contains(oid) {
+                continue;
+            }
+            if let Some(c) = peel_to_commit(negotiator.repo(), *oid) {
+                negotiator.known_common(c)?;
+            }
+        }
     }
-    for (_, oid) in &advertised {
-        if want_set.contains(oid) {
-            continue;
-        }
-        if let Some(c) = peel_to_commit(negotiator.repo(), *oid) {
-            negotiator.known_common(c)?;
-        }
+
+    // Shallow-info section: for a deepen/shallow request the v0/v1 server emits
+    // its `shallow`/`unshallow` lines (flush-terminated) immediately after the
+    // wants block, before any ACK round. Read it now so the subsequent ACK/NAK
+    // and pack reads line up.
+    let mut shallow_update = ShallowUpdate::default();
+    if shallow_request {
+        let (sh, unsh) = crate::shallow::read_shallow_info_section(&mut conn.reader())?;
+        shallow_update.shallow = sh;
+        shallow_update.unshallow = unsh;
     }
 
     // Have/ACK exchange: batch haves, flush, read interleaved ACK rounds.
@@ -374,7 +451,7 @@ fn negotiate_pack(
 
     let mut pack = Vec::new();
     read_sideband_pack(conn.reader(), &mut pack, progress)?;
-    Ok(pack)
+    Ok((pack, shallow_update))
 }
 
 // ===========================================================================
@@ -674,20 +751,32 @@ fn negotiate_pack_v2(
     server_caps: &[String],
     local_odb: &crate::odb::Odb,
     wants: &[ObjectId],
+    deepen: &V2DeepenArgs,
     progress: &mut dyn Progress,
-) -> Result<Vec<u8>> {
+) -> Result<(Vec<u8>, ShallowUpdate)> {
     if wants.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), ShallowUpdate::default()));
     }
     let object_format = v2_object_format(server_caps, local_odb);
     let cap_echo = protocol_v2::cap_lines_for_command_request(server_caps);
     let sideband_all = protocol_v2::fetch_supports_sideband_all(server_caps);
 
+    // A deepen/shallow request does not offer local haves (the local objects
+    // bottom out at grafts and are not a usable negotiation base), forcing the
+    // single-round path so the server sends a `shallow-info` section + pack.
+    let shallow_request = deepen.is_shallow_request();
+
     // The ordered `have` list, built from the local ref tips with the skipping
-    // negotiator (shared with the stateless-HTTP v2 path).
-    let haves = v2_local_haves(local_git_dir, wants)?;
+    // negotiator (shared with the stateless-HTTP v2 path). Empty for a shallow
+    // request.
+    let haves = if shallow_request {
+        Vec::new()
+    } else {
+        v2_local_haves(local_git_dir, wants)?
+    };
 
     let mut pack = Vec::new();
+    let mut shallow_update = ShallowUpdate::default();
     if haves.is_empty() {
         // No local history to offer: single round, wants + done, read the pack.
         write_v2_fetch_request(
@@ -697,10 +786,11 @@ fn negotiate_pack_v2(
             wants,
             &[],
             sideband_all,
+            deepen,
             true,
         )?;
-        read_v2_fetch_pack_response(conn.reader(), &mut pack, progress)?;
-        return Ok(pack);
+        read_v2_fetch_pack_response(conn.reader(), &mut pack, &mut shallow_update, progress)?;
+        return Ok((pack, shallow_update));
     }
 
     // Multi-round: round 1 sends the first batch of haves WITHOUT done.
@@ -712,6 +802,7 @@ fn negotiate_pack_v2(
         wants,
         &haves[..first_batch],
         sideband_all,
+        deepen,
         false,
     )?;
 
@@ -719,12 +810,12 @@ fn negotiate_pack_v2(
     match ack {
         // Server is `ready`: the pack follows in the SAME response after a delim.
         Some(round) if round.ready => {
-            read_v2_fetch_pack_response(conn.reader(), &mut pack, progress)?;
+            read_v2_fetch_pack_response(conn.reader(), &mut pack, &mut shallow_update, progress)?;
         }
         // Server skipped acknowledgments and went straight to the pack header
         // (consumed inside the reader); read the pack now.
         None => {
-            read_v2_fetch_pack_response(conn.reader(), &mut pack, progress)?;
+            read_v2_fetch_pack_response(conn.reader(), &mut pack, &mut shallow_update, progress)?;
         }
         // Not ready yet: round 2 sends the remaining haves + `done`, then pack.
         Some(_) => {
@@ -735,19 +826,72 @@ fn negotiate_pack_v2(
                 wants,
                 &haves[first_batch..],
                 sideband_all,
+                deepen,
                 true,
             )?;
-            read_v2_fetch_pack_response(conn.reader(), &mut pack, progress)?;
+            read_v2_fetch_pack_response(conn.reader(), &mut pack, &mut shallow_update, progress)?;
         }
     }
-    Ok(pack)
+    Ok((pack, shallow_update))
+}
+
+/// The shallow/deepen arguments for a v2 `command=fetch` request, derived from
+/// [`FetchOptions`] plus the local `shallow` file. Built once by the fetch driver
+/// and passed to [`write_v2_fetch_request`] on each round (every stateless POST
+/// must resend them).
+#[derive(Clone, Default)]
+pub(crate) struct V2DeepenArgs {
+    /// The client's current shallow grafts (`shallow <oid>` lines).
+    pub(crate) local_shallow: Vec<ObjectId>,
+    /// `deepen <n>` (absolute depth, or `INFINITE_DEPTH` for `--unshallow`).
+    pub(crate) depth: Option<u32>,
+    /// `deepen-since <unix-ts>`.
+    pub(crate) deepen_since: Option<String>,
+    /// `deepen-not <ref>` exclusions.
+    pub(crate) deepen_not: Vec<String>,
+}
+
+impl V2DeepenArgs {
+    /// Build the v2 deepen args from the fetch options and the local shallow file,
+    /// translating `--unshallow` into the `INFINITE_DEPTH` deepen Git uses.
+    pub(crate) fn from_opts(opts: &FetchOptions, local_shallow: &[ObjectId]) -> Self {
+        let depth = if opts.unshallow {
+            Some(crate::shallow::INFINITE_DEPTH)
+        } else {
+            opts.depth.filter(|d| *d > 0)
+        };
+        Self {
+            local_shallow: local_shallow.to_vec(),
+            depth,
+            deepen_since: opts
+                .deepen_since
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(crate::shallow::deepen_since_wire_value),
+            deepen_not: opts
+                .deepen_not
+                .iter()
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        }
+    }
+
+    /// Whether any deepen/shallow argument is present (drives `shallow-info`
+    /// handling and the "skip offering haves" decision).
+    pub(crate) fn is_shallow_request(&self) -> bool {
+        self.depth.is_some()
+            || self.deepen_since.is_some()
+            || !self.deepen_not.is_empty()
+            || !self.local_shallow.is_empty()
+    }
 }
 
 /// Write a v2 `command=fetch` request: capability echo, `0001`, the standard
 /// `thin-pack`/`no-progress`/`ofs-delta` (+ `sideband-all`/`include-tag`)
-/// arguments, the `want <oid>` lines, the `have <oid>` lines, and `done` when
-/// `send_done`, terminated by flush. Lifted from the CLI's
-/// `write_v2_fetch_request` (streaming-fetch subset).
+/// arguments, the shallow/deepen arguments, the `want <oid>` lines, the
+/// `have <oid>` lines, and `done` when `send_done`, terminated by flush. Lifted
+/// from the CLI's `write_v2_fetch_request` (streaming-fetch subset).
 pub(crate) fn write_v2_fetch_request(
     w: &mut dyn Write,
     object_format: &str,
@@ -755,6 +899,7 @@ pub(crate) fn write_v2_fetch_request(
     wants: &[ObjectId],
     haves: &[ObjectId],
     sideband_all: bool,
+    deepen: &V2DeepenArgs,
     send_done: bool,
 ) -> Result<()> {
     let mut req: Vec<u8> = Vec::new();
@@ -780,6 +925,20 @@ pub(crate) fn write_v2_fetch_request(
     // Ask the server to bundle tag objects pointing at fetched history; the
     // TagMode plumbing in `fetch_remote` decides which tag refs to write.
     pkt_line::write_line(&mut req, "include-tag")?;
+
+    // Shallow/deepen arguments (the `fetch` v2 command's `shallow`/`deepen*` args).
+    for oid in &deepen.local_shallow {
+        pkt_line::write_line(&mut req, &format!("shallow {}", oid.to_hex()))?;
+    }
+    if let Some(depth) = deepen.depth {
+        pkt_line::write_line(&mut req, &format!("deepen {depth}"))?;
+    }
+    if let Some(since) = &deepen.deepen_since {
+        pkt_line::write_line(&mut req, &format!("deepen-since {since}"))?;
+    }
+    for excl in &deepen.deepen_not {
+        pkt_line::write_line(&mut req, &format!("deepen-not {excl}"))?;
+    }
 
     for want in wants {
         pkt_line::write_line(&mut req, &format!("want {}", want.to_hex()))?;
@@ -867,13 +1026,15 @@ pub(crate) fn read_v2_acknowledgments(reader: &mut dyn Read) -> Result<Option<V2
     Ok(Some(V2AckRound { ready }))
 }
 
-/// Read a v2 `command=fetch` response: skip the non-pack sections
-/// (`acknowledgments`/`wanted-refs`/`shallow-info`/`packfile-uris`) and demux the
+/// Read a v2 `command=fetch` response: capture the `shallow-info` section's
+/// `shallow`/`unshallow` lines into `shallow_out`, skip the other non-pack
+/// sections (`acknowledgments`/`wanted-refs`/`packfile-uris`), and demux the
 /// side-band-64k pack from the `packfile` section into `out`. Lifted from the
-/// CLI's `read_v2_fetch_pack_response`.
+/// CLI's `read_v2_fetch_pack_response`, extended to surface shallow updates.
 pub(crate) fn read_v2_fetch_pack_response(
     reader: &mut dyn Read,
     out: &mut Vec<u8>,
+    shallow_out: &mut ShallowUpdate,
     progress: &mut dyn Progress,
 ) -> Result<()> {
     loop {
@@ -892,7 +1053,15 @@ pub(crate) fn read_v2_fetch_pack_response(
             return Err(Error::Message(format!("remote error: {}", msg.trim_end())));
         }
         match hdr {
-            "acknowledgments" | "wanted-refs" | "shallow-info" | "packfile-uris" => {
+            "shallow-info" => {
+                // Capture the shallow/unshallow boundary updates. The section is
+                // delim-terminated (before the `packfile` header), which
+                // `read_shallow_info_section` stops at, leaving the header intact.
+                let (sh, unsh) = crate::shallow::read_shallow_info_section(&mut *reader)?;
+                shallow_out.shallow.extend(sh);
+                shallow_out.unshallow.extend(unsh);
+            }
+            "acknowledgments" | "wanted-refs" | "packfile-uris" => {
                 skip_v2_section_until_boundary(&mut *reader)?;
             }
             "packfile" => {
@@ -1030,7 +1199,13 @@ pub fn fetch_remote(
     // `Following` we approximate using the advertised remote odb if present
     // (it is not, over the wire), so we add following tags whose oid is among
     // the matched set after the fact — handled below using the local odb.
-    add_wire_tags(
+    //
+    // `following_only` collects the oids of tags added *provisionally* under
+    // `Following`. These must NOT be `want`ed up front: git's tag-following only
+    // keeps a tag whose target is already reachable from the fetched heads, so
+    // wanting the tag itself would drag down its (otherwise unreachable) target
+    // and incorrectly keep the tag. They are pruned by `retain_following_tags`.
+    let following_only = add_wire_tags(
         opts.tags,
         &remote_refs,
         &negatives,
@@ -1039,19 +1214,41 @@ pub fn fetch_remote(
         &mut seen_remote_ref,
     );
 
-    // 4. Wants = matched oids absent locally. Negotiate + ingest the pack.
-    let wants: Vec<ObjectId> = matched_oids
-        .iter()
-        .copied()
-        .filter(|oid| !local_odb.exists(oid))
-        .collect();
+    // The client's current shallow grafts (drives the wire `shallow <oid>` lines
+    // and the "this is a shallow request" decisions in the negotiators).
+    let local_shallow = crate::shallow::load_shallow_oids(local_git_dir)?;
+    let shallow_request = opts.has_deepen_request() || !local_shallow.is_empty();
+
+    // 4. Wants. Normally the matched oids that are absent locally. For a
+    // deepen/`--unshallow` request the wanted tips may already be present (a prior
+    // shallow fetch landed them); we must still `want` them so the server fills in
+    // the now-reachable ancestors past the old boundary.
+    let wants: Vec<ObjectId> = if shallow_request {
+        matched_oids
+            .iter()
+            .copied()
+            .filter(|oid| !following_only.contains(oid))
+            .collect()
+    } else {
+        matched_oids
+            .iter()
+            .copied()
+            .filter(|oid| !following_only.contains(oid) && !local_odb.exists(oid))
+            .collect()
+    };
+
+    // Shallow-boundary updates the server reports (`shallow`/`unshallow`), applied
+    // to the local `shallow` file and surfaced in the outcome.
+    let mut shallow_update = ShallowUpdate::default();
 
     if !wants.is_empty() && !opts.dry_run {
-        let pack = if let Some(caps) = v2_caps.as_ref() {
-            negotiate_pack_v2(local_git_dir, conn, caps, &local_odb, &wants, progress)?
+        let (pack, su) = if let Some(caps) = v2_caps.as_ref() {
+            let deepen = V2DeepenArgs::from_opts(opts, &local_shallow);
+            negotiate_pack_v2(local_git_dir, conn, caps, &local_odb, &wants, &deepen, progress)?
         } else {
-            negotiate_pack(local_git_dir, conn, &wants, progress)?
+            negotiate_pack(local_git_dir, conn, &wants, opts, &local_shallow, progress)?
         };
+        shallow_update = su;
         if !pack.is_empty() {
             let mut cursor = std::io::Cursor::new(pack);
             crate::unpack_objects::unpack_objects(
@@ -1063,6 +1260,16 @@ pub fn fetch_remote(
                 },
             )?;
         }
+    }
+
+    // Apply the shallow/unshallow boundary updates to the on-disk `shallow` file
+    // before classifying refs (so connectivity reflects the new graft set).
+    if !opts.dry_run {
+        crate::shallow::apply_shallow_updates(
+            local_git_dir,
+            &shallow_update.shallow,
+            &shallow_update.unshallow,
+        )?;
     }
 
     // Close the write side once the v2 conversation is done so the server's
@@ -1137,16 +1344,22 @@ pub fn fetch_remote(
     Ok(FetchOutcome {
         updates,
         default_branch,
+        new_shallow: shallow_update.shallow,
+        new_unshallow: shallow_update.unshallow,
     })
 }
 
 /// Add advertised tags to the matched set per [`crate::transfer::TagMode`].
 ///
 /// Over the wire we cannot peel remote tags before the pack arrives, so:
-/// * `All` adds every advertised tag.
+/// * `All` adds every advertised tag (and `want`s it unconditionally).
 /// * `Following` provisionally adds every advertised tag here; unreachable ones
 ///   are dropped by [`retain_following_tags`] after the pack is ingested.
 /// * `None` adds nothing.
+///
+/// Returns the oids of tags added under `Following` — the caller must keep these
+/// out of the `want` list so an unreachable tag does not drag its target into
+/// the pack (which would make it look reachable and survive the prune).
 fn add_wire_tags(
     mode: crate::transfer::TagMode,
     remote_refs: &[(String, ObjectId)],
@@ -1154,9 +1367,10 @@ fn add_wire_tags(
     matched: &mut Vec<crate::transfer::MatchedRef>,
     matched_oids: &mut HashSet<ObjectId>,
     seen_remote_ref: &mut HashSet<String>,
-) {
+) -> HashSet<ObjectId> {
+    let mut following_only: HashSet<ObjectId> = HashSet::new();
     if mode == crate::transfer::TagMode::None {
-        return;
+        return following_only;
     }
     for (name, oid) in remote_refs {
         if !name.starts_with("refs/tags/") {
@@ -1167,6 +1381,9 @@ fn add_wire_tags(
         }
         seen_remote_ref.insert(name.clone());
         matched_oids.insert(*oid);
+        if mode == crate::transfer::TagMode::Following {
+            following_only.insert(*oid);
+        }
         matched.push(crate::transfer::MatchedRef {
             remote_ref: name.clone(),
             local_ref: Some(name.clone()),
@@ -1175,6 +1392,7 @@ fn add_wire_tags(
             is_tag: true,
         });
     }
+    following_only
 }
 
 /// Drop provisional `Following` tags whose object (or peeled target) did not

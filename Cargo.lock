@@ -499,6 +499,7 @@ version = "0.3.99"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "clap",
  "grit-protocol",
  "serde",
