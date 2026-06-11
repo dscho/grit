@@ -24,9 +24,10 @@ use flate2::Compression;
 use sha1::{Digest as _, Sha1};
 use sha2::Sha256;
 
+use crate::delta_encode::{encode_lcp_delta, encode_prefix_extension_delta};
 use crate::error::{Error, Result};
 use crate::objects::{
-    parse_commit, parse_tag, parse_tree, HashAlgo, ObjectId, ObjectKind,
+    parse_commit, parse_tag, parse_tree, HashAlgo, Object, ObjectId, ObjectKind,
 };
 use crate::odb::Odb;
 use crate::push_report::{PushRefResult, PushRefStatus};
@@ -165,16 +166,36 @@ pub struct PushOutcome {
 /// Options controlling [`build_pack`].
 #[derive(Clone, Copy, Debug)]
 pub struct PackBuildOptions {
-    /// Build a thin pack (allow deltas against bases not present in the pack).
-    ///
-    /// Not yet honored in phase 1 — the builder always emits whole (non-delta)
-    /// objects. Reserved so the signature is stable for later phases.
+    /// Build a thin pack: allow deltas whose base is reachable from the `haves`
+    /// (so present on the peer) but **not** itself emitted in the pack. The base
+    /// is referenced by `REF_DELTA` and the peer reconstructs the object from its
+    /// own copy. Requires [`Self::delta`] to have any effect.
     pub thin: bool,
+    /// Emit delta-compressed objects (`OFS_DELTA`/`REF_DELTA`) for similar blobs
+    /// instead of whole objects. When `false` the builder emits whole objects
+    /// only (the phase-1 behavior).
+    pub delta: bool,
+    /// How many candidate bases (size-sorted neighbors) to consider per blob.
+    /// `0` disables in-pack delta selection. Mirrors Git's `--window`.
+    pub window: usize,
+    /// Cap delta chain length (number of edges). `0` stores all blobs whole.
+    /// Mirrors Git's `--depth`.
+    pub max_depth: usize,
+    /// Use `OFS_DELTA` (offset-relative base) when the base precedes the target
+    /// in the pack; otherwise `REF_DELTA` (base named by OID). Thin/external
+    /// bases always use `REF_DELTA` regardless of this flag.
+    pub use_ofs_delta: bool,
 }
 
 impl Default for PackBuildOptions {
     fn default() -> Self {
-        Self { thin: false }
+        Self {
+            thin: false,
+            delta: false,
+            window: 10,
+            max_depth: 50,
+            use_ofs_delta: true,
+        }
     }
 }
 
@@ -204,12 +225,8 @@ pub fn build_pack(
     odb: &Odb,
     wants: &[ObjectId],
     haves: &[ObjectId],
-    _opts: &PackBuildOptions,
+    opts: &PackBuildOptions,
 ) -> Result<Vec<u8>> {
-    // TODO(phase: thin/delta packs): honor `_opts.thin` and emit OFS/REF deltas.
-    // Phase 1 emits whole objects only — correct and minimal in object count,
-    // not byte-optimal.
-
     // Objects already reachable from the remote's haves: never repack these, and
     // stop descent into them. A `have` that is not present in this odb (e.g. a
     // local-only commit named by a local tracking ref) simply prunes nothing, so
@@ -220,7 +237,16 @@ pub fn build_pack(
     // missing want IS an error (we were asked to pack an object we don't have).
     let send = collect_reachable_excluding(odb, wants, &have_closure, false)?;
 
-    serialize_pack(odb, &send)
+    if !opts.delta {
+        // Phase-1 behavior: whole objects only. Correct and minimal in object
+        // count, not byte-optimal.
+        return serialize_pack(odb, &send);
+    }
+
+    // Delta path: pick blob deltas (within the pack, and — when `thin` — against
+    // bases the peer already holds), then serialize OFS/REF-delta entries.
+    let plan = plan_deltas(odb, &send, &have_closure, opts)?;
+    serialize_pack_with_deltas(odb, &plan, opts)
 }
 
 /// Compute the full object closure reachable from `roots`, stopping descent into
@@ -380,6 +406,332 @@ fn append_pack_trailer(buf: &mut Vec<u8>, algo: HashAlgo) {
             buf.extend_from_slice(&hasher.finalize());
         }
     }
+}
+
+/// A single object to write, either whole or as a delta against a chosen base.
+struct PlannedEntry {
+    oid: ObjectId,
+    kind: ObjectKind,
+    /// Object payload, kept so the serializer can re-hash/compress without a
+    /// second odb read.
+    data: Vec<u8>,
+    /// `Some(base_oid)` when this entry is a (blob) delta against `base_oid`.
+    /// The base may be an in-pack object or — for thin packs — an external base
+    /// present only on the peer.
+    base: Option<ObjectId>,
+}
+
+/// The full delta plan: the ordered entries to emit plus the set of external
+/// (thin) bases that were referenced but deliberately not emitted.
+struct DeltaPlan {
+    entries: Vec<PlannedEntry>,
+    #[allow(dead_code)]
+    external_bases: HashSet<ObjectId>,
+}
+
+/// Length of the common prefix of `a` and `b`.
+fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+/// Break delta chains longer than `max_depth` edges, mirroring Git's
+/// `break_delta_chains` modulo rule so re-indexing stays within `--depth`.
+fn apply_delta_depth_limit(map: &mut HashMap<ObjectId, ObjectId>, max_depth: usize) {
+    let keys: Vec<ObjectId> = map.keys().copied().collect();
+    let value_set: HashSet<ObjectId> = map.values().copied().collect();
+    let tips: Vec<ObjectId> = keys
+        .into_iter()
+        .filter(|k| !value_set.contains(k))
+        .collect();
+
+    let modulus = max_depth.saturating_add(1);
+    let mut snip: HashSet<ObjectId> = HashSet::new();
+
+    for tip in tips {
+        let mut chain: Vec<ObjectId> = Vec::new();
+        let mut cur = tip;
+        let mut seen = HashSet::new();
+        while seen.insert(cur) {
+            chain.push(cur);
+            let Some(&b) = map.get(&cur) else {
+                break;
+            };
+            cur = b;
+        }
+        let n = chain.len();
+        if n < 2 {
+            continue;
+        }
+        let mut total_depth = (n - 1) as u32;
+        for &oid in &chain {
+            let assigned = (total_depth as usize) % modulus;
+            total_depth = total_depth.saturating_sub(1);
+            if assigned == 0 {
+                snip.insert(oid);
+            }
+        }
+    }
+    for oid in snip {
+        map.remove(&oid);
+    }
+}
+
+/// Select blob deltas for `send` and produce an ordered emit plan.
+///
+/// This is a simplified lift of the CLI's `optimize_blob_deltas`: a size-sorted
+/// prefix/LCP window heuristic over blobs only, depth-limited via
+/// [`apply_delta_depth_limit`]. It does NOT implement full delta-island parity
+/// (islands default to inactive here) and does not delta trees/commits — those
+/// are emitted whole. Correctness (re-indexability) is preserved because every
+/// chosen base is acyclic and either in-pack or, for thin packs, peer-held.
+///
+/// When `opts.thin`, a blob may also delta against a base reachable from the
+/// peer's `haves` (`have_closure`) even though that base is not emitted; the base
+/// oid is recorded in [`DeltaPlan::external_bases`] and referenced via REF_DELTA.
+fn plan_deltas(
+    odb: &Odb,
+    send: &[ObjectId],
+    have_closure: &HashSet<ObjectId>,
+    opts: &PackBuildOptions,
+) -> Result<DeltaPlan> {
+    // Load every object once. The plan keeps payloads so the serializer needn't
+    // re-read; for the typical pack sizes this is the same data the whole-object
+    // path would touch anyway.
+    let mut objects: HashMap<ObjectId, Object> = HashMap::new();
+    for &oid in send {
+        objects.insert(oid, odb.read(&oid)?);
+    }
+
+    let in_pack: HashSet<ObjectId> = send.iter().copied().collect();
+
+    // target oid -> base oid (the object `target` deltas against).
+    let mut delta_to_base: HashMap<ObjectId, ObjectId> = HashMap::new();
+    let mut external_bases: HashSet<ObjectId> = HashSet::new();
+
+    if opts.window > 0 && opts.max_depth > 0 {
+        // Blobs in the pack, smallest-first (size-sorted window proximity).
+        let mut blobs: Vec<ObjectId> = send
+            .iter()
+            .copied()
+            .filter(|oid| objects[oid].kind == ObjectKind::Blob && !objects[oid].data.is_empty())
+            .collect();
+        blobs.sort_by_key(|oid| objects[oid].data.len());
+
+        // Optional thin bases: blobs present only on the peer that a packed blob
+        // could delta against. We load them lazily and cache by oid.
+        let mut external_blob_data: HashMap<ObjectId, Vec<u8>> = HashMap::new();
+        if opts.thin {
+            for &oid in have_closure {
+                if in_pack.contains(&oid) {
+                    continue;
+                }
+                if let Ok(obj) = odb.read(&oid) {
+                    if obj.kind == ObjectKind::Blob && !obj.data.is_empty() {
+                        external_blob_data.insert(oid, obj.data);
+                    }
+                }
+            }
+        }
+
+        for (i, &t) in blobs.iter().enumerate() {
+            let t_data = &objects[&t].data;
+
+            let mut best: Option<(ObjectId, usize, usize, bool)> = None; // (base, common, base_len, external)
+
+            // Consider larger in-pack blobs within the window (closest in size).
+            // `blobs` is ascending by size, so later entries are the larger bases.
+            let mut considered = 0usize;
+            for &b in blobs.iter().skip(i + 1) {
+                if considered >= opts.window {
+                    break;
+                }
+                considered += 1;
+                let b_data = &objects[&b].data;
+                if b_data.len() <= t_data.len() {
+                    continue;
+                }
+                let common = if b_data.starts_with(t_data) {
+                    t_data.len()
+                } else {
+                    common_prefix_len(t_data, b_data)
+                };
+                if common > 64 && common.saturating_mul(2) >= t_data.len() {
+                    let better = best.is_none_or(|(_, bc, bl, _)| {
+                        common > bc || (common == bc && b_data.len() < bl)
+                    });
+                    if better {
+                        best = Some((b, common, b_data.len(), false));
+                    }
+                }
+            }
+
+            // Thin: also consider peer-held external bases. An external base may
+            // be SMALLER than the target (the common "target extends an earlier
+            // version" case) — that is still a cheap delta and, because external
+            // bases are never emitted, can never form an in-pack chain cycle. We
+            // only switch to a thin base when no equally-good in-pack base exists.
+            if opts.thin {
+                for (&b, b_data) in &external_blob_data {
+                    if b == t {
+                        continue;
+                    }
+                    let common = common_prefix_len(t_data, b_data);
+                    if common > 64 && common.saturating_mul(2) >= t_data.len() {
+                        let better = best.is_none_or(|(_, bc, bl, ext)| {
+                            common > bc || (common == bc && ext && b_data.len() < bl)
+                        });
+                        if better {
+                            best = Some((b, common, b_data.len(), true));
+                        }
+                    }
+                }
+            }
+
+            if let Some((base, _, _, external)) = best {
+                delta_to_base.insert(t, base);
+                if external {
+                    external_bases.insert(base);
+                    external_blob_data
+                        .get(&base)
+                        .map(|d| objects.entry(base).or_insert_with(|| Object::new(ObjectKind::Blob, d.clone())));
+                }
+            }
+        }
+
+        // Cap chain length. After snipping, any removed target reverts to whole.
+        apply_delta_depth_limit(&mut delta_to_base, opts.max_depth);
+
+        // A base that is no longer referenced as an external base (because its
+        // only dependent was snipped) must not be counted as external.
+        external_bases.retain(|b| delta_to_base.values().any(|v| v == b));
+    }
+
+    // Emit in the original discovery order so commits precede their trees/blobs.
+    // For OFS_DELTA the serializer needs each base to appear before its target;
+    // discovery order already places a larger base blob no earlier than a smaller
+    // one only by coincidence, so the serializer falls back to REF_DELTA whenever
+    // the base has not yet been written.
+    let mut entries: Vec<PlannedEntry> = Vec::with_capacity(send.len());
+    for &oid in send {
+        let obj = &objects[&oid];
+        entries.push(PlannedEntry {
+            oid,
+            kind: obj.kind,
+            data: obj.data.clone(),
+            base: delta_to_base.get(&oid).copied(),
+        });
+    }
+
+    Ok(DeltaPlan {
+        entries,
+        external_bases,
+    })
+}
+
+/// Serialize a [`DeltaPlan`] into a PACK v2 stream.
+///
+/// Whole entries are written as base objects; delta entries are written as
+/// `OFS_DELTA` when the base is already in the pack at a known offset and
+/// `opts.use_ofs_delta` is set, otherwise `REF_DELTA` (which also covers thin /
+/// external bases that are never emitted).
+fn serialize_pack_with_deltas(
+    odb: &Odb,
+    plan: &DeltaPlan,
+    opts: &PackBuildOptions,
+) -> Result<Vec<u8>> {
+    let algo = odb.hash_algo();
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"PACK");
+    buf.extend_from_slice(&2u32.to_be_bytes());
+    let count = u32::try_from(plan.entries.len())
+        .map_err(|_| Error::CorruptObject("pack object count exceeds u32".to_owned()))?;
+    buf.extend_from_slice(&count.to_be_bytes());
+
+    // Payload of every emitted object, so a base reached later can be deltified
+    // and so we can compute deltas without another odb round-trip.
+    let payloads: HashMap<ObjectId, &[u8]> =
+        plan.entries.iter().map(|e| (e.oid, e.data.as_slice())).collect();
+
+    let mut oid_to_offset: HashMap<ObjectId, u64> = HashMap::new();
+
+    for entry in &plan.entries {
+        let start = buf.len() as u64;
+        match entry.base {
+            None => {
+                encode_pack_object_header(&mut buf, pack_type_code(entry.kind), entry.data.len());
+                write_zlib(&mut buf, &entry.data)?;
+                oid_to_offset.insert(entry.oid, start);
+            }
+            Some(base_oid) => {
+                // Resolve the base payload: in-pack first, else (thin) from odb.
+                let base_data: Vec<u8> = if let Some(d) = payloads.get(&base_oid) {
+                    d.to_vec()
+                } else {
+                    odb.read(&base_oid)?.data
+                };
+                let delta = if entry.data.starts_with(&base_data)
+                    && entry.data.len() > base_data.len()
+                {
+                    encode_prefix_extension_delta(&base_data, &entry.data)?
+                } else {
+                    encode_lcp_delta(&base_data, &entry.data)?
+                };
+
+                let in_pack_offset = oid_to_offset.get(&base_oid).copied();
+                if opts.use_ofs_delta && in_pack_offset.is_some() {
+                    let base_off = in_pack_offset.expect("checked is_some");
+                    let dist = start.checked_sub(base_off).ok_or_else(|| {
+                        Error::CorruptObject("ofs-delta distance underflow".to_owned())
+                    })?;
+                    encode_pack_object_header(&mut buf, 6, delta.len());
+                    encode_ofs_delta_distance(&mut buf, dist);
+                } else {
+                    encode_pack_object_header(&mut buf, 7, delta.len());
+                    if base_oid.as_bytes().len() != algo.len() {
+                        return Err(Error::CorruptObject(
+                            "ref-delta base oid width mismatch".to_owned(),
+                        ));
+                    }
+                    buf.extend_from_slice(base_oid.as_bytes());
+                }
+                write_zlib(&mut buf, &delta)?;
+                oid_to_offset.insert(entry.oid, start);
+            }
+        }
+    }
+
+    append_pack_trailer(&mut buf, algo);
+    Ok(buf)
+}
+
+/// zlib-deflate `data` and append it to `buf`.
+fn write_zlib(buf: &mut Vec<u8>, data: &[u8]) -> Result<()> {
+    let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(data).map_err(Error::Io)?;
+    let compressed = enc.finish().map_err(Error::Io)?;
+    buf.extend_from_slice(&compressed);
+    Ok(())
+}
+
+/// Encode an `OFS_DELTA` base distance (Git's offset varint). Lifted verbatim
+/// from the CLI pack writer's `encode_git_ofs_delta_distance`.
+fn encode_ofs_delta_distance(buf: &mut Vec<u8>, mut ofs: u64) {
+    let mut dheader = [0u8; 32];
+    let mut pos = dheader.len() - 1;
+    dheader[pos] = (ofs & 0x7f) as u8;
+    while {
+        ofs >>= 7;
+        ofs != 0
+    } {
+        pos -= 1;
+        ofs -= 1;
+        dheader[pos] = 0x80 | ((ofs & 0x7f) as u8);
+    }
+    buf.extend_from_slice(&dheader[pos..]);
 }
 
 /// Fetch refs and objects from one on-disk git repository into another, entirely
@@ -968,18 +1320,18 @@ fn decide_push(
 }
 
 /// A remote ref selected for fetch, with its computed local destination.
-struct MatchedRef {
-    remote_ref: String,
+pub(crate) struct MatchedRef {
+    pub(crate) remote_ref: String,
     /// Destination local tracking ref, or `None` for an empty (no-store) dst.
-    local_ref: Option<String>,
-    oid: ObjectId,
-    force: bool,
-    is_tag: bool,
+    pub(crate) local_ref: Option<String>,
+    pub(crate) oid: ObjectId,
+    pub(crate) force: bool,
+    pub(crate) is_tag: bool,
 }
 
 /// Open an [`Odb`] for a git directory, attaching the git dir so `hash_algo`
 /// (and MIDX config) resolve correctly.
-fn open_odb(git_dir: &Path) -> Odb {
+pub(crate) fn open_odb(git_dir: &Path) -> Odb {
     Odb::new(&git_dir.join("objects")).with_config_git_dir(git_dir.to_path_buf())
 }
 
@@ -987,7 +1339,7 @@ fn open_odb(git_dir: &Path) -> Odb {
 /// local ref name (`Some(name)`), `None`+stored=false collapsed: returns
 /// `Some(Some(dst))` to store, `Some(None)` to fetch-without-store, or `None`
 /// when no positive refspec matches.
-fn match_positive(refname: &str, positive: &[RefspecItem]) -> Option<Option<String>> {
+pub(crate) fn match_positive(refname: &str, positive: &[RefspecItem]) -> Option<Option<String>> {
     for item in positive {
         let Some(src) = item.src.as_deref() else {
             continue;
@@ -1004,7 +1356,7 @@ fn match_positive(refname: &str, positive: &[RefspecItem]) -> Option<Option<Stri
 }
 
 /// Whether any positive refspec matching `refname` requested force (`+`).
-fn refspecs_force(refname: &str, positive: &[RefspecItem]) -> bool {
+pub(crate) fn refspecs_force(refname: &str, positive: &[RefspecItem]) -> bool {
     positive.iter().any(|item| {
         item.force
             && item
@@ -1015,7 +1367,7 @@ fn refspecs_force(refname: &str, positive: &[RefspecItem]) -> bool {
 }
 
 /// Whether `refname` is excluded by any negative refspec.
-fn ref_excluded(refname: &str, negatives: &[RefspecItem]) -> bool {
+pub(crate) fn ref_excluded(refname: &str, negatives: &[RefspecItem]) -> bool {
     negatives.iter().any(|item| {
         item.src
             .as_deref()
@@ -1075,7 +1427,7 @@ fn glob_matches(pattern: &str, refname: &str) -> bool {
 
 /// Add tags to the matched set according to [`TagMode`].
 #[allow(clippy::too_many_arguments)]
-fn apply_tag_mode(
+pub(crate) fn apply_tag_mode(
     mode: TagMode,
     remote_refs: &[(String, ObjectId)],
     remote_odb: &Odb,
@@ -1147,7 +1499,7 @@ fn peel_tag_target(odb: &Odb, oid: ObjectId) -> Result<ObjectId> {
 }
 
 /// Classify a single ref update into an [`UpdateMode`].
-fn classify_update(
+pub(crate) fn classify_update(
     old: Option<&ObjectId>,
     new: &ObjectId,
     force: bool,
@@ -1181,7 +1533,7 @@ fn classify_update(
 /// A local tracking ref is a prune candidate when it lives under the destination
 /// namespace of some positive wildcard refspec and no current remote ref maps to
 /// it. Matches `git fetch --prune` for the common `refs/remotes/<remote>/*` case.
-fn prune_tracking_refs(
+pub(crate) fn prune_tracking_refs(
     local_git_dir: &Path,
     positive: &[RefspecItem],
     remote_refs: &[(String, ObjectId)],
