@@ -100,8 +100,12 @@ pub fn write_to_worktree(work_tree: &Path, rel_path: &str, data: &[u8], mode: u3
         let target = std::str::from_utf8(data).map_err(|_| {
             Error::PathError(format!("symlink target for '{rel_path}' is not UTF-8"))
         })?;
+        #[cfg(unix)]
         std::os::unix::fs::symlink(target, &abs_path)
             .map_err(|e| Error::PathError(format!("creating symlink '{rel_path}': {e}")))?;
+        #[cfg(not(unix))]
+        std::fs::write(&abs_path, target.as_bytes())
+            .map_err(|e| Error::PathError(format!("writing symlink stub '{rel_path}': {e}")))?;
     } else {
         std::fs::write(&abs_path, data)
             .map_err(|e| Error::PathError(format!("writing '{rel_path}': {e}")))?;

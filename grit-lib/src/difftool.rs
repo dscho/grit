@@ -991,7 +991,10 @@ fn populate_dir_side(
         let wt = work_tree.join(rel);
         if wt.is_file() {
             let _ = std::fs::remove_file(&dest);
+            #[cfg(unix)]
             std::os::unix::fs::symlink(&wt, &dest).map_err(Error::Io)?;
+            #[cfg(not(unix))]
+            std::fs::copy(&wt, &dest).map_err(Error::Io)?;
             return Ok(());
         }
     }
