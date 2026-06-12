@@ -44,4 +44,4 @@ To update your version of Grit CLI, you can run `grit update` and it will re-run
 
 ## License
 
-All Rust code and crates are MIT.
+The `grit-cli` code is GPL-2.0, all other code and crates, including `grit-lib` are MIT licensed.
