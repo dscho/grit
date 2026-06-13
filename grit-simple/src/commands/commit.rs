@@ -2,9 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use grit_lib::config::ConfigSet;
-use grit_lib::ident_resolve::{
-    resolve_email_with, resolve_name_with, IdentRole, IdentityError, SystemIdentityEnv,
-};
+use grit_lib::ident_resolve::IdentRole;
 use grit_lib::objects::{serialize_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::porcelain::status::{status, StatusOptions};
 use grit_lib::progress::NullProgress;
@@ -50,8 +48,8 @@ pub fn run(message: Option<String>, all: bool) -> Result<()> {
 
     let config = ConfigSet::load(Some(&repo.git_dir), true).context("could not load config")?;
     let now = OffsetDateTime::now_utc();
-    let author = identity(&config, IdentRole::Author, "GIT_AUTHOR_DATE", now)?;
-    let committer = identity(&config, IdentRole::Committer, "GIT_COMMITTER_DATE", now)?;
+    let author = context::identity(&config, IdentRole::Author, "GIT_AUTHOR_DATE", now)?;
+    let committer = context::identity(&config, IdentRole::Committer, "GIT_COMMITTER_DATE", now)?;
 
     let mut message = message.trim().to_owned();
     message.push('\n');
@@ -85,39 +83,10 @@ pub fn run(message: Option<String>, all: bool) -> Result<()> {
     refs::append_reflog(&repo.git_dir, "HEAD", &old, &oid, &committer, &reflog_msg, false)?;
 
     let count = model.staged.len();
-    println!(
-        "[{short_name} {}] {subject}",
-        short_oid(&oid),
-    );
+    println!("[{short_name} {}] {subject}", short_oid(&oid));
     println!(
         "{count} change{} committed",
         if count == 1 { "" } else { "s" }
     );
     Ok(())
-}
-
-/// Resolve a commit identity line (`Name <email> <epoch> <offset>`) for a role,
-/// honoring the matching `GIT_*_DATE` environment override.
-fn identity(
-    config: &ConfigSet,
-    role: IdentRole,
-    date_var: &str,
-    now: OffsetDateTime,
-) -> Result<String> {
-    let env = SystemIdentityEnv;
-    let name = resolve_name_with(&env, config, role).map_err(identity_error)?;
-    let email = resolve_email_with(&env, config, role).map_err(identity_error)?;
-    let date = std::env::var(date_var).ok();
-    Ok(grit_lib::commit::assemble_identity(
-        &name,
-        &email,
-        date.as_deref(),
-        now,
-    ))
-}
-
-fn identity_error(err: IdentityError) -> anyhow::Error {
-    anyhow::anyhow!(
-        "{err}\n\nTell gi who you are:\n  grit config --global user.name \"Your Name\"\n  grit config --global user.email \"you@example.com\""
-    )
 }

@@ -4,9 +4,14 @@ use std::collections::HashSet;
 
 use anyhow::{bail, Context, Result};
 use grit_lib::config::ConfigSet;
+use grit_lib::ident_resolve::{
+    resolve_email_with, resolve_loose_committer_parts_with, resolve_name_with, IdentRole,
+    IdentityError, SystemIdentityEnv,
+};
 use grit_lib::objects::{parse_commit, CommitData, ObjectId, ObjectKind};
 use grit_lib::refs;
 use grit_lib::repo::Repository;
+use time::OffsetDateTime;
 
 /// A resolved "target" branch (the trunk `gi` measures the current branch against).
 #[derive(Debug, Clone)]
@@ -127,6 +132,11 @@ fn reachable_commits(repo: &Repository, start: ObjectId) -> Result<HashSet<Objec
     Ok(reachable)
 }
 
+/// The tree OID recorded by a commit.
+pub fn commit_tree(repo: &Repository, oid: &ObjectId) -> Result<ObjectId> {
+    Ok(read_commit(repo, oid)?.tree)
+}
+
 fn read_commit(repo: &Repository, oid: &ObjectId) -> Result<CommitData> {
     let object = repo
         .odb
@@ -151,4 +161,38 @@ pub fn subject_line(message: &str) -> String {
 /// An abbreviated, 7-character object id.
 pub fn short_oid(oid: &ObjectId) -> String {
     oid.to_hex().chars().take(7).collect()
+}
+
+/// Resolve a strict commit identity line (`Name <email> <epoch> <offset>`) for a
+/// role, honoring the matching `GIT_*_DATE` override. Errors if no identity is
+/// configured — used when creating a commit.
+pub fn identity(
+    config: &ConfigSet,
+    role: IdentRole,
+    date_var: &str,
+    now: OffsetDateTime,
+) -> Result<String> {
+    let env = SystemIdentityEnv;
+    let name = resolve_name_with(&env, config, role).map_err(identity_error)?;
+    let email = resolve_email_with(&env, config, role).map_err(identity_error)?;
+    let date = std::env::var(date_var).ok();
+    Ok(grit_lib::commit::assemble_identity(
+        &name,
+        &email,
+        date.as_deref(),
+        now,
+    ))
+}
+
+/// A best-effort committer identity for reflog entries: never fails, even when
+/// no identity is configured.
+pub fn reflog_identity(config: &ConfigSet, now: OffsetDateTime) -> String {
+    let (name, email) = resolve_loose_committer_parts_with(&SystemIdentityEnv, config);
+    grit_lib::commit::assemble_identity(&name, &email, None, now)
+}
+
+fn identity_error(err: IdentityError) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{err}\n\nTell gi who you are:\n  grit config --global user.name \"Your Name\"\n  grit config --global user.email \"you@example.com\""
+    )
 }

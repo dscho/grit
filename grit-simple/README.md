@@ -74,6 +74,50 @@ gi commit -a "stage everything, then commit"
 Author/committer identity comes from `user.name` / `user.email` (honoring the
 `GIT_AUTHOR_DATE` / `GIT_COMMITTER_DATE` overrides).
 
+### `gi branch`
+
+List branches, or create / delete one.
+
+```sh
+gi branch            # list (current marked with *)
+gi branch feature    # create "feature" at HEAD (does not switch)
+gi branch -d feature # delete "feature"
+```
+
+### `gi switch`
+
+Move to another branch, updating the working tree. Refuses to switch with
+uncommitted changes, and won't clobber an untracked file the destination needs.
+
+```sh
+gi switch main          # switch to an existing branch
+gi switch -c feature    # create "feature" and switch to it
+gi checkout main        # aliases: checkout, co
+```
+
+### `gi merge`
+
+Merge another branch into the current one — fast-forwarding when possible,
+otherwise recording a merge commit. Conflicts are reported without leaving a
+half-finished merge (resolving them is out of scope for `gi`).
+
+```sh
+gi merge feature
+```
+
+### `gi fetch` / `gi pull` / `gi push`
+
+Talk to remotes. `gi` keeps these argument-free: they default to `origin` and
+the current branch's same-named counterpart — no `-u origin <branch>` ceremony.
+
+```sh
+gi fetch          # download refs/objects from origin (or: gi fetch <remote>)
+gi pull           # fetch, then fast-forward / merge the upstream in
+gi push           # publish the current branch to origin
+```
+
+Local (`file://` / path), `git://`, `ssh`, and `http(s)` remotes are supported.
+
 ### `gi shortlog`
 
 Show the current branch, the target branch, and commits that are reachable from

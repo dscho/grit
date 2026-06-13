@@ -7,6 +7,7 @@
 
 mod commands;
 mod context;
+mod net;
 mod ui;
 
 use anyhow::Result;
@@ -45,6 +46,37 @@ enum Command {
         #[arg(short = 'a', long = "all")]
         all: bool,
     },
+    /// List branches, or create / delete one.
+    Branch {
+        /// Name of the branch to create. Omit to list branches.
+        name: Option<String>,
+        /// Delete the named branch instead of creating it.
+        #[arg(short = 'd', long = "delete")]
+        delete: bool,
+    },
+    /// Switch to another branch.
+    #[command(alias = "checkout", alias = "co")]
+    Switch {
+        /// Branch to switch to.
+        name: String,
+        /// Create the branch first, then switch to it.
+        #[arg(short = 'c', long = "create")]
+        create: bool,
+    },
+    /// Merge another branch into the current one.
+    Merge {
+        /// Branch to merge in.
+        branch: String,
+    },
+    /// Download refs and objects from a remote.
+    Fetch {
+        /// Remote to fetch from (defaults to origin).
+        remote: Option<String>,
+    },
+    /// Fetch from the remote and integrate it into the current branch.
+    Pull,
+    /// Publish the current branch to its remote.
+    Push,
 }
 
 fn main() {
@@ -65,5 +97,11 @@ fn run() -> Result<()> {
             message_flag,
             all,
         } => commands::commit::run(message.or(message_flag), all),
+        Command::Branch { name, delete } => commands::branch::run(name, delete),
+        Command::Switch { name, create } => commands::switch::run(&name, create),
+        Command::Merge { branch } => commands::merge::run(&branch),
+        Command::Fetch { remote } => commands::fetch::run(remote),
+        Command::Pull => commands::pull::run(),
+        Command::Push => commands::push::run(),
     }
 }
