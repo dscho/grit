@@ -5210,12 +5210,13 @@ pub(crate) fn resolve_committer(config: &ConfigSet, now: OffsetDateTime) -> Resu
     let email = resolve_email(config, IdentRole::Committer)?;
 
     let date_str = std::env::var("GIT_COMMITTER_DATE").ok();
-    let timestamp = match date_str {
-        Some(d) => parse_date_to_git_timestamp(&d).unwrap_or(d),
-        None => format_git_timestamp(now),
-    };
 
-    Ok(format!("{name} <{email}> {timestamp}"))
+    Ok(grit_lib::commit::assemble_identity(
+        &name,
+        &email,
+        date_str.as_deref(),
+        now,
+    ))
 }
 
 fn validate_explicit_committer_identity(config: &ConfigSet) -> Result<()> {

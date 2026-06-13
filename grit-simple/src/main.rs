@@ -1,41 +1,82 @@
-//! `gi` — a small opinionated command line interface backed by `grit-lib`.
+//! `gi` — a small, opinionated command line interface backed by `grit-lib`.
+//!
+//! `gi` deliberately does not mirror Git's UX. It favors a single obvious way
+//! to do the common thing, plain-language output, and a status screen that
+//! doubles as the home base: running `gi` with no arguments shows you where you
+//! are, what's changed, and what to do next.
 
-use std::collections::HashSet;
+mod commands;
+mod context;
+mod net;
+mod ui;
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
-use grit_lib::config::ConfigSet;
-use grit_lib::objects::{parse_commit, ObjectId, ObjectKind};
-use grit_lib::refs;
-use grit_lib::repo::Repository;
-use grit_lib::state::{resolve_head, HeadState};
 
 /// A simplified alternative to the Git-compatible `grit` command line.
 #[derive(Debug, Parser)]
 #[command(name = "gi", version, about = "A simple Grit-powered CLI")]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 /// Top-level `gi` commands.
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Show the current branch and commits ahead of the target branch.
+    /// Show what's changed and where you are (this is the default).
+    #[command(alias = "st")]
+    Status,
+    /// List the commits on this branch that aren't on the target branch yet.
     #[command(alias = "sl")]
     Shortlog,
-}
-
-#[derive(Debug, Clone)]
-struct TargetBranch {
-    display_name: String,
-    oid: ObjectId,
-}
-
-#[derive(Debug, Clone)]
-struct CommitSummary {
-    oid: ObjectId,
-    subject: String,
+    /// Stage changes. With no paths, stages everything.
+    Add {
+        /// Files or directories to stage. Omit to stage all changes.
+        paths: Vec<String>,
+    },
+    /// Record the staged changes as a new commit.
+    Commit {
+        /// Commit message (you can also pass it with -m).
+        message: Option<String>,
+        /// Commit message.
+        #[arg(short = 'm', long = "message", conflicts_with = "message")]
+        message_flag: Option<String>,
+        /// Stage every change first, then commit.
+        #[arg(short = 'a', long = "all")]
+        all: bool,
+    },
+    /// List branches, or create / delete one.
+    Branch {
+        /// Name of the branch to create. Omit to list branches.
+        name: Option<String>,
+        /// Delete the named branch instead of creating it.
+        #[arg(short = 'd', long = "delete")]
+        delete: bool,
+    },
+    /// Switch to another branch.
+    #[command(alias = "checkout", alias = "co")]
+    Switch {
+        /// Branch to switch to.
+        name: String,
+        /// Create the branch first, then switch to it.
+        #[arg(short = 'c', long = "create")]
+        create: bool,
+    },
+    /// Merge another branch into the current one.
+    Merge {
+        /// Branch to merge in.
+        branch: String,
+    },
+    /// Download refs and objects from a remote.
+    Fetch {
+        /// Remote to fetch from (defaults to origin).
+        remote: Option<String>,
+    },
+    /// Fetch from the remote and integrate it into the current branch.
+    Pull,
+    /// Publish the current branch to its remote.
+    Push,
 }
 
 fn main() {
@@ -47,170 +88,20 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
-        Command::Shortlog => shortlog(),
+    match cli.command.unwrap_or(Command::Status) {
+        Command::Status => commands::status::run(),
+        Command::Shortlog => commands::shortlog::run(),
+        Command::Add { paths } => commands::add::run(&paths),
+        Command::Commit {
+            message,
+            message_flag,
+            all,
+        } => commands::commit::run(message.or(message_flag), all),
+        Command::Branch { name, delete } => commands::branch::run(name, delete),
+        Command::Switch { name, create } => commands::switch::run(&name, create),
+        Command::Merge { branch } => commands::merge::run(&branch),
+        Command::Fetch { remote } => commands::fetch::run(remote),
+        Command::Pull => commands::pull::run(),
+        Command::Push => commands::push::run(),
     }
-}
-
-fn shortlog() -> Result<()> {
-    let repo = Repository::discover(None).context("not in a repository")?;
-    let head = resolve_head(&repo.git_dir).context("could not resolve HEAD")?;
-    let (branch_name, head_oid) = current_branch_and_oid(&head)?;
-
-    println!("On {branch_name}");
-
-    let Some(target) = find_target_branch(&repo)? else {
-        println!("No target branch found (tried target.branch, origin/master, origin/main, master, main).");
-        return Ok(());
-    };
-
-    let commits = commits_ahead_of(&repo, head_oid, target.oid)?;
-    println!(
-        "Ahead of {} by {} commit{}",
-        target.display_name,
-        commits.len(),
-        if commits.len() == 1 { "" } else { "s" }
-    );
-
-    for commit in commits {
-        println!("{} {}", short_oid(&commit.oid), commit.subject);
-    }
-
-    Ok(())
-}
-
-fn current_branch_and_oid(head: &HeadState) -> Result<(&str, ObjectId)> {
-    match head {
-        HeadState::Branch {
-            short_name,
-            oid: Some(oid),
-            ..
-        } => Ok((short_name.as_str(), *oid)),
-        HeadState::Branch { short_name, .. } => {
-            bail!("branch '{short_name}' does not have any commits yet")
-        }
-        HeadState::Detached { .. } => bail!("HEAD is detached; gi shortlog needs a current branch"),
-        HeadState::Invalid => bail!("HEAD is invalid"),
-    }
-}
-
-fn find_target_branch(repo: &Repository) -> Result<Option<TargetBranch>> {
-    for candidate in target_branch_candidates(repo)? {
-        if let Some(oid) = resolve_branch_candidate(repo, &candidate) {
-            return Ok(Some(TargetBranch {
-                display_name: candidate,
-                oid,
-            }));
-        }
-    }
-    Ok(None)
-}
-
-fn target_branch_candidates(repo: &Repository) -> Result<Vec<String>> {
-    let config = ConfigSet::load(Some(&repo.git_dir), true).context("could not load config")?;
-    let mut candidates = Vec::new();
-    if let Some(target) = config.get("target.branch") {
-        let trimmed = target.trim();
-        if !trimmed.is_empty() {
-            candidates.push(trimmed.to_owned());
-        }
-    }
-    candidates.extend([
-        "origin/master".to_owned(),
-        "origin/main".to_owned(),
-        "master".to_owned(),
-        "main".to_owned(),
-    ]);
-    Ok(candidates)
-}
-
-fn resolve_branch_candidate(repo: &Repository, candidate: &str) -> Option<ObjectId> {
-    for refname in candidate_refnames(candidate) {
-        if let Ok(oid) = refs::resolve_ref(&repo.git_dir, &refname) {
-            return Some(oid);
-        }
-    }
-    None
-}
-
-fn candidate_refnames(candidate: &str) -> Vec<String> {
-    if candidate.starts_with("refs/") || candidate == "HEAD" {
-        return vec![candidate.to_owned()];
-    }
-
-    if let Some(remote_branch) = candidate.strip_prefix("origin/") {
-        return vec![
-            format!("refs/remotes/origin/{remote_branch}"),
-            format!("refs/heads/{candidate}"),
-        ];
-    }
-
-    vec![
-        format!("refs/heads/{candidate}"),
-        format!("refs/remotes/{candidate}"),
-    ]
-}
-
-fn commits_ahead_of(
-    repo: &Repository,
-    head: ObjectId,
-    target: ObjectId,
-) -> Result<Vec<CommitSummary>> {
-    let excluded = reachable_commits(repo, target)?;
-    let mut seen = HashSet::new();
-    let mut stack = vec![head];
-    let mut commits = Vec::new();
-
-    while let Some(oid) = stack.pop() {
-        if !seen.insert(oid) || excluded.contains(&oid) {
-            continue;
-        }
-        let commit = read_commit(repo, &oid)?;
-        stack.extend(commit.parents.iter().copied());
-        commits.push(CommitSummary {
-            oid,
-            subject: subject_line(&commit.message),
-        });
-    }
-
-    Ok(commits)
-}
-
-fn reachable_commits(repo: &Repository, start: ObjectId) -> Result<HashSet<ObjectId>> {
-    let mut reachable = HashSet::new();
-    let mut stack = vec![start];
-
-    while let Some(oid) = stack.pop() {
-        if !reachable.insert(oid) {
-            continue;
-        }
-        let commit = read_commit(repo, &oid)?;
-        stack.extend(commit.parents.iter().copied());
-    }
-
-    Ok(reachable)
-}
-
-fn read_commit(repo: &Repository, oid: &ObjectId) -> Result<grit_lib::objects::CommitData> {
-    let object = repo
-        .odb
-        .read(oid)
-        .with_context(|| format!("could not read commit {oid}"))?;
-    if object.kind != ObjectKind::Commit {
-        bail!("object {oid} is a {}, not a commit", object.kind);
-    }
-    parse_commit(&object.data).with_context(|| format!("could not parse commit {oid}"))
-}
-
-fn subject_line(message: &str) -> String {
-    message
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .unwrap_or("(no subject)")
-        .to_owned()
-}
-
-fn short_oid(oid: &ObjectId) -> String {
-    oid.to_hex().chars().take(7).collect()
 }

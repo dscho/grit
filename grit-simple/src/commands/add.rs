@@ -1,0 +1,113 @@
+//! `gi add` — stage changes. With no paths, stages everything.
+//!
+//! Staging is driven by the same status model the dashboard uses, so `gi add`
+//! stages exactly what `gi status` reports as changed — including deletions and
+//! untracked files — without reimplementing worktree walking or ignore rules.
+
+use anyhow::{Context, Result};
+use grit_lib::diff::{mode_from_metadata, DiffStatus};
+use grit_lib::index::{entry_from_stat, Index};
+use grit_lib::objects::ObjectKind;
+use grit_lib::porcelain::status::{status, StatusOptions};
+use grit_lib::progress::NullProgress;
+use grit_lib::repo::Repository;
+
+use crate::context;
+use crate::ui::entry_path;
+
+pub fn run(paths: &[String]) -> Result<()> {
+    let repo = context::discover()?;
+    let staged = stage(&repo, paths)?;
+
+    match staged {
+        0 if paths.is_empty() => println!("Nothing to stage — working tree clean."),
+        0 => println!("Nothing to stage matched the given paths."),
+        1 => println!("Staged 1 change."),
+        n => println!("Staged {n} changes."),
+    }
+    Ok(())
+}
+
+/// Stage all changes matching `selectors` (empty selectors = everything).
+///
+/// Returns the number of paths staged. Shared with `gi commit -a`.
+pub fn stage(repo: &Repository, selectors: &[String]) -> Result<usize> {
+    let work_tree = repo
+        .work_tree
+        .clone()
+        .context("gi add needs a working tree")?;
+    let model = status(repo, &StatusOptions::default(), &mut NullProgress)
+        .context("could not compute status")?;
+    let mut index = repo.load_index().context("could not load the index")?;
+
+    let matches = |path: &str| selectors.is_empty() || selectors.iter().any(|s| path_matches(s, path));
+
+    let mut staged = 0;
+    for entry in &model.unstaged {
+        let path = entry_path(entry);
+        if !matches(path) {
+            continue;
+        }
+        if entry.status == DiffStatus::Deleted {
+            if index.remove(path.as_bytes()) {
+                staged += 1;
+            }
+        } else {
+            stage_worktree_file(repo, &work_tree, path, &mut index)?;
+            staged += 1;
+        }
+    }
+    for path in &model.untracked {
+        if !matches(path) {
+            continue;
+        }
+        stage_worktree_file(repo, &work_tree, path, &mut index)?;
+        staged += 1;
+    }
+
+    if staged > 0 {
+        index.sort();
+        repo.write_index(&mut index)
+            .context("could not write the index")?;
+    }
+    Ok(staged)
+}
+
+/// Hash a working-tree file into a blob and (re)stage it in the index.
+fn stage_worktree_file(
+    repo: &Repository,
+    work_tree: &std::path::Path,
+    rel_path: &str,
+    index: &mut Index,
+) -> Result<()> {
+    let abs = work_tree.join(rel_path);
+    let meta = std::fs::symlink_metadata(&abs)
+        .with_context(|| format!("could not read {rel_path}"))?;
+    let mode = mode_from_metadata(&meta);
+
+    let data = if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(&abs)
+            .with_context(|| format!("could not read symlink {rel_path}"))?;
+        target.to_string_lossy().into_owned().into_bytes()
+    } else {
+        std::fs::read(&abs).with_context(|| format!("could not read {rel_path}"))?
+    };
+
+    let oid = repo
+        .odb
+        .write(ObjectKind::Blob, &data)
+        .with_context(|| format!("could not store {rel_path}"))?;
+    let entry = entry_from_stat(&abs, rel_path.as_bytes(), oid, mode)
+        .with_context(|| format!("could not stage {rel_path}"))?;
+    index.add_or_replace(entry);
+    Ok(())
+}
+
+/// Whether a worktree `path` is covered by a user-provided `selector`.
+fn path_matches(selector: &str, path: &str) -> bool {
+    let selector = selector.trim_start_matches("./").trim_end_matches('/');
+    if selector.is_empty() || selector == "." {
+        return true;
+    }
+    path == selector || path.starts_with(&format!("{selector}/"))
+}

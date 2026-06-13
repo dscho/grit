@@ -14,8 +14,62 @@
 
 use std::path::Path;
 
+use crate::diff::{diff_trees, DiffStatus};
 use crate::error::{Error, Result};
-use crate::index::{MODE_EXECUTABLE, MODE_SYMLINK};
+use crate::index::{entry_from_stat, MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
+use crate::objects::ObjectId;
+use crate::repo::Repository;
+
+/// Apply the change from tree `from` to tree `to` onto the working tree and
+/// index, then write the index.
+///
+/// This is the reusable core of a clean branch switch / fast-forward: it writes,
+/// updates, and deletes only the paths that differ between the two trees, and
+/// rebuilds the matching index entries (with fresh stat data so a subsequent
+/// status reports a clean tree). Unchanged paths are left untouched.
+///
+/// The caller is responsible for policy: this function assumes the tracked
+/// working tree is **clean** relative to `from` (no staged or unstaged changes
+/// that would be silently overwritten) and that no untracked file sits where an
+/// added path needs to land. It performs the mechanical apply only.
+pub fn checkout_between_trees(
+    repo: &Repository,
+    from: Option<&ObjectId>,
+    to: &ObjectId,
+) -> Result<()> {
+    let work_tree = repo
+        .work_tree
+        .clone()
+        .ok_or_else(|| Error::PathError("cannot update a bare repository's working tree".into()))?;
+
+    let changes = diff_trees(&repo.odb, from, Some(to), "")?;
+    let mut index = repo.load_index()?;
+
+    for change in &changes {
+        if change.status == DiffStatus::Deleted {
+            if let Some(path) = &change.old_path {
+                let abs = work_tree.join(path);
+                let _ = std::fs::remove_file(&abs);
+                remove_empty_parent_dirs(&work_tree, &abs);
+                index.remove(path.as_bytes());
+            }
+            continue;
+        }
+
+        let Some(path) = &change.new_path else {
+            continue;
+        };
+        let mode = u32::from_str_radix(&change.new_mode, 8).unwrap_or(MODE_REGULAR);
+        let object = repo.odb.read(&change.new_oid)?;
+        write_to_worktree(&work_tree, path, &object.data, mode)?;
+        let entry = entry_from_stat(&work_tree.join(path), path.as_bytes(), change.new_oid, mode)?;
+        index.add_or_replace(entry);
+    }
+
+    index.sort();
+    repo.write_index(&mut index)?;
+    Ok(())
+}
 
 /// Set `abs_path` permissions to match Git index `mode` (regular vs executable blob).
 pub fn apply_index_file_mode(abs_path: &Path, mode: u32) -> Result<()> {

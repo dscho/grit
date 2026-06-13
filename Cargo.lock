@@ -548,6 +548,7 @@ dependencies = [
  "anyhow",
  "clap",
  "grit-lib",
+ "time",
 ]
 
 [[package]]

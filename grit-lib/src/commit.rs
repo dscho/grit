@@ -105,3 +105,50 @@ pub fn format_git_timestamp(dt: OffsetDateTime) -> String {
     let minutes = offset.minutes_past_hour().unsigned_abs();
     format!("{epoch} {hours:+03}{minutes:02}")
 }
+
+/// Assemble a commit identity line (`Name <email> <epoch> <offset>`) from an
+/// already-resolved name and email plus a timestamp.
+///
+/// `date_override` is the raw value of a `GIT_AUTHOR_DATE` /
+/// `GIT_COMMITTER_DATE`-style environment variable, if set: it is parsed with
+/// [`parse_date_to_git_timestamp`] and used verbatim if parsing fails (matching
+/// Git's lenient behavior). When `None`, `now` is formatted instead.
+#[must_use]
+pub fn assemble_identity(
+    name: &str,
+    email: &str,
+    date_override: Option<&str>,
+    now: OffsetDateTime,
+) -> String {
+    let timestamp = match date_override {
+        Some(d) => parse_date_to_git_timestamp(d).unwrap_or_else(|| d.to_string()),
+        None => format_git_timestamp(now),
+    };
+    format!("{name} <{email}> {timestamp}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn assemble_identity_formats_now_without_override() {
+        // 2005-04-07T22:13:13Z
+        let now = OffsetDateTime::from_unix_timestamp(1_112_911_993).unwrap();
+        let line = assemble_identity("A U Thor", "author@example.com", None, now);
+        assert_eq!(line, "A U Thor <author@example.com> 1112911993 +0000");
+    }
+
+    #[test]
+    fn assemble_identity_parses_date_override() {
+        let now = OffsetDateTime::from_unix_timestamp(0).unwrap();
+        let line = assemble_identity(
+            "A U Thor",
+            "author@example.com",
+            Some("2005-04-07T22:13:13 +0000"),
+            now,
+        );
+        assert_eq!(line, "A U Thor <author@example.com> 1112911993 +0000");
+    }
+}
