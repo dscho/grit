@@ -2509,6 +2509,23 @@ pub fn refresh_index_stat_content_verified(
     changed
 }
 
+/// Symlink target as the byte string Git hashes for the blob OID.
+///
+/// On Unix the raw `OsStr` bytes are used verbatim. On Windows `OsStr` is WTF-8
+/// and has no stable byte view, so the lossy UTF-8 form is used (symlink targets
+/// in Git trees are UTF-8 in practice).
+fn symlink_target_bytes(target: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        target.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(not(unix))]
+    {
+        target.as_os_str().to_string_lossy().as_bytes().to_vec()
+    }
+}
+
 /// Whether the work tree blob at `abs` matches the index entry OID (raw bytes, no CRLF smudge).
 fn worktree_content_matches_index_oid(ie: &IndexEntry, abs: &Path, meta: &fs::Metadata) -> bool {
     use crate::index::{MODE_EXECUTABLE, MODE_REGULAR, MODE_SYMLINK};
@@ -2516,9 +2533,8 @@ fn worktree_content_matches_index_oid(ie: &IndexEntry, abs: &Path, meta: &fs::Me
         if !meta.file_type().is_symlink() {
             return false;
         }
-        use std::os::unix::ffi::OsStrExt as _;
         fs::read_link(abs)
-            .map(|t| Odb::hash_object_data(ObjectKind::Blob, t.as_os_str().as_bytes()) == ie.oid)
+            .map(|t| Odb::hash_object_data(ObjectKind::Blob, &symlink_target_bytes(&t)) == ie.oid)
             .unwrap_or(false)
     } else if ie.mode == MODE_REGULAR || ie.mode == MODE_EXECUTABLE {
         if !meta.file_type().is_file() {
