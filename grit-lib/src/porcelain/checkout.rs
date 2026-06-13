@@ -19,15 +19,22 @@ use crate::index::{MODE_EXECUTABLE, MODE_SYMLINK};
 
 /// Set `abs_path` permissions to match Git index `mode` (regular vs executable blob).
 pub fn apply_index_file_mode(abs_path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(abs_path)?.permissions();
-    let new_mode = if mode == MODE_EXECUTABLE {
-        0o755
-    } else {
-        0o644
-    };
-    perms.set_mode(new_mode);
-    std::fs::set_permissions(abs_path, perms)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(abs_path)?.permissions();
+        let new_mode = if mode == MODE_EXECUTABLE {
+            0o755
+        } else {
+            0o644
+        };
+        perms.set_mode(new_mode);
+        std::fs::set_permissions(abs_path, perms)?;
+    }
+    // Windows has no POSIX mode bits; the executable bit is not represented in
+    // the filesystem, so this is a no-op there.
+    #[cfg(not(unix))]
+    let _ = (abs_path, mode);
     Ok(())
 }
 
@@ -87,17 +94,26 @@ pub fn write_to_worktree(work_tree: &Path, rel_path: &str, data: &[u8], mode: u3
         let target = std::str::from_utf8(data).map_err(|_| {
             Error::PathError(format!("symlink target for '{rel_path}' is not UTF-8"))
         })?;
+        #[cfg(unix)]
         std::os::unix::fs::symlink(target, &abs_path)
             .map_err(|e| Error::PathError(format!("creating symlink '{rel_path}': {e}")))?;
+        // Windows lacks unprivileged symlink creation; materialise the link as a
+        // regular file containing the target path so the worktree stays populated.
+        #[cfg(not(unix))]
+        std::fs::write(&abs_path, target.as_bytes())
+            .map_err(|e| Error::PathError(format!("writing symlink '{rel_path}': {e}")))?;
     } else {
         std::fs::write(&abs_path, data)
             .map_err(|e| Error::PathError(format!("writing '{rel_path}': {e}")))?;
 
         if mode == MODE_EXECUTABLE {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&abs_path)?.permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&abs_path, perms)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&abs_path)?.permissions();
+                perms.set_mode(0o755);
+                std::fs::set_permissions(&abs_path, perms)?;
+            }
         }
     }
 

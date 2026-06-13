@@ -987,6 +987,9 @@ fn populate_dir_side(
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
     }
 
+    // Symlink-backed difftool checkout is a Unix optimisation; on Windows we fall
+    // through to copying the work-tree file into the temp dir below.
+    #[cfg(unix)]
     if !is_left && use_symlinks {
         let wt = work_tree.join(rel);
         if wt.is_file() {
@@ -995,6 +998,8 @@ fn populate_dir_side(
             return Ok(());
         }
     }
+    #[cfg(not(unix))]
+    let _ = use_symlinks;
 
     if !is_left {
         let wt = work_tree.join(rel);
