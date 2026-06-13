@@ -2,8 +2,10 @@
 
 pub mod add;
 pub mod branch;
+pub mod clone;
 pub mod commit;
 pub mod fetch;
+pub mod init;
 pub mod merge;
 pub mod pull;
 pub mod push;
