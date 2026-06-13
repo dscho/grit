@@ -24,6 +24,21 @@ struct Cli {
 /// Top-level `gs` commands.
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a new, empty repository.
+    Init {
+        /// Where to create the repository (defaults to the current directory).
+        path: Option<String>,
+        /// Create a bare repository (no working tree).
+        #[arg(long)]
+        bare: bool,
+    },
+    /// Copy a remote repository into a new directory.
+    Clone {
+        /// The repository to clone (URL or local path).
+        url: String,
+        /// Directory to clone into (defaults to the repository name).
+        dir: Option<String>,
+    },
     /// Show what's changed and where you are (this is the default).
     #[command(alias = "st")]
     Status,
@@ -89,6 +104,8 @@ fn main() {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Status) {
+        Command::Init { path, bare } => commands::init::run(path, bare),
+        Command::Clone { url, dir } => commands::clone::run(&url, dir),
         Command::Status => commands::status::run(),
         Command::Shortlog => commands::shortlog::run(),
         Command::Add { paths } => commands::add::run(&paths),
