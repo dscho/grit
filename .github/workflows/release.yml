@@ -73,10 +73,13 @@ jobs:
           tar czf ../../../gs-${{ matrix.target }}.tar.gz gs
         shell: bash
 
+      # Manual (workflow_dispatch) runs publish a `*-nightly` artifact so the
+      # `install-nightly` script can find them; tag pushes keep the plain name
+      # the release job globs over.
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: grit-${{ matrix.target }}
+          name: grit-${{ matrix.target }}${{ github.event_name == 'workflow_dispatch' && '-nightly' || '' }}
           path: |
             grit-${{ matrix.target }}.tar.gz
             gs-${{ matrix.target }}.tar.gz
@@ -119,7 +122,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: gs-${{ matrix.target }}
+          name: gs-${{ matrix.target }}${{ github.event_name == 'workflow_dispatch' && '-nightly' || '' }}
           path: gs-${{ matrix.target }}.zip
 
   release:
