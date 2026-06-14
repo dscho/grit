@@ -381,6 +381,29 @@ impl HttpClientContext {
         url: &str,
         git_protocol_header: Option<&str>,
     ) -> Result<Vec<u8>> {
+        self.get_raw_with_git_protocol(url, git_protocol_header)
+            .map(|resp| resp.body)
+    }
+
+    /// Like [`get_with_git_protocol`](Self::get_with_git_protocol), but also
+    /// returns the final URL the request resolved to after any followed HTTP
+    /// redirects (`None` when the transport does not report it). Callers use
+    /// this to re-base subsequent smart-HTTP POSTs onto a redirected
+    /// `info/refs` location (Git's `http.followRedirects` behavior).
+    pub fn get_with_final_url(
+        &self,
+        url: &str,
+        git_protocol_header: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        self.get_raw_with_git_protocol(url, git_protocol_header)
+            .map(|resp| (resp.body, resp.final_url))
+    }
+
+    fn get_raw_with_git_protocol(
+        &self,
+        url: &str,
+        git_protocol_header: Option<&str>,
+    ) -> Result<RawHttpResponse> {
         self.trace_proxy_auth_header();
         self.trace_request_start("GET", url, self.smart_http_enabled);
         if let Some(v) = git_protocol_header {
@@ -402,7 +425,7 @@ impl HttpClientContext {
                 return Err(http_access_error(url, first.status));
             }
             self.approve_cached_auth_for_url(url);
-            return Ok(first.body);
+            return Ok(first);
         }
         let auth_challenges = first.www_authenticate_challenges();
 
@@ -450,7 +473,7 @@ impl HttpClientContext {
                 let approve_extras = next_auth.credential_extras();
                 let _ = self.run_credential_action("approve", &credential_input, &approve_extras);
                 self.store_cached_auth(next_auth);
-                return Ok(retry2.body);
+                return Ok(retry2);
             }
         }
         if retry.status >= 400 {
@@ -461,7 +484,7 @@ impl HttpClientContext {
         let approve_extras = auth.credential_extras();
         let _ = self.run_credential_action("approve", &credential_input, &approve_extras);
         self.store_cached_auth(auth);
-        Ok(retry.body)
+        Ok(retry)
     }
 
     /// Perform POST with given headers, returning the body.
@@ -657,6 +680,7 @@ impl HttpClientContext {
                         let status = resp.status();
                         let reason = resp.status_text().to_string();
                         let headers = response_headers(&resp);
+                        let final_url = Some(resp.get_url().to_string());
                         let mut body = Vec::new();
                         resp.into_reader()
                             .read_to_end(&mut body)
@@ -666,11 +690,13 @@ impl HttpClientContext {
                             reason,
                             headers,
                             body,
+                            final_url,
                         })
                     }
                     Err(ureq::Error::Status(code, resp)) => {
                         let reason = resp.status_text().to_string();
                         let headers = response_headers(&resp);
+                        let final_url = Some(resp.get_url().to_string());
                         let mut body = Vec::new();
                         resp.into_reader()
                             .read_to_end(&mut body)
@@ -680,6 +706,7 @@ impl HttpClientContext {
                             reason,
                             headers,
                             body,
+                            final_url,
                         })
                     }
                     Err(err) => Err(http_request_error("GET", &request_url, err)),
@@ -781,6 +808,7 @@ impl HttpClientContext {
                             reason,
                             headers,
                             body: out,
+                            final_url: None,
                         })
                     }
                     Err(ureq::Error::Status(code, resp)) => {
@@ -795,6 +823,7 @@ impl HttpClientContext {
                             reason,
                             headers,
                             body: out,
+                            final_url: None,
                         })
                     }
                     Err(err) => Err(http_request_error("POST", &request_url, err)),
@@ -1415,6 +1444,12 @@ struct RawHttpResponse {
     reason: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    /// The final URL the request resolved to after any HTTP redirects the
+    /// transport followed (ureq follows redirects on GET). `None` when the
+    /// transport does not report it (the manual proxy/SOCKS paths). Used to
+    /// re-base subsequent smart-HTTP POSTs onto a redirected `info/refs`
+    /// location, matching Git's `http.followRedirects` behavior.
+    final_url: Option<String>,
 }
 
 impl RawHttpResponse {
@@ -1980,6 +2015,7 @@ fn read_http_response(r: &mut impl Read) -> Result<RawHttpResponse> {
         reason,
         headers,
         body,
+        final_url: None,
     })
 }
 

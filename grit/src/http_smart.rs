@@ -192,22 +192,63 @@ fn trace_http_packet_data(prefix: &str, data: &[u8], seen_pack: &mut bool) {
     trace_http_line(format!("{prefix} {text}"));
 }
 
-fn http_get(client: &crate::http_client::HttpClientContext, url: &str) -> Result<Vec<u8>> {
-    trace_http_line(format!("> GET {url}"));
-    if let Some(v) = client.git_protocol_header() {
-        trace_http_line(format!("> Git-Protocol: {v}"));
-    }
-    let body = client.get(url)?;
-    trace_http_line(format!("< GET {url} body {} bytes", body.len()));
-    trace_http_payload("<", &body);
-    Ok(body)
+/// Re-base a redirected `info/refs` URL onto the location to use for follow-up
+/// POSTs. Shared with grit-simple via grit-lib; see
+/// [`grit_lib::transport::http::rebased_base_from_redirect`] for the rationale
+/// (Git's `http.followRedirects` smart-HTTP behavior).
+use grit_lib::transport::http::rebased_base_from_redirect;
+
+/// Build the `info/refs?service=git-upload-pack` discovery URL for a repo base.
+fn info_refs_url(base: &str) -> String {
+    let mut url = format!("{base}/info/refs");
+    url.push_str(if url.contains('?') { "&" } else { "?" });
+    url.push_str(&format!("service={SERVICE}"));
+    url
 }
 
-fn http_get_discovery(
+/// Perform the `info/refs` discovery GET and return both the advertisement body
+/// and the (possibly redirected) repo base URL to use for follow-up POSTs.
+///
+/// When the server redirects `info/refs` to a new location (see
+/// [`rebased_base_from_redirect`]), the discovery GET is re-issued against the
+/// redirected base. This re-roots the subsequent `git-upload-pack` POSTs onto
+/// the new host (ureq will not follow a POST redirect) and re-attaches the
+/// `?service=` query that a redirect may drop — without it the redirected GET
+/// lands on the *dumb* `info/refs` response and fails to parse as a smart
+/// advertisement.
+///
+/// `git_protocol` is the `Git-Protocol` header value for both the discovery GET
+/// and its post-redirect re-fetch — pass `client.git_protocol_header()` to honor
+/// the client default, or an explicit value (e.g. `Some("version=2")`) for a
+/// caller that requires a specific protocol regardless of config.
+pub(crate) fn http_get_discovery_with_base(
     client: &crate::http_client::HttpClientContext,
-    url: &str,
-) -> Result<Vec<u8>> {
-    http_get(client, url)
+    refs_url: &str,
+    original_base: &str,
+    git_protocol: Option<&str>,
+) -> Result<(Vec<u8>, String)> {
+    trace_http_line(format!("> GET {refs_url}"));
+    if let Some(v) = git_protocol {
+        trace_http_line(format!("> Git-Protocol: {v}"));
+    }
+    let (body, final_url) = client.get_with_final_url(refs_url, git_protocol)?;
+    trace_http_line(format!("< GET {refs_url} body {} bytes", body.len()));
+    trace_http_payload("<", &body);
+
+    let Some(new_base) = rebased_base_from_redirect(original_base, final_url.as_deref()) else {
+        return Ok((body, original_base.to_string()));
+    };
+    trace_http_line(format!("< redirected base {original_base} -> {new_base}"));
+
+    let new_refs_url = info_refs_url(&new_base);
+    trace_http_line(format!("> GET {new_refs_url}"));
+    if let Some(v) = git_protocol {
+        trace_http_line(format!("> Git-Protocol: {v}"));
+    }
+    let (body, _) = client.get_with_final_url(&new_refs_url, git_protocol)?;
+    trace_http_line(format!("< GET {new_refs_url} body {} bytes", body.len()));
+    trace_http_payload("<", &body);
+    Ok((body, new_base))
 }
 
 fn http_post(
@@ -638,12 +679,12 @@ pub fn http_ls_refs(
     repo_url: &str,
     client: &crate::http_client::HttpClientContext,
 ) -> Result<Vec<LsRefEntry>> {
-    let base = repo_url.trim_end_matches('/');
-    let mut refs_url = format!("{base}/info/refs");
+    let original_base = repo_url.trim_end_matches('/');
+    let mut refs_url = format!("{original_base}/info/refs");
     refs_url.push_str(if refs_url.contains('?') { "&" } else { "?" });
     refs_url.push_str(&format!("service={SERVICE}"));
 
-    let body = http_get(client, &refs_url)?;
+    let (body, base) = http_get_discovery_with_base(client, &refs_url, original_base, client.git_protocol_header())?;
     let pkt_body = strip_v0_service_advertisement_if_present(&body)?;
     let (caps, object_format) = match discover_http_protocol(pkt_body)? {
         HttpDiscovery::V2 {
@@ -687,12 +728,12 @@ pub fn http_negotiate_only_common(
     negotiation_tips: &[ObjectId],
     client: &crate::http_client::HttpClientContext,
 ) -> Result<Vec<ObjectId>> {
-    let base = repo_url.trim_end_matches('/');
-    let mut refs_url = format!("{base}/info/refs");
+    let original_base = repo_url.trim_end_matches('/');
+    let mut refs_url = format!("{original_base}/info/refs");
     refs_url.push_str(if refs_url.contains('?') { "&" } else { "?" });
     refs_url.push_str(&format!("service={SERVICE}"));
 
-    let body = http_get(client, &refs_url)?;
+    let (body, base) = http_get_discovery_with_base(client, &refs_url, original_base, client.git_protocol_header())?;
     let pkt_body = strip_v0_service_advertisement_if_present(&body)?;
     let (caps, object_format) = match discover_http_protocol(pkt_body)? {
         HttpDiscovery::V2 {
@@ -1535,12 +1576,13 @@ pub fn http_fetch_pack(
     client: &crate::http_client::HttpClientContext,
 ) -> Result<HttpFetchResult> {
     trace_http_v0_v1_negotiated(client);
-    let base = repo_url.trim_end_matches('/');
-    let mut refs_url = format!("{base}/info/refs");
+    let original_base = repo_url.trim_end_matches('/');
+    let mut refs_url = format!("{original_base}/info/refs");
     refs_url.push_str(if refs_url.contains('?') { "&" } else { "?" });
     refs_url.push_str(&format!("service={SERVICE}"));
 
-    let body = http_get(client, &refs_url)?;
+    let (body, base) = http_get_discovery_with_base(client, &refs_url, original_base, client.git_protocol_header())?;
+    let base = base.as_str();
     let pkt_body = strip_v0_service_advertisement_if_present(&body)?;
     let discovery = discover_http_protocol(pkt_body)?;
     let (caps, object_format) = match discovery {

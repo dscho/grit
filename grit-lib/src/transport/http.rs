@@ -84,6 +84,29 @@ pub trait HttpClient: Send + Sync {
         git_protocol: Option<&str>,
     ) -> Result<Vec<u8>>;
 
+    /// Issue a `GET` to `url` and return both the response body and the final
+    /// URL the request resolved to after any HTTP redirects the client followed
+    /// (`None` when the client does not track it).
+    ///
+    /// The smart-HTTP transport uses this on the `info/refs` discovery GET to
+    /// re-base subsequent `git-upload-pack` POSTs onto a redirected location
+    /// (Git's `http.followRedirects`): a host that redirects `info/refs` to a
+    /// backing host expects the stateless-RPC POSTs there too, and many HTTP
+    /// clients follow redirects on GET but not on POST. The default
+    /// implementation calls [`get`](Self::get) and reports no final URL, so
+    /// existing clients keep working unchanged (without redirect re-basing).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a transport failure or a non-success HTTP status.
+    fn get_with_final_url(
+        &self,
+        url: &str,
+        git_protocol: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        Ok((self.get(url, git_protocol)?, None))
+    }
+
     /// The default `Git-Protocol` request-header value to apply when the caller
     /// passes `None`. Defaults to no header.
     fn git_protocol_header(&self) -> Option<&str> {
@@ -113,6 +136,14 @@ impl<C: HttpClient> HttpClient for std::sync::Arc<C> {
         git_protocol: Option<&str>,
     ) -> Result<Vec<u8>> {
         (**self).post(url, content_type, accept, body, git_protocol)
+    }
+
+    fn get_with_final_url(
+        &self,
+        url: &str,
+        git_protocol: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        (**self).get_with_final_url(url, git_protocol)
     }
 
     fn git_protocol_header(&self) -> Option<&str> {
@@ -312,6 +343,30 @@ fn info_refs_url(repo_url: &str) -> String {
     url.push_str("service=");
     url.push_str(UPLOAD_PACK);
     url
+}
+
+/// Given the `original_base` of an `info/refs` discovery request and the final
+/// URL it resolved to after any HTTP redirects the client followed, return the
+/// re-based repo URL to use for subsequent smart-HTTP requests — or `None` when
+/// there was no usable redirect (keep the original base).
+///
+/// This implements the client side of Git's `http.followRedirects`: when a host
+/// redirects `info/refs` to a backing location (e.g. tangled.org → its "knot"
+/// host), the later `git-upload-pack` POSTs must target the redirected location.
+/// Many HTTP clients follow the redirect on the discovery GET but not on a POST
+/// (which then hits the redirecting host and comes back as an un-followed `3xx`
+/// with an empty body — zero refs, a silently empty clone). The redirect must
+/// preserve the `/info/refs` path suffix; the new base is the final URL with
+/// that suffix (and any query) removed.
+#[must_use]
+pub fn rebased_base_from_redirect(original_base: &str, final_url: Option<&str>) -> Option<String> {
+    let final_url = final_url?;
+    let final_path = final_url.split('?').next().unwrap_or(final_url);
+    let new_base = final_path.strip_suffix("/info/refs")?.trim_end_matches('/');
+    if new_base.is_empty() || new_base == original_base.trim_end_matches('/') {
+        return None;
+    }
+    Some(new_base.to_owned())
 }
 
 /// The `git-upload-pack` stateless-RPC endpoint URL for `repo_url`.
@@ -1050,12 +1105,29 @@ pub fn http_fetch(
         opts.tags
     );
     // 1. Discovery (request v2 via the client's default `Git-Protocol` header;
-    // a v0/v1 server ignores it and returns the classic advertisement).
-    let disc = {
-        let url = info_refs_url(repo_url);
-        let body = client.get(&url, client.git_protocol_header())?;
-        let stripped = strip_service_advertisement(&body)?;
-        parse_advertisement(stripped)?
+    // a v0/v1 server ignores it and returns the classic advertisement). If the
+    // server redirects `info/refs` to another location, re-base every following
+    // request onto it (Git's `http.followRedirects`): re-fetch discovery from
+    // the new base so the request carries the `?service=` query a redirect may
+    // drop, and so the stateless-RPC POSTs target the redirected host (which a
+    // client that won't follow a POST redirect would otherwise miss).
+    let info_url = info_refs_url(repo_url);
+    let (body, final_url) = client.get_with_final_url(&info_url, client.git_protocol_header())?;
+    let rebased = rebased_base_from_redirect(repo_url, final_url.as_deref());
+    let repo_url_owned;
+    let (repo_url, disc) = match rebased {
+        Some(new_base) => {
+            net_trace!("http_fetch: redirected base {repo_url} -> {new_base}");
+            let url = info_refs_url(&new_base);
+            let body = client.get(&url, client.git_protocol_header())?;
+            let disc = parse_advertisement(strip_service_advertisement(&body)?)?;
+            repo_url_owned = new_base;
+            (repo_url_owned.as_str(), disc)
+        }
+        None => {
+            let disc = parse_advertisement(strip_service_advertisement(&body)?)?;
+            (repo_url, disc)
+        }
     };
     net_trace!(
         "http_fetch: discovered protocol v{}, {} ref(s)",
@@ -1686,6 +1758,42 @@ pub fn discovery_advertisement(conn: &SmartHttpConnection) -> Advertisement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebase_redirect_strips_info_refs_and_query() {
+        let base = "https://tangled.org/me/repo";
+        // A redirect that preserves the query (real-world: tangled.org → knot host).
+        assert_eq!(
+            rebased_base_from_redirect(
+                base,
+                Some("https://knot.example/did:plc:xyz/info/refs?service=git-upload-pack")
+            )
+            .as_deref(),
+            Some("https://knot.example/did:plc:xyz")
+        );
+        // A redirect that drops the query (still re-bases on the path suffix).
+        assert_eq!(
+            rebased_base_from_redirect(base, Some("https://host/smart/repo/info/refs")).as_deref(),
+            Some("https://host/smart/repo")
+        );
+    }
+
+    #[test]
+    fn rebase_redirect_none_when_no_change_or_unknown() {
+        let base = "https://host/smart/repo";
+        // No final URL reported (client doesn't track redirects) → keep original base.
+        assert_eq!(rebased_base_from_redirect(base, None), None);
+        // Same base (no actual redirect) → None.
+        assert_eq!(
+            rebased_base_from_redirect(base, Some("https://host/smart/repo/info/refs?service=git-upload-pack")),
+            None
+        );
+        // A final URL that is not an `info/refs` request → None (don't guess).
+        assert_eq!(
+            rebased_base_from_redirect(base, Some("https://host/elsewhere")),
+            None
+        );
+    }
 
     #[test]
     fn strips_smart_service_preamble() {
