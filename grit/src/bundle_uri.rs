@@ -608,8 +608,8 @@ fn read_bundle_list_from_http(
     repo_url: &str,
     client_override: Option<&crate::http_client::HttpClientContext>,
 ) -> Result<String> {
-    let base = repo_url.trim_end_matches('/');
-    let mut refs_url = format!("{base}/info/refs");
+    let original_base = repo_url.trim_end_matches('/');
+    let mut refs_url = format!("{original_base}/info/refs");
     refs_url.push_str(if refs_url.contains('?') { "&" } else { "?" });
     refs_url.push_str("service=git-upload-pack");
 
@@ -621,9 +621,10 @@ fn read_bundle_list_from_http(
         owned_client = crate::http_client::HttpClientContext::from_config_set(&config)?;
         &owned_client
     };
-    let body = client
-        .get_with_git_protocol(&refs_url, Some("version=2"))
-        .with_context(|| format!("GET {refs_url}"))?;
+    // Re-base onto a redirected `info/refs` location so the bundle-uri POST
+    // targets the right host (shared with the fetch path via grit-lib).
+    let (body, base) =
+        crate::http_smart::http_get_discovery_with_base(client, &refs_url, original_base, Some("version=2"))?;
     let pkt_body = strip_v0_service_advertisement_if_present(&body)?;
     let mut cur = Cursor::new(pkt_body);
     let first = match pkt_line::read_packet(&mut cur)? {

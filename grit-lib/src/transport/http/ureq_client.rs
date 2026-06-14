@@ -272,6 +272,8 @@ struct RawResponse {
     www_authenticate: Vec<String>,
     set_cookie: Vec<String>,
     body: Vec<u8>,
+    /// The final URL after any redirects ureq followed (from `Response::get_url`).
+    final_url: String,
 }
 
 fn default_user_agent() -> String {
@@ -424,8 +426,9 @@ impl UreqHttpClient {
         finish(req.send_bytes(body))
     }
 
-    /// Run `attempt` (a GET or POST closure) with auth-retry on 401.
-    fn with_auth_retry<F>(&self, url: &str, attempt: F) -> Result<Vec<u8>>
+    /// Run `attempt` (a GET or POST closure) with auth-retry on 401, returning
+    /// the response body and the final URL after any followed redirects.
+    fn with_auth_retry<F>(&self, url: &str, attempt: F) -> Result<(Vec<u8>, String)>
     where
         F: Fn(Option<&str>) -> Result<RawResponse>,
     {
@@ -433,7 +436,7 @@ impl UreqHttpClient {
         let first = attempt(initial_auth.as_deref())?;
         if first.status != 401 {
             self.save_response_cookies(&first.set_cookie);
-            return finalize_status(url, first.status, first.body);
+            return finalize_status(url, first.status, first.body, first.final_url);
         }
         // 401: need credentials. Without a provider, surface a typed auth error
         // (so embedders can detect it and e.g. fall back to a subprocess path)
@@ -485,7 +488,7 @@ impl UreqHttpClient {
         let _ = provider.approve(&cred);
         self.store_auth_header(header);
         self.save_response_cookies(&retry.set_cookie);
-        Ok(retry.body)
+        Ok((retry.body, retry.final_url))
     }
 }
 
@@ -493,6 +496,7 @@ impl HttpClient for UreqHttpClient {
     fn get(&self, url: &str, git_protocol: Option<&str>) -> Result<Vec<u8>> {
         let gp = git_protocol.or(self.git_protocol.as_deref());
         self.with_auth_retry(url, |auth| self.do_get(url, gp, auth))
+            .map(|(body, _)| body)
     }
 
     fn post(
@@ -507,6 +511,17 @@ impl HttpClient for UreqHttpClient {
         self.with_auth_retry(url, |auth| {
             self.do_post(url, content_type, accept, body, gp, auth)
         })
+        .map(|(body, _)| body)
+    }
+
+    fn get_with_final_url(
+        &self,
+        url: &str,
+        git_protocol: Option<&str>,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let gp = git_protocol.or(self.git_protocol.as_deref());
+        self.with_auth_retry(url, |auth| self.do_get(url, gp, auth))
+            .map(|(body, final_url)| (body, Some(final_url)))
     }
 
     fn git_protocol_header(&self) -> Option<&str> {
@@ -529,6 +544,7 @@ fn finish(result: std::result::Result<ureq::Response, ureq::Error>) -> Result<Ra
 
 fn read_response(resp: ureq::Response) -> RawResponse {
     let status = resp.status();
+    let final_url = resp.get_url().to_string();
     let www_authenticate = resp
         .all("WWW-Authenticate")
         .into_iter()
@@ -547,14 +563,20 @@ fn read_response(resp: ureq::Response) -> RawResponse {
         www_authenticate,
         set_cookie,
         body,
+        final_url,
     }
 }
 
-fn finalize_status(url: &str, status: u16, body: Vec<u8>) -> Result<Vec<u8>> {
+fn finalize_status(
+    url: &str,
+    status: u16,
+    body: Vec<u8>,
+    final_url: String,
+) -> Result<(Vec<u8>, String)> {
     if status >= 400 {
         return Err(http_status_error(url, status));
     }
-    Ok(body)
+    Ok((body, final_url))
 }
 
 fn http_status_error(url: &str, status: u16) -> Error {
