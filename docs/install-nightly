@@ -1,0 +1,109 @@
+#!/bin/sh
+# grit nightly installer - installs the latest manually-triggered CI build.
+#
+# Unlike the release installer (docs/install), nightly builds are not published
+# as GitHub Releases. They live as `*-nightly` artifacts on the most recent
+# manual (workflow_dispatch) run of the Release workflow. GitHub requires
+# authentication to download workflow artifacts, so this script drives the
+# GitHub CLI (`gh`) - log in first with `gh auth login`.
+#
+# Installs both `grit` (grit-cli) and `gs` (grit-simple).
+# Usage: curl -fsSL https://grit-scm.com/install-nightly | sh
+
+main() {
+  set -eu
+
+  REPO="gitbutlerapp/grit"
+  INSTALL_DIR="${INSTALL_DIR:-$HOME/.local/bin}"
+
+  for cmd in command uname tr tar mkdir gh; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "error: required command '$cmd' not found" >&2
+      if [ "$cmd" = "gh" ]; then
+        echo "Install the GitHub CLI (https://cli.github.com) and run 'gh auth login'." >&2
+      fi
+      exit 1
+    fi
+  done
+
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  ARCH=$(uname -m)
+
+  case "$OS" in
+    darwin)  OS_TARGET="apple-darwin" ;;
+    linux)
+      # Pick the right C library flavor. musl-based distros (e.g. Alpine) get the
+      # statically-linked musl binary; everything else gets the glibc (gnu) one.
+      LIBC="gnu"
+      if { command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; } \
+         || ls /lib/ld-musl-* >/dev/null 2>&1 \
+         || { [ -f /etc/os-release ] && grep -qiE '^(ID|ID_LIKE)=.*alpine' /etc/os-release; }; then
+        LIBC="musl"
+      fi
+      OS_TARGET="unknown-linux-${LIBC}"
+      ;;
+    mingw*|msys*|cygwin*)
+      echo "On Windows, run: irm grit-scm.com/install-nightly.ps1 | iex" >&2
+      exit 1
+      ;;
+    *)
+      echo "error: unsupported OS: $OS" >&2
+      exit 1
+      ;;
+  esac
+
+  case "$ARCH" in
+    x86_64|amd64)  ARCH_TARGET="x86_64" ;;
+    arm64|aarch64) ARCH_TARGET="aarch64" ;;
+    *)
+      echo "error: unsupported architecture: $ARCH" >&2
+      exit 1
+      ;;
+  esac
+
+  TARGET="${ARCH_TARGET}-${OS_TARGET}"
+
+  echo "Detected: $OS/$ARCH -> $TARGET"
+
+  # Find the most recent successful manual (workflow_dispatch) build.
+  echo "Looking up the latest manual build..."
+  RUN_ID=$(gh run list --repo "$REPO" --workflow release.yml \
+    --event workflow_dispatch --status success --limit 1 \
+    --json databaseId --jq '.[0].databaseId')
+
+  if [ -z "$RUN_ID" ]; then
+    echo "error: no successful manual build found." >&2
+    echo "Trigger one from the Actions tab (Run workflow) and try again." >&2
+    exit 1
+  fi
+  echo "Using run #$RUN_ID"
+
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+
+  mkdir -p "$INSTALL_DIR"
+
+  # The unix build uploads both tarballs under a single `grit-<target>-nightly`
+  # artifact. Download it once, then extract `grit` and `gs`.
+  ART="grit-${TARGET}-nightly"
+  echo "Downloading artifact: $ART"
+  gh run download "$RUN_ID" --repo "$REPO" -n "$ART" -D "$TMP"
+
+  for BIN in grit gs; do
+    tar xzf "$TMP/${BIN}-${TARGET}.tar.gz" -C "$TMP"
+    mv "$TMP/${BIN}" "$INSTALL_DIR/${BIN}"
+    chmod +x "$INSTALL_DIR/${BIN}"
+    echo "Installed ${BIN} to $INSTALL_DIR/${BIN}"
+  done
+
+  if ! command -v grit >/dev/null 2>&1; then
+    echo ""
+    echo "Note: $INSTALL_DIR is not on your PATH."
+    echo "Add it with:  export PATH=\"$INSTALL_DIR:\$PATH\""
+  else
+    echo "$(grit --version)"
+    echo "$(gs --version)"
+  fi
+}
+
+main "$@"
