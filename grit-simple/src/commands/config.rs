@@ -141,37 +141,26 @@ fn target_file(global: bool) -> Result<(ConfigScope, PathBuf)> {
     }
 }
 
-/// The global config file to write to, following Git's preference order: an
-/// explicit `$GIT_CONFIG_GLOBAL`, then an existing `~/.gitconfig`, then an
-/// existing XDG `git/config`, otherwise `~/.gitconfig`.
+/// The global config file to write to.
+///
+/// We derive this from grit-lib's own global-config search list
+/// ([`global_config_paths_pub`]) so a write always lands in a file the loader
+/// will read back — crucial on Windows, where the home directory may resolve via
+/// `%USERPROFILE%` rather than `$HOME`. Following Git's writer preference, we use
+/// an existing `~/.gitconfig`, then an existing XDG `git/config`, otherwise the
+/// conventional `~/.gitconfig`.
 fn global_config_path() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("GIT_CONFIG_GLOBAL") {
-        return Some(PathBuf::from(p));
+    let paths = grit_lib::config::global_config_paths_pub();
+    // grit-lib returns `[XDG git/config, ~/.gitconfig]` (or a single
+    // `$GIT_CONFIG_GLOBAL`); the last entry is the conventional `~/.gitconfig`.
+    let dotgitconfig = paths.last().cloned();
+    if dotgitconfig.as_ref().is_some_and(|p| p.exists()) {
+        return dotgitconfig;
     }
-    let home = home_dir();
-    let home_config = home.as_ref().map(|h| h.join(".gitconfig"));
-    if let Some(p) = &home_config {
-        if p.exists() {
-            return home_config;
+    if let Some(xdg) = paths.first() {
+        if xdg.exists() {
+            return Some(xdg.clone());
         }
     }
-    let xdg = if let Some(x) = std::env::var_os("XDG_CONFIG_HOME") {
-        Some(PathBuf::from(x).join("git/config"))
-    } else {
-        home.as_ref().map(|h| h.join(".config/git/config"))
-    };
-    if let Some(p) = &xdg {
-        if p.exists() {
-            return xdg;
-        }
-    }
-    home_config
-}
-
-/// The user's home directory (`$HOME`, or `$USERPROFILE` on Windows).
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    dotgitconfig
 }

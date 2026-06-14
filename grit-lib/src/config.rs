@@ -3355,8 +3355,30 @@ fn global_config_paths() -> Vec<PathBuf> {
 }
 
 /// Return the user's home directory.
+///
+/// `$HOME` is honored on every platform. On Windows, where `$HOME` is usually
+/// unset outside a Git-for-Windows/MSYS shell, we fall back to the same sources
+/// Git does: `%HOMEDRIVE%%HOMEPATH%`, then `%USERPROFILE%`. Without this, global
+/// config (`~/.gitconfig`) would be invisible on a stock Windows shell.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
+    if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+    #[cfg(windows)]
+    {
+        if let (Some(drive), Some(path)) = (
+            std::env::var_os("HOMEDRIVE").filter(|d| !d.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|p| !p.is_empty()),
+        ) {
+            let mut combined = drive;
+            combined.push(path);
+            return Some(PathBuf::from(combined));
+        }
+        if let Some(profile) = std::env::var_os("USERPROFILE").filter(|p| !p.is_empty()) {
+            return Some(PathBuf::from(profile));
+        }
+    }
+    None
 }
 
 /// True when Git would treat the config source as `CONFIG_ORIGIN_FILE` for includes.
