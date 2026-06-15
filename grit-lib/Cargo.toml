@@ -57,3 +57,6 @@ nix.workspace = true
 # used by the built-in `gs manager` credential helper. Windows-only.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+
+[dev-dependencies]
+grit-test-support = { path = "../grit-test-support" }

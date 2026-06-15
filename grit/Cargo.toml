@@ -53,3 +53,6 @@ atty = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+
+[dev-dependencies]
+grit-test-support = { path = "../grit-test-support" }
