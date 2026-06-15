@@ -8,35 +8,12 @@
 //! repeat after advancing the remote to assert a `FastForward`.
 
 use std::path::Path;
-use std::process::Command;
 
 use grit_lib::objects::{ObjectId, ObjectKind};
 use grit_lib::odb::Odb;
 use grit_lib::refs::resolve_ref;
 use grit_lib::transfer::{fetch_local, FetchOptions, TagMode, UpdateMode};
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_AUTHOR_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8 git output")
-}
+use grit_test_support::git;
 
 fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
     ObjectId::from_hex(git(dir, &["rev-parse", rev]).trim()).expect("valid oid")

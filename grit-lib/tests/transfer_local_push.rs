@@ -9,47 +9,19 @@
 //! checking remote state with the system `git`.
 
 use std::path::Path;
-use std::process::Command;
 
 use grit_lib::objects::ObjectId;
 use grit_lib::push_report::PushRefStatus;
 use grit_lib::transfer::{push_local, PushOptions, PushRefSpec};
-
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "T")
-        .env("GIT_AUTHOR_EMAIL", "t@example.com")
-        .env("GIT_AUTHOR_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_COMMITTER_NAME", "T")
-        .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_COMMITTER_DATE", "2005-04-07T22:13:13 +0200")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    assert!(
-        out.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).expect("utf8 git output")
-}
+use grit_test_support::{git, git_cmd};
 
 /// `git` that may fail; returns whether it succeeded plus combined output.
 fn git_try(dir: &Path, args: &[&str]) -> (bool, String) {
-    let out = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .output()
-        .expect("run git");
-    let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-    combined.push_str(&String::from_utf8_lossy(&out.stderr));
-    (out.status.success(), combined)
+    let out = git_cmd(args).in_dir(dir).exec();
+    let ok = out.ok();
+    let mut combined = out.stdout;
+    combined.push_str(&out.stderr);
+    (ok, combined)
 }
 
 fn rev_parse(dir: &Path, rev: &str) -> ObjectId {
@@ -139,7 +111,15 @@ fn push_local_full_lifecycle() {
     let c2_prime = rev_parse(&local, "refs/heads/main");
     assert_ne!(c2_prime, c2);
     // Sanity: c2 is not an ancestor of c2_prime (true non-ff).
-    let (anc, _) = git_try(&local, &["merge-base", "--is-ancestor", &c2.to_hex(), &c2_prime.to_hex()]);
+    let (anc, _) = git_try(
+        &local,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &c2.to_hex(),
+            &c2_prime.to_hex(),
+        ],
+    );
     assert!(!anc, "rewrite must be non-fast-forward");
 
     let outcome = push_local(
@@ -201,14 +181,15 @@ fn push_local_full_lifecycle() {
     .expect("delete push call");
     assert_eq!(outcome.results[0].status, PushRefStatus::Ok);
     assert!(outcome.results[0].deletion);
-    assert_eq!(remote_ref(remote_git, "refs/heads/main"), None, "ref deleted");
+    assert_eq!(
+        remote_ref(remote_git, "refs/heads/main"),
+        None,
+        "ref deleted"
+    );
 
     // --- (e) CAS push with a wrong expected_old: rejected as stale, no change. ---
     // Re-establish a ref first so there's something to compare-and-swap.
-    git(
-        remote_git,
-        &["update-ref", "refs/heads/cas", &c1.to_hex()],
-    );
+    git(remote_git, &["update-ref", "refs/heads/cas", &c1.to_hex()]);
     assert_eq!(remote_ref(remote_git, "refs/heads/cas"), Some(c1));
 
     let outcome = push_local(
