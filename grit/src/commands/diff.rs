@@ -7559,7 +7559,6 @@ fn write_patch_with_prefix(
     let mut ext_found_changes = false;
     let mut ext_died: Option<String> = None;
     let mut ext_counter: usize = 0;
-    let mut ext_total: usize = 0;
     for entry in entries {
         let old_path = entry.old_path.as_deref().unwrap_or("/dev/null");
         let new_path = entry.new_path.as_deref().unwrap_or("/dev/null");
@@ -7667,7 +7666,7 @@ fn write_patch_with_prefix(
             };
             if let Some((ext, trust)) = resolved {
                 ext_invoked = true;
-                ext_total = entries.len();
+                let ext_total = entries.len();
                 ext_counter += 1;
                 // `other` = the destination path for renames/copies (Git's `two->path`).
                 let display = entry.path();
