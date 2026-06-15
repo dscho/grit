@@ -79,10 +79,8 @@ pub struct CommitGraphLayer {
     chunk_bloom_data: Option<(usize, usize)>,
     bloom_settings: Option<BloomFilterSettings>,
     bloom_disabled: bool,
-    /// Number of base graphs this layer declares in its header (`body[7]`).
-    base_layers_declared: u32,
     /// Size in bytes of the BASE chunk (0 if absent). Used to bounds-check the
-    /// base-graph list against `base_layers_declared` (Git `add_graph_to_chain`).
+    /// base-graph list from the commit-graph header (Git `add_graph_to_chain`).
     base_chunk_size: usize,
     /// OID width in bytes implied by the header hash version (20 for SHA-1, 32 for SHA-256).
     hash_len: usize,
@@ -359,7 +357,6 @@ impl CommitGraphLayer {
             None
         };
 
-        let base_layers_declared = body[7] as u32;
         let base_chunk_size = match base_graphs_off {
             Some(off) => {
                 let end = chunk_byte_range(off, &toc_entries, file_end)?;
@@ -380,7 +377,6 @@ impl CommitGraphLayer {
             chunk_bloom_data,
             bloom_settings,
             bloom_disabled: false,
-            base_layers_declared,
             base_chunk_size,
             hash_len,
         })

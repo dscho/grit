@@ -1556,7 +1556,7 @@ fn geometric_midx_included_idx_names(
     promisor_new_hashes: &[String],
 ) -> Vec<String> {
     let mut include: Vec<String> = Vec::new();
-    let mut push = |name: String, into: &mut Vec<String>| {
+    let push = |name: String, into: &mut Vec<String>| {
         if !into.contains(&name) {
             into.push(name);
         }

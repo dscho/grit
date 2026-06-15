@@ -1,4 +1,4 @@
-//! `gs commit` — record the staged changes as a new commit.
+//! `gs commit` — stage every change and record a new commit.
 
 use anyhow::{bail, Context, Result};
 use grit_lib::config::ConfigSet;
@@ -13,12 +13,10 @@ use time::OffsetDateTime;
 use crate::commands::add;
 use crate::context::{self, short_oid, subject_line};
 
-pub fn run(message: Option<String>, all: bool) -> Result<()> {
+pub fn run(message: Option<String>) -> Result<()> {
     let repo = context::discover()?;
 
-    if all {
-        add::stage(&repo, &[])?;
-    }
+    add::stage(&repo, &[])?;
 
     let message = match message {
         Some(m) if !m.trim().is_empty() => m,
@@ -28,7 +26,7 @@ pub fn run(message: Option<String>, all: bool) -> Result<()> {
     let model = status(&repo, &StatusOptions::default(), &mut NullProgress)
         .context("could not compute status")?;
     if model.staged.is_empty() {
-        bail!("nothing staged to commit — use \"gs add\" first");
+        bail!("nothing to commit — working tree clean");
     }
 
     let (refname, short_name, parent) = match &model.head {

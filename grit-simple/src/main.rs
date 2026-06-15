@@ -73,14 +73,14 @@ enum Command {
         /// Files or directories to stage. Omit to stage all changes.
         paths: Vec<String>,
     },
-    /// Record the staged changes as a new commit.
+    /// Stage every change and record a new commit.
     Commit {
         /// Commit message (you can also pass it with -m).
         message: Option<String>,
         /// Commit message.
         #[arg(short = 'm', long = "message", conflicts_with = "message")]
         message_flag: Option<String>,
-        /// Stage every change first, then commit.
+        /// Stage every change first, then commit. This is the default behavior.
         #[arg(short = 'a', long = "all")]
         all: bool,
     },
@@ -166,8 +166,8 @@ fn run() -> Result<()> {
         Command::Commit {
             message,
             message_flag,
-            all,
-        } => commands::commit::run(message.or(message_flag), all),
+            all: _,
+        } => commands::commit::run(message.or(message_flag)),
         Command::Branch { name, delete } => commands::branch::run(name, delete),
         Command::Switch { name, create } => commands::switch::run(&name, create),
         Command::Merge { branch } => commands::merge::run(&branch),

@@ -4010,26 +4010,25 @@ fn maybe_prefetch_partial_clone_merge_blobs(
     // general (full-matrix) phase over remaining relevant sources x all unpaired
     // destinations. A phase only produces a batch when it actually has missing
     // blobs to hydrate.
-    let mut push_batch =
-        |oids: Vec<ObjectId>,
-         batches: &mut Vec<Vec<ObjectId>>,
-         already: &mut std::collections::HashSet<ObjectId>| {
-            let mut batch: Vec<ObjectId> = Vec::new();
-            let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
-            for oid in oids {
-                if already.contains(&oid) || seen.contains(&oid) || !is_missing(&oid) {
-                    continue;
-                }
-                seen.insert(oid);
-                batch.push(oid);
+    let push_batch = |oids: Vec<ObjectId>,
+                      batches: &mut Vec<Vec<ObjectId>>,
+                      already: &mut std::collections::HashSet<ObjectId>| {
+        let mut batch: Vec<ObjectId> = Vec::new();
+        let mut seen: BTreeSet<ObjectId> = BTreeSet::new();
+        for oid in oids {
+            if already.contains(&oid) || seen.contains(&oid) || !is_missing(&oid) {
+                continue;
             }
-            if !batch.is_empty() {
-                for o in &batch {
-                    already.insert(*o);
-                }
-                batches.push(batch);
+            seen.insert(oid);
+            batch.push(oid);
+        }
+        if !batch.is_empty() {
+            for o in &batch {
+                already.insert(*o);
             }
-        };
+            batches.push(batch);
+        }
+    };
 
     for (side, other) in [(ours, theirs), (theirs, ours)] {
         let RenameDetectionBlobs { basename, general } =

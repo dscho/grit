@@ -62,13 +62,15 @@ gs add src/ a.txt # stage only these paths
 
 ### `gs commit`
 
-Record the staged changes as a new commit. The message can be a positional
-argument or `-m`; `-a` stages every change first.
+Stage every change and record a new commit. The message can be a positional
+argument or `-m`; `-a` is accepted for familiarity and makes the staging step
+explicit.
 
 ```sh
-gs commit "what changed"
-gs commit -m "what changed"
-gs commit -a "stage everything, then commit"
+gs commit "what changed"    # stage everything, then commit
+gs commit -m "what changed" # same, with -m
+gs commit -am "what changed"
+gs commit -a                # stages everything, then asks for a message
 ```
 
 Author/committer identity comes from `user.name` / `user.email` (honoring the
