@@ -81,6 +81,11 @@ enum Command {
         /// Commit to show the diff of (defaults to uncommitted changes).
         commit: Option<String>,
     },
+    /// Show information about a commit, tag, or branch (defaults to HEAD).
+    Show {
+        /// The commit, tag, or branch to show.
+        object: Option<String>,
+    },
     /// Show what's changed and where you are (this is the default).
     #[command(alias = "st")]
     Status,
@@ -124,6 +129,11 @@ enum Command {
     Merge {
         /// Branch to merge in.
         branch: String,
+    },
+    /// Cherry-pick a commit onto the current branch.
+    Pick {
+        /// Commit to pick (any revision spec — full / short oid, branch, HEAD~2, …).
+        commit: String,
     },
     /// Download refs and objects from a remote.
     Fetch {
@@ -209,6 +219,7 @@ fn dispatch(cli: Cli, mode: OutputMode) -> Result<()> {
         }
         Command::Log { before } => emit(&commands::log::run(before)?, mode),
         Command::Diff { commit } => emit(&commands::diff::run(commit)?, mode),
+        Command::Show { object } => emit(&commands::show::run(object)?, mode),
         Command::Status => emit(&commands::status::run()?, mode),
         Command::Shortlog => emit(&commands::shortlog::run()?, mode),
         Command::Add { paths } => emit(&commands::add::run(&paths)?, mode),
@@ -221,6 +232,7 @@ fn dispatch(cli: Cli, mode: OutputMode) -> Result<()> {
         Command::Tag { name, delete } => emit(&commands::tag::run(name, delete)?, mode),
         Command::Switch { name, create } => emit(&commands::switch::run(&name, create)?, mode),
         Command::Merge { branch } => emit(&commands::merge::run(&branch)?, mode),
+        Command::Pick { commit } => emit(&commands::pick::run(&commit)?, mode),
         Command::Fetch { remote } => emit(&commands::fetch::run(remote)?, mode),
         Command::Pull => emit(&commands::pull::run()?, mode),
         Command::Push { tags } => {
