@@ -133,7 +133,20 @@ enum Command {
     /// Fetch from the remote and integrate it into the current branch.
     Pull,
     /// Publish the current branch to its remote.
-    Push,
+    Push {
+        /// Push tags instead of the current branch. Pushes every local tag
+        /// under `refs/tags/` to the remote.
+        #[arg(short = 't', long = "tags")]
+        tags: bool,
+    },
+    /// List tags, or create / delete one. A new tag points at HEAD.
+    Tag {
+        /// Name of the tag to create. Omit to list tags.
+        name: Option<String>,
+        /// Delete the named tag instead of creating it.
+        #[arg(short = 'd', long = "delete")]
+        delete: bool,
+    },
     /// Sign in to GitHub (device flow) and store a token for HTTPS push/fetch.
     Auth {
         #[command(subcommand)]
@@ -205,12 +218,13 @@ fn dispatch(cli: Cli, mode: OutputMode) -> Result<()> {
             all: _,
         } => emit(&commands::commit::run(message.or(message_flag))?, mode),
         Command::Branch { name, delete } => emit(&commands::branch::run(name, delete)?, mode),
+        Command::Tag { name, delete } => emit(&commands::tag::run(name, delete)?, mode),
         Command::Switch { name, create } => emit(&commands::switch::run(&name, create)?, mode),
         Command::Merge { branch } => emit(&commands::merge::run(&branch)?, mode),
         Command::Fetch { remote } => emit(&commands::fetch::run(remote)?, mode),
         Command::Pull => emit(&commands::pull::run()?, mode),
-        Command::Push => {
-            let outcome = commands::push::run()?;
+        Command::Push { tags } => {
+            let outcome = commands::push::run(tags)?;
             emit(&outcome, mode)?;
             // The outcome (per-ref results) is reported in both modes; a rejected
             // push is still a failure, so mirror Git and exit non-zero.
@@ -230,7 +244,10 @@ fn dispatch(cli: Cli, mode: OutputMode) -> Result<()> {
             unset,
             key,
             value,
-        } => emit(&commands::config::run(global, list, unset, key, value)?, mode),
+        } => emit(
+            &commands::config::run(global, list, unset, key, value)?,
+            mode,
+        ),
         // `manager` speaks Git's credential protocol on stdout; it has no JSON form.
         Command::Manager { operation } => commands::manager::run(&operation),
     }

@@ -18,4 +18,5 @@ pub mod remote;
 pub mod shortlog;
 pub mod status;
 pub mod switch;
+pub mod tag;
 pub mod update;
