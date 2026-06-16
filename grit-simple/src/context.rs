@@ -159,11 +159,6 @@ pub fn subject_line(message: &str) -> String {
         .to_owned()
 }
 
-/// An abbreviated, 7-character object id.
-pub fn short_oid(oid: &ObjectId) -> String {
-    oid.to_hex().chars().take(7).collect()
-}
-
 /// Resolve a strict commit identity line (`Name <email> <epoch> <offset>`) for a
 /// role, honoring the matching `GIT_*_DATE` override. Errors if no identity is
 /// configured — used when creating a commit.

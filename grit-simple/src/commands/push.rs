@@ -9,12 +9,54 @@ use grit_lib::config::ConfigSet;
 use grit_lib::push_report::PushRefStatus;
 use grit_lib::state::{resolve_head, HeadState};
 use grit_lib::transfer::PushRefSpec;
+use serde::Serialize;
 
 use crate::commands::auth;
 use crate::context;
 use crate::net;
+use crate::output::HumanRender;
 
-pub fn run() -> Result<()> {
+/// Result of `gs push`: the per-ref outcomes for the remote.
+#[derive(Serialize)]
+pub struct PushOutcome {
+    pub remote: String,
+    /// Local branch (short name) that was pushed.
+    pub branch: String,
+    pub results: Vec<PushRefResult>,
+    /// True when any ref was rejected (dispatch exits non-zero on this).
+    pub rejected: bool,
+}
+
+/// One ref's push result.
+#[derive(Serialize)]
+pub struct PushRefResult {
+    #[serde(rename = "ref")]
+    pub ref_name: String,
+    /// `ok` | `up_to_date` | `rejected`.
+    pub status: String,
+    /// Rejection detail, present only when `status == "rejected"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl HumanRender for PushOutcome {
+    fn render_human(&self) {
+        for result in &self.results {
+            let target = format!("{} {}", self.remote, result.ref_name);
+            match result.status.as_str() {
+                "ok" => println!("  pushed {} → {target}", self.branch),
+                "up_to_date" => println!("  {target} already up to date"),
+                // Rejections are diagnostics → stderr (as before).
+                _ => eprintln!(
+                    "  rejected {target}: {}",
+                    result.reason.as_deref().unwrap_or("rejected")
+                ),
+            }
+        }
+    }
+}
+
+pub fn run() -> Result<PushOutcome> {
     let repo = context::discover()?;
 
     let (short_name, oid) = match resolve_head(&repo.git_dir)? {
@@ -48,8 +90,8 @@ pub fn run() -> Result<()> {
     };
 
     // On an HTTPS auth failure, `gs auth` can refresh the token and we retry once.
-    let outcome = match net::push(&repo, &config, &remote, std::slice::from_ref(&spec)) {
-        Ok(outcome) => outcome,
+    let report = match net::push(&repo, &config, &remote, std::slice::from_ref(&spec)) {
+        Ok(report) => report,
         Err(err) => {
             let url = net::remote_url(&config, &remote).unwrap_or_default();
             if auth::offer_reauth(&err, &url)? {
@@ -61,28 +103,40 @@ pub fn run() -> Result<()> {
     };
 
     let mut rejected = false;
-    for result in &outcome.results {
-        let target = format!("{remote} {}", result.remote_ref);
-        match result.status {
-            PushRefStatus::Ok => println!("  pushed {short_name} → {target}"),
-            PushRefStatus::UpToDate => println!("  {target} already up to date"),
-            PushRefStatus::RejectNonFastForward => {
-                rejected = true;
-                eprintln!("  rejected {target}: not a fast-forward — run `gs pull` first");
+    let results = report
+        .results
+        .iter()
+        .map(|result| {
+            let (status, reason) = match result.status {
+                PushRefStatus::Ok => ("ok", None),
+                PushRefStatus::UpToDate => ("up_to_date", None),
+                PushRefStatus::RejectNonFastForward => {
+                    rejected = true;
+                    (
+                        "rejected",
+                        Some("not a fast-forward — run `gs pull` first".to_owned()),
+                    )
+                }
+                _ => {
+                    rejected = true;
+                    (
+                        "rejected",
+                        Some(result.message.clone().unwrap_or_else(|| "rejected".to_owned())),
+                    )
+                }
+            };
+            PushRefResult {
+                ref_name: result.remote_ref.clone(),
+                status: status.to_owned(),
+                reason,
             }
-            _ => {
-                rejected = true;
-                let reason = result
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "rejected".to_owned());
-                eprintln!("  rejected {target}: {reason}");
-            }
-        }
-    }
+        })
+        .collect();
 
-    if rejected {
-        bail!("push rejected");
-    }
-    Ok(())
+    Ok(PushOutcome {
+        remote,
+        branch: short_name,
+        results,
+        rejected,
+    })
 }

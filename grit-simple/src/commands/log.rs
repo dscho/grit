@@ -5,13 +5,45 @@
 
 use anyhow::{Context, Result};
 use grit_lib::rev_list::{rev_list, RevListOptions};
+use serde::Serialize;
 
-use crate::context::{self, short_oid, subject_line};
+use crate::context::{self, subject_line};
+use crate::output::{CommitJson, HumanRender};
 
 /// How many commits to show per page.
 const PAGE: usize = 10;
 
-pub fn run(before: Option<String>) -> Result<()> {
+/// Result of `gs log`: one page of commits, plus the next page's start (if any).
+#[derive(Serialize)]
+pub struct LogOutcome {
+    pub commits: Vec<CommitJson>,
+    /// Full oid to resume from (`gs log --before=<next>`), or `null` when there
+    /// is no further history.
+    pub next: Option<String>,
+}
+
+impl HumanRender for LogOutcome {
+    fn render_human(&self) {
+        if self.commits.is_empty() {
+            println!("No commits yet.");
+            return;
+        }
+        for commit in &self.commits {
+            println!("{}  {}", short_hex(&commit.oid), commit.subject);
+        }
+        if let Some(next) = &self.next {
+            println!();
+            println!("→ more: gs log --before={}", short_hex(next));
+        }
+    }
+}
+
+/// Abbreviate a full hex oid to the 7-char short form used in human output.
+fn short_hex(oid: &str) -> &str {
+    oid.get(..7).unwrap_or(oid)
+}
+
+pub fn run(before: Option<String>) -> Result<LogOutcome> {
     let repo = context::discover()?;
     let start = before.unwrap_or_else(|| "HEAD".to_owned());
 
@@ -20,22 +52,23 @@ pub fn run(before: Option<String>) -> Result<()> {
         max_count: Some(PAGE + 1),
         ..Default::default()
     };
-    let result = rev_list(&repo, &[start.clone()], &[], &opts)
+    let result = rev_list(&repo, std::slice::from_ref(&start), &[], &opts)
         .with_context(|| format!("could not list commits from {start}"))?;
 
-    if result.commits.is_empty() {
-        println!("No commits yet.");
-        return Ok(());
-    }
+    let commits = result
+        .commits
+        .iter()
+        .take(PAGE)
+        .map(|oid| {
+            let commit = context::read_commit(&repo, oid)?;
+            Ok(CommitJson {
+                oid: oid.to_hex(),
+                subject: subject_line(&commit.message),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
 
-    for oid in result.commits.iter().take(PAGE) {
-        let commit = context::read_commit(&repo, oid)?;
-        println!("{}  {}", short_oid(oid), subject_line(&commit.message));
-    }
+    let next = result.commits.get(PAGE).map(grit_lib::objects::ObjectId::to_hex);
 
-    if let Some(next) = result.commits.get(PAGE) {
-        println!();
-        println!("→ more: gs log --before={}", short_oid(next));
-    }
-    Ok(())
+    Ok(LogOutcome { commits, next })
 }

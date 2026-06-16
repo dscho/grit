@@ -8,15 +8,21 @@
 mod commands;
 mod context;
 mod net;
+mod output;
 mod ui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+use output::{emit, OutputMode};
+
 /// A simplified alternative to the Git-compatible `grit` command line.
 #[derive(Debug, Parser)]
 #[command(name = "gs", version, about = "A simple Grit-powered CLI")]
 struct Cli {
+    /// Emit machine-readable JSON instead of human-readable text.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -31,6 +37,13 @@ enum RemoteAction {
         /// The remote's URL or path.
         url: String,
     },
+}
+
+/// Subcommands of `gs auth`.
+#[derive(Debug, Subcommand)]
+enum AuthAction {
+    /// Forget the stored GitHub token (sign out).
+    Logout,
 }
 
 /// Top-level `gs` commands.
@@ -116,7 +129,12 @@ enum Command {
     /// Publish the current branch to its remote.
     Push,
     /// Sign in to GitHub (device flow) and store a token for HTTPS push/fetch.
-    Auth,
+    Auth {
+        #[command(subcommand)]
+        action: Option<AuthAction>,
+    },
+    /// Update gs to the latest release (re-runs the install script).
+    Update,
     /// Read, set, or list configuration values.
     Config {
         /// Use the global (per-user) config file instead of this repository's.
@@ -144,44 +162,69 @@ enum Command {
 }
 
 fn main() {
-    if let Err(err) = run() {
-        eprintln!("error: {err:#}");
+    let cli = Cli::parse();
+    let mode = if cli.json {
+        OutputMode::Json
+    } else {
+        OutputMode::Human
+    };
+    if let Err(err) = dispatch(cli, mode) {
+        output::emit_error(&err, mode);
         std::process::exit(1);
     }
 }
 
-fn run() -> Result<()> {
-    let cli = Cli::parse();
+/// Run the selected subcommand and render its outcome in `mode`.
+///
+/// Each command computes a typed, serializable outcome; [`emit`] renders it as
+/// human text or a single JSON object. The two exceptions are `manager` (a raw
+/// credential-helper protocol on stdin/stdout — no outcome) and `push` (which
+/// emits its per-ref outcome and then exits non-zero when a ref was rejected).
+fn dispatch(cli: Cli, mode: OutputMode) -> Result<()> {
     match cli.command.unwrap_or(Command::Status) {
-        Command::Init { path, bare } => commands::init::run(path, bare),
-        Command::Clone { url, dir } => commands::clone::run(&url, dir),
+        Command::Init { path, bare } => emit(&commands::init::run(path, bare)?, mode),
+        Command::Clone { url, dir } => emit(&commands::clone::run(&url, dir, mode)?, mode),
         Command::Remote { action } => {
             let add = action.map(|RemoteAction::Add { name, url }| (name, url));
-            commands::remote::run(add)
+            emit(&commands::remote::run(add)?, mode)
         }
-        Command::Log { before } => commands::log::run(before),
-        Command::Status => commands::status::run(),
-        Command::Shortlog => commands::shortlog::run(),
-        Command::Add { paths } => commands::add::run(&paths),
+        Command::Log { before } => emit(&commands::log::run(before)?, mode),
+        Command::Status => emit(&commands::status::run()?, mode),
+        Command::Shortlog => emit(&commands::shortlog::run()?, mode),
+        Command::Add { paths } => emit(&commands::add::run(&paths)?, mode),
         Command::Commit {
             message,
             message_flag,
             all: _,
-        } => commands::commit::run(message.or(message_flag)),
-        Command::Branch { name, delete } => commands::branch::run(name, delete),
-        Command::Switch { name, create } => commands::switch::run(&name, create),
-        Command::Merge { branch } => commands::merge::run(&branch),
-        Command::Fetch { remote } => commands::fetch::run(remote),
-        Command::Pull => commands::pull::run(),
-        Command::Push => commands::push::run(),
-        Command::Auth => commands::auth::run(),
+        } => emit(&commands::commit::run(message.or(message_flag))?, mode),
+        Command::Branch { name, delete } => emit(&commands::branch::run(name, delete)?, mode),
+        Command::Switch { name, create } => emit(&commands::switch::run(&name, create)?, mode),
+        Command::Merge { branch } => emit(&commands::merge::run(&branch)?, mode),
+        Command::Fetch { remote } => emit(&commands::fetch::run(remote)?, mode),
+        Command::Pull => emit(&commands::pull::run()?, mode),
+        Command::Push => {
+            let outcome = commands::push::run()?;
+            emit(&outcome, mode)?;
+            // The outcome (per-ref results) is reported in both modes; a rejected
+            // push is still a failure, so mirror Git and exit non-zero.
+            if outcome.rejected {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Command::Auth { action } => match action {
+            None => emit(&commands::auth::run()?, mode),
+            Some(AuthAction::Logout) => emit(&commands::auth::logout()?, mode),
+        },
+        Command::Update => emit(&commands::update::run(mode)?, mode),
         Command::Config {
             global,
             list,
             unset,
             key,
             value,
-        } => commands::config::run(global, list, unset, key, value),
+        } => emit(&commands::config::run(global, list, unset, key, value)?, mode),
+        // `manager` speaks Git's credential protocol on stdout; it has no JSON form.
         Command::Manager { operation } => commands::manager::run(&operation),
     }
 }
