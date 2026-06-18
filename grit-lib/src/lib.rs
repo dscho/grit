@@ -241,6 +241,7 @@ pub mod submodule_config;
 pub mod submodule_config_cache;
 pub mod submodule_gitdir;
 pub mod tab_expand;
+pub mod terminal;
 #[cfg(feature = "test-tools")]
 pub mod test_tool_progress;
 pub mod textconv_cache;
