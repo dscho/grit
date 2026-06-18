@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parent.parent
 RUN_TESTS = REPO / "scripts" / "run-tests.sh"
 CATALOG = REPO / "scripts" / "generate-test-files-catalog.py"
 GEN_DASH = REPO / "scripts" / "generate-dashboard-from-test-files.py"
-BIN = REPO / "target" / "release" / "grit"
+BIN = REPO / "target" / "release" / "grit-git"
 TESTS_DIR = REPO / "tests"
 
 
@@ -69,7 +69,7 @@ def families_from_positionals(positionals: list[str]) -> list[int] | None:
 def prelude() -> None:
     if not BIN.is_file() or not os.access(BIN, os.X_OK):
         print(f"ERROR: grit binary not found or not executable: {BIN}", file=sys.stderr)
-        print("Run: cargo build --release -p grit-cli", file=sys.stderr)
+        print("Run: cargo build --release -p grit-legacy", file=sys.stderr)
         sys.exit(1)
     TESTS_DIR.mkdir(parents=True, exist_ok=True)
     shutil.copy2(BIN, TESTS_DIR / "grit")

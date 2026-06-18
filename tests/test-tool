@@ -1356,7 +1356,7 @@ PY
     esac
     ;;
   dump-untracked-cache)
-    _grit="${GUST_BIN:-$SCRIPT_DIR/../target/release/grit}"
+    _grit="${GUST_BIN:-$SCRIPT_DIR/../target/release/grit-git}"
     if [ ! -x "$_grit" ]; then
       echo "test-tool dump-untracked-cache: no grit binary (set GUST_BIN)" >&2
       exit 1
@@ -1367,7 +1367,7 @@ PY
     exec "$_grit" test-tool dump-untracked-cache "$@" ;;
   find-pack)
     shift
-    _grit="${GUST_BIN:-$SCRIPT_DIR/../target/release/grit}"
+    _grit="${GUST_BIN:-$SCRIPT_DIR/../target/release/grit-git}"
     if [ ! -x "$_grit" ]; then
       echo "test-tool find-pack: no grit binary (set GUST_BIN or build: tests/grit)" >&2
       exit 1
@@ -1411,7 +1411,7 @@ PY
     exec "$_grit" test-tool ref-store "$@" ;;
   path-walk)
     shift
-    _grit="${GUST_BIN:-$SCRIPT_DIR/../target/release/grit}"
+    _grit="${GUST_BIN:-$SCRIPT_DIR/../target/release/grit-git}"
     if [ ! -x "$_grit" ]; then
       echo "test-tool path-walk: no grit binary (set GUST_BIN)" >&2
       exit 1

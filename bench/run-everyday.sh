@@ -16,14 +16,14 @@
 set -uo pipefail   # NOT -e: a failed state-mutation must not kill the whole sweep
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GRIT="$REPO_ROOT/target/release/grit"
+GRIT="$REPO_ROOT/target/release/grit-git"
 GIT="$(which git)"
 RESULTS_DIR="$REPO_ROOT/bench/results"
 SCRATCH="${BENCH_SCRATCH:-/tmp/grit-bench-everyday}"
 WARMUP="${BENCH_WARMUP:-2}"
 MIN_RUNS="${BENCH_MIN_RUNS:-10}"
 
-[[ -x "$GRIT" ]] || { echo "Building grit (release)..."; (cd "$REPO_ROOT" && cargo build --release -q -p grit-cli); }
+[[ -x "$GRIT" ]] || { echo "Building grit (release)..."; (cd "$REPO_ROOT" && cargo build --release -q -p grit-legacy); }
 command -v hyperfine >/dev/null || { echo "ERROR: hyperfine not found (cargo install hyperfine)"; exit 1; }
 mkdir -p "$RESULTS_DIR"
 GIT="$GIT -c user.email=b@b -c user.name=bench -c init.defaultBranch=main -c commit.gpgsign=false"

@@ -15,8 +15,8 @@ then
 	_tests_home="$(cd "$(dirname "$0")" && pwd)"
 	_repo_root="$(cd "$_tests_home/.." && pwd)"
 	for candidate in \
-		"$_repo_root/target/debug/grit" \
-		"$_repo_root/target/release/grit" \
+		"$_repo_root/target/debug/grit-git" \
+		"$_repo_root/target/release/grit-git" \
 		"$_tests_home/grit"
 	do
 		if test -x "$candidate"
@@ -27,8 +27,8 @@ then
 	done
 	if test -z "$GUST_BIN"
 	then
-		for f in /var/folders/*/T/cursor-sandbox-cache/*/cargo-target/debug/grit \
-		          /tmp/cargo-target/debug/grit
+		for f in /var/folders/*/T/cursor-sandbox-cache/*/cargo-target/debug/grit-git \
+		          /tmp/cargo-target/debug/grit-git
 		do
 			if test -x "$f"
 			then

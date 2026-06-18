@@ -4,7 +4,7 @@
 set -eu
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-GRIT_BIN=$REPO/target/release/grit
+GRIT_BIN=$REPO/target/release/grit-git
 RESULTS=/tmp/grit-upstream-results
 WORKDIR=/tmp/grit-upstream-workdir
 TEST_FILTER="${1:-}"
