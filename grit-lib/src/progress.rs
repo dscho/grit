@@ -6,7 +6,7 @@
 //! draws to stderr (gated on `isatty`) and decides colour, redraw rate, and
 //! whether a pager is attached; the library makes none of those decisions.
 //!
-//! Tests, `grit-simple`, and any call site that does not want output use the
+//! Tests, `grit-cli`, and any call site that does not want output use the
 //! no-op [`NullProgress`] / [`NeverCancel`].
 
 /// A sink for progress updates emitted by a library operation.
@@ -62,7 +62,7 @@ impl<T: ProgressSink + ?Sized> ProgressSink for &mut T {
 }
 
 /// A [`ProgressSink`] that discards every update. The default for tests,
-/// `grit-simple`, and any call site that does not want progress output.
+/// `grit-cli`, and any call site that does not want progress output.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NullProgress;
 

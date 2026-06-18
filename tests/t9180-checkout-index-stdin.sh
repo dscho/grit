@@ -12,7 +12,7 @@ if test -z "$GUST_BIN"
 then
 	_here="$(cd "$(dirname "$0")" && pwd)"
 	_root="$(cd "$_here/.." && pwd)"
-	for _c in "$_root/target/release/grit" "$_root/target/debug/grit"
+	for _c in "$_root/target/release/grit-git" "$_root/target/debug/grit-git"
 	do
 		if test -x "$_c"
 		then

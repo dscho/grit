@@ -17,7 +17,7 @@ expect_used = "deny"
 
 [features]
 # Gates the test-tool-only modules (`parse_options_test_tool`, `test_tool_progress`).
-# Empty by default; enabled transitively by `grit-cli`'s default `test-tools` feature.
+# Empty by default; enabled transitively by `grit-legacy`'s default `test-tools` feature.
 test-tools = []
 # Provides the default `ureq`-backed `HttpClient` for the smart-HTTP transport
 # (`transport::http::ureq_client`). Off by default so embedders can bring their
@@ -54,9 +54,10 @@ base64 = { workspace = true, optional = true }
 nix.workspace = true
 
 # `windows-sys` backs the Windows Credential Manager store (`credentials::windows_store`),
-# used by the built-in `gs manager` credential helper. Windows-only.
+# used by the built-in `gs manager` credential helper, and enabling ANSI virtual
+# terminal processing for colored output (`terminal`). Windows-only.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_System_Console"] }
 
 [dev-dependencies]
 grit-test-support = { path = "../grit-test-support" }

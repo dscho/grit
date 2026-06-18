@@ -1,0 +1,59 @@
+[package]
+name = "grit-legacy"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+license = "GPL-2.0-only"
+description = "A Git implementation in Rust"
+readme = "README.md"
+repository = "https://github.com/gitbutlerapp/grit"
+
+[[bin]]
+name = "grit-git"
+path = "src/main.rs"
+
+[[bin]]
+name = "test-httpd"
+path = "src/bin/test_httpd.rs"
+
+[lints]
+workspace = true
+
+[features]
+# `test-tools` is on by default so normal builds and the test harness keep the
+# full `grit test-tool <sub>` surface. Build the product binary without the test
+# scaffolding via `--no-default-features`.
+default = ["test-tools"]
+test-tools = ["grit-lib/test-tools"]
+
+[dependencies]
+libc = { workspace = true }
+grit-lib = { version = "0.5", path = "../grit-lib" }
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+time.workspace = true
+tempfile.workspace = true
+regex.workspace = true
+regex-automata = { version = "0.4", features = ["dfa-build", "dfa-search", "syntax", "std", "perf"] }
+similar.workspace = true
+merge3.workspace = true
+sha1 = { workspace = true }
+sha2 = { workspace = true }
+hex.workspace = true
+flate2.workspace = true
+unicode-width.workspace = true
+encoding_rs = "0.8.35"
+hungarian.workspace = true
+ureq.workspace = true
+url.workspace = true
+base64.workspace = true
+shell-words.workspace = true
+filetime.workspace = true
+atty = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[dev-dependencies]
+grit-test-support = { path = "../grit-test-support" }
