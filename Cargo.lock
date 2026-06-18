@@ -480,6 +480,46 @@ name = "grit-cli"
 version = "0.4.10"
 dependencies = [
  "anyhow",
+ "clap",
+ "grit-lib",
+ "jaq-core",
+ "jaq-json",
+ "jaq-std",
+ "serde",
+ "serde_json",
+ "similar",
+ "terminal_size",
+ "time",
+]
+
+[[package]]
+name = "grit-examples"
+version = "0.4.10"
+dependencies = [
+ "anyhow",
+ "clap",
+ "grit-lib",
+ "tempfile",
+]
+
+[[package]]
+name = "grit-http-server"
+version = "0.4.10"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "clap",
+ "grit-protocol",
+ "serde",
+ "tokio",
+]
+
+[[package]]
+name = "grit-legacy"
+version = "0.4.10"
+dependencies = [
+ "anyhow",
  "atty",
  "base64",
  "clap",
@@ -505,29 +545,6 @@ dependencies = [
  "unicode-width",
  "ureq",
  "url",
-]
-
-[[package]]
-name = "grit-examples"
-version = "0.4.10"
-dependencies = [
- "anyhow",
- "clap",
- "grit-lib",
- "tempfile",
-]
-
-[[package]]
-name = "grit-http-server"
-version = "0.4.10"
-dependencies = [
- "anyhow",
- "axum",
- "base64",
- "clap",
- "grit-protocol",
- "serde",
- "tokio",
 ]
 
 [[package]]
@@ -565,23 +582,6 @@ version = "0.4.10"
 dependencies = [
  "anyhow",
  "grit-lib",
-]
-
-[[package]]
-name = "grit-simple"
-version = "0.4.10"
-dependencies = [
- "anyhow",
- "clap",
- "grit-lib",
- "jaq-core",
- "jaq-json",
- "jaq-std",
- "serde",
- "serde_json",
- "similar",
- "terminal_size",
- "time",
 ]
 
 [[package]]
