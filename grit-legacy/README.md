@@ -1,4 +1,4 @@
-# grit-cli
+# grit-legacy
 
 A from-scratch reimplementation of the `git` command-line tool in Rust, built
 on top of [`grit-lib`](https://crates.io/crates/grit-lib).
@@ -21,22 +21,22 @@ rates.
 ## Install
 
 ```sh
-cargo install grit-cli
+cargo install grit-legacy
 ```
 
-This puts a `grit` binary on your `$PATH`.
+This puts a `grit-git` binary on your `$PATH`.
 
 ## Usage
 
-`grit` is used exactly like `git`:
+`grit-git` is used exactly like `git`:
 
 ```sh
-grit init myrepo
+grit-git init myrepo
 cd myrepo
 echo "hello" > file.txt
-grit add file.txt
-grit commit -m "first commit"
-grit log
+grit-git add file.txt
+grit-git commit -m "first commit"
+grit-git log
 ```
 
 ## Implemented commands

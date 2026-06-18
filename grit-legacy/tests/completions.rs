@@ -1,4 +1,4 @@
-//! Tests for `grit completions <shell>` (the `clap_complete`-backed generator).
+//! Tests for `grit-git completions <shell>` (the `clap_complete`-backed generator).
 //!
 //! The generator reconstructs the full clap command tree on demand (grit's hot
 //! path uses manual pre-dispatch and never builds it). These tests guard that
@@ -10,13 +10,13 @@
 
 use std::process::Command;
 
-const GRIT_BIN: &str = env!("CARGO_BIN_EXE_grit");
+const GRIT_BIN: &str = env!("CARGO_BIN_EXE_grit-git");
 
 fn completions(shell: &str) -> std::process::Output {
     Command::new(GRIT_BIN)
         .args(["completions", shell])
         .output()
-        .expect("failed to run grit completions")
+        .expect("failed to run grit-git completions")
 }
 
 #[test]
@@ -27,11 +27,11 @@ fn fish_completion_is_well_formed() {
 
     // fish completion scaffolding clap_complete always emits for our binary.
     assert!(
-        script.contains("complete -c grit"),
-        "missing `complete -c grit` directives"
+        script.contains("complete -c grit-git"),
+        "missing `complete -c grit-git` directives"
     );
     assert!(
-        script.contains("__fish_grit_needs_command"),
+        script.contains("__fish_grit_git_needs_command"),
         "missing fish subcommand helper"
     );
 
@@ -43,7 +43,7 @@ fn fish_completion_is_well_formed() {
 
     // Per-subcommand option carried through from the command's clap `Args`.
     assert!(
-        script.contains("__fish_grit_using_subcommand checkout"),
+        script.contains("__fish_grit_git_using_subcommand checkout"),
         "missing checkout option completions"
     );
 
@@ -95,7 +95,7 @@ fn missing_shell_argument_is_rejected() {
     let out = Command::new(GRIT_BIN)
         .arg("completions")
         .output()
-        .expect("failed to run grit completions");
+        .expect("failed to run grit-git completions");
     assert!(!out.status.success(), "missing shell arg should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

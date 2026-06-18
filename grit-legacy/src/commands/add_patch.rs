@@ -52,7 +52,8 @@ fn color_auto() -> bool {
     if crate::editor::is_terminal_dumb() {
         return false;
     }
-    std::io::stdout().is_terminal() || std::env::var_os("GIT_PAGER_IN_USE").is_some()
+    (std::io::stdout().is_terminal() && grit_lib::terminal::ansi_supported())
+        || std::env::var_os("GIT_PAGER_IN_USE").is_some()
 }
 
 /// Resolve whether a given color domain (`color.interactive` / `color.diff`) is active, mirroring

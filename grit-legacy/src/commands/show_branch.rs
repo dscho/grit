@@ -353,7 +353,7 @@ fn want_color_stdout(w: ColorWhen) -> bool {
     match w {
         ColorWhen::Never => false,
         ColorWhen::Always => true,
-        ColorWhen::Auto => io::stdout().is_terminal(),
+        ColorWhen::Auto => io::stdout().is_terminal() && grit_lib::terminal::ansi_supported(),
     }
 }
 

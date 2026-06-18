@@ -193,7 +193,7 @@ fn trace_http_packet_data(prefix: &str, data: &[u8], seen_pack: &mut bool) {
 }
 
 /// Re-base a redirected `info/refs` URL onto the location to use for follow-up
-/// POSTs. Shared with grit-simple via grit-lib; see
+/// POSTs. Shared with grit-cli via grit-lib; see
 /// [`grit_lib::transport::http::rebased_base_from_redirect`] for the rationale
 /// (Git's `http.followRedirects` smart-HTTP behavior).
 use grit_lib::transport::http::rebased_base_from_redirect;

@@ -6647,7 +6647,7 @@ fn want_color_stderr(mode: GitColorBool) -> bool {
     match mode {
         GitColorBool::Never => false,
         GitColorBool::Always => true,
-        GitColorBool::Auto => io::stderr().is_terminal(),
+        GitColorBool::Auto => io::stderr().is_terminal() && grit_lib::terminal::ansi_supported(),
     }
 }
 

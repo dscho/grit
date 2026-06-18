@@ -869,7 +869,7 @@ fn list_branches(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
     }
 
     if let Some(ref fmt) = args.format {
-        let stdout_tty = std::io::stdout().is_terminal();
+        let stdout_tty = std::io::stdout().is_terminal() && grit_lib::terminal::ansi_supported();
         let emit_fmt_color = if args.no_color {
             false
         } else if let Some(ref when) = args.color {
@@ -917,7 +917,7 @@ fn list_branches(repo: &Repository, head: &HeadState, args: &Args) -> Result<()>
         return Ok(());
     }
 
-    let stdout_tty = std::io::stdout().is_terminal();
+    let stdout_tty = std::io::stdout().is_terminal() && grit_lib::terminal::ansi_supported();
     let use_color = if args.no_color {
         false
     } else if let Some(ref when) = args.color {

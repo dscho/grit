@@ -940,16 +940,21 @@ fn diff_use_color(cli_color: Option<&str>, config: &ConfigSet, output_path: Opti
         .get("diff.color")
         .or_else(|| config.get("color.diff"))
         .map(|s| s.to_ascii_lowercase());
+    // `auto` colors only when writing to a terminal that can render ANSI: not a
+    // file/pipe, and on Windows only when the console understands VT sequences.
+    let auto = output_path.is_none()
+        && io::stdout().is_terminal()
+        && grit_lib::terminal::ansi_supported();
     match cli_color.map(|s| s.to_ascii_lowercase()).as_deref() {
         Some("always") => true,
         Some("never") => false,
-        Some("auto") => output_path.is_none() && io::stdout().is_terminal(),
+        Some("auto") => auto,
         Some(_) => false,
         None => match cfg_val.as_deref() {
             Some("always") => true,
             Some("never") | Some("false") => false,
-            Some("auto") | None => output_path.is_none() && io::stdout().is_terminal(),
-            _ => output_path.is_none() && io::stdout().is_terminal(),
+            Some("auto") | None => auto,
+            _ => auto,
         },
     }
 }
@@ -4576,7 +4581,7 @@ fn run_no_index(args: Args) -> Result<()> {
     let use_color = match args.color.as_deref() {
         Some("always") => true,
         Some("never") => false,
-        Some("auto") | None => stdout_is_tty,
+        Some("auto") | None => stdout_is_tty && grit_lib::terminal::ansi_supported(),
         Some(_) => false,
     };
     let use_color_patch = use_color

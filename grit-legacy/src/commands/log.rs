@@ -996,7 +996,8 @@ fn log_resolve_stdout_color(args: &Args, git_dir: &Path) -> bool {
             match val.as_str() {
                 "always" | "true" => c = true,
                 "auto" => {
-                    c = std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    c = (std::io::IsTerminal::is_terminal(&std::io::stdout())
+                        && grit_lib::terminal::ansi_supported())
                         || std::env::var_os("GIT_PAGER_IN_USE").is_some()
                 }
                 _ => {}
@@ -1007,7 +1008,8 @@ fn log_resolve_stdout_color(args: &Args, git_dir: &Path) -> bool {
                 match val.as_str() {
                     "always" | "true" => c = true,
                     "auto" => {
-                        c = std::io::IsTerminal::is_terminal(&std::io::stdout())
+                        c = (std::io::IsTerminal::is_terminal(&std::io::stdout())
+                            && grit_lib::terminal::ansi_supported())
                             || std::env::var_os("GIT_PAGER_IN_USE").is_some()
                     }
                     _ => {}
@@ -1125,7 +1127,8 @@ fn run_line_log(
                 match val.as_str() {
                     "always" | "true" => c = true,
                     "auto" => {
-                        c = std::io::IsTerminal::is_terminal(&std::io::stdout())
+                        c = (std::io::IsTerminal::is_terminal(&std::io::stdout())
+                            && grit_lib::terminal::ansi_supported())
                             || std::env::var_os("GIT_PAGER_IN_USE").is_some()
                     }
                     _ => {}

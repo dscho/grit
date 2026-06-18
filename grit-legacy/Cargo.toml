@@ -1,5 +1,5 @@
 [package]
-name = "grit-cli"
+name = "grit-legacy"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
@@ -9,7 +9,7 @@ readme = "README.md"
 repository = "https://github.com/gitbutlerapp/grit"
 
 [[bin]]
-name = "grit"
+name = "grit-git"
 path = "src/main.rs"
 
 [[bin]]

@@ -1,4 +1,4 @@
-//! `grit completions <shell>` — emit shell completion scripts.
+//! `grit-git completions <shell>` — emit shell completion scripts.
 //!
 //! grit uses manual pre-dispatch (see `main.rs`) and never assembles a full
 //! clap `Command` tree at runtime, because building a parser for all 169
@@ -15,11 +15,11 @@ use clap_complete::Shell;
 
 use crate::commands;
 
-/// Per-command one-line summaries, parsed from the same asset `grit help -a`
+/// Per-command one-line summaries, parsed from the same asset `grit-git help -a`
 /// prints, so the completion menu shows identical descriptions.
 const ALL_COMMANDS_HELP: &str = include_str!("help/assets/all_commands_help.txt");
 
-/// `grit completions <shell>` — write a completion script for `<shell>` to stdout.
+/// `grit-git completions <shell>` — write a completion script for `<shell>` to stdout.
 pub fn run(rest: &[String]) -> Result<()> {
     // A bare `-h`/`--help` (with no shell) prints usage rather than erroring.
     let shell_arg = rest.iter().find(|a| !a.starts_with('-'));
@@ -41,7 +41,7 @@ pub fn run(rest: &[String]) -> Result<()> {
     })?;
 
     let mut cmd = build_cli();
-    clap_complete::generate(shell, &mut cmd, "grit", &mut std::io::stdout());
+    clap_complete::generate(shell, &mut cmd, "grit-git", &mut std::io::stdout());
     Ok(())
 }
 
@@ -55,14 +55,14 @@ fn shell_list() -> String {
 
 fn usage() -> String {
     format!(
-        "usage: grit completions <{}>\n",
+        "usage: grit-git completions <{}>\n",
         shell_list().replace(", ", "|")
     )
 }
 
 /// Assemble the full clap `Command` tree, used only for completion generation.
 pub(crate) fn build_cli() -> Command {
-    let mut cli = Command::new("grit")
+    let mut cli = Command::new("grit-git")
         .about("A Git implementation in Rust")
         .disable_help_subcommand(true);
 
@@ -77,7 +77,7 @@ pub(crate) fn build_cli() -> Command {
     }
 
     // `completions` is grit-specific (not in KNOWN_COMMANDS); register it so the
-    // generated script can complete `grit completions <shell>` too.
+    // generated script can complete `grit-git completions <shell>` too.
     cli.subcommand(
         Command::new("completions")
             .about("Generate shell completion scripts")
